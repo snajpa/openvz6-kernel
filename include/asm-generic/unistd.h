@@ -641,7 +641,7 @@ __SYSCALL(__NR_recvmmsg, sys_recvmmsg)
 __SC_COMP(__NR_wait4, sys_ni_syscall, sys_ni_syscall)
 */
 #define __NR_prlimit64 261
-__SYSCALL(__NR_prlimit64, sys_ni_syscall)
+__SYSCALL(__NR_prlimit64, sys_prlimit64)
 #define __NR_fanotify_init 262
 __SYSCALL(__NR_fanotify_init, sys_ni_syscall)
 #define __NR_fanotify_mark 263
