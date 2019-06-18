@@ -673,7 +673,12 @@ void sysfs_addrm_finish(struct sysfs_addrm_cxt *acxt)
 struct sysfs_dirent *sysfs_find_dirent(struct sysfs_dirent *parent_sd,
 				       const unsigned char *name)
 {
-	struct rb_node *p = parent_sd->s_dir.name_tree.rb_node;
+	struct rb_node *p;
+
+	if (!parent_sd)
+		return NULL;
+
+	p = parent_sd->s_dir.name_tree.rb_node;
 
 	while (p) {
 		int c;
