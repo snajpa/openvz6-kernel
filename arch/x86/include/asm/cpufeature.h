@@ -5,8 +5,15 @@
 #define _ASM_X86_CPUFEATURE_H
 
 #include <asm/required-features.h>
+#include <asm/cache.h>
 
 #define NCAPINTS	9	/* N 32-bit words worth of info */
+/*
+ * KABI prevents us from extending NCAPINTS.  Instead use RH_EXT_NCAPINTS and
+ *  extend the array in the non-whitelisted cpuinfo_x86_rh structure.
+ */
+#define RH_EXT_NCAPINTS 10
+#define RHNCAPINTS	(NCAPINTS + RH_EXT_NCAPINTS)
 
 /*
  * Note: If the comment begins with a quoted string, that string is used
@@ -85,7 +92,7 @@
 #define X86_FEATURE_SYSCALL32	(3*32+14) /* "" syscall in ia32 userspace */
 #define X86_FEATURE_SYSENTER32	(3*32+15) /* "" sysenter in ia32 userspace */
 #define X86_FEATURE_REP_GOOD	(3*32+16) /* rep microcode works well */
-#define X86_FEATURE_MFENCE_RDTSC (3*32+17) /* "" Mfence synchronizes RDTSC */
+
 #define X86_FEATURE_LFENCE_RDTSC (3*32+18) /* "" Lfence synchronizes RDTSC */
 #define X86_FEATURE_11AP	(3*32+19) /* "" Bad local APIC aka 11AP */
 #define X86_FEATURE_NOPL	(3*32+20) /* The NOPL (0F 1F) instructions */
@@ -97,6 +104,7 @@
 #define X86_FEATURE_EXTD_APICID	(3*32+26) /* has extended APICID (8 bits) */
 #define X86_FEATURE_AMD_DCM     (3*32+27) /* multi-node processor */
 #define X86_FEATURE_APERFMPERF	(3*32+28) /* APERFMPERF */
+#define X86_FEATURE_UNFAIR_SPINLOCK (3*32+29) /* use unfair spinlocks */
 
 /* Intel-defined CPU features, CPUID level 0x00000001 (ecx), word 4 */
 #define X86_FEATURE_XMM3	(4*32+ 0) /* "pni" SSE-3 */
@@ -114,16 +122,20 @@
 #define X86_FEATURE_CX16	(4*32+13) /* CMPXCHG16B */
 #define X86_FEATURE_XTPR	(4*32+14) /* Send Task Priority Messages */
 #define X86_FEATURE_PDCM	(4*32+15) /* Performance Capabilities */
+#define X86_FEATURE_PCID	(4*32+17) /* Process Context Identifiers */
 #define X86_FEATURE_DCA		(4*32+18) /* Direct Cache Access */
 #define X86_FEATURE_XMM4_1	(4*32+19) /* "sse4_1" SSE-4.1 */
 #define X86_FEATURE_XMM4_2	(4*32+20) /* "sse4_2" SSE-4.2 */
 #define X86_FEATURE_X2APIC	(4*32+21) /* x2APIC */
 #define X86_FEATURE_MOVBE	(4*32+22) /* MOVBE instruction */
 #define X86_FEATURE_POPCNT      (4*32+23) /* POPCNT instruction */
+#define X86_FEATURE_TSC_DEADLINE_TIMER	(4*32+24) /* Tsc deadline timer */
 #define X86_FEATURE_AES		(4*32+25) /* AES instructions */
 #define X86_FEATURE_XSAVE	(4*32+26) /* XSAVE/XRSTOR/XSETBV/XGETBV */
 #define X86_FEATURE_OSXSAVE	(4*32+27) /* "" XSAVE enabled in the OS */
 #define X86_FEATURE_AVX		(4*32+28) /* Advanced Vector Extensions */
+#define X86_FEATURE_F16C	(4*32+29) /* 16-bit fp conversions */
+#define X86_FEATURE_RDRAND	(4*32+30) /* The RDRAND instruction */
 #define X86_FEATURE_HYPERVISOR	(4*32+31) /* Running on a hypervisor */
 
 /* VIA/Cyrix/Centaur-defined CPU features, CPUID level 0xC0000001, word 5 */
@@ -150,33 +162,132 @@
 #define X86_FEATURE_3DNOWPREFETCH (6*32+ 8) /* 3DNow prefetch instructions */
 #define X86_FEATURE_OSVW	(6*32+ 9) /* OS Visible Workaround */
 #define X86_FEATURE_IBS		(6*32+10) /* Instruction Based Sampling */
-#define X86_FEATURE_SSE5	(6*32+11) /* SSE-5 */
+#define X86_FEATURE_XOP		(6*32+11) /* extended AVX instructions */
 #define X86_FEATURE_SKINIT	(6*32+12) /* SKINIT/STGI instructions */
 #define X86_FEATURE_WDT		(6*32+13) /* Watchdog timer */
+#define X86_FEATURE_LWP		(6*32+15) /* Light Weight Profiling */
+#define X86_FEATURE_FMA4	(6*32+16) /* 4 operands MAC instructions */
+#define X86_FEATURE_TCE		(6*32+17) /* translation cache extension */
+#define X86_FEATURE_NODEID_MSR	(6*32+19) /* NodeId MSR */
+#define X86_FEATURE_TBM		(6*32+21) /* trailing bit manipulations */
+#define X86_FEATURE_TOPOEXT	(6*32+22) /* topology extensions CPUID leafs */
+#define X86_FEATURE_PERFCTR_CORE (6*32+23) /* core performance counter extensions */
+#define X86_FEATURE_PERFCTR_NB  (6*32+24) /* NB performance counter extensions */
+#define X86_FEATURE_PERFCTR_L2	(6*32+28) /* L2 performance counter extensions */
 
 /*
  * Auxiliary flags: Linux defined - For features scattered in various
- * CPUID levels like 0x6, 0xA etc
+ * CPUID levels like 0x6, 0xA etc, word 7
  */
 #define X86_FEATURE_IDA		(7*32+ 0) /* Intel Dynamic Acceleration */
 #define X86_FEATURE_ARAT	(7*32+ 1) /* Always Running APIC Timer */
+#define X86_FEATURE_CPB		(7*32+ 2) /* AMD Core Performance Boost */
+#define X86_FEATURE_EPB		(7*32+ 3) /* IA32_ENERGY_PERF_BIAS support */
+#define X86_FEATURE_XSAVEOPT	(7*32+ 4) /* Optimized Xsave */
+#define X86_FEATURE_PLN		(7*32+ 5) /* Intel Power Limit Notification */
+#define X86_FEATURE_PTS		(7*32+ 6) /* Intel Package Thermal Status */
+#define X86_FEATURE_DTHERM	(7*32+ 7) /* Digital Thermal Sensor */
+#define X86_FEATURE_HWP		( 7*32+ 10) /* "hwp" Intel HWP */
+#define X86_FEATURE_HWP_NOITFY	( 7*32+ 11) /* Intel HWP_NOTIFY */
+#define X86_FEATURE_HWP_ACT_WINDOW ( 7*32+ 12) /* Intel HWP_ACT_WINDOW */
+#define X86_FEATURE_HWP_EPP	( 7*32+13) /* Intel HWP_EPP */
+#define X86_FEATURE_HWP_PKG_REQ ( 7*32+14) /* Intel HWP_PKG_REQ */
+#define X86_FEATURE_INVPCID_SINGLE ( 7*32+15) /* Effectively INVPCID && CR4.PCIDE=1 */
+#define X86_FEATURE_PTI		( 7*32+18) /* Kernel Page Table Isolation enabled */
+#define X86_FEATURE_RETPOLINE	( 7*32+19) /* Generic Retpoline mitigation for Spectre variant 2 */
+#define X86_FEATURE_RETPOLINE_AMD ( 7*32+20) /* "" AMD Retpoline mitigation for Spectre variant 2 */
+#define X86_FEATURE_IBP_DISABLE	( 7*32+21) /* Old AMD Indirect Branch Predictor Disable */
+#define X86_FEATURE_PTI_SUPPORT	( 7*32+22) /* "" Provide PTI support */
+#define X86_FEATURE_SPEC_STORE_BYPASS_DISABLE (7*32+23) /* "" Disable Speculative Store Bypass. */
+#define X86_FEATURE_AMD_SSBD		      (7*32+24) /* "" AMD SSBD implementation */
 
-/* Virtualization flags: Linux defined */
+/* Virtualization flags: Linux defined, word 8 */
 #define X86_FEATURE_TPR_SHADOW  (8*32+ 0) /* Intel TPR Shadow */
 #define X86_FEATURE_VNMI        (8*32+ 1) /* Intel Virtual NMI */
 #define X86_FEATURE_FLEXPRIORITY (8*32+ 2) /* Intel FlexPriority */
 #define X86_FEATURE_EPT         (8*32+ 3) /* Intel Extended Page Table */
 #define X86_FEATURE_VPID        (8*32+ 4) /* Intel Virtual Processor ID */
+#define X86_FEATURE_NPT		(8*32+5)  /* AMD Nested Page Table support */
+#define X86_FEATURE_LBRV	(8*32+6)  /* AMD LBR Virtualization support */
+#define X86_FEATURE_SVML	(8*32+7)  /* "svm_lock" AMD SVM locking MSR */
+#define X86_FEATURE_NRIPS	(8*32+8)  /* "nrip_save" AMD SVM next_rip save */
+#define X86_FEATURE_TSCRATEMSR	(8*32+ 9) /* "tsc_scale" AMD TSC scaling support */
+#define X86_FEATURE_VMCBCLEAN	(8*32+10) /* "vmcb_clean" AMD VMCB clean bits support */
+#define X86_FEATURE_FLUSHBYASID	(8*32+11) /* AMD flush-by-ASID support */
+#define X86_FEATURE_DECODEASSISTS (8*32+12) /* AMD Decode Assists support */
+#define X86_FEATURE_PAUSEFILTER	(8*32+13) /* AMD filtered pause intercept */
+#define X86_FEATURE_PFTHRESHOLD	(8*32+14) /* AMD pause filter threshold */
+
+/* Intel-defined CPU features, CPUID level 0x00000007:0 (ebx), word 9 */
+#define X86_FEATURE_FSGSBASE	(9*32+ 0) /* {RD/WR}{FS/GS}BASE instructions*/
+#define X86_FEATURE_BMI1	(9*32+ 3) /* 1st group bit manipulation extensions */
+#define X86_FEATURE_HLE		(9*32+ 4) /* Hardware Lock Elision */
+#define X86_FEATURE_AVX2	(9*32+ 5) /* AVX2 instructions */
+#define X86_FEATURE_SMEP	(9*32+ 7) /* Supervisor Mode Execution Protection */
+#define X86_FEATURE_BMI2	(9*32+ 8) /* 2nd group bit manipulation extensions */
+#define X86_FEATURE_ERMS	(9*32+ 9) /* Enhanced REP MOVSB/STOSB */
+#define X86_FEATURE_INVPCID	(9*32+10) /* Invalidate Processor Context ID */
+#define X86_FEATURE_RTM		(9*32+11) /* Restricted Transactional Memory */
+#define X86_FEATURE_CQM		(9*32+12) /* Cache QoS Monitoring */
+#define X86_FEATURE_AVX512F	(9*32+16) /* AVX-512 Foundation */
+#define X86_FEATURE_AVX512PF	(9*32+26) /* AVX-512 Prefetch */
+#define X86_FEATURE_AVX512ER	(9*32+27) /* AVX-512 Exponential and Reciprocal */
+#define X86_FEATURE_AVX512CD	(9*32+28) /* AVX-512 Conflict Detection */
+#define X86_FEATURE_RDSEED	(9*32+18) /* The RDSEED instruction */
+#define X86_FEATURE_ADX		(9*32+19) /* The ADCX and ADOX instructions */
+
+/* Intel-defined CPU QoS Sub-leaf, CPUID level 0x0000000F:0 (edx), word 11 */
+#define X86_FEATURE_CQM_LLC	(11*32+ 1) /* LLC QoS if 1 */
+
+/* Intel-defined CPU QoS Sub-leaf, CPUID level 0x0000000F:1 (edx), word 12 */
+#define X86_FEATURE_CQM_OCCUP_LLC (12*32+ 0) /* LLC occupancy monitoring if 1 */
+
+/* AMD-defined CPU features, CPUID level 0x80000008 (ebx), word 13 */
+#define X86_FEATURE_CLZERO	(13*32+ 0) /* CLZERO instruction */
+#define X86_FEATURE_IBPB	(13*32+12) /* Indirect Branch Prediction Barrier */
+#define X86_FEATURE_IBRS	(13*32+14) /* Indirect Branch Restricted Speculation */
+#define X86_FEATURE_STIBP	(13*32+15) /* Single Thread Indirect Branch Predictors */
+
+/* Intel-defined CPU features, CPUID level 0x00000007:0 (EDX), word 18 */
+#define X86_FEATURE_AVX512_4VNNIW	(18*32+ 2) /* AVX-512 Neural Network Instructions */
+#define X86_FEATURE_AVX512_4FMAPS	(18*32+ 3) /* AVX-512 Multiply Accumulation Single precision */
+#define X86_FEATURE_SPEC_CTRL		(18*32+26) /* "" Speculation Control (IBRS + IBPB) */
+#define X86_FEATURE_INTEL_STIBP		(18*32+27) /* "" Single Thread Indirect Branch Predictors */
+#define X86_FEATURE_ARCH_CAPABILITIES	(18*32+29) /* IA32_ARCH_CAPABILITIES MSR (Intel) */
+#define X86_FEATURE_SSBD		(18*32+31) /* Speculative Store Bypass Disable */
 
 #if defined(__KERNEL__) && !defined(__ASSEMBLY__)
 
+#include <asm/asm.h>
 #include <linux/bitops.h>
 
-extern const char * const x86_cap_flags[NCAPINTS*32];
+extern const char * const x86_cap_flags[RHNCAPINTS*32];
 extern const char * const x86_power_flags[32];
 
-#define test_cpu_cap(c, bit)						\
-	 test_bit(bit, (unsigned long *)((c)->x86_capability))
+ /* start of RH extended capabilities word 9, bit 0 */
+#define RH_EXT_CAP_BIT0 (9*32+0)
+
+/*
+ * RHEL: If the bit is in the cpuinfo_x86 struct (ie, is word 8 or less),
+ * then just use the bit like it always has been.  If it is in the new
+ * extended struct, cpuinfo_x86_rh, then check to see if the cpuinfo_x86
+ * struct was the boot_cpu_data struct.  If it was the boot_cpu_data
+ * struct then use boot_cpu_data_rh, o/w use the cpu_data_rh per_cpu data
+ */
+#define _cpu_cap_fn(func, c, bit)					\
+	((bit < RH_EXT_CAP_BIT0) ?					\
+	 func##_bit(bit, (unsigned long *)((c)->x86_capability)) :	\
+	 ((c == &boot_cpu_data) ?					\
+	  func##_bit(bit - RH_EXT_CAP_BIT0,				\
+		     (unsigned long *)boot_cpu_data_rh.x86_capability):	\
+	  func##_bit(bit - RH_EXT_CAP_BIT0,				\
+		 (unsigned long *)cpu_data_rh((c)->cpu_index).x86_capability)\
+	 )								\
+	)
+
+#define test_cpu_cap(c, bit) _cpu_cap_fn(test, c, bit)
+#define set_cpu_cap(c, bit) _cpu_cap_fn(set, c, bit)
+#define clear_cpu_cap(c, bit) _cpu_cap_fn(clear, c, bit)
 
 #define cpu_has(c, bit)							\
 	(__builtin_constant_p(bit) &&					\
@@ -187,14 +298,17 @@ extern const char * const x86_power_flags[32];
 	   (((bit)>>5)==4 && (1UL<<((bit)&31) & REQUIRED_MASK4)) ||	\
 	   (((bit)>>5)==5 && (1UL<<((bit)&31) & REQUIRED_MASK5)) ||	\
 	   (((bit)>>5)==6 && (1UL<<((bit)&31) & REQUIRED_MASK6)) ||	\
-	   (((bit)>>5)==7 && (1UL<<((bit)&31) & REQUIRED_MASK7)) )	\
+	   (((bit)>>5)==7 && (1UL<<((bit)&31) & REQUIRED_MASK7)) ||	\
+	   (((bit)>>5)==8 && (1UL<<((bit)&31) & REQUIRED_MASK8)) ||	\
+	   (((bit)>>5)==9 && (1UL<<((bit)&31) & REQUIRED_MASK9)) )	\
 	  ? 1 :								\
 	 test_cpu_cap(c, bit))
 
+#define this_cpu_has(bit)						\
+	cpu_has(&current_cpu_data, bit)
+
 #define boot_cpu_has(bit)	cpu_has(&boot_cpu_data, bit)
 
-#define set_cpu_cap(c, bit)	set_bit(bit, (unsigned long *)((c)->x86_capability))
-#define clear_cpu_cap(c, bit)	clear_bit(bit, (unsigned long *)((c)->x86_capability))
 #define setup_clear_cpu_cap(bit) do { \
 	clear_cpu_cap(&boot_cpu_data, bit);	\
 	set_bit(bit, (unsigned long *)cpu_caps_cleared); \
@@ -219,7 +333,9 @@ extern const char * const x86_power_flags[32];
 #define cpu_has_xmm		boot_cpu_has(X86_FEATURE_XMM)
 #define cpu_has_xmm2		boot_cpu_has(X86_FEATURE_XMM2)
 #define cpu_has_xmm3		boot_cpu_has(X86_FEATURE_XMM3)
+#define cpu_has_ssse3		boot_cpu_has(X86_FEATURE_SSSE3)
 #define cpu_has_aes		boot_cpu_has(X86_FEATURE_AES)
+#define cpu_has_avx		boot_cpu_has(X86_FEATURE_AVX)
 #define cpu_has_ht		boot_cpu_has(X86_FEATURE_HT)
 #define cpu_has_mp		boot_cpu_has(X86_FEATURE_MP)
 #define cpu_has_nx		boot_cpu_has(X86_FEATURE_NX)
@@ -247,7 +363,13 @@ extern const char * const x86_power_flags[32];
 #define cpu_has_xmm4_2		boot_cpu_has(X86_FEATURE_XMM4_2)
 #define cpu_has_x2apic		boot_cpu_has(X86_FEATURE_X2APIC)
 #define cpu_has_xsave		boot_cpu_has(X86_FEATURE_XSAVE)
+#define cpu_has_osxsave		boot_cpu_has(X86_FEATURE_OSXSAVE)
 #define cpu_has_hypervisor	boot_cpu_has(X86_FEATURE_HYPERVISOR)
+#define cpu_has_pclmulqdq	boot_cpu_has(X86_FEATURE_PCLMULQDQ)
+#define cpu_has_perfctr_core	boot_cpu_has(X86_FEATURE_PERFCTR_CORE)
+#define cpu_has_perfctr_nb	boot_cpu_has(X86_FEATURE_PERFCTR_NB)
+#define cpu_has_topoext		boot_cpu_has(X86_FEATURE_TOPOEXT)
+#define cpu_has_perfctr_l2	boot_cpu_has(X86_FEATURE_PERFCTR_L2)
 
 #if defined(CONFIG_X86_INVLPG) || defined(CONFIG_X86_64)
 # define cpu_has_invlpg		1
@@ -276,6 +398,79 @@ extern const char * const x86_power_flags[32];
 #define cpu_has_centaur_mcr	0
 
 #endif /* CONFIG_X86_64 */
+
+/*
+ * Static testing of CPU features.  Used the same as boot_cpu_has().
+ * These are only valid after alternatives have run, but will statically
+ * patch the target code for additional performance.
+ *
+ */
+static __always_inline __pure bool __static_cpu_has(u16 bit)
+{
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 5)
+		asm goto("1: jmp %l[t_no]\n"
+			 "2:\n"
+			 ".section .altinstructions,\"a\"\n"
+			 _ASM_ALIGN "\n"
+			 _ASM_PTR "1b\n"
+			 _ASM_PTR "0\n" 	/* no replacement */
+			 " .word %P0\n"		/* feature bit */
+			 " .byte 2b - 1b\n"	/* source len */
+			 " .byte 0\n"		/* replacement len */
+			 ".previous\n"
+			 /* skipping size check since replacement size = 0 */
+			 : : "i" (bit) : : t_no);
+		return true;
+	t_no:
+		return false;
+#else
+		u8 flag;
+		/* Open-coded due to __stringify() in ALTERNATIVE() */
+		asm volatile("1: movb $0,%0\n"
+			     "2:\n"
+			     ".section .altinstructions,\"a\"\n"
+			     _ASM_ALIGN "\n"
+			     _ASM_PTR "1b\n"
+			     _ASM_PTR "3f\n"
+			     " .word %P1\n"		/* feature bit */
+			     " .byte 2b - 1b\n"		/* source len */
+			     " .byte 4f - 3f\n"		/* replacement len */
+			     ".previous\n"
+			     ".section .discard,\"aw\",@progbits\n"
+			     " .byte 0xff + (4f-3f) - (2b-1b)\n" /* size check */
+			     ".previous\n"
+			     ".section .altinstr_replacement,\"ax\"\n"
+			     "3: movb $1,%0\n"
+			     "4:\n"
+			     ".previous\n"
+			     : "=qm" (flag) : "i" (bit));
+		return flag;
+#endif
+}
+
+#define static_cpu_has(bit)					\
+(								\
+	__builtin_constant_p(boot_cpu_has(bit)) ?		\
+		boot_cpu_has(bit) :				\
+	__builtin_constant_p(bit) ?				\
+		__static_cpu_has(bit) :				\
+		boot_cpu_has(bit)				\
+)
+
+/*
+ * CPU bug word emulation
+ */
+extern unsigned long __cpu_bugs __read_mostly;
+#define boot_cpu_has_bug(bit)		test_bit(bit, &__cpu_bugs)
+#define boot_cpu_set_bug(bit)		set_bit(bit, &__cpu_bugs)
+#define boot_cpu_clear_bug(bit) 	clear_bit(bit, &__cpu_bugs)
+#define setup_force_cpu_bug(bit)	boot_cpu_set_bug(bit)
+
+#define X86_BUG(x)			(x)
+#define X86_BUG_CPU_MELTDOWN		X86_BUG(0) /* CPU is affected by meltdown attack and needs kernel page table isolation */
+#define X86_BUG_SPECTRE_V1		X86_BUG(1) /* CPU is affected by Spectre variant 1 attack with conditional branches */
+#define X86_BUG_SPECTRE_V2		X86_BUG(2) /* CPU is affected by Spectre variant 2 attack with indirect branches */
+#define X86_BUG_SPEC_STORE_BYPASS	X86_BUG(3) /* CPU is affected by speculative store bypass attack */
 
 #endif /* defined(__KERNEL__) && !defined(__ASSEMBLY__) */
 

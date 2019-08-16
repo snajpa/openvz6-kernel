@@ -16,6 +16,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/security.h>
+#include <linux/ima.h>
 
 /* Boot-time LSM user choice */
 static __initdata char chosen_lsm[SECURITY_NAME_MAX + 1];
@@ -151,10 +152,9 @@ int security_capset(struct cred *new, const struct cred *old,
 				    effective, inheritable, permitted);
 }
 
-int security_capable(int cap)
+int security_capable(const struct cred *cred, int cap)
 {
-	return security_ops->capable(current, current_cred(), cap,
-				     SECURITY_CAP_AUDIT);
+	return security_ops->capable(current, cred, cap, SECURITY_CAP_AUDIT);
 }
 
 int security_real_capable(struct task_struct *tsk, int cap)
@@ -204,7 +204,7 @@ int security_syslog(int type)
 	return security_ops->syslog(type);
 }
 
-int security_settime(struct timespec *ts, struct timezone *tz)
+int security_settime(const struct timespec *ts, const struct timezone *tz)
 {
 	return security_ops->settime(ts, tz);
 }
@@ -235,7 +235,12 @@ int security_bprm_set_creds(struct linux_binprm *bprm)
 
 int security_bprm_check(struct linux_binprm *bprm)
 {
-	return security_ops->bprm_check_security(bprm);
+	int ret;
+
+	ret = security_ops->bprm_check_security(bprm);
+	if (ret)
+		return ret;
+	return ima_bprm_check(bprm);
 }
 
 void security_bprm_committing_creds(struct linux_binprm *bprm)
@@ -268,6 +273,11 @@ int security_sb_copy_data(char *orig, char *copy)
 	return security_ops->sb_copy_data(orig, copy);
 }
 EXPORT_SYMBOL(security_sb_copy_data);
+
+int security_sb_remount(struct super_block *sb, void *data)
+{
+	return security_ops->sb_remount(sb, data);
+}
 
 int security_sb_kern_mount(struct super_block *sb, int flags, void *data)
 {
@@ -337,10 +347,10 @@ int security_sb_set_mnt_opts(struct super_block *sb,
 }
 EXPORT_SYMBOL(security_sb_set_mnt_opts);
 
-void security_sb_clone_mnt_opts(const struct super_block *oldsb,
+int security_sb_clone_mnt_opts(const struct super_block *oldsb,
 				struct super_block *newsb)
 {
-	security_ops->sb_clone_mnt_opts(oldsb, newsb);
+	return security_ops->sb_clone_mnt_opts(oldsb, newsb);
 }
 EXPORT_SYMBOL(security_sb_clone_mnt_opts);
 
@@ -352,12 +362,21 @@ EXPORT_SYMBOL(security_sb_parse_opts_str);
 
 int security_inode_alloc(struct inode *inode)
 {
+	int ret;
+
 	inode->i_security = NULL;
-	return security_ops->inode_alloc_security(inode);
+	ret =  security_ops->inode_alloc_security(inode);
+	if (ret)
+		return ret;
+	ret = ima_inode_alloc(inode);
+	if (ret)
+		security_inode_free(inode);
+	return ret;
 }
 
 void security_inode_free(struct inode *inode)
 {
+	ima_inode_free(inode);
 	security_ops->inode_free_security(inode);
 }
 
@@ -426,6 +445,7 @@ int security_path_rename(struct path *old_dir, struct dentry *old_dentry,
 	return security_ops->path_rename(old_dir, old_dentry, new_dir,
 					 new_dentry);
 }
+#endif
 
 int security_path_truncate(struct path *path, loff_t length,
 			   unsigned int time_attrs)
@@ -434,7 +454,6 @@ int security_path_truncate(struct path *path, loff_t length,
 		return 0;
 	return security_ops->path_truncate(path, length, time_attrs);
 }
-#endif
 
 int security_inode_create(struct inode *dir, struct dentry *dentry, int mode)
 {
@@ -639,7 +658,12 @@ int security_file_mmap(struct file *file, unsigned long reqprot,
 			unsigned long prot, unsigned long flags,
 			unsigned long addr, unsigned long addr_only)
 {
-	return security_ops->file_mmap(file, reqprot, prot, flags, addr, addr_only);
+	int ret;
+
+	ret = security_ops->file_mmap(file, reqprot, prot, flags, addr, addr_only);
+	if (ret)
+		return ret;
+	return ima_file_mmap(file, prot);
 }
 
 int security_file_mprotect(struct vm_area_struct *vma, unsigned long reqprot,
@@ -719,9 +743,9 @@ int security_kernel_create_files_as(struct cred *new, struct inode *inode)
 	return security_ops->kernel_create_files_as(new, inode);
 }
 
-int security_kernel_module_request(void)
+int security_kernel_module_request(char *kmod_name)
 {
-	return security_ops->kernel_module_request();
+	return security_ops->kernel_module_request(kmod_name);
 }
 
 int security_task_setuid(uid_t id0, uid_t id1, uid_t id2, int flags)
@@ -781,9 +805,10 @@ int security_task_getioprio(struct task_struct *p)
 	return security_ops->task_getioprio(p);
 }
 
-int security_task_setrlimit(unsigned int resource, struct rlimit *new_rlim)
+int security_task_setrlimit(struct task_struct *p, unsigned int resource,
+		struct rlimit *new_rlim)
 {
-	return security_ops->task_setrlimit(resource, new_rlim);
+	return security_ops->task_setrlimit(p, resource, new_rlim);
 }
 
 int security_task_setscheduler(struct task_struct *p,
@@ -950,12 +975,6 @@ int security_netlink_send(struct sock *sk, struct sk_buff *skb)
 	return security_ops->netlink_send(sk, skb);
 }
 
-int security_netlink_recv(struct sk_buff *skb, int cap)
-{
-	return security_ops->netlink_recv(skb, cap);
-}
-EXPORT_SYMBOL(security_netlink_recv);
-
 int security_secid_to_secctx(u32 secid, char **secdata, u32 *seclen)
 {
 	return security_ops->secid_to_secctx(secid, secdata, seclen);
@@ -1107,6 +1126,7 @@ void security_sk_clone(const struct sock *sk, struct sock *newsk)
 {
 	security_ops->sk_clone_security(sk, newsk);
 }
+EXPORT_SYMBOL(security_sk_clone);
 
 void security_sk_classify_flow(struct sock *sk, struct flowi *fl)
 {
@@ -1145,23 +1165,35 @@ void security_inet_conn_established(struct sock *sk,
 	security_ops->inet_conn_established(sk, skb);
 }
 
+int security_tun_dev_alloc_security(void **security)
+{
+	return security_ops->tun_dev_alloc_security(security);
+}
+EXPORT_SYMBOL(security_tun_dev_alloc_security);
+
+void security_tun_dev_free_security(void *security)
+{
+	security_ops->tun_dev_free_security(security);
+}
+EXPORT_SYMBOL(security_tun_dev_free_security);
+
 int security_tun_dev_create(void)
 {
 	return security_ops->tun_dev_create();
 }
 EXPORT_SYMBOL(security_tun_dev_create);
 
-void security_tun_dev_post_create(struct sock *sk)
+int security_tun_dev_attach(struct sock *sk, void *security)
 {
-	return security_ops->tun_dev_post_create(sk);
-}
-EXPORT_SYMBOL(security_tun_dev_post_create);
-
-int security_tun_dev_attach(struct sock *sk)
-{
-	return security_ops->tun_dev_attach(sk);
+	return security_ops->tun_dev_attach(sk, security);
 }
 EXPORT_SYMBOL(security_tun_dev_attach);
+
+int security_tun_dev_open(void *security)
+{
+	return security_ops->tun_dev_open(security);
+}
+EXPORT_SYMBOL(security_tun_dev_open);
 
 #endif	/* CONFIG_SECURITY_NETWORK */
 

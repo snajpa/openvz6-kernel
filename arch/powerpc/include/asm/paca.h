@@ -39,6 +39,22 @@ extern unsigned int debug_smp_processor_id(void); /* from linux/smp.h */
 struct task_struct;
 
 /*
+ * This is pointed to by paca->aux_ptr, for the purpose of extending the
+ * paca structure without kABI breakage.
+ */
+#ifdef CONFIG_PPC_BOOK3S_64
+struct paca_aux_struct {
+	/*
+	 * rfi fallback flush must be in its own cacheline to prevent
+	 * other paca data leaking into the L1d
+	 */
+	u64 exrfi[13] __aligned(0x80);
+	void *rfi_flush_fallback_area;
+	u64 l1d_flush_size;
+};
+#endif
+
+/*
  * Defines the layout of the paca.
  *
  * This structure is not directly accessed by firmware or the service
@@ -78,7 +94,19 @@ struct paca_struct {
 					/* this becomes non-zero. */
 #ifdef CONFIG_PPC_STD_MMU_64
 	struct slb_shadow *slb_shadow_ptr;
+	struct dtl_entry *dispatch_log;
+	struct dtl_entry *dispatch_log_end;
 
+	/*
+	 * Because of alignement of exgen there is a hole here, we use that hole
+	 * for the aux_ptr and so don't change the size of the paca or the
+	 * location of any members.
+	 */
+#ifdef CONFIG_PPC_BOOK3S_64
+#ifndef __GENKSYMS__
+	struct paca_aux_struct *aux_ptr;
+#endif
+#endif
 	/*
 	 * Now, starting in cacheline 2, the exception save areas
 	 */
@@ -122,13 +150,23 @@ struct paca_struct {
 	u8 soft_enabled;		/* irq soft-enable flag */
 	u8 hard_enabled;		/* set if irqs are enabled in MSR */
 	u8 io_sync;			/* writel() needs spin_unlock sync */
+#ifndef __GENKSYMS__
+	u8 irq_work_pending;		/* IRQ_WORK interrupt while soft-disable */
+#else
 	u8 perf_event_pending;		/* PM interrupt while soft-disabled */
+#endif
 
 	/* Stuff for accurate time accounting */
 	u64 user_time;			/* accumulated usermode TB ticks */
 	u64 system_time;		/* accumulated system TB ticks */
-	u64 startpurr;			/* PURR/TB value snapshot */
+	u64 user_time_scaled;		/* accumulated usermode SPURR ticks */
+	u64 starttime;			/* TB value snapshot */
+	u64 starttime_user;		/* TB value on exit to usermode */
 	u64 startspurr;			/* SPURR value snapshot */
+	u64 utime_sspurr;		/* ->user_time when ->startspurr set */
+	u64 stolen_time;		/* TB ticks taken by hypervisor */
+	u64 dtl_ridx;			/* read index in dispatch log */
+	struct dtl_entry *dtl_curr;	/* pointer corresponding to dtl_ridx */
 };
 
 extern struct paca_struct paca[];

@@ -100,7 +100,7 @@ static void __init setup_pci_atmu(struct pci_controller *hose,
 	struct ccsr_pci __iomem *pci;
 	int i, j, n, mem_log, win_idx = 2;
 	u64 mem, sz, paddr_hi = 0;
-	u64 paddr_lo = ULLONG_MAX;
+	u64 offset = 0, paddr_lo = ULLONG_MAX;
 	u32 pcicsrbar = 0, pcicsrbar_sz;
 	u32 piwar = PIWAR_EN | PIWAR_PF | PIWAR_TGI_LOCAL |
 			PIWAR_READ_SNOOP | PIWAR_WRITE_SNOOP;
@@ -128,8 +128,9 @@ static void __init setup_pci_atmu(struct pci_controller *hose,
 		paddr_lo = min(paddr_lo, (u64)hose->mem_resources[i].start);
 		paddr_hi = max(paddr_hi, (u64)hose->mem_resources[i].end);
 
-		n = setup_one_atmu(pci, j, &hose->mem_resources[i],
-				   hose->pci_mem_offset);
+		/* We assume all memory resources have the same offset */
+		offset = hose->mem_offset[i];
+		n = setup_one_atmu(pci, j, &hose->mem_resources[i], offset);
 
 		if (n < 0 || j >= 5) {
 			pr_err("Ran out of outbound PCI ATMUs for resource %d!\n", i);
@@ -159,8 +160,8 @@ static void __init setup_pci_atmu(struct pci_controller *hose,
 	}
 
 	/* convert to pci address space */
-	paddr_hi -= hose->pci_mem_offset;
-	paddr_lo -= hose->pci_mem_offset;
+	paddr_hi -= offset;
+	paddr_lo -= offset;
 
 	if (paddr_hi == paddr_lo) {
 		pr_err("%s: No outbound window space\n", name);
@@ -330,7 +331,7 @@ int __init fsl_add_bridge(struct device_node *dev, int is_primary)
 		printk(KERN_WARNING "Can't get bus-range for %s, assume"
 			" bus 0\n", dev->full_name);
 
-	ppc_pci_add_flags(PPC_PCI_REASSIGN_ALL_BUS);
+	pci_add_flags(PCI_REASSIGN_ALL_BUS);
 	hose = pcibios_alloc_controller(dev);
 	if (!hose)
 		return -ENOMEM;
@@ -392,8 +393,22 @@ DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_MPC8536, quirk_fsl_pcie_header);
 DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_MPC8641, quirk_fsl_pcie_header);
 DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_MPC8641D, quirk_fsl_pcie_header);
 DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_MPC8610, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P1011E, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P1011, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P1013E, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P1013, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P1020E, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P1020, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P1022E, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P1022, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P2010E, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P2010, quirk_fsl_pcie_header);
 DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P2020E, quirk_fsl_pcie_header);
 DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P2020, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P4040E, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P4040, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P4080E, quirk_fsl_pcie_header);
+DECLARE_PCI_FIXUP_HEADER(0x1957, PCI_DEVICE_ID_P4080, quirk_fsl_pcie_header);
 #endif /* CONFIG_PPC_85xx || CONFIG_PPC_86xx */
 
 #if defined(CONFIG_PPC_83xx) || defined(CONFIG_PPC_MPC512x)
@@ -626,7 +641,7 @@ int __init mpc83xx_add_bridge(struct device_node *dev)
 		       " bus 0\n", dev->full_name);
 	}
 
-	ppc_pci_add_flags(PPC_PCI_REASSIGN_ALL_BUS);
+	pci_add_flags(PCI_REASSIGN_ALL_BUS);
 	hose = pcibios_alloc_controller(dev);
 	if (!hose)
 		return -ENOMEM;

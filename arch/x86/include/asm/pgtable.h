@@ -16,6 +16,8 @@
 
 #ifndef __ASSEMBLY__
 
+#include <asm/x86_init.h>
+
 /*
  * ZERO_PAGE is a global shared page that is always zero: used
  * for zero-mapped memory areas etc..
@@ -26,11 +28,14 @@ extern unsigned long empty_zero_page[PAGE_SIZE / sizeof(unsigned long)];
 extern spinlock_t pgd_lock;
 extern struct list_head pgd_list;
 
+extern struct mm_struct *pgd_page_get_mm(struct page *page);
+
 #ifdef CONFIG_PARAVIRT
 #include <asm/paravirt.h>
 #else  /* !CONFIG_PARAVIRT */
 #define set_pte(ptep, pte)		native_set_pte(ptep, pte)
 #define set_pte_at(mm, addr, ptep, pte)	native_set_pte_at(mm, addr, ptep, pte)
+#define set_pmd_at(mm, addr, pmdp, pmd)	native_set_pmd_at(mm, addr, pmdp, pmd)
 
 #define set_pte_atomic(ptep, pte)					\
 	native_set_pte_atomic(ptep, pte)
@@ -55,6 +60,8 @@ extern struct list_head pgd_list;
 
 #define pte_update(mm, addr, ptep)              do { } while (0)
 #define pte_update_defer(mm, addr, ptep)        do { } while (0)
+#define pmd_update(mm, addr, ptep)              do { } while (0)
+#define pmd_update_defer(mm, addr, ptep)        do { } while (0)
 
 #define pgd_val(x)	native_pgd_val(x)
 #define __pgd(x)	native_make_pgd(x)
@@ -82,7 +89,7 @@ extern struct list_head pgd_list;
  */
 static inline int pte_dirty(pte_t pte)
 {
-	return pte_flags(pte) & _PAGE_DIRTY;
+	return pte_flags(pte) & (_PAGE_DIRTY | _PAGE_SOFTDIRTY);
 }
 
 static inline int pte_young(pte_t pte)
@@ -130,12 +137,16 @@ static inline unsigned long pmd_pfn(pmd_t pmd)
 	return (pmd_val(pmd) & PTE_PFN_MASK) >> PAGE_SHIFT;
 }
 
+static inline unsigned long pud_pfn(pud_t pud)
+{
+	return (pud_val(pud) & PTE_PFN_MASK) >> PAGE_SHIFT;
+}
+
 #define pte_page(pte)	pfn_to_page(pte_pfn(pte))
 
 static inline int pmd_large(pmd_t pte)
 {
-	return (pmd_flags(pte) & (_PAGE_PSE | _PAGE_PRESENT)) ==
-		(_PAGE_PSE | _PAGE_PRESENT);
+	return pmd_flags(pte) & _PAGE_PSE;
 }
 
 static inline pte_t pte_set_flags(pte_t pte, pteval_t set)
@@ -154,7 +165,7 @@ static inline pte_t pte_clear_flags(pte_t pte, pteval_t clear)
 
 static inline pte_t pte_mkclean(pte_t pte)
 {
-	return pte_clear_flags(pte, _PAGE_DIRTY);
+	return pte_clear_flags(pte, (_PAGE_DIRTY | _PAGE_SOFTDIRTY));
 }
 
 static inline pte_t pte_mkold(pte_t pte)
@@ -252,6 +263,16 @@ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
 	return __pte(val);
 }
 
+static inline pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot)
+{
+	pmdval_t val = pmd_val(pmd);
+
+	val &= _HPAGE_CHG_MASK;
+	val |= massage_pgprot(newprot) & ~_HPAGE_CHG_MASK;
+
+	return __pmd(val);
+}
+
 /* mprotect needs to preserve PAT bits when updating vm_page_prot */
 #define pgprot_modify pgprot_modify
 static inline pgprot_t pgprot_modify(pgprot_t oldprot, pgprot_t newprot)
@@ -270,9 +291,9 @@ static inline int is_new_memtype_allowed(u64 paddr, unsigned long size,
 					 unsigned long new_flags)
 {
 	/*
-	 * PAT type is always WB for ISA. So no need to check.
+	 * PAT type is always WB for untracked ranges, so no need to check.
 	 */
-	if (is_ISA_range(paddr, paddr + size - 1))
+	if (x86_platform.is_untracked_pat_range(paddr, paddr + size))
 		return 1;
 
 	/*
@@ -293,7 +314,68 @@ static inline int is_new_memtype_allowed(u64 paddr, unsigned long size,
 
 pmd_t *populate_extra_pmd(unsigned long vaddr);
 pte_t *populate_extra_pte(unsigned long vaddr);
+
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+/*
+ * All top-level KAISER page tables are order-1 pages (8k-aligned
+ * and 8k in size).  The kernel one is at the beginning 4k and
+ * the user (shadow) one is in the last 4k.  To switch between
+ * them, you just need to flip the 12th bit in their addresses.
+ */
+#define KAISER_PGTABLE_SWITCH_BIT	PAGE_SHIFT
+
+/*
+ * This generates better code than the inline assembly in
+ * __set_bit().
+ */
+static inline void *ptr_set_bit(void *ptr, int bit)
+{
+	unsigned long __ptr = (unsigned long)ptr;
+
+	__ptr |= (1<<bit);
+	return (void *)__ptr;
+}
+static inline void *ptr_clear_bit(void *ptr, int bit)
+{
+	unsigned long __ptr = (unsigned long)ptr;
+
+	__ptr &= ~(1<<bit);
+	return (void *)__ptr;
+}
+
+static inline pgd_t *kernel_to_shadow_pgdp(pgd_t *pgdp)
+{
+	return ptr_set_bit(pgdp, KAISER_PGTABLE_SWITCH_BIT);
+}
+static inline pgd_t *shadow_to_kernel_pgdp(pgd_t *pgdp)
+{
+	return ptr_clear_bit(pgdp, KAISER_PGTABLE_SWITCH_BIT);
+}
+
+pgd_t __pti_set_user_pgd(pgd_t *pgdp, pgd_t pgd);
+
+/*
+ * Take a PGD location (pgdp) and a pgd value that needs
+ * to be set there.  Populates the shadow and returns
+ * the resulting PGD that must be set in the kernel copy
+ * of the page tables.
+ */
+static inline pgd_t pti_set_user_pgd(pgd_t *pgdp, pgd_t pgd)
+{
+	if (!boot_cpu_has(X86_FEATURE_PTI_SUPPORT))
+		return pgd;
+	return __pti_set_user_pgd(pgdp, pgd);
+}
+#else
+static inline pgd_t pti_set_user_pgd(pgd_t *pgdp, pgd_t pgd)
+{
+	return pgd;
+}
+#endif /* CONFIG_PAGE_TABLE_ISOLATION */
 #endif	/* __ASSEMBLY__ */
+
+#ifndef __ASSEMBLY__
+#include <linux/mm_types.h>
 
 #ifdef CONFIG_X86_32
 # include "pgtable_32.h"
@@ -301,8 +383,27 @@ pte_t *populate_extra_pte(unsigned long vaddr);
 # include "pgtable_64.h"
 #endif
 
-#ifndef __ASSEMBLY__
-#include <linux/mm_types.h>
+/*
+ * Page table pages are page-aligned.  The lower half of the top
+ * level is used for userspace and the top half for the kernel.
+ *
+ * Returns true for parts of the PGD that map userspace and
+ * false for the parts that map the kernel.
+ */
+static inline bool pgdp_maps_userspace(void *__ptr)
+{
+	unsigned long ptr = (unsigned long)__ptr;
+
+	return (((ptr & ~PAGE_MASK) / sizeof(pgd_t)) < PGD_KERNEL_START);
+}
+
+/*
+ * Does this PGD allow access from userspace?
+ */
+static inline bool pgd_userspace_access(pgd_t pgd)
+{
+	return pgd.pgd & _PAGE_USER;
+}
 
 static inline int pte_none(pte_t pte)
 {
@@ -327,7 +428,13 @@ static inline int pte_hidden(pte_t pte)
 
 static inline int pmd_present(pmd_t pmd)
 {
-	return pmd_flags(pmd) & _PAGE_PRESENT;
+	/*
+	 * Checking for _PAGE_PSE is needed too because
+	 * split_huge_page will temporarily clear the present bit (but
+	 * the _PAGE_PSE flag will remain set at all times while the
+	 * _PAGE_PRESENT bit is clear).
+	 */
+	return pmd_flags(pmd) & (_PAGE_PRESENT | _PAGE_PROTNONE | _PAGE_PSE);
 }
 
 static inline int pmd_none(pmd_t pmd)
@@ -346,7 +453,7 @@ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
  * Currently stuck as a macro due to indirect forward reference to
  * linux/mmzone.h's __section_mem_map_addr() definition:
  */
-#define pmd_page(pmd)	pfn_to_page(pmd_val(pmd) >> PAGE_SHIFT)
+#define pmd_page(pmd)	pfn_to_page((pmd_val(pmd) & PTE_PFN_MASK) >> PAGE_SHIFT)
 
 /*
  * the pmd page can be thought of an array like this: pmd_t[PTRS_PER_PMD]
@@ -472,7 +579,12 @@ static inline pud_t *pud_offset(pgd_t *pgd, unsigned long address)
 
 static inline int pgd_bad(pgd_t pgd)
 {
-	return (pgd_flags(pgd) & ~_PAGE_USER) != _KERNPG_TABLE;
+	unsigned long ignore_flags = _PAGE_USER;
+
+	if (IS_ENABLED(CONFIG_PAGE_TABLE_ISOLATION))
+		ignore_flags |= _PAGE_NX;
+
+	return (pgd_flags(pgd) & ~ignore_flags) != _KERNPG_TABLE;
 }
 
 static inline int pgd_none(pgd_t pgd)
@@ -509,6 +621,7 @@ static inline int pgd_none(pgd_t pgd)
 #ifndef __ASSEMBLY__
 
 extern int direct_gbpages;
+extern pgprotval_t kernel_page_global __read_mostly;
 
 /* local pte updates need not use xchg for locking */
 static inline pte_t native_local_ptep_get_and_clear(pte_t *ptep)
@@ -524,6 +637,12 @@ static inline void native_set_pte_at(struct mm_struct *mm, unsigned long addr,
 				     pte_t *ptep , pte_t pte)
 {
 	native_set_pte(ptep, pte);
+}
+
+static inline void native_set_pmd_at(struct mm_struct *mm, unsigned long addr,
+				     pmd_t *pmdp , pmd_t pmd)
+{
+	native_set_pmd(pmdp, pmd);
 }
 
 #ifndef CONFIG_PARAVIRT
@@ -601,6 +720,11 @@ static inline void ptep_set_wrprotect(struct mm_struct *mm,
 	pte_update(mm, addr, ptep);
 }
 
+static inline void __clone_pgd_range(pgd_t *dst, pgd_t *src, int count)
+{
+       memcpy(dst, src, count * sizeof(pgd_t));
+}
+
 /*
  * clone_pgd_range(pgd_t *dst, pgd_t *src, int count);
  *
@@ -613,7 +737,14 @@ static inline void ptep_set_wrprotect(struct mm_struct *mm,
  */
 static inline void clone_pgd_range(pgd_t *dst, pgd_t *src, int count)
 {
-       memcpy(dst, src, count * sizeof(pgd_t));
+	__clone_pgd_range(dst, src, count);
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	/* Clone the shadow pgd part as well */
+	if (!static_cpu_has(X86_FEATURE_PTI_SUPPORT))
+		return;
+	__clone_pgd_range(kernel_to_shadow_pgdp(dst),
+			  kernel_to_shadow_pgdp(src), count);
+#endif
 }
 
 

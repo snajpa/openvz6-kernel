@@ -31,6 +31,12 @@
 #define R600_PCIE_PORT_INDEX                0x0038
 #define R600_PCIE_PORT_DATA                 0x003c
 
+#define R600_RCU_INDEX                      0x0100
+#define R600_RCU_DATA                       0x0104
+
+#define R600_UVD_CTX_INDEX                  0xf4a0
+#define R600_UVD_CTX_DATA                   0xf4a4
+
 #define R600_MC_VM_FB_LOCATION			0x2180
 #define		R600_MC_FB_BASE_MASK			0x0000FFFF
 #define		R600_MC_FB_BASE_SHIFT			0
@@ -81,15 +87,29 @@
 #define R600_MEDIUM_VID_LOWER_GPIO_CNTL                            0x720
 #define R600_LOW_VID_LOWER_GPIO_CNTL                               0x724
 
-
+#define R600_D1GRPH_SWAP_CONTROL                               0x610C
+#       define R600_D1GRPH_SWAP_ENDIAN_NONE                    (0 << 0)
+#       define R600_D1GRPH_SWAP_ENDIAN_16BIT                   (1 << 0)
+#       define R600_D1GRPH_SWAP_ENDIAN_32BIT                   (2 << 0)
+#       define R600_D1GRPH_SWAP_ENDIAN_64BIT                   (3 << 0)
 
 #define R600_HDP_NONSURFACE_BASE                                0x2c04
 
 #define R600_BUS_CNTL                                           0x5420
+#       define R600_BIOS_ROM_DIS                                (1 << 1)
 #define R600_CONFIG_CNTL                                        0x5424
 #define R600_CONFIG_MEMSIZE                                     0x5428
 #define R600_CONFIG_F0_BASE                                     0x542C
 #define R600_CONFIG_APER_SIZE                                   0x5430
+
+#define	R600_BIF_FB_EN						0x5490
+#define		R600_FB_READ_EN					(1 << 0)
+#define		R600_FB_WRITE_EN				(1 << 1)
+
+#define R600_CITF_CNTL           				0x200c
+#define		R600_BLACKOUT_MASK				0x00000003
+
+#define R700_MC_CITF_CNTL           				0x25c0
 
 #define R600_ROM_CNTL                              0x1600
 #       define R600_SCK_OVERWRITE                  (1 << 1)
@@ -110,5 +130,51 @@
 #define R600_BIOS_6_SCRATCH               0x173c
 #define R600_BIOS_7_SCRATCH               0x1740
 
+/* Audio, these regs were reverse enginered,
+ * so the chance is high that the naming is wrong
+ * R6xx+ ??? */
+
+/* Audio clocks */
+#define R600_AUDIO_PLL1_MUL               0x0514
+#define R600_AUDIO_PLL1_DIV               0x0518
+#define R600_AUDIO_PLL2_MUL               0x0524
+#define R600_AUDIO_PLL2_DIV               0x0528
+#define R600_AUDIO_CLK_SRCSEL             0x0534
+
+/* Audio general */
+#define R600_AUDIO_ENABLE                 0x7300
+#define R600_AUDIO_TIMING                 0x7344
+
+/* Audio params */
+#define R600_AUDIO_VENDOR_ID              0x7380
+#define R600_AUDIO_REVISION_ID            0x7384
+#define R600_AUDIO_ROOT_NODE_COUNT        0x7388
+#define R600_AUDIO_NID1_NODE_COUNT        0x738c
+#define R600_AUDIO_NID1_TYPE              0x7390
+#define R600_AUDIO_SUPPORTED_SIZE_RATE    0x7394
+#define R600_AUDIO_SUPPORTED_CODEC        0x7398
+#define R600_AUDIO_SUPPORTED_POWER_STATES 0x739c
+#define R600_AUDIO_NID2_CAPS              0x73a0
+#define R600_AUDIO_NID3_CAPS              0x73a4
+#define R600_AUDIO_NID3_PIN_CAPS          0x73a8
+
+/* Audio conn list */
+#define R600_AUDIO_CONN_LIST_LEN          0x73ac
+#define R600_AUDIO_CONN_LIST              0x73b0
+
+/* Audio verbs */
+#define R600_AUDIO_RATE_BPS_CHANNEL       0x73c0
+#define R600_AUDIO_PLAYING                0x73c4
+#define R600_AUDIO_IMPLEMENTATION_ID      0x73c8
+#define R600_AUDIO_CONFIG_DEFAULT         0x73cc
+#define R600_AUDIO_PIN_SENSE              0x73d0
+#define R600_AUDIO_PIN_WIDGET_CNTL        0x73d4
+#define R600_AUDIO_STATUS_BITS            0x73d8
+
+#define DCE2_HDMI_OFFSET0		(0x7400 - 0x7400)
+#define DCE2_HDMI_OFFSET1		(0x7700 - 0x7400)
+/* DCE3.2 second instance starts at 0x7800 */
+#define DCE3_HDMI_OFFSET0		(0x7400 - 0x7400)
+#define DCE3_HDMI_OFFSET1		(0x7800 - 0x7400)
 
 #endif

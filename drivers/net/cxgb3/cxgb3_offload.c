@@ -30,6 +30,8 @@
  * SOFTWARE.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/list.h>
 #include <net/neighbour.h>
 #include <linux/notifier.h>
@@ -39,6 +41,7 @@
 #include <net/netevent.h>
 #include <linux/highmem.h>
 #include <linux/vmalloc.h>
+#include <linux/export.h>
 
 #include "common.h"
 #include "regs.h"
@@ -59,11 +62,14 @@ static LIST_HEAD(adapter_list);
 static const unsigned int MAX_ATIDS = 64 * 1024;
 static const unsigned int ATID_BASE = 0x10000;
 
+static void cxgb_neigh_update(struct neighbour *neigh);
+static void cxgb_redirect(struct dst_entry *old, struct dst_entry *new);
+
 static inline int offload_activated(struct t3cdev *tdev)
 {
 	const struct adapter *adapter = tdev2adap(tdev);
 
-	return (test_bit(OFFLOAD_DEVMAP_BIT, &adapter->open_device_map));
+	return test_bit(OFFLOAD_DEVMAP_BIT, &adapter->open_device_map);
 }
 
 /**
@@ -165,6 +171,8 @@ void cxgb3_event_notify(struct t3cdev *tdev, u32 event, u32 port)
 	mutex_unlock(&cxgb3_db_lock);
 }
 
+#define is_bond_slave(dev)\
+ ((dev->flags & IFF_SLAVE) && (dev->priv_flags & IFF_BONDING))
 static struct net_device *get_iff_from_mac(struct adapter *adapter,
 					   const unsigned char *mac,
 					   unsigned int vlan)
@@ -182,9 +190,10 @@ static struct net_device *get_iff_from_mac(struct adapter *adapter,
 				dev = NULL;
 				if (grp)
 					dev = vlan_group_get_device(grp, vlan);
-			} else
+			} else if (is_bond_slave(dev)) {
 				while (dev->master)
 					dev = dev->master;
+			}
 			return dev;
 		}
 	}
@@ -227,8 +236,7 @@ static int cxgb_ulp_iscsi_ctl(struct adapter *adapter, unsigned int req,
 		if ((val >> S_MAXRXDATA) != 0x3f60) {
 			val &= (M_RXCOALESCESIZE << S_RXCOALESCESIZE);
 			val |= V_MAXRXDATA(0x3f60);
-			printk(KERN_INFO
-				"%s, iscsi set MaxRxData to 16224 (0x%x).\n",
+			pr_info("%s, iscsi set MaxRxData to 16224 (0x%x)\n",
 				adapter->name, val);
 			t3_write_reg(adapter, A_TP_PARA_REG2, val);
 		}
@@ -248,8 +256,7 @@ static int cxgb_ulp_iscsi_ctl(struct adapter *adapter, unsigned int req,
 		for (i = 0; i < 4; i++)
 			val |= (uiip->pgsz_factor[i] & 0xF) << (8 * i);
 		if (val && (val != t3_read_reg(adapter, A_ULPRX_ISCSI_PSZ))) {
-			printk(KERN_INFO
-				"%s, setting iscsi pgsz 0x%x, %u,%u,%u,%u.\n",
+			pr_info("%s, setting iscsi pgsz 0x%x, %u,%u,%u,%u\n",
 				adapter->name, val, uiip->pgsz_factor[0],
 				uiip->pgsz_factor[1], uiip->pgsz_factor[2],
 				uiip->pgsz_factor[3]);
@@ -562,7 +569,7 @@ static void t3_process_tid_release_list(struct work_struct *work)
 	while (td->tid_release_list) {
 		struct t3c_tid_entry *p = td->tid_release_list;
 
-		td->tid_release_list = (struct t3c_tid_entry *)p->ctx;
+		td->tid_release_list = p->ctx;
 		spin_unlock_bh(&td->tid_release_lock);
 
 		skb = alloc_skb(sizeof(struct cpl_tid_release),
@@ -701,8 +708,7 @@ static int do_smt_write_rpl(struct t3cdev *dev, struct sk_buff *skb)
 	struct cpl_smt_write_rpl *rpl = cplhdr(skb);
 
 	if (rpl->status != CPL_ERR_NONE)
-		printk(KERN_ERR
-		       "Unexpected SMT_WRITE_RPL status %u for entry %u\n",
+		pr_err("Unexpected SMT_WRITE_RPL status %u for entry %u\n",
 		       rpl->status, GET_TID(rpl));
 
 	return CPL_RET_BUF_DONE;
@@ -713,8 +719,7 @@ static int do_l2t_write_rpl(struct t3cdev *dev, struct sk_buff *skb)
 	struct cpl_l2t_write_rpl *rpl = cplhdr(skb);
 
 	if (rpl->status != CPL_ERR_NONE)
-		printk(KERN_ERR
-		       "Unexpected L2T_WRITE_RPL status %u for entry %u\n",
+		pr_err("Unexpected L2T_WRITE_RPL status %u for entry %u\n",
 		       rpl->status, GET_TID(rpl));
 
 	return CPL_RET_BUF_DONE;
@@ -725,8 +730,7 @@ static int do_rte_write_rpl(struct t3cdev *dev, struct sk_buff *skb)
 	struct cpl_rte_write_rpl *rpl = cplhdr(skb);
 
 	if (rpl->status != CPL_ERR_NONE)
-		printk(KERN_ERR
-		       "Unexpected RTE_WRITE_RPL status %u for entry %u\n",
+		pr_err("Unexpected RTE_WRITE_RPL status %u for entry %u\n",
 		       rpl->status, GET_TID(rpl));
 
 	return CPL_RET_BUF_DONE;
@@ -746,7 +750,7 @@ static int do_act_open_rpl(struct t3cdev *dev, struct sk_buff *skb)
 								    t3c_tid->
 								    ctx);
 	} else {
-		printk(KERN_ERR "%s: received clientless CPL command 0x%x\n",
+		pr_err("%s: received clientless CPL command 0x%x\n",
 		       dev->name, CPL_ACT_OPEN_RPL);
 		return CPL_RET_BUF_DONE | CPL_RET_BAD_MSG;
 	}
@@ -764,7 +768,7 @@ static int do_stid_rpl(struct t3cdev *dev, struct sk_buff *skb)
 		return t3c_tid->client->handlers[p->opcode] (dev, skb,
 							     t3c_tid->ctx);
 	} else {
-		printk(KERN_ERR "%s: received clientless CPL command 0x%x\n",
+		pr_err("%s: received clientless CPL command 0x%x\n",
 		       dev->name, p->opcode);
 		return CPL_RET_BUF_DONE | CPL_RET_BAD_MSG;
 	}
@@ -782,7 +786,7 @@ static int do_hwtid_rpl(struct t3cdev *dev, struct sk_buff *skb)
 		return t3c_tid->client->handlers[p->opcode]
 		    (dev, skb, t3c_tid->ctx);
 	} else {
-		printk(KERN_ERR "%s: received clientless CPL command 0x%x\n",
+		pr_err("%s: received clientless CPL command 0x%x\n",
 		       dev->name, p->opcode);
 		return CPL_RET_BUF_DONE | CPL_RET_BAD_MSG;
 	}
@@ -809,7 +813,7 @@ static int do_cr(struct t3cdev *dev, struct sk_buff *skb)
 		return t3c_tid->client->handlers[CPL_PASS_ACCEPT_REQ]
 		    (dev, skb, t3c_tid->ctx);
 	} else {
-		printk(KERN_ERR "%s: received clientless CPL command 0x%x\n",
+		pr_err("%s: received clientless CPL command 0x%x\n",
 		       dev->name, CPL_PASS_ACCEPT_REQ);
 		return CPL_RET_BUF_DONE | CPL_RET_BAD_MSG;
 	}
@@ -903,7 +907,7 @@ static int do_act_establish(struct t3cdev *dev, struct sk_buff *skb)
 		return t3c_tid->client->handlers[CPL_ACT_ESTABLISH]
 		    (dev, skb, t3c_tid->ctx);
 	} else {
-		printk(KERN_ERR "%s: received clientless CPL command 0x%x\n",
+		pr_err("%s: received clientless CPL command 0x%x\n",
 		       dev->name, CPL_ACT_ESTABLISH);
 		return CPL_RET_BUF_DONE | CPL_RET_BAD_MSG;
 	}
@@ -949,7 +953,7 @@ static int do_term(struct t3cdev *dev, struct sk_buff *skb)
 		return t3c_tid->client->handlers[opcode] (dev, skb,
 							  t3c_tid->ctx);
 	} else {
-		printk(KERN_ERR "%s: received clientless CPL command 0x%x\n",
+		pr_err("%s: received clientless CPL command 0x%x\n",
 		       dev->name, opcode);
 		return CPL_RET_BUF_DONE | CPL_RET_BAD_MSG;
 	}
@@ -963,8 +967,6 @@ static int nb_callback(struct notifier_block *self, unsigned long event,
 		cxgb_neigh_update((struct neighbour *)ctx);
 		break;
 	}
-	case (NETEVENT_PMTU_UPDATE):
-		break;
 	case (NETEVENT_REDIRECT):{
 		struct netevent_redirect *nr = ctx;
 		cxgb_redirect(nr->old, nr->new);
@@ -986,8 +988,7 @@ static struct notifier_block nb = {
  */
 static int do_bad_cpl(struct t3cdev *dev, struct sk_buff *skb)
 {
-	printk(KERN_ERR "%s: received bad CPL command 0x%x\n", dev->name,
-	       *skb->data);
+	pr_err("%s: received bad CPL command 0x%x\n", dev->name, *skb->data);
 	return CPL_RET_BUF_DONE | CPL_RET_BAD_MSG;
 }
 
@@ -1005,8 +1006,8 @@ void t3_register_cpl_handler(unsigned int opcode, cpl_handler_func h)
 	if (opcode < NUM_CPL_CMDS)
 		cpl_handlers[opcode] = h ? h : do_bad_cpl;
 	else
-		printk(KERN_ERR "T3C: handler registration for "
-		       "opcode %x failed\n", opcode);
+		pr_err("T3C: handler registration for opcode %x failed\n",
+		       opcode);
 }
 
 EXPORT_SYMBOL(t3_register_cpl_handler);
@@ -1014,7 +1015,7 @@ EXPORT_SYMBOL(t3_register_cpl_handler);
 /*
  * T3CDEV's receive method.
  */
-int process_rx(struct t3cdev *dev, struct sk_buff **skbs, int n)
+static int process_rx(struct t3cdev *dev, struct sk_buff **skbs, int n)
 {
 	while (n--) {
 		struct sk_buff *skb = *skbs++;
@@ -1025,9 +1026,8 @@ int process_rx(struct t3cdev *dev, struct sk_buff **skbs, int n)
 		if (ret & CPL_RET_UNKNOWN_TID) {
 			union opcode_tid *p = cplhdr(skb);
 
-			printk(KERN_ERR "%s: CPL message (opcode %u) had "
-			       "unknown TID %u\n", dev->name, opcode,
-			       G_TID(ntohl(p->opcode_tid)));
+			pr_err("%s: CPL message (opcode %u) had unknown TID %u\n",
+			       dev->name, opcode, G_TID(ntohl(p->opcode_tid)));
 		}
 #endif
 		if (ret & CPL_RET_BUF_DONE)
@@ -1069,10 +1069,13 @@ static int is_offloading(struct net_device *dev)
 	return 0;
 }
 
-void cxgb_neigh_update(struct neighbour *neigh)
+static void cxgb_neigh_update(struct neighbour *neigh)
 {
-	struct net_device *dev = neigh->dev;
+	struct net_device *dev;
 
+	if (!neigh)
+		return;
+	dev = neigh->dev;
 	if (dev && (is_offloading(dev))) {
 		struct t3cdev *tdev = dev2t3cdev(dev);
 
@@ -1088,7 +1091,7 @@ static void set_l2t_ix(struct t3cdev *tdev, u32 tid, struct l2t_entry *e)
 
 	skb = alloc_skb(sizeof(*req), GFP_ATOMIC);
 	if (!skb) {
-		printk(KERN_ERR "%s: cannot allocate skb!\n", __func__);
+		pr_err("%s: cannot allocate skb!\n", __func__);
 		return;
 	}
 	skb->priority = CPL_PRIORITY_CONTROL;
@@ -1103,9 +1106,10 @@ static void set_l2t_ix(struct t3cdev *tdev, u32 tid, struct l2t_entry *e)
 	tdev->send(tdev, skb);
 }
 
-void cxgb_redirect(struct dst_entry *old, struct dst_entry *new)
+static void cxgb_redirect(struct dst_entry *old, struct dst_entry *new)
 {
 	struct net_device *olddev, *newdev;
+	struct neighbour *n;
 	struct tid_info *ti;
 	struct t3cdev *tdev;
 	u32 tid;
@@ -1113,28 +1117,35 @@ void cxgb_redirect(struct dst_entry *old, struct dst_entry *new)
 	struct l2t_entry *e;
 	struct t3c_tid_entry *te;
 
-	olddev = old->neighbour->dev;
-	newdev = new->neighbour->dev;
+	n = old->neighbour;
+	if (!n)
+		return;
+	olddev = n->dev;
+
+	n = new->neighbour;
+	if (!n)
+		return;
+	newdev = n->dev;
+
 	if (!is_offloading(olddev))
 		return;
 	if (!is_offloading(newdev)) {
-		printk(KERN_WARNING "%s: Redirect to non-offload "
-		       "device ignored.\n", __func__);
+		pr_warn("%s: Redirect to non-offload device ignored\n",
+			__func__);
 		return;
 	}
 	tdev = dev2t3cdev(olddev);
 	BUG_ON(!tdev);
 	if (tdev != dev2t3cdev(newdev)) {
-		printk(KERN_WARNING "%s: Redirect to different "
-		       "offload device ignored.\n", __func__);
+		pr_warn("%s: Redirect to different offload device ignored\n",
+			__func__);
 		return;
 	}
 
 	/* Add new L2T entry */
-	e = t3_l2t_get(tdev, new->neighbour, newdev);
+	e = t3_l2t_get(tdev, new, newdev);
 	if (!e) {
-		printk(KERN_ERR "%s: couldn't allocate new l2t entry!\n",
-		       __func__);
+		pr_err("%s: couldn't allocate new l2t entry!\n", __func__);
 		return;
 	}
 
@@ -1146,12 +1157,14 @@ void cxgb_redirect(struct dst_entry *old, struct dst_entry *new)
 		if (te && te->ctx && te->client && te->client->redirect) {
 			update_tcb = te->client->redirect(te->ctx, old, new, e);
 			if (update_tcb) {
+				rcu_read_lock();
 				l2t_hold(L2DATA(tdev), e);
+				rcu_read_unlock();
 				set_l2t_ix(tdev, tid, e);
 			}
 		}
 	}
-	l2t_release(L2DATA(tdev), e);
+	l2t_release(tdev, e);
 }
 
 /*
@@ -1160,12 +1173,10 @@ void cxgb_redirect(struct dst_entry *old, struct dst_entry *new)
  */
 void *cxgb_alloc_mem(unsigned long size)
 {
-	void *p = kmalloc(size, GFP_KERNEL);
+	void *p = kzalloc(size, GFP_KERNEL);
 
 	if (!p)
-		p = vmalloc(size);
-	if (p)
-		memset(p, 0, size);
+		p = vzalloc(size);
 	return p;
 }
 
@@ -1252,7 +1263,7 @@ int cxgb3_offload_activate(struct adapter *adapter)
 	struct mtutab mtutab;
 	unsigned int l2t_capacity;
 
-	t = kcalloc(1, sizeof(*t), GFP_KERNEL);
+	t = kzalloc(sizeof(*t), GFP_KERNEL);
 	if (!t)
 		return -ENOMEM;
 
@@ -1266,7 +1277,7 @@ int cxgb3_offload_activate(struct adapter *adapter)
 		goto out_free;
 
 	err = -ENOMEM;
-	L2DATA(dev) = t3_init_l2t(l2t_capacity);
+	dev->l2opt = t3_init_l2t(l2t_capacity);
 	if (!L2DATA(dev))
 		goto out_free;
 
@@ -1300,16 +1311,24 @@ int cxgb3_offload_activate(struct adapter *adapter)
 
 out_free_l2t:
 	t3_free_l2t(L2DATA(dev));
-	L2DATA(dev) = NULL;
+	RCU_INIT_POINTER(dev->l2opt, NULL);
 out_free:
 	kfree(t);
 	return err;
 }
 
+static void clean_l2_data(struct rcu_head *head)
+{
+	struct l2t_data *d = container_of(head, struct l2t_data, rcu_head);
+	t3_free_l2t(d);
+}
+
+
 void cxgb3_offload_deactivate(struct adapter *adapter)
 {
 	struct t3cdev *tdev = &adapter->tdev;
 	struct t3c_data *t = T3C_DATA(tdev);
+	struct l2t_data *d;
 
 	remove_adapter(adapter);
 	if (list_empty(&adapter_list))
@@ -1317,8 +1336,11 @@ void cxgb3_offload_deactivate(struct adapter *adapter)
 
 	free_tid_maps(&t->tid_maps);
 	T3C_DATA(tdev) = NULL;
-	t3_free_l2t(L2DATA(tdev));
-	L2DATA(tdev) = NULL;
+	rcu_read_lock();
+	d = L2DATA(tdev);
+	rcu_read_unlock();
+	RCU_INIT_POINTER(tdev->l2opt, NULL);
+	call_rcu(&d->rcu_head, clean_l2_data);
 	if (t->nofail_skb)
 		kfree_skb(t->nofail_skb);
 	kfree(t);

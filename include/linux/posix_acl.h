@@ -71,17 +71,19 @@ posix_acl_release(struct posix_acl *acl)
 
 /* posix_acl.c */
 
+extern void posix_acl_init(struct posix_acl *, int);
 extern struct posix_acl *posix_acl_alloc(int, gfp_t);
 extern struct posix_acl *posix_acl_clone(const struct posix_acl *, gfp_t);
 extern int posix_acl_valid(const struct posix_acl *);
 extern int posix_acl_permission(struct inode *, const struct posix_acl *, int);
 extern struct posix_acl *posix_acl_from_mode(mode_t, gfp_t);
-extern int posix_acl_equiv_mode(const struct posix_acl *, mode_t *);
+extern int posix_acl_equiv_mode(const struct posix_acl *, umode_t *);
 extern int posix_acl_create_masq(struct posix_acl *, mode_t *);
 extern int posix_acl_chmod_masq(struct posix_acl *, mode_t);
 
 extern struct posix_acl *get_posix_acl(struct inode *, int);
 extern int set_posix_acl(struct inode *, int, struct posix_acl *);
+extern int posix_acl_update_mode(struct inode *, umode_t *, struct posix_acl **);
 
 #ifdef CONFIG_FS_POSIX_ACL
 static inline struct posix_acl *get_cached_acl(struct inode *inode, int type)
@@ -146,6 +148,20 @@ static inline void forget_cached_acl(struct inode *inode, int type)
 	spin_unlock(&inode->i_lock);
 	if (old != ACL_NOT_CACHED)
 		posix_acl_release(old);
+}
+
+static inline void forget_all_cached_acls(struct inode *inode)
+{
+	struct posix_acl *old_access, *old_default;
+	spin_lock(&inode->i_lock);
+	old_access = inode->i_acl;
+	old_default = inode->i_default_acl;
+	inode->i_acl = inode->i_default_acl = ACL_NOT_CACHED;
+	spin_unlock(&inode->i_lock);
+	if (old_access != ACL_NOT_CACHED)
+		posix_acl_release(old_access);
+	if (old_default != ACL_NOT_CACHED)
+		posix_acl_release(old_default);
 }
 #endif
 

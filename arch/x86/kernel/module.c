@@ -23,6 +23,7 @@
 #include <linux/kernel.h>
 #include <linux/bug.h>
 #include <linux/mm.h>
+#include <linux/version.h>
 
 #include <asm/system.h>
 #include <asm/page.h>
@@ -58,12 +59,40 @@ void module_free(struct module *mod, void *module_region)
 	vfree(module_region);
 }
 
-/* We don't need anything special. */
 int module_frob_arch_sections(Elf_Ehdr *hdr,
 			      Elf_Shdr *sechdrs,
 			      char *secstrings,
 			      struct module *mod)
 {
+	Elf_Shdr *s, *alt = NULL;
+	unsigned long diff;
+
+	/* RHEL: A bug exists where the ELF headers for kernel modules
+	 * are incorrectly calculated.  The result is that the
+	 * .altinstructions section size is not a multiple of struct alt_instr.
+	 * The fixes introduced in BZs 696457 and 737753 result in the usage of
+	 * the missing memory and when it is used the result is memory
+	 * corruption.  This simple fix calculates how much missing memory
+	 * there is and adjusts the .altinstructions section size by the
+	 * appropriate amount.  As a result module loading no longer
+	 * corrupts memory.
+	 */
+	for (s = sechdrs; s < sechdrs + hdr->e_shnum; s++)
+		if (!strcmp(".altinstructions", secstrings + s->sh_name))
+			alt = s;
+
+	if (!alt)
+		return 0;
+
+	diff = ((unsigned long)alt->sh_size % (sizeof(struct alt_instr)));
+	if (!diff)
+		return 0;
+
+	DEBUGP("%s: .alternatives size is off by 0x%lx ... adjusting\n",
+	       __FUNCTION__, (sizeof(struct alt_instr)) - diff);
+	/* fix it up */
+	alt->sh_size = alt->sh_size + (sizeof(struct alt_instr)) - diff;
+
 	return 0;
 }
 
@@ -112,7 +141,8 @@ int apply_relocate_add(Elf32_Shdr *sechdrs,
 		       const char *strtab,
 		       unsigned int symindex,
 		       unsigned int relsec,
-		       struct module *me)
+		       struct module *me,
+		       struct rheldata *rheldata)
 {
 	printk(KERN_ERR "module %s: ADD RELOCATION unsupported\n",
 	       me->name);
@@ -123,7 +153,8 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 		   const char *strtab,
 		   unsigned int symindex,
 		   unsigned int relsec,
-		   struct module *me)
+		   struct module *me,
+		   struct rheldata *rheldata)
 {
 	unsigned int i;
 	Elf64_Rela *rel = (void *)sechdrs[relsec].sh_addr;
@@ -147,7 +178,28 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 			(int)ELF64_R_TYPE(rel[i].r_info),
 			sym->st_value, rel[i].r_addend, (u64)loc);
 
-		val = sym->st_value + rel[i].r_addend;
+		/*
+		 * kernel_stack is referenced to access current_thread_info in
+		 * a variety of places... if we're loading a module which
+		 * expects an 8K stack, fix up the symbol reference to look
+		 * at a second copy. Nobody should be using this symbol for
+		 * any other purpose.
+		 */
+		if ((!rheldata || rheldata->rhel_release < RHEL_16KSTACK_BUILD) &&
+		    !strcmp(strtab + sym->st_name, "per_cpu__kernel_stack")) {
+			const struct kernel_symbol *compat_sym;
+
+			printk(KERN_INFO
+			       "%s: applying 16k kernel stack fix up\n",
+			       me->name);
+
+			compat_sym = find_symbol("per_cpu__kernel_stack8k",
+						 NULL, NULL, true, true);
+			val = compat_sym->value;
+		} else
+			val = sym->st_value;
+
+		val += rel[i].r_addend;
 
 		switch (ELF64_R_TYPE(rel[i].r_info)) {
 		case R_X86_64_NONE:
@@ -206,7 +258,7 @@ int module_finalize(const Elf_Ehdr *hdr,
 		    struct module *me)
 {
 	const Elf_Shdr *s, *text = NULL, *alt = NULL, *locks = NULL,
-		*para = NULL;
+		*para = NULL, *rhel = NULL;
 	char *secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
 
 	for (s = sechdrs; s < sechdrs + hdr->e_shnum; s++) {
@@ -218,12 +270,32 @@ int module_finalize(const Elf_Ehdr *hdr,
 			locks = s;
 		if (!strcmp(".parainstructions", secstrings + s->sh_name))
 			para = s;
+		if (!strcmp(".rheldata", secstrings + s->sh_name))
+			rhel = s;
 	}
 
 	if (alt) {
 		/* patch .altinstructions */
 		void *aseg = (void *)alt->sh_addr;
-		apply_alternatives(aseg, aseg + alt->sh_size);
+		int fixup = 0;
+
+		/*
+		 * RHEL6: We had to modify the alt_instr struct's cpuid
+		 * field so that we could account for future X86 cpu features.
+		 *
+		 * In order to protect KABI we must modify the values in
+		 * modules 6.1 or older that maybe loaded at this time.
+		 */
+
+		if (!rhel) {
+			/* modules older than 6.2 do not have .rheldata */
+			printk(KERN_DEBUG
+			       "%s module is older than RHEL 6.2 ... applying fixups\n",
+			       me->name);
+			fixup = 1;
+		}
+
+		apply_alternatives(aseg, aseg + alt->sh_size, fixup);
 	}
 	if (locks && text) {
 		void *lseg = (void *)locks->sh_addr;

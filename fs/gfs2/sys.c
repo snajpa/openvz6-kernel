@@ -49,7 +49,7 @@ static ssize_t gfs2_attr_store(struct kobject *kobj, struct attribute *attr,
 	return a->store ? a->store(sdp, buf, len) : len;
 }
 
-static struct sysfs_ops gfs2_attr_ops = {
+static const struct sysfs_ops gfs2_attr_ops = {
 	.show  = gfs2_attr_show,
 	.store = gfs2_attr_store,
 };
@@ -114,7 +114,7 @@ static ssize_t freeze_store(struct gfs2_sbd *sdp, const char *buf, size_t len)
 
 	switch (n) {
 	case 0:
-		gfs2_unfreeze_fs(sdp);
+		gfs2_unfreeze_fs(sdp, 0);
 		break;
 	case 1:
 		error = gfs2_freeze_fs(sdp);
@@ -158,7 +158,7 @@ static ssize_t statfs_sync_store(struct gfs2_sbd *sdp, const char *buf,
 	if (simple_strtol(buf, NULL, 0) != 1)
 		return -EINVAL;
 
-	gfs2_statfs_sync(sdp);
+	gfs2_statfs_sync(sdp->sd_vfs, 0);
 	return len;
 }
 
@@ -171,13 +171,14 @@ static ssize_t quota_sync_store(struct gfs2_sbd *sdp, const char *buf,
 	if (simple_strtol(buf, NULL, 0) != 1)
 		return -EINVAL;
 
-	gfs2_quota_sync(sdp);
+	gfs2_quota_sync(sdp->sd_vfs, 0);
 	return len;
 }
 
 static ssize_t quota_refresh_user_store(struct gfs2_sbd *sdp, const char *buf,
 					size_t len)
 {
+	int error;
 	u32 id;
 
 	if (!capable(CAP_SYS_ADMIN))
@@ -185,13 +186,14 @@ static ssize_t quota_refresh_user_store(struct gfs2_sbd *sdp, const char *buf,
 
 	id = simple_strtoul(buf, NULL, 0);
 
-	gfs2_quota_refresh(sdp, 1, id);
-	return len;
+	error = gfs2_quota_refresh(sdp, 1, id);
+	return error ? error : len;
 }
 
 static ssize_t quota_refresh_group_store(struct gfs2_sbd *sdp, const char *buf,
 					 size_t len)
 {
+	int error;
 	u32 id;
 
 	if (!capable(CAP_SYS_ADMIN))
@@ -199,8 +201,8 @@ static ssize_t quota_refresh_group_store(struct gfs2_sbd *sdp, const char *buf,
 
 	id = simple_strtoul(buf, NULL, 0);
 
-	gfs2_quota_refresh(sdp, 0, id);
-	return len;
+	error = gfs2_quota_refresh(sdp, 0, id);
+	return error ? error : len;
 }
 
 static ssize_t demote_rq_store(struct gfs2_sbd *sdp, const char *buf, size_t len)
@@ -235,6 +237,8 @@ static ssize_t demote_rq_store(struct gfs2_sbd *sdp, const char *buf, size_t len
 	glops = gfs2_glops_list[gltype];
 	if (glops == NULL)
 		return -EINVAL;
+	if (!test_and_set_bit(SDF_DEMOTE, &sdp->sd_flags))
+		fs_info(sdp, "demote interface used\n");
 	rv = gfs2_glock_get(sdp, glnum, glops, 0, &gl);
 	if (rv)
 		return rv;
@@ -272,7 +276,15 @@ static struct attribute *gfs2_attrs[] = {
 	NULL,
 };
 
+static void gfs2_sbd_release(struct kobject *kobj)
+{
+	struct gfs2_sbd *sdp = container_of(kobj, struct gfs2_sbd, sd_kobj);
+
+	kfree(sdp);
+}
+
 static struct kobj_type gfs2_ktype = {
+	.release       = gfs2_sbd_release,
 	.default_attrs = gfs2_attrs,
 	.sysfs_ops     = &gfs2_attr_ops,
 };
@@ -317,6 +329,28 @@ static ssize_t block_store(struct gfs2_sbd *sdp, const char *buf, size_t len)
 	} else {
 		ret = -EINVAL;
 	}
+	return ret;
+}
+
+static ssize_t wdack_show(struct gfs2_sbd *sdp, char *buf)
+{
+	int val = completion_done(&sdp->sd_wdack) ? 1 : 0;
+
+	return sprintf(buf, "%d\n", val);
+}
+
+static ssize_t wdack_store(struct gfs2_sbd *sdp, const char *buf, size_t len)
+{
+	ssize_t ret = len;
+	int val;
+
+	val = simple_strtol(buf, NULL, 0);
+
+	if ((val == 1) &&
+	    !strcmp(sdp->sd_lockstruct.ls_ops->lm_proto_name, "lock_dlm"))
+		complete(&sdp->sd_wdack);
+	else
+		ret = -EINVAL;
 	return ret;
 }
 
@@ -383,7 +417,7 @@ static struct gfs2_attr gdlm_attr_##_name = __ATTR(_name,_mode,_show,_store)
 
 GDLM_ATTR(proto_name,		0444, proto_name_show,		NULL);
 GDLM_ATTR(block,		0644, block_show,		block_store);
-GDLM_ATTR(withdraw,		0644, withdraw_show,		withdraw_store);
+GDLM_ATTR(withdraw,		0644, wdack_show,		wdack_store);
 GDLM_ATTR(jid,			0444, jid_show,			NULL);
 GDLM_ATTR(first,		0444, lkfirst_show,		NULL);
 GDLM_ATTR(first_done,		0444, first_done_show,		NULL);
@@ -480,7 +514,6 @@ TUNE_ATTR(complain_secs, 0);
 TUNE_ATTR(statfs_slow, 0);
 TUNE_ATTR(new_files_jdata, 0);
 TUNE_ATTR(quota_simul_sync, 1);
-TUNE_ATTR(stall_secs, 1);
 TUNE_ATTR(statfs_quantum, 1);
 TUNE_ATTR_3(quota_scale, quota_scale_show, quota_scale_store);
 
@@ -493,7 +526,6 @@ static struct attribute *tune_attrs[] = {
 	&tune_attr_complain_secs.attr,
 	&tune_attr_statfs_slow.attr,
 	&tune_attr_quota_simul_sync.attr,
-	&tune_attr_stall_secs.attr,
 	&tune_attr_statfs_quantum.attr,
 	&tune_attr_quota_scale.attr,
 	&tune_attr_new_files_jdata.attr,
@@ -517,6 +549,7 @@ int gfs2_sys_fs_add(struct gfs2_sbd *sdp)
 	char ro[20];
 	char spectator[20];
 	char *envp[] = { ro, spectator, NULL };
+	int sysfs_frees_sdp = 0;
 
 	sprintf(ro, "RDONLY=%d", (sb->s_flags & MS_RDONLY) ? 1 : 0);
 	sprintf(spectator, "SPECTATOR=%d", sdp->sd_args.ar_spectator ? 1 : 0);
@@ -525,8 +558,10 @@ int gfs2_sys_fs_add(struct gfs2_sbd *sdp)
 	error = kobject_init_and_add(&sdp->sd_kobj, &gfs2_ktype, NULL,
 				     "%s", sdp->sd_table_name);
 	if (error)
-		goto fail;
+		goto fail_reg;
 
+	sysfs_frees_sdp = 1; /* Freeing sdp is now done by sysfs calling
+				function gfs2_sbd_release. */
 	error = sysfs_create_group(&sdp->sd_kobj, &tune_group);
 	if (error)
 		goto fail_reg;
@@ -549,9 +584,12 @@ fail_lock_module:
 fail_tune:
 	sysfs_remove_group(&sdp->sd_kobj, &tune_group);
 fail_reg:
-	kobject_put(&sdp->sd_kobj);
-fail:
 	fs_err(sdp, "error %d adding sysfs files", error);
+	if (sysfs_frees_sdp)
+		kobject_put(&sdp->sd_kobj);
+	else
+		kfree(sdp);
+	sb->s_fs_info = NULL;
 	return error;
 }
 

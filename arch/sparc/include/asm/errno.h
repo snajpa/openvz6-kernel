@@ -40,7 +40,7 @@
 #define EPROCLIM        67      /* SUNOS: Too many processes */
 #define	EUSERS		68	/* Too many users */
 #define	EDQUOT		69	/* Quota exceeded */
-#define	ESTALE		70	/* Stale NFS file handle */
+#define	ESTALE		70	/* Stale file handle */
 #define	EREMOTE		71	/* Object is remote */
 #define	ENOSTR		72	/* Device not a stream */
 #define	ETIME		73	/* Timer expired */
@@ -111,5 +111,7 @@
 #define	ENOTRECOVERABLE	133	/* State not recoverable */
 
 #define	ERFKILL		134	/* Operation not possible due to RF-kill */
+
+#define EHWPOISON	135	/* Memory page has hardware error */
 
 #endif

@@ -4610,6 +4610,7 @@ static int snd_hdsp_hwdep_ioctl(struct snd_hwdep *hw, struct file *file, unsigne
 		if (err < 0)
 			return err;
 
+		memset(&info, 0, sizeof(info));
 		spin_lock_irqsave(&hdsp->lock, flags);
 		info.pref_sync_ref = (unsigned char)hdsp_pref_sync_ref(hdsp);
 		info.wordclock_sync_check = (unsigned char)hdsp_wc_sync_check(hdsp);
@@ -5177,8 +5178,8 @@ static int __devinit snd_hdsp_probe(struct pci_dev *pci,
 		return -ENOENT;
 	}
 
-	err = snd_card_create(index[dev], id[dev], THIS_MODULE,
-			      sizeof(struct hdsp), &card);
+	err = snd_card_new(&pci->dev, index[dev], id[dev], THIS_MODULE,
+			   sizeof(struct hdsp), &card);
 	if (err < 0)
 		return err;
 
@@ -5186,7 +5187,6 @@ static int __devinit snd_hdsp_probe(struct pci_dev *pci,
 	card->private_free = snd_hdsp_card_free;
 	hdsp->dev = dev;
 	hdsp->pci = pci;
-	snd_card_set_dev(card, &pci->dev);
 
 	if ((err = snd_hdsp_create(card, hdsp)) < 0) {
 		snd_card_free(card);

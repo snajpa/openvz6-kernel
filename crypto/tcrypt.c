@@ -8,6 +8,13 @@
  * Copyright (c) 2002 Jean-Francois Dive <jef@linuxbe.org>
  * Copyright (c) 2007 Nokia Siemens Networks
  *
+ * Updated RFC4106 AES-GCM testing.
+ *    Authors: Aidan O'Mahony (aidan.o.mahony@intel.com)
+ *             Adrian Hoban <adrian.hoban@intel.com>
+ *             Gabriele Paoloni <gabriele.paoloni@intel.com>
+ *             Tadeusz Struk (tadeusz.struk@intel.com)
+ *             Copyright (c) 2010, Intel Corporation.
+ *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
  * Software Foundation; either version 2 of the License, or (at your option)
@@ -683,6 +690,10 @@ static int do_test(int m)
 		ret += tcrypt_test("rfc4309(ccm(aes))");
 		break;
 
+	case 47:
+		ret += tcrypt_test("crct10dif");
+		break;
+
 	case 100:
 		ret += tcrypt_test("hmac(md5)");
 		break;
@@ -725,6 +736,10 @@ static int do_test(int m)
 
 	case 150:
 		ret += tcrypt_test("ansi_cprng");
+		break;
+
+	case 151:
+		ret += tcrypt_test("rfc4106(gcm(aes))");
 		break;
 
 	case 200:
@@ -879,6 +894,14 @@ static int do_test(int m)
 
 	case 317:
 		test_hash_speed("rmd320", sec, generic_hash_speed_template);
+		if (mode > 300 && mode < 400) break;
+
+	case 320:
+		test_hash_speed("crct10dif", sec, generic_hash_speed_template);
+		if (mode > 300 && mode < 400) break;
+
+	case 319:
+		test_hash_speed("crc32c", sec, generic_hash_speed_template);
 		if (mode > 300 && mode < 400) break;
 
 	case 399:

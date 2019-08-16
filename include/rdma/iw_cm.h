@@ -46,23 +46,16 @@ enum iw_cm_event_type {
 	IW_CM_EVENT_CLOSE		 /* close complete */
 };
 
-enum iw_cm_event_status {
-	IW_CM_EVENT_STATUS_OK = 0,	 /* request successful */
-	IW_CM_EVENT_STATUS_ACCEPTED = 0, /* connect request accepted */
-	IW_CM_EVENT_STATUS_REJECTED,	 /* connect request rejected */
-	IW_CM_EVENT_STATUS_TIMEOUT,	 /* the operation timed out */
-	IW_CM_EVENT_STATUS_RESET,	 /* reset from remote peer */
-	IW_CM_EVENT_STATUS_EINVAL,	 /* asynchronous failure for bad parm */
-};
-
 struct iw_cm_event {
 	enum iw_cm_event_type event;
-	enum iw_cm_event_status status;
-	struct sockaddr_in local_addr;
-	struct sockaddr_in remote_addr;
+	int			 status;
+	struct sockaddr_storage local_addr;
+	struct sockaddr_storage remote_addr;
 	void *private_data;
-	u8 private_data_len;
 	void *provider_data;
+	u8 private_data_len;
+	u8 ord;
+	u8 ird;
 };
 
 /**
@@ -90,8 +83,8 @@ struct iw_cm_id {
 	iw_cm_handler		cm_handler;      /* client callback function */
 	void		        *context;	 /* client cb context */
 	struct ib_device	*device;
-	struct sockaddr_in      local_addr;
-	struct sockaddr_in	remote_addr;
+	struct sockaddr_storage local_addr;
+	struct sockaddr_storage	remote_addr;
 	void			*provider_data;	 /* provider private data */
 	iw_event_handler        event_handler;   /* cb for provider
 						    events */

@@ -35,7 +35,57 @@
 #define DEVPTS_DEFAULT_PTMX_MODE 0000
 #define PTMX_MINOR	2
 
-extern int pty_limit;			/* Config limit on Unix98 ptys */
+/*
+ * sysctl support for setting limits on the number of Unix98 ptys allocated.
+ * Otherwise one can eat up all kernel memory by opening /dev/ptmx repeatedly.
+ */
+static int pty_limit = NR_UNIX98_PTY_DEFAULT;
+static int pty_limit_min;
+static int pty_limit_max = NR_UNIX98_PTY_MAX;
+static int pty_count;
+
+static struct ctl_table pty_table[] = {
+	{
+		.ctl_name	= PTY_MAX,
+		.procname	= "max",
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.data		= &pty_limit,
+		.proc_handler	= proc_dointvec_minmax,
+		.strategy	= &sysctl_intvec,
+		.extra1		= &pty_limit_min,
+		.extra2		= &pty_limit_max,
+	}, {
+		.ctl_name	= PTY_NR,
+		.procname	= "nr",
+		.maxlen		= sizeof(int),
+		.mode		= 0444,
+		.data		= &pty_count,
+		.proc_handler	= proc_dointvec,
+	},
+	{}
+};
+
+static struct ctl_table pty_kern_table[] = {
+	{
+		.ctl_name	= KERN_PTY,
+		.procname	= "pty",
+		.mode		= 0555,
+		.child		= pty_table,
+	},
+	{}
+};
+
+static struct ctl_table pty_root_table[] = {
+	{
+		.ctl_name	= CTL_KERN,
+		.procname	= "kernel",
+		.mode		= 0555,
+		.child		= pty_kern_table,
+	},
+	{}
+};
+
 static DEFINE_MUTEX(allocated_ptys_lock);
 
 static struct vfsmount *devpts_mnt;
@@ -417,6 +467,7 @@ static void devpts_kill_sb(struct super_block *sb)
 {
 	struct pts_fs_info *fsi = DEVPTS_SB(sb);
 
+	ida_destroy(&fsi->allocated_ptys);
 	kfree(fsi);
 	kill_litter_super(sb);
 }
@@ -457,6 +508,7 @@ retry:
 		mutex_unlock(&allocated_ptys_lock);
 		return -EIO;
 	}
+	pty_count++;
 	mutex_unlock(&allocated_ptys_lock);
 	return index;
 }
@@ -468,6 +520,7 @@ void devpts_kill_index(struct inode *ptmx_inode, int idx)
 
 	mutex_lock(&allocated_ptys_lock);
 	ida_remove(&fsi->allocated_ptys, idx);
+	pty_count--;
 	mutex_unlock(&allocated_ptys_lock);
 }
 
@@ -517,11 +570,23 @@ int devpts_pty_new(struct inode *ptmx_inode, struct tty_struct *tty)
 
 struct tty_struct *devpts_get_tty(struct inode *pts_inode, int number)
 {
+	struct dentry *dentry;
+	struct tty_struct *tty;
+
 	BUG_ON(pts_inode->i_rdev == MKDEV(TTYAUX_MAJOR, PTMX_MINOR));
 
+	/* Ensure dentry has not been deleted by devpts_pty_kill() */
+	dentry = d_find_alias(pts_inode);
+	if (!dentry)
+		return NULL;
+
+	tty = NULL;
 	if (pts_inode->i_sb->s_magic == DEVPTS_SUPER_MAGIC)
-		return (struct tty_struct *)pts_inode->i_private;
-	return NULL;
+		tty = (struct tty_struct *)pts_inode->i_private;
+
+	dput(dentry);
+
+	return tty;
 }
 
 void devpts_pty_kill(struct tty_struct *tty)
@@ -553,11 +618,15 @@ out:
 static int __init init_devpts_fs(void)
 {
 	int err = register_filesystem(&devpts_fs_type);
+	struct ctl_table_header *table;
+
 	if (!err) {
+		table = register_sysctl_table(pty_root_table);
 		devpts_mnt = kern_mount(&devpts_fs_type);
 		if (IS_ERR(devpts_mnt)) {
 			err = PTR_ERR(devpts_mnt);
 			unregister_filesystem(&devpts_fs_type);
+			unregister_sysctl_table(table);
 		}
 	}
 	return err;

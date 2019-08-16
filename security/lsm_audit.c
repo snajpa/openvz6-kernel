@@ -354,6 +354,10 @@ static void dump_common_audit_data(struct audit_buffer *ab,
 		}
 		break;
 #endif
+	case LSM_AUDIT_DATA_KMOD:
+		audit_log_format(ab, " kmod=");
+		audit_log_untrustedstring(ab, a->u.kmod_name);
+		break;
 	} /* switch (a->type) */
 }
 
@@ -371,7 +375,8 @@ void common_lsm_audit(struct common_audit_data *a)
 	if (a == NULL)
 		return;
 	/* we use GFP_ATOMIC so we won't sleep */
-	ab = audit_log_start(current->audit_context, GFP_ATOMIC, AUDIT_AVC);
+	ab = audit_log_start(current->audit_context, GFP_ATOMIC | __GFP_NOWARN,
+			     AUDIT_AVC);
 
 	if (ab == NULL)
 		return;

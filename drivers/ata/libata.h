@@ -64,7 +64,7 @@ enum {
 	ATA_DNXFER_QUIET	= (1 << 31),
 };
 
-extern unsigned int ata_print_id;
+extern atomic_t ata_print_id;
 extern struct workqueue_struct *ata_aux_wq;
 extern int atapi_passthru16;
 extern int libata_fua;
@@ -79,7 +79,6 @@ extern int ata_build_rw_tf(struct ata_taskfile *tf, struct ata_device *dev,
 			   u64 block, u32 n_block, unsigned int tf_flags,
 			   unsigned int tag);
 extern u64 ata_tf_read_block(struct ata_taskfile *tf, struct ata_device *dev);
-extern void ata_port_flush_task(struct ata_port *ap);
 extern unsigned ata_exec_internal(struct ata_device *dev,
 				  struct ata_taskfile *tf, const u8 *cdb,
 				  int dma_dir, void *buf, unsigned int buflen,
@@ -113,6 +112,8 @@ extern int sata_link_init_spd(struct ata_link *link);
 extern int ata_task_ioctl(struct scsi_device *scsidev, void __user *arg);
 extern int ata_cmd_ioctl(struct scsi_device *scsidev, void __user *arg);
 extern struct ata_port *ata_port_alloc(struct ata_host *host);
+extern int ata_port_probe(struct ata_port *ap);
+extern void __ata_port_probe(struct ata_port *ap);
 extern void ata_dev_enable_pm(struct ata_device *dev, enum link_pm policy);
 extern void ata_lpm_schedule(struct ata_port *ap, enum link_pm);
 
@@ -154,9 +155,10 @@ extern int ata_bus_probe(struct ata_port *ap);
 /* libata-eh.c */
 extern unsigned long ata_internal_cmd_timeout(struct ata_device *dev, u8 cmd);
 extern void ata_internal_cmd_timed_out(struct ata_device *dev, u8 cmd);
+extern void ata_eh_acquire(struct ata_port *ap);
+extern void ata_eh_release(struct ata_port *ap);
 extern enum blk_eh_timer_return ata_scsi_timed_out(struct scsi_cmnd *cmd);
 extern void ata_scsi_error(struct Scsi_Host *host);
-extern void ata_port_wait_eh(struct ata_port *ap);
 extern void ata_eh_fastdrain_timerfn(unsigned long arg);
 extern void ata_qc_schedule_eh(struct ata_queued_cmd *qc);
 extern void ata_dev_disable(struct ata_device *dev);
@@ -205,7 +207,19 @@ static inline int sata_pmp_attach(struct ata_device *dev)
 extern void ata_dev_select(struct ata_port *ap, unsigned int device,
                            unsigned int wait, unsigned int can_sleep);
 extern u8 ata_irq_on(struct ata_port *ap);
-extern void ata_pio_task(struct work_struct *work);
+extern void ata_sff_flush_pio_task(struct ata_port *ap);
+extern void ata_sff_port_init(struct ata_port *ap);
+extern int ata_sff_init(void);
+extern void ata_sff_exit(void);
+#else /* CONFIG_ATA_SFF */
+static inline void ata_sff_flush_pio_task(struct ata_port *ap)
+{ }
+static inline void ata_sff_port_init(struct ata_port *ap)
+{ }
+static inline int ata_sff_init(void)
+{ return 0; }
+static inline void ata_sff_exit(void)
+{ }
 #endif /* CONFIG_ATA_SFF */
 
 #endif /* __LIBATA_H__ */

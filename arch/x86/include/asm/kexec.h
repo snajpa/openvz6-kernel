@@ -23,6 +23,7 @@
 
 #include <asm/page.h>
 #include <asm/ptrace.h>
+#include <asm-generic/kexec.h>
 
 /*
  * KEXEC_SOURCE_MEMORY_LIMIT maximum page get_free_page can return.
@@ -60,6 +61,8 @@
 /* The native architecture */
 # define KEXEC_ARCH KEXEC_ARCH_X86_64
 #endif
+
+#define KEXEC_RESERVE_UPPER_LIMIT    (896 * 1024 * 1024)
 
 /*
  * CPU does not save ss and sp on stack if execution is already
@@ -162,6 +165,9 @@ struct kimage_arch {
 	pte_t *pte;
 };
 #endif
+
+typedef void crash_vmclear_fn(void);
+extern crash_vmclear_fn __rcu *crash_vmclear_loaded_vmcss;
 
 #endif /* __ASSEMBLY__ */
 

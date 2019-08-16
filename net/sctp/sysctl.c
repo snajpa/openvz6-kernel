@@ -41,6 +41,8 @@
  * be incorporated into the next SCTP release.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <net/sctp/structs.h>
 #include <net/sctp/sctp.h>
 #include <linux/sysctl.h>
@@ -52,11 +54,27 @@ static int int_max = INT_MAX;
 static int sack_timer_min = 1;
 static int sack_timer_max = 500;
 static int addr_scope_max = 3; /* check sctp_scope_policy_t in include/net/sctp/constants.h for max entries */
+static int rwnd_scale_max = 16;
+static int rto_alpha_min = 0;
+static int rto_beta_min = 0;
+static int rto_alpha_max = 1000;
+static int rto_beta_max = 1000;
 
 extern int sysctl_sctp_mem[3];
 extern int sysctl_sctp_rmem[3];
 extern int sysctl_sctp_wmem[3];
 
+static int proc_sctp_do_hmac_alg(ctl_table *ctl,
+				int write,
+				void __user *buffer, size_t *lenp,
+
+				loff_t *ppos);
+static int proc_sctp_do_auth(struct ctl_table *ctl, int write,
+			     void __user *buffer, size_t *lenp,
+			     loff_t *ppos);
+static int proc_sctp_do_alpha_beta(struct ctl_table *ctl, int write,
+				   void __user *buffer, size_t *lenp,
+				   loff_t *ppos);
 static ctl_table sctp_table[] = {
 	{
 		.ctl_name	= NET_SCTP_RTO_INITIAL,
@@ -125,6 +143,12 @@ static ctl_table sctp_table[] = {
 		.extra2		= &int_max
 	},
 	{
+		.procname	= "cookie_hmac_alg",
+		.maxlen		= 8,
+		.mode		= 0644,
+		.proc_handler	= proc_sctp_do_hmac_alg,
+	},
+	{
 		.ctl_name	= NET_SCTP_SNDBUF_POLICY,
 		.procname	= "sndbuf_policy",
 		.data		= &sctp_sndbuf_policy,
@@ -151,6 +175,16 @@ static ctl_table sctp_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.strategy	= sysctl_intvec,
 		.extra1		= &one,
+		.extra2		= &int_max
+	},
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "pf_retrans",
+		.data		= &sctp_pf_retrans,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
 		.extra2		= &int_max
 	},
 	{
@@ -189,18 +223,22 @@ static ctl_table sctp_table[] = {
 		.procname	= "rto_alpha_exp_divisor",
 		.data		= &sctp_rto_alpha,
 		.maxlen		= sizeof(int),
-		.mode		= 0444,
-		.proc_handler	= proc_dointvec,
-		.strategy	= sysctl_intvec
+		.mode		= 0644,
+		.proc_handler	= proc_sctp_do_alpha_beta,
+		.strategy	= sysctl_intvec,
+		.extra1		= &rto_alpha_min,
+		.extra2		= &rto_alpha_max,
 	},
 	{
 		.ctl_name	= NET_SCTP_RTO_BETA,
 		.procname	= "rto_beta_exp_divisor",
 		.data		= &sctp_rto_beta,
 		.maxlen		= sizeof(int),
-		.mode		= 0444,
-		.proc_handler	= proc_dointvec,
-		.strategy	= sysctl_intvec
+		.mode		= 0644,
+		.proc_handler	= proc_sctp_do_alpha_beta,
+		.strategy	= sysctl_intvec,
+		.extra1		= &rto_beta_min,
+		.extra2		= &rto_beta_max,
 	},
 	{
 		.ctl_name	= NET_SCTP_ADDIP_ENABLE,
@@ -261,8 +299,7 @@ static ctl_table sctp_table[] = {
 		.data		= &sctp_auth_enable,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-		.strategy	= sysctl_intvec
+		.proc_handler	= proc_sctp_do_auth,
 	},
 	{
 		.ctl_name	= CTL_UNNUMBERED,
@@ -284,6 +321,18 @@ static ctl_table sctp_table[] = {
 		.extra1		= &zero,
 		.extra2		= &addr_scope_max,
 	},
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "rwnd_update_shift",
+		.data		= &sctp_rwnd_upd_shift,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec_minmax,
+		.strategy	= &sysctl_intvec,
+		.extra1		= &one,
+		.extra2		= &rwnd_scale_max,
+	},
+
 	{ .ctl_name = 0 }
 };
 
@@ -293,7 +342,95 @@ static struct ctl_path sctp_path[] = {
 	{ }
 };
 
+static int proc_sctp_do_hmac_alg(ctl_table *ctl,
+				int write,
+				void __user *buffer, size_t *lenp,
+				loff_t *ppos)
+{
+	char tmp[8];
+	ctl_table tbl;
+	int ret;
+	int changed = 0;
+	char *none = "none";
+
+	memset(&tbl, 0, sizeof(struct ctl_table));
+
+	if (write) {
+		tbl.data = tmp;
+		tbl.maxlen = 8;
+	} else {
+		tbl.data = sctp_hmac_algorithm ? : none;
+		tbl.maxlen = strlen(tbl.data);
+	}
+		ret = proc_dostring(&tbl, write, buffer, lenp, ppos);
+
+	if (write) {
+#ifdef CONFIG_CRYPTO_MD5
+		if (!strncmp(tmp, "md5", 3)) {
+			sctp_hmac_algorithm = "md5";
+			changed = 1;
+		}
+#endif
+#ifdef CONFIG_CRYPTO_SHA1
+		if (!strncmp(tmp, "sha1", 4)) {
+			sctp_hmac_algorithm = "sha1";
+			changed = 1;
+		}
+#endif
+		if (!strncmp(tmp, "none", 4)) {
+			sctp_hmac_algorithm = NULL;
+			changed = 1;
+		}
+
+		if (!changed)
+			ret = -EINVAL;
+	}
+
+	return ret;
+}
+
 static struct ctl_table_header * sctp_sysctl_header;
+
+static int proc_sctp_do_alpha_beta(struct ctl_table *ctl, int write,
+				   void __user *buffer, size_t *lenp,
+				   loff_t *ppos)
+{
+	if (write)
+		pr_warn_once("Changing rto_alpha or rto_beta may lead to "
+			     "suboptimal rtt/srtt estimations!\n");
+
+	return proc_dointvec_minmax(ctl, write, buffer, lenp, ppos);
+}
+
+static int proc_sctp_do_auth(struct ctl_table *ctl, int write,
+			     void __user *buffer, size_t *lenp,
+			     loff_t *ppos)
+{
+	struct ctl_table tbl;
+	int new_value, ret;
+
+	memset(&tbl, 0, sizeof(struct ctl_table));
+	tbl.maxlen = sizeof(unsigned int);
+
+	if (write)
+		tbl.data = &new_value;
+	else
+		tbl.data = &sctp_auth_enable;
+
+	ret = proc_dointvec(&tbl, write, buffer, lenp, ppos);
+
+	if (write) {
+		struct sock *sk = sctp_get_ctl_sock();
+
+		sctp_auth_enable = new_value;
+		/* Update the value in the control socket */
+		lock_sock(sk);
+		sctp_sk(sk)->ep->auth_enable = new_value;
+		release_sock(sk);
+	}
+
+	return ret;
+}
 
 /* Sysctl registration.  */
 void sctp_sysctl_register(void)

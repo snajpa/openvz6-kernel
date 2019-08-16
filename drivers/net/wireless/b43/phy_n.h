@@ -2,6 +2,7 @@
 #define B43_NPHY_H_
 
 #include "phy_common.h"
+#include "ppr.h"
 
 
 /* N-PHY registers. */
@@ -54,10 +55,15 @@
 #define  B43_NPHY_C1_INITGAIN_HPVGA2_SHIFT	7
 #define  B43_NPHY_C1_INITGAIN_TRRX		0x1000 /* TR RX index */
 #define  B43_NPHY_C1_INITGAIN_TRTX		0x2000 /* TR TX index */
+#define B43_NPHY_REV3_C1_INITGAIN_A		B43_PHY_N(0x020)
 #define B43_NPHY_C1_CLIP1_HIGAIN		B43_PHY_N(0x021) /* Core 1 clip1 high gain code */
+#define B43_NPHY_REV3_C1_INITGAIN_B		B43_PHY_N(0x021)
 #define B43_NPHY_C1_CLIP1_MEDGAIN		B43_PHY_N(0x022) /* Core 1 clip1 medium gain code */
+#define B43_NPHY_REV3_C1_CLIP_HIGAIN_A		B43_PHY_N(0x022)
 #define B43_NPHY_C1_CLIP1_LOGAIN		B43_PHY_N(0x023) /* Core 1 clip1 low gain code */
+#define B43_NPHY_REV3_C1_CLIP_HIGAIN_B		B43_PHY_N(0x023)
 #define B43_NPHY_C1_CLIP2_GAIN			B43_PHY_N(0x024) /* Core 1 clip2 gain code */
+#define B43_NPHY_REV3_C1_CLIP_MEDGAIN_A		B43_PHY_N(0x024)
 #define B43_NPHY_C1_FILTERGAIN			B43_PHY_N(0x025) /* Core 1 filter gain */
 #define B43_NPHY_C1_LPF_QHPF_BW			B43_PHY_N(0x026) /* Core 1 LPF Q HP F bandwidth */
 #define B43_NPHY_C1_CLIPWBTHRES			B43_PHY_N(0x027) /* Core 1 clip wideband threshold */
@@ -107,10 +113,15 @@
 #define  B43_NPHY_C2_INITGAIN_HPVGA2_SHIFT	7
 #define  B43_NPHY_C2_INITGAIN_TRRX		0x1000 /* TR RX index */
 #define  B43_NPHY_C2_INITGAIN_TRTX		0x2000 /* TR TX index */
+#define B43_NPHY_REV3_C1_CLIP_MEDGAIN_B		B43_PHY_N(0x036)
 #define B43_NPHY_C2_CLIP1_HIGAIN		B43_PHY_N(0x037) /* Core 2 clip1 high gain code */
+#define B43_NPHY_REV3_C1_CLIP_LOGAIN_A		B43_PHY_N(0x037)
 #define B43_NPHY_C2_CLIP1_MEDGAIN		B43_PHY_N(0x038) /* Core 2 clip1 medium gain code */
+#define B43_NPHY_REV3_C1_CLIP_LOGAIN_B		B43_PHY_N(0x038)
 #define B43_NPHY_C2_CLIP1_LOGAIN		B43_PHY_N(0x039) /* Core 2 clip1 low gain code */
+#define B43_NPHY_REV3_C1_CLIP2_GAIN_A		B43_PHY_N(0x039)
 #define B43_NPHY_C2_CLIP2_GAIN			B43_PHY_N(0x03A) /* Core 2 clip2 gain code */
+#define B43_NPHY_REV3_C1_CLIP2_GAIN_B		B43_PHY_N(0x03A)
 #define B43_NPHY_C2_FILTERGAIN			B43_PHY_N(0x03B) /* Core 2 filter gain */
 #define B43_NPHY_C2_LPF_QHPF_BW			B43_PHY_N(0x03C) /* Core 2 LPF Q HP F bandwidth */
 #define B43_NPHY_C2_CLIPWBTHRES			B43_PHY_N(0x03D) /* Core 2 clip wideband threshold */
@@ -231,6 +242,7 @@
 #define B43_NPHY_C2_TXIQ_COMP_OFF		B43_PHY_N(0x088) /* Core 2 TX I/Q comp offset */
 #define B43_NPHY_C1_TXCTL			B43_PHY_N(0x08B) /* Core 1 TX control */
 #define B43_NPHY_C2_TXCTL			B43_PHY_N(0x08C) /* Core 2 TX control */
+#define B43_NPHY_AFECTL_OVER1			B43_PHY_N(0x08F) /* AFE control override 1 */
 #define B43_NPHY_SCRAM_SIGCTL			B43_PHY_N(0x090) /* Scram signal control */
 #define  B43_NPHY_SCRAM_SIGCTL_INITST		0x007F /* Initial state value */
 #define  B43_NPHY_SCRAM_SIGCTL_INITST_SHIFT	0
@@ -355,11 +367,13 @@
 #define B43_NPHY_TXF_40CO_B1S0			B43_PHY_N(0x0E5) /* TX filter 40 coeff B1 stage 0 */
 #define B43_NPHY_TXF_40CO_B32S1			B43_PHY_N(0x0E6) /* TX filter 40 coeff B32 stage 1 */
 #define B43_NPHY_TXF_40CO_B1S1			B43_PHY_N(0x0E7) /* TX filter 40 coeff B1 stage 1 */
+#define B43_NPHY_REV3_RFCTL_OVER0		B43_PHY_N(0x0E7)
 #define B43_NPHY_TXF_40CO_B32S2			B43_PHY_N(0x0E8) /* TX filter 40 coeff B32 stage 2 */
 #define B43_NPHY_TXF_40CO_B1S2			B43_PHY_N(0x0E9) /* TX filter 40 coeff B1 stage 2 */
 #define B43_NPHY_BIST_STAT2			B43_PHY_N(0x0EA) /* BIST status 2 */
 #define B43_NPHY_BIST_STAT3			B43_PHY_N(0x0EB) /* BIST status 3 */
 #define B43_NPHY_RFCTL_OVER			B43_PHY_N(0x0EC) /* RF control override */
+#define B43_NPHY_REV3_RFCTL_OVER1		B43_PHY_N(0x0EC)
 #define B43_NPHY_MIMOCFG			B43_PHY_N(0x0ED) /* MIMO config */
 #define  B43_NPHY_MIMOCFG_GFMIX			0x0004 /* Greenfield or mixed mode */
 #define  B43_NPHY_MIMOCFG_AUTO			0x0100 /* Greenfield/mixed mode auto */
@@ -702,225 +716,288 @@
 #define B43_NPHY_CHAN_ESTHANG			B43_PHY_N(0x21D) /* Channel estimate hang */
 #define B43_NPHY_FINERX2_CGC			B43_PHY_N(0x221) /* Fine RX 2 clock gate control */
 #define  B43_NPHY_FINERX2_CGC_DECGC		0x0008 /* Decode gated clocks */
-#define B43_NPHY_TXPCTL_INIT			B43_PHY_N(0x222) /* TX power controll init */
+#define B43_NPHY_TXPCTL_INIT			B43_PHY_N(0x222) /* TX power control init */
 #define  B43_NPHY_TXPCTL_INIT_PIDXI1		0x00FF /* Power index init 1 */
 #define  B43_NPHY_TXPCTL_INIT_PIDXI1_SHIFT	0
+#define B43_NPHY_ED_CRSEN			B43_PHY_N(0x223)
+#define B43_NPHY_ED_CRS40ASSERTTHRESH0		B43_PHY_N(0x224)
+#define B43_NPHY_ED_CRS40ASSERTTHRESH1		B43_PHY_N(0x225)
+#define B43_NPHY_ED_CRS40DEASSERTTHRESH0	B43_PHY_N(0x226)
+#define B43_NPHY_ED_CRS40DEASSERTTHRESH1	B43_PHY_N(0x227)
+#define B43_NPHY_ED_CRS20LASSERTTHRESH0		B43_PHY_N(0x228)
+#define B43_NPHY_ED_CRS20LASSERTTHRESH1		B43_PHY_N(0x229)
+#define B43_NPHY_ED_CRS20LDEASSERTTHRESH0	B43_PHY_N(0x22A)
+#define B43_NPHY_ED_CRS20LDEASSERTTHRESH1	B43_PHY_N(0x22B)
+#define B43_NPHY_ED_CRS20UASSERTTHRESH0		B43_PHY_N(0x22C)
+#define B43_NPHY_ED_CRS20UASSERTTHRESH1		B43_PHY_N(0x22D)
+#define B43_NPHY_ED_CRS20UDEASSERTTHRESH0	B43_PHY_N(0x22E)
+#define B43_NPHY_ED_CRS20UDEASSERTTHRESH1	B43_PHY_N(0x22F)
+#define B43_NPHY_ED_CRS				B43_PHY_N(0x230)
+#define B43_NPHY_TIMEOUTEN			B43_PHY_N(0x231)
+#define B43_NPHY_OFDMPAYDECODETIMEOUTLEN	B43_PHY_N(0x232)
+#define B43_NPHY_CCKPAYDECODETIMEOUTLEN		B43_PHY_N(0x233)
+#define B43_NPHY_NONPAYDECODETIMEOUTLEN		B43_PHY_N(0x234)
+#define B43_NPHY_TIMEOUTSTATUS			B43_PHY_N(0x235)
+#define B43_NPHY_RFCTRLCORE0GPIO0		B43_PHY_N(0x236)
+#define B43_NPHY_RFCTRLCORE0GPIO1		B43_PHY_N(0x237)
+#define B43_NPHY_RFCTRLCORE0GPIO2		B43_PHY_N(0x238)
+#define B43_NPHY_RFCTRLCORE0GPIO3		B43_PHY_N(0x239)
+#define B43_NPHY_RFCTRLCORE1GPIO0		B43_PHY_N(0x23A)
+#define B43_NPHY_RFCTRLCORE1GPIO1		B43_PHY_N(0x23B)
+#define B43_NPHY_RFCTRLCORE1GPIO2		B43_PHY_N(0x23C)
+#define B43_NPHY_RFCTRLCORE1GPIO3		B43_PHY_N(0x23D)
+#define B43_NPHY_BPHYTESTCONTROL		B43_PHY_N(0x23E)
+/* REV3+ */
+#define B43_NPHY_FORCEFRONT0			B43_PHY_N(0x23F)
+#define B43_NPHY_FORCEFRONT1			B43_PHY_N(0x240)
+#define B43_NPHY_NORMVARHYSTTH			B43_PHY_N(0x241)
+#define B43_NPHY_TXCCKERROR			B43_PHY_N(0x242)
+#define B43_NPHY_AFESEQINITDACGAIN		B43_PHY_N(0x243)
+#define B43_NPHY_TXANTSWLUT			B43_PHY_N(0x244)
+#define B43_NPHY_CORECONFIG			B43_PHY_N(0x245)
+#define B43_NPHY_ANTENNADIVDWELLTIME		B43_PHY_N(0x246)
+#define B43_NPHY_ANTENNACCKDIVDWELLTIME		B43_PHY_N(0x247)
+#define B43_NPHY_ANTENNADIVBACKOFFGAIN		B43_PHY_N(0x248)
+#define B43_NPHY_ANTENNADIVMINGAIN		B43_PHY_N(0x249)
+#define B43_NPHY_BRDSEL_NORMVARHYSTTH		B43_PHY_N(0x24A)
+#define B43_NPHY_RXANTSWITCHCTRL		B43_PHY_N(0x24B)
+#define B43_NPHY_ENERGYDROPTIMEOUTLEN2		B43_PHY_N(0x24C)
+#define B43_NPHY_ML_LOG_TXEVM0			B43_PHY_N(0x250)
+#define B43_NPHY_ML_LOG_TXEVM1			B43_PHY_N(0x251)
+#define B43_NPHY_ML_LOG_TXEVM2			B43_PHY_N(0x252)
+#define B43_NPHY_ML_LOG_TXEVM3			B43_PHY_N(0x253)
+#define B43_NPHY_ML_LOG_TXEVM4			B43_PHY_N(0x254)
+#define B43_NPHY_ML_LOG_TXEVM5			B43_PHY_N(0x255)
+#define B43_NPHY_ML_LOG_TXEVM6			B43_PHY_N(0x256)
+#define B43_NPHY_ML_LOG_TXEVM7			B43_PHY_N(0x257)
+#define B43_NPHY_ML_SCALE_TWEAK			B43_PHY_N(0x258)
+#define B43_NPHY_MLUA				B43_PHY_N(0x259)
+#define B43_NPHY_ZFUA				B43_PHY_N(0x25A)
+#define B43_NPHY_CHANUPSYM01			B43_PHY_N(0x25B)
+#define B43_NPHY_CHANUPSYM2			B43_PHY_N(0x25C)
+#define B43_NPHY_RXSTRNFILT20NUM00		B43_PHY_N(0x25D)
+#define B43_NPHY_RXSTRNFILT20NUM01		B43_PHY_N(0x25E)
+#define B43_NPHY_RXSTRNFILT20NUM02		B43_PHY_N(0x25F)
+#define B43_NPHY_RXSTRNFILT20DEN00		B43_PHY_N(0x260)
+#define B43_NPHY_RXSTRNFILT20DEN01		B43_PHY_N(0x261)
+#define B43_NPHY_RXSTRNFILT20NUM10		B43_PHY_N(0x262)
+#define B43_NPHY_RXSTRNFILT20NUM11		B43_PHY_N(0x263)
+#define B43_NPHY_RXSTRNFILT20NUM12		B43_PHY_N(0x264)
+#define B43_NPHY_RXSTRNFILT20DEN10		B43_PHY_N(0x265)
+#define B43_NPHY_RXSTRNFILT20DEN11		B43_PHY_N(0x266)
+#define B43_NPHY_RXSTRNFILT40NUM00		B43_PHY_N(0x267)
+#define B43_NPHY_RXSTRNFILT40NUM01		B43_PHY_N(0x268)
+#define B43_NPHY_RXSTRNFILT40NUM02		B43_PHY_N(0x269)
+#define B43_NPHY_RXSTRNFILT40DEN00		B43_PHY_N(0x26A)
+#define B43_NPHY_RXSTRNFILT40DEN01		B43_PHY_N(0x26B)
+#define B43_NPHY_RXSTRNFILT40NUM10		B43_PHY_N(0x26C)
+#define B43_NPHY_RXSTRNFILT40NUM11		B43_PHY_N(0x26D)
+#define B43_NPHY_RXSTRNFILT40NUM12		B43_PHY_N(0x26E)
+#define B43_NPHY_RXSTRNFILT40DEN10		B43_PHY_N(0x26F)
+#define B43_NPHY_RXSTRNFILT40DEN11		B43_PHY_N(0x270)
+#define B43_NPHY_CRSHIGHPOWTHRESHOLD1		B43_PHY_N(0x271)
+#define B43_NPHY_CRSHIGHPOWTHRESHOLD2		B43_PHY_N(0x272)
+#define B43_NPHY_CRSHIGHLOWPOWTHRESHOLD		B43_PHY_N(0x273)
+#define B43_NPHY_CRSHIGHPOWTHRESHOLD1L		B43_PHY_N(0x274)
+#define B43_NPHY_CRSHIGHPOWTHRESHOLD2L		B43_PHY_N(0x275)
+#define B43_NPHY_CRSHIGHLOWPOWTHRESHOLDL	B43_PHY_N(0x276)
+#define B43_NPHY_CRSHIGHPOWTHRESHOLD1U		B43_PHY_N(0x277)
+#define B43_NPHY_CRSHIGHPOWTHRESHOLD2U		B43_PHY_N(0x278)
+#define B43_NPHY_CRSHIGHLOWPOWTHRESHOLDU	B43_PHY_N(0x279)
+#define B43_NPHY_CRSACIDETECTTHRESH		B43_PHY_N(0x27A)
+#define B43_NPHY_CRSACIDETECTTHRESHL		B43_PHY_N(0x27B)
+#define B43_NPHY_CRSACIDETECTTHRESHU		B43_PHY_N(0x27C)
+#define B43_NPHY_CRSMINPOWER0			B43_PHY_N(0x27D)
+#define B43_NPHY_CRSMINPOWER1			B43_PHY_N(0x27E)
+#define B43_NPHY_CRSMINPOWER2			B43_PHY_N(0x27F)
+#define B43_NPHY_CRSMINPOWERL0			B43_PHY_N(0x280)
+#define B43_NPHY_CRSMINPOWERL1			B43_PHY_N(0x281)
+#define B43_NPHY_CRSMINPOWERL2			B43_PHY_N(0x282)
+#define B43_NPHY_CRSMINPOWERU0			B43_PHY_N(0x283)
+#define B43_NPHY_CRSMINPOWERU1			B43_PHY_N(0x284)
+#define B43_NPHY_CRSMINPOWERU2			B43_PHY_N(0x285)
+#define B43_NPHY_STRPARAM			B43_PHY_N(0x286)
+#define B43_NPHY_STRPARAML			B43_PHY_N(0x287)
+#define B43_NPHY_STRPARAMU			B43_PHY_N(0x288)
+#define B43_NPHY_BPHYCRSMINPOWER0		B43_PHY_N(0x289)
+#define B43_NPHY_BPHYCRSMINPOWER1		B43_PHY_N(0x28A)
+#define B43_NPHY_BPHYCRSMINPOWER2		B43_PHY_N(0x28B)
+#define B43_NPHY_BPHYFILTDEN0COEF		B43_PHY_N(0x28C)
+#define B43_NPHY_BPHYFILTDEN1COEF		B43_PHY_N(0x28D)
+#define B43_NPHY_BPHYFILTDEN2COEF		B43_PHY_N(0x28E)
+#define B43_NPHY_BPHYFILTNUM0COEF		B43_PHY_N(0x28F)
+#define B43_NPHY_BPHYFILTNUM1COEF		B43_PHY_N(0x290)
+#define B43_NPHY_BPHYFILTNUM2COEF		B43_PHY_N(0x291)
+#define B43_NPHY_BPHYFILTNUM01COEF2		B43_PHY_N(0x292)
+#define B43_NPHY_BPHYFILTBYPASS			B43_PHY_N(0x293)
+#define B43_NPHY_SGILTRNOFFSET			B43_PHY_N(0x294)
+#define B43_NPHY_RADAR_T2_MIN			B43_PHY_N(0x295)
+#define B43_NPHY_TXPWRCTRLDAMPING		B43_PHY_N(0x296)
+#define B43_NPHY_PAPD_EN0			B43_PHY_N(0x297) /* PAPD Enable0 TBD */
+#define B43_NPHY_EPS_TABLE_ADJ0			B43_PHY_N(0x298) /* EPS Table Adj0 TBD */
+#define B43_NPHY_EPS_OVERRIDEI_0		B43_PHY_N(0x299)
+#define B43_NPHY_EPS_OVERRIDEQ_0		B43_PHY_N(0x29A)
+#define B43_NPHY_PAPD_EN1			B43_PHY_N(0x29B) /* PAPD Enable1 TBD */
+#define B43_NPHY_EPS_TABLE_ADJ1			B43_PHY_N(0x29C) /* EPS Table Adj1 TBD */
+#define B43_NPHY_EPS_OVERRIDEI_1		B43_PHY_N(0x29D)
+#define B43_NPHY_EPS_OVERRIDEQ_1		B43_PHY_N(0x29E)
+#define B43_NPHY_PAPD_CAL_ADDRESS		B43_PHY_N(0x29F)
+#define B43_NPHY_PAPD_CAL_YREFEPSILON		B43_PHY_N(0x2A0)
+#define B43_NPHY_PAPD_CAL_SETTLE		B43_PHY_N(0x2A1)
+#define B43_NPHY_PAPD_CAL_CORRELATE		B43_PHY_N(0x2A2)
+#define B43_NPHY_PAPD_CAL_SHIFTS0		B43_PHY_N(0x2A3)
+#define B43_NPHY_PAPD_CAL_SHIFTS1		B43_PHY_N(0x2A4)
+#define B43_NPHY_SAMPLE_START_ADDR		B43_PHY_N(0x2A5)
+#define B43_NPHY_RADAR_ADC_TO_DBM		B43_PHY_N(0x2A6)
+#define B43_NPHY_REV3_C2_INITGAIN_A		B43_PHY_N(0x2A7)
+#define B43_NPHY_REV3_C2_INITGAIN_B		B43_PHY_N(0x2A8)
+#define B43_NPHY_REV3_C2_CLIP_HIGAIN_A		B43_PHY_N(0x2A9)
+#define B43_NPHY_REV3_C2_CLIP_HIGAIN_B		B43_PHY_N(0x2AA)
+#define B43_NPHY_REV3_C2_CLIP_MEDGAIN_A		B43_PHY_N(0x2AB)
+#define B43_NPHY_REV3_C2_CLIP_MEDGAIN_B		B43_PHY_N(0x2AC)
+#define B43_NPHY_REV3_C2_CLIP_LOGAIN_A		B43_PHY_N(0x2AD)
+#define B43_NPHY_REV3_C2_CLIP_LOGAIN_B		B43_PHY_N(0x2AE)
+#define B43_NPHY_REV3_C2_CLIP2_GAIN_A		B43_PHY_N(0x2AF)
+#define B43_NPHY_REV3_C2_CLIP2_GAIN_B		B43_PHY_N(0x2B0)
 
+#define B43_NPHY_REV7_RF_CTL_MISC_REG3		B43_PHY_N(0x340)
+#define B43_NPHY_REV7_RF_CTL_MISC_REG4		B43_PHY_N(0x341)
+#define B43_NPHY_REV7_RF_CTL_OVER3		B43_PHY_N(0x342)
+#define B43_NPHY_REV7_RF_CTL_OVER4		B43_PHY_N(0x343)
+#define B43_NPHY_REV7_RF_CTL_MISC_REG5		B43_PHY_N(0x344)
+#define B43_NPHY_REV7_RF_CTL_MISC_REG6		B43_PHY_N(0x345)
+#define B43_NPHY_REV7_RF_CTL_OVER5		B43_PHY_N(0x346)
+#define B43_NPHY_REV7_RF_CTL_OVER6		B43_PHY_N(0x347)
 
-
-/* Broadcom 2055 radio registers */
-
-#define B2055_GEN_SPARE			0x00 /* GEN spare */
-#define B2055_SP_PINPD			0x02 /* SP PIN PD */
-#define B2055_C1_SP_RSSI		0x03 /* SP RSSI Core 1 */
-#define B2055_C1_SP_PDMISC		0x04 /* SP PD MISC Core 1 */
-#define B2055_C2_SP_RSSI		0x05 /* SP RSSI Core 2 */
-#define B2055_C2_SP_PDMISC		0x06 /* SP PD MISC Core 2 */
-#define B2055_C1_SP_RXGC1		0x07 /* SP RX GC1 Core 1 */
-#define B2055_C1_SP_RXGC2		0x08 /* SP RX GC2 Core 1 */
-#define B2055_C2_SP_RXGC1		0x09 /* SP RX GC1 Core 2 */
-#define B2055_C2_SP_RXGC2		0x0A /* SP RX GC2 Core 2 */
-#define B2055_C1_SP_LPFBWSEL		0x0B /* SP LPF BW select Core 1 */
-#define B2055_C2_SP_LPFBWSEL		0x0C /* SP LPF BW select Core 2 */
-#define B2055_C1_SP_TXGC1		0x0D /* SP TX GC1 Core 1 */
-#define B2055_C1_SP_TXGC2		0x0E /* SP TX GC2 Core 1 */
-#define B2055_C2_SP_TXGC1		0x0F /* SP TX GC1 Core 2 */
-#define B2055_C2_SP_TXGC2		0x10 /* SP TX GC2 Core 2 */
-#define B2055_MASTER1			0x11 /* Master control 1 */
-#define B2055_MASTER2			0x12 /* Master control 2 */
-#define B2055_PD_LGEN			0x13 /* PD LGEN */
-#define B2055_PD_PLLTS			0x14 /* PD PLL TS */
-#define B2055_C1_PD_LGBUF		0x15 /* PD Core 1 LGBUF */
-#define B2055_C1_PD_TX			0x16 /* PD Core 1 TX */
-#define B2055_C1_PD_RXTX		0x17 /* PD Core 1 RXTX */
-#define B2055_C1_PD_RSSIMISC		0x18 /* PD Core 1 RSSI MISC */
-#define B2055_C2_PD_LGBUF		0x19 /* PD Core 2 LGBUF */
-#define B2055_C2_PD_TX			0x1A /* PD Core 2 TX */
-#define B2055_C2_PD_RXTX		0x1B /* PD Core 2 RXTX */
-#define B2055_C2_PD_RSSIMISC		0x1C /* PD Core 2 RSSI MISC */
-#define B2055_PWRDET_LGEN		0x1D /* PWRDET LGEN */
-#define B2055_C1_PWRDET_LGBUF		0x1E /* PWRDET LGBUF Core 1 */
-#define B2055_C1_PWRDET_RXTX		0x1F /* PWRDET RXTX Core 1 */
-#define B2055_C2_PWRDET_LGBUF		0x20 /* PWRDET LGBUF Core 2 */
-#define B2055_C2_PWRDET_RXTX		0x21 /* PWRDET RXTX Core 2 */
-#define B2055_RRCCAL_CS			0x22 /* RRCCAL Control spare */
-#define B2055_RRCCAL_NOPTSEL		0x23 /* RRCCAL N OPT SEL */
-#define B2055_CAL_MISC			0x24 /* CAL MISC */
-#define B2055_CAL_COUT			0x25 /* CAL Counter out */
-#define B2055_CAL_COUT2			0x26 /* CAL Counter out 2 */
-#define B2055_CAL_CVARCTL		0x27 /* CAL CVAR Control */
-#define B2055_CAL_RVARCTL		0x28 /* CAL RVAR Control */
-#define B2055_CAL_LPOCTL		0x29 /* CAL LPO Control */
-#define B2055_CAL_TS			0x2A /* CAL TS */
-#define B2055_CAL_RCCALRTS		0x2B /* CAL RCCAL READ TS */
-#define B2055_CAL_RCALRTS		0x2C /* CAL RCAL READ TS */
-#define B2055_PADDRV			0x2D /* PAD driver */
-#define B2055_XOCTL1			0x2E /* XO Control 1 */
-#define B2055_XOCTL2			0x2F /* XO Control 2 */
-#define B2055_XOREGUL			0x30 /* XO Regulator */
-#define B2055_XOMISC			0x31 /* XO misc */
-#define B2055_PLL_LFC1			0x32 /* PLL LF C1 */
-#define B2055_PLL_CALVTH		0x33 /* PLL CAL VTH */
-#define B2055_PLL_LFC2			0x34 /* PLL LF C2 */
-#define B2055_PLL_REF			0x35 /* PLL reference */
-#define B2055_PLL_LFR1			0x36 /* PLL LF R1 */
-#define B2055_PLL_PFDCP			0x37 /* PLL PFD CP */
-#define B2055_PLL_IDAC_CPOPAMP		0x38 /* PLL IDAC CPOPAMP */
-#define B2055_PLL_CPREG			0x39 /* PLL CP Regulator */
-#define B2055_PLL_RCAL			0x3A /* PLL RCAL */
-#define B2055_RF_PLLMOD0		0x3B /* RF PLL MOD0 */
-#define B2055_RF_PLLMOD1		0x3C /* RF PLL MOD1 */
-#define B2055_RF_MMDIDAC1		0x3D /* RF MMD IDAC 1 */
-#define B2055_RF_MMDIDAC0		0x3E /* RF MMD IDAC 0 */
-#define B2055_RF_MMDSP			0x3F /* RF MMD spare */
-#define B2055_VCO_CAL1			0x40 /* VCO cal 1 */
-#define B2055_VCO_CAL2			0x41 /* VCO cal 2 */
-#define B2055_VCO_CAL3			0x42 /* VCO cal 3 */
-#define B2055_VCO_CAL4			0x43 /* VCO cal 4 */
-#define B2055_VCO_CAL5			0x44 /* VCO cal 5 */
-#define B2055_VCO_CAL6			0x45 /* VCO cal 6 */
-#define B2055_VCO_CAL7			0x46 /* VCO cal 7 */
-#define B2055_VCO_CAL8			0x47 /* VCO cal 8 */
-#define B2055_VCO_CAL9			0x48 /* VCO cal 9 */
-#define B2055_VCO_CAL10			0x49 /* VCO cal 10 */
-#define B2055_VCO_CAL11			0x4A /* VCO cal 11 */
-#define B2055_VCO_CAL12			0x4B /* VCO cal 12 */
-#define B2055_VCO_CAL13			0x4C /* VCO cal 13 */
-#define B2055_VCO_CAL14			0x4D /* VCO cal 14 */
-#define B2055_VCO_CAL15			0x4E /* VCO cal 15 */
-#define B2055_VCO_CAL16			0x4F /* VCO cal 16 */
-#define B2055_VCO_KVCO			0x50 /* VCO KVCO */
-#define B2055_VCO_CAPTAIL		0x51 /* VCO CAP TAIL */
-#define B2055_VCO_IDACVCO		0x52 /* VCO IDAC VCO */
-#define B2055_VCO_REG			0x53 /* VCO Regulator */
-#define B2055_PLL_RFVTH			0x54 /* PLL RF VTH */
-#define B2055_LGBUF_CENBUF		0x55 /* LGBUF CEN BUF */
-#define B2055_LGEN_TUNE1		0x56 /* LGEN tune 1 */
-#define B2055_LGEN_TUNE2		0x57 /* LGEN tune 2 */
-#define B2055_LGEN_IDAC1		0x58 /* LGEN IDAC 1 */
-#define B2055_LGEN_IDAC2		0x59 /* LGEN IDAC 2 */
-#define B2055_LGEN_BIASC		0x5A /* LGEN BIAS counter */
-#define B2055_LGEN_BIASIDAC		0x5B /* LGEN BIAS IDAC */
-#define B2055_LGEN_RCAL			0x5C /* LGEN RCAL */
-#define B2055_LGEN_DIV			0x5D /* LGEN div */
-#define B2055_LGEN_SPARE2		0x5E /* LGEN spare 2 */
-#define B2055_C1_LGBUF_ATUNE		0x5F /* Core 1 LGBUF A tune */
-#define B2055_C1_LGBUF_GTUNE		0x60 /* Core 1 LGBUF G tune */
-#define B2055_C1_LGBUF_DIV		0x61 /* Core 1 LGBUF div */
-#define B2055_C1_LGBUF_AIDAC		0x62 /* Core 1 LGBUF A IDAC */
-#define B2055_C1_LGBUF_GIDAC		0x63 /* Core 1 LGBUF G IDAC */
-#define B2055_C1_LGBUF_IDACFO		0x64 /* Core 1 LGBUF IDAC filter override */
-#define B2055_C1_LGBUF_SPARE		0x65 /* Core 1 LGBUF spare */
-#define B2055_C1_RX_RFSPC1		0x66 /* Core 1 RX RF SPC1 */
-#define B2055_C1_RX_RFR1		0x67 /* Core 1 RX RF reg 1 */
-#define B2055_C1_RX_RFR2		0x68 /* Core 1 RX RF reg 2 */
-#define B2055_C1_RX_RFRCAL		0x69 /* Core 1 RX RF RCAL */
-#define B2055_C1_RX_BB_BLCMP		0x6A /* Core 1 RX Baseband BUFI LPF CMP */
-#define B2055_C1_RX_BB_LPF		0x6B /* Core 1 RX Baseband LPF */
-#define B2055_C1_RX_BB_MIDACHP		0x6C /* Core 1 RX Baseband MIDAC High-pass */
-#define B2055_C1_RX_BB_VGA1IDAC		0x6D /* Core 1 RX Baseband VGA1 IDAC */
-#define B2055_C1_RX_BB_VGA2IDAC		0x6E /* Core 1 RX Baseband VGA2 IDAC */
-#define B2055_C1_RX_BB_VGA3IDAC		0x6F /* Core 1 RX Baseband VGA3 IDAC */
-#define B2055_C1_RX_BB_BUFOCTL		0x70 /* Core 1 RX Baseband BUFO Control */
-#define B2055_C1_RX_BB_RCCALCTL		0x71 /* Core 1 RX Baseband RCCAL Control */
-#define B2055_C1_RX_BB_RSSICTL1		0x72 /* Core 1 RX Baseband RSSI Control 1 */
-#define B2055_C1_RX_BB_RSSICTL2		0x73 /* Core 1 RX Baseband RSSI Control 2 */
-#define B2055_C1_RX_BB_RSSICTL3		0x74 /* Core 1 RX Baseband RSSI Control 3 */
-#define B2055_C1_RX_BB_RSSICTL4		0x75 /* Core 1 RX Baseband RSSI Control 4 */
-#define B2055_C1_RX_BB_RSSICTL5		0x76 /* Core 1 RX Baseband RSSI Control 5 */
-#define B2055_C1_RX_BB_REG		0x77 /* Core 1 RX Baseband Regulator */
-#define B2055_C1_RX_BB_SPARE1		0x78 /* Core 1 RX Baseband spare 1 */
-#define B2055_C1_RX_TXBBRCAL		0x79 /* Core 1 RX TX BB RCAL */
-#define B2055_C1_TX_RF_SPGA		0x7A /* Core 1 TX RF SGM PGA */
-#define B2055_C1_TX_RF_SPAD		0x7B /* Core 1 TX RF SGM PAD */
-#define B2055_C1_TX_RF_CNTPGA1		0x7C /* Core 1 TX RF counter PGA 1 */
-#define B2055_C1_TX_RF_CNTPAD1		0x7D /* Core 1 TX RF counter PAD 1 */
-#define B2055_C1_TX_RF_PGAIDAC		0x7E /* Core 1 TX RF PGA IDAC */
-#define B2055_C1_TX_PGAPADTN		0x7F /* Core 1 TX PGA PAD TN */
-#define B2055_C1_TX_PADIDAC1		0x80 /* Core 1 TX PAD IDAC 1 */
-#define B2055_C1_TX_PADIDAC2		0x81 /* Core 1 TX PAD IDAC 2 */
-#define B2055_C1_TX_MXBGTRIM		0x82 /* Core 1 TX MX B/G TRIM */
-#define B2055_C1_TX_RF_RCAL		0x83 /* Core 1 TX RF RCAL */
-#define B2055_C1_TX_RF_PADTSSI1		0x84 /* Core 1 TX RF PAD TSSI1 */
-#define B2055_C1_TX_RF_PADTSSI2		0x85 /* Core 1 TX RF PAD TSSI2 */
-#define B2055_C1_TX_RF_SPARE		0x86 /* Core 1 TX RF spare */
-#define B2055_C1_TX_RF_IQCAL1		0x87 /* Core 1 TX RF I/Q CAL 1 */
-#define B2055_C1_TX_RF_IQCAL2		0x88 /* Core 1 TX RF I/Q CAL 2 */
-#define B2055_C1_TXBB_RCCAL		0x89 /* Core 1 TXBB RC CAL Control */
-#define B2055_C1_TXBB_LPF1		0x8A /* Core 1 TXBB LPF 1 */
-#define B2055_C1_TX_VOSCNCL		0x8B /* Core 1 TX VOS CNCL */
-#define B2055_C1_TX_LPF_MXGMIDAC	0x8C /* Core 1 TX LPF MXGM IDAC */
-#define B2055_C1_TX_BB_MXGM		0x8D /* Core 1 TX BB MXGM */
-#define B2055_C2_LGBUF_ATUNE		0x8E /* Core 2 LGBUF A tune */
-#define B2055_C2_LGBUF_GTUNE		0x8F /* Core 2 LGBUF G tune */
-#define B2055_C2_LGBUF_DIV		0x90 /* Core 2 LGBUF div */
-#define B2055_C2_LGBUF_AIDAC		0x91 /* Core 2 LGBUF A IDAC */
-#define B2055_C2_LGBUF_GIDAC		0x92 /* Core 2 LGBUF G IDAC */
-#define B2055_C2_LGBUF_IDACFO		0x93 /* Core 2 LGBUF IDAC filter override */
-#define B2055_C2_LGBUF_SPARE		0x94 /* Core 2 LGBUF spare */
-#define B2055_C2_RX_RFSPC1		0x95 /* Core 2 RX RF SPC1 */
-#define B2055_C2_RX_RFR1		0x96 /* Core 2 RX RF reg 1 */
-#define B2055_C2_RX_RFR2		0x97 /* Core 2 RX RF reg 2 */
-#define B2055_C2_RX_RFRCAL		0x98 /* Core 2 RX RF RCAL */
-#define B2055_C2_RX_BB_BLCMP		0x99 /* Core 2 RX Baseband BUFI LPF CMP */
-#define B2055_C2_RX_BB_LPF		0x9A /* Core 2 RX Baseband LPF */
-#define B2055_C2_RX_BB_MIDACHP		0x9B /* Core 2 RX Baseband MIDAC High-pass */
-#define B2055_C2_RX_BB_VGA1IDAC		0x9C /* Core 2 RX Baseband VGA1 IDAC */
-#define B2055_C2_RX_BB_VGA2IDAC		0x9D /* Core 2 RX Baseband VGA2 IDAC */
-#define B2055_C2_RX_BB_VGA3IDAC		0x9E /* Core 2 RX Baseband VGA3 IDAC */
-#define B2055_C2_RX_BB_BUFOCTL		0x9F /* Core 2 RX Baseband BUFO Control */
-#define B2055_C2_RX_BB_RCCALCTL		0xA0 /* Core 2 RX Baseband RCCAL Control */
-#define B2055_C2_RX_BB_RSSICTL1		0xA1 /* Core 2 RX Baseband RSSI Control 1 */
-#define B2055_C2_RX_BB_RSSICTL2		0xA2 /* Core 2 RX Baseband RSSI Control 2 */
-#define B2055_C2_RX_BB_RSSICTL3		0xA3 /* Core 2 RX Baseband RSSI Control 3 */
-#define B2055_C2_RX_BB_RSSICTL4		0xA4 /* Core 2 RX Baseband RSSI Control 4 */
-#define B2055_C2_RX_BB_RSSICTL5		0xA5 /* Core 2 RX Baseband RSSI Control 5 */
-#define B2055_C2_RX_BB_REG		0xA6 /* Core 2 RX Baseband Regulator */
-#define B2055_C2_RX_BB_SPARE1		0xA7 /* Core 2 RX Baseband spare 1 */
-#define B2055_C2_RX_TXBBRCAL		0xA8 /* Core 2 RX TX BB RCAL */
-#define B2055_C2_TX_RF_SPGA		0xA9 /* Core 2 TX RF SGM PGA */
-#define B2055_C2_TX_RF_SPAD		0xAA /* Core 2 TX RF SGM PAD */
-#define B2055_C2_TX_RF_CNTPGA1		0xAB /* Core 2 TX RF counter PGA 1 */
-#define B2055_C2_TX_RF_CNTPAD1		0xAC /* Core 2 TX RF counter PAD 1 */
-#define B2055_C2_TX_RF_PGAIDAC		0xAD /* Core 2 TX RF PGA IDAC */
-#define B2055_C2_TX_PGAPADTN		0xAE /* Core 2 TX PGA PAD TN */
-#define B2055_C2_TX_PADIDAC1		0xAF /* Core 2 TX PAD IDAC 1 */
-#define B2055_C2_TX_PADIDAC2		0xB0 /* Core 2 TX PAD IDAC 2 */
-#define B2055_C2_TX_MXBGTRIM		0xB1 /* Core 2 TX MX B/G TRIM */
-#define B2055_C2_TX_RF_RCAL		0xB2 /* Core 2 TX RF RCAL */
-#define B2055_C2_TX_RF_PADTSSI1		0xB3 /* Core 2 TX RF PAD TSSI1 */
-#define B2055_C2_TX_RF_PADTSSI2		0xB4 /* Core 2 TX RF PAD TSSI2 */
-#define B2055_C2_TX_RF_SPARE		0xB5 /* Core 2 TX RF spare */
-#define B2055_C2_TX_RF_IQCAL1		0xB6 /* Core 2 TX RF I/Q CAL 1 */
-#define B2055_C2_TX_RF_IQCAL2		0xB7 /* Core 2 TX RF I/Q CAL 2 */
-#define B2055_C2_TXBB_RCCAL		0xB8 /* Core 2 TXBB RC CAL Control */
-#define B2055_C2_TXBB_LPF1		0xB9 /* Core 2 TXBB LPF 1 */
-#define B2055_C2_TX_VOSCNCL		0xBA /* Core 2 TX VOS CNCL */
-#define B2055_C2_TX_LPF_MXGMIDAC	0xBB /* Core 2 TX LPF MXGM IDAC */
-#define B2055_C2_TX_BB_MXGM		0xBC /* Core 2 TX BB MXGM */
-#define B2055_PRG_GCHP21		0xBD /* PRG GC HPVGA23 21 */
-#define B2055_PRG_GCHP22		0xBE /* PRG GC HPVGA23 22 */
-#define B2055_PRG_GCHP23		0xBF /* PRG GC HPVGA23 23 */
-#define B2055_PRG_GCHP24		0xC0 /* PRG GC HPVGA23 24 */
-#define B2055_PRG_GCHP25		0xC1 /* PRG GC HPVGA23 25 */
-#define B2055_PRG_GCHP26		0xC2 /* PRG GC HPVGA23 26 */
-#define B2055_PRG_GCHP27		0xC3 /* PRG GC HPVGA23 27 */
-#define B2055_PRG_GCHP28		0xC4 /* PRG GC HPVGA23 28 */
-#define B2055_PRG_GCHP29		0xC5 /* PRG GC HPVGA23 29 */
-#define B2055_PRG_GCHP30		0xC6 /* PRG GC HPVGA23 30 */
-#define B2055_C1_LNA_GAINBST		0xCD /* Core 1 LNA GAINBST */
-#define B2055_C1_B0NB_RSSIVCM		0xD2 /* Core 1 B0 narrow-band RSSI VCM */
-#define B2055_C1_GENSPARE2		0xD6 /* Core 1 GEN spare 2 */
-#define B2055_C2_LNA_GAINBST		0xD9 /* Core 2 LNA GAINBST */
-#define B2055_C2_B0NB_RSSIVCM		0xDE /* Core 2 B0 narrow-band RSSI VCM */
-#define B2055_C2_GENSPARE2		0xE2 /* Core 2 GEN spare 2 */
-
-
+#define B43_PHY_B_BBCFG				B43_PHY_N_BMODE(0x001) /* BB config */
+#define  B43_PHY_B_BBCFG_RSTCCA			0x4000 /* Reset CCA */
+#define  B43_PHY_B_BBCFG_RSTRX			0x8000 /* Reset RX */
+#define B43_PHY_B_TEST				B43_PHY_N_BMODE(0x00A)
 
 struct b43_wldev;
 
+enum b43_nphy_spur_avoid {
+	B43_SPUR_AVOID_DISABLE,
+	B43_SPUR_AVOID_AUTO,
+	B43_SPUR_AVOID_FORCE,
+};
+
+struct b43_chanspec {
+	u16 center_freq;
+	enum nl80211_channel_type channel_type;
+};
+
+struct b43_phy_n_iq_comp {
+	s16 a0;
+	s16 b0;
+	s16 a1;
+	s16 b1;
+};
+
+struct b43_phy_n_rssical_cache {
+	u16 rssical_radio_regs_2G[2];
+	u16 rssical_phy_regs_2G[12];
+
+	u16 rssical_radio_regs_5G[2];
+	u16 rssical_phy_regs_5G[12];
+};
+
+struct b43_phy_n_cal_cache {
+	u16 txcal_radio_regs_2G[8];
+	u16 txcal_coeffs_2G[8];
+	struct b43_phy_n_iq_comp rxcal_coeffs_2G;
+
+	u16 txcal_radio_regs_5G[8];
+	u16 txcal_coeffs_5G[8];
+	struct b43_phy_n_iq_comp rxcal_coeffs_5G;
+};
+
+struct b43_phy_n_txpwrindex {
+	s8 index;
+	s8 index_internal;
+	s8 index_internal_save;
+	u16 AfectrlOverride;
+	u16 AfeCtrlDacGain;
+	u16 rad_gain;
+	u8 bbmult;
+	u16 iqcomp_a;
+	u16 iqcomp_b;
+	u16 locomp;
+};
+
+struct b43_phy_n_pwr_ctl_info {
+	u8 idle_tssi_2g;
+	u8 idle_tssi_5g;
+};
+
 struct b43_phy_n {
-	//TODO lots of missing stuff
+	u8 antsel_type;
+	u8 cal_orig_pwr_idx[2];
+	u8 measure_hold;
+	u8 phyrxchain;
+	u8 hw_phyrxchain;
+	u8 hw_phytxchain;
+	u8 perical;
+	u32 deaf_count;
+	u32 rxcalparams;
+	bool hang_avoid;
+	bool mute;
+	u16 papd_epsilon_offset[2];
+	s32 preamble_override;
+	u32 bb_mult_save;
+
+	bool gain_boost;
+	bool elna_gain_config;
+	bool band5g_pwrgain;
+	bool use_int_tx_iq_lo_cal;
+	bool lpf_bw_overrode_for_sample_play;
+
+	u8 mphase_cal_phase_id;
+	u16 mphase_txcal_cmdidx;
+	u16 mphase_txcal_numcmds;
+	u16 mphase_txcal_bestcoeffs[11];
+
+	bool txpwrctrl;
+	bool pwg_gain_5ghz;
+	u8 tx_pwr_idx[2];
+	s8 tx_power_offset[101];
+	u16 adj_pwr_tbl[84];
+	u16 txcal_bbmult;
+	u16 txiqlocal_bestc[11];
+	bool txiqlocal_coeffsvalid;
+	struct b43_phy_n_txpwrindex txpwrindex[2];
+	struct b43_phy_n_pwr_ctl_info pwr_ctl_info[2];
+	struct b43_chanspec txiqlocal_chanspec;
+	struct b43_ppr tx_pwr_max_ppr;
+	u16 tx_pwr_last_recalc_freq;
+	int tx_pwr_last_recalc_limit;
+
+	u8 txrx_chain;
+	u16 tx_rx_cal_phy_saveregs[11];
+	u16 tx_rx_cal_radio_saveregs[22];
+
+	u16 rfctrl_intc1_save;
+	u16 rfctrl_intc2_save;
+
+	u16 classifier_state;
+	u16 clip_state[2];
+
+	enum b43_nphy_spur_avoid spur_avoid;
+	bool aband_spurwar_en;
+	bool gband_spurwar_en;
+
+	bool ipa2g_on;
+	struct b43_chanspec iqcal_chanspec_2G;
+	struct b43_chanspec rssical_chanspec_2G;
+
+	bool ipa5g_on;
+	struct b43_chanspec iqcal_chanspec_5G;
+	struct b43_chanspec rssical_chanspec_5G;
+
+	struct b43_phy_n_rssical_cache rssical_cache;
+	struct b43_phy_n_cal_cache cal_cache;
+	bool crsminpwr_adjusted;
+	bool noisevars_adjusted;
 };
 
 

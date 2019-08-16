@@ -19,12 +19,18 @@
  */
 #define SD_TIMEOUT		(30 * HZ)
 #define SD_MOD_TIMEOUT		(75 * HZ)
+/*
+ * Flush timeout is a multiplier over the standard device timeout which is
+ * user modifiable via sysfs but initially set to SD_TIMEOUT
+ */
+#define SD_FLUSH_TIMEOUT_MULTIPLIER	2
 
 /*
  * Number of allowed retries
  */
 #define SD_MAX_RETRIES		5
 #define SD_PASSTHROUGH_RETRIES	1
+#define SD_MAX_MEDIUM_TIMEOUTS	2
 
 /*
  * Size of the initial data buffer for mode and read capacity data
@@ -42,6 +48,15 @@ enum {
 	SD_MEMPOOL_SIZE = 2,	/* CDB pool size */
 };
 
+enum {
+	SD_LBP_FULL = 0,	/* Full logical block provisioning */
+	SD_LBP_UNMAP,		/* Use UNMAP command */
+	SD_LBP_WS16,		/* Use WRITE SAME(16) with UNMAP bit */
+	SD_LBP_WS10,		/* Use WRITE SAME(10) with UNMAP bit */
+	SD_LBP_ZERO,		/* Use WRITE SAME(10) with zero payload */
+	SD_LBP_DISABLE,		/* Discard disabled due to failed cmd */
+};
+
 struct scsi_disk {
 	struct scsi_driver *driver;	/* always &sd_template */
 	struct scsi_device *device;
@@ -49,17 +64,33 @@ struct scsi_disk {
 	struct gendisk	*disk;
 	unsigned int	openers;	/* protected by BKL for now, yuck */
 	sector_t	capacity;	/* size in 512-byte sectors */
+	u32		max_ws_blocks;
+	u32		max_unmap_blocks;
+	u32		unmap_granularity;
+	u32		unmap_alignment;
 	u32		index;
-	unsigned short	hw_sector_size;
+	unsigned int	physical_block_size;
+	unsigned int	max_medium_access_timeouts;
+	unsigned int	medium_access_timed_out;
 	u8		media_present;
 	u8		write_prot;
 	u8		protection_type;/* Data Integrity Field */
+	u8		provisioning_mode;
 	unsigned	previous_state : 1;
 	unsigned	ATO : 1;	/* state of disk ATO bit */
 	unsigned	WCE : 1;	/* state of disk WCE bit */
 	unsigned	RCD : 1;	/* state of disk RCD bit, unused */
 	unsigned	DPOFUA : 1;	/* state of disk DPOFUA bit */
 	unsigned	first_scan : 1;
+	unsigned	lbpme : 1;
+	unsigned	lbprz : 1;
+	unsigned	lbpu : 1;
+	unsigned	lbpws : 1;
+	unsigned	lbpws10 : 1;
+	unsigned	lbpvpd : 1;
+#ifndef __GENKSYMS__
+	unsigned	cache_override : 1; /* temp override of WCE,RCD */
+#endif
 };
 #define to_scsi_disk(obj) container_of(obj,struct scsi_disk,dev)
 
@@ -73,6 +104,38 @@ static inline struct scsi_disk *scsi_disk(struct gendisk *disk)
 	sdev_printk(prefix, (sdsk)->device, "[%s] " fmt,		\
 		    (sdsk)->disk->disk_name, ##a) :			\
 	sdev_printk(prefix, (sdsk)->device, fmt, ##a)
+
+static inline int scsi_medium_access_command(struct scsi_cmnd *scmd)
+{
+	switch (scmd->cmnd[0]) {
+	case READ_6:
+	case READ_10:
+	case READ_12:
+	case READ_16:
+	case SYNCHRONIZE_CACHE:
+	case VERIFY:
+	case VERIFY_12:
+	case VERIFY_16:
+	case WRITE_6:
+	case WRITE_10:
+	case WRITE_12:
+	case WRITE_16:
+	case WRITE_SAME:
+	case WRITE_SAME_16:
+	case UNMAP:
+		return 1;
+	case VARIABLE_LENGTH_CMD:
+		switch (scmd->cmnd[9]) {
+		case READ_32:
+		case VERIFY_32:
+		case WRITE_32:
+		case WRITE_SAME_32:
+			return 1;
+		}
+	}
+
+	return 0;
+}
 
 /*
  * A DIF-capable target device can be formatted with different
@@ -107,7 +170,7 @@ struct sd_dif_tuple {
 #ifdef CONFIG_BLK_DEV_INTEGRITY
 
 extern void sd_dif_config_host(struct scsi_disk *);
-extern int sd_dif_prepare(struct request *rq, sector_t, unsigned int);
+extern void sd_dif_prepare(struct request *rq, sector_t, unsigned int);
 extern void sd_dif_complete(struct scsi_cmnd *, unsigned int);
 
 #else /* CONFIG_BLK_DEV_INTEGRITY */

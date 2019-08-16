@@ -46,20 +46,12 @@ typedef struct xfs_bmdr_block {
 #define BMBT_STARTBLOCK_BITLEN	52
 #define BMBT_BLOCKCOUNT_BITLEN	21
 
-
-#define BMBT_USE_64	1
-
-typedef struct xfs_bmbt_rec_32
-{
-	__uint32_t		l0, l1, l2, l3;
-} xfs_bmbt_rec_32_t;
-typedef struct xfs_bmbt_rec_64
-{
+typedef struct xfs_bmbt_rec {
 	__be64			l0, l1;
-} xfs_bmbt_rec_64_t;
+} xfs_bmbt_rec_t;
 
 typedef __uint64_t	xfs_bmbt_rec_base_t;	/* use this for casts */
-typedef xfs_bmbt_rec_64_t xfs_bmbt_rec_t, xfs_bmdr_rec_t;
+typedef xfs_bmbt_rec_t xfs_bmdr_rec_t;
 
 typedef struct xfs_bmbt_rec_host {
 	__uint64_t		l0, l1;
@@ -203,6 +195,8 @@ typedef __be64 xfs_bmbt_ptr_t, xfs_bmdr_ptr_t;
 #define XFS_BMDR_SPACE_CALC(nrecs) \
 	(int)(sizeof(xfs_bmdr_block_t) + \
 	       ((nrecs) * (sizeof(xfs_bmbt_key_t) + sizeof(xfs_bmbt_ptr_t))))
+#define XFS_BMAP_BMDR_SPACE(bb) \
+	(XFS_BMDR_SPACE_CALC(be16_to_cpu((bb)->bb_numrecs)))
 
 /*
  * Maximum number of bmap btree levels.
@@ -231,7 +225,6 @@ extern void xfs_bmbt_set_startblock(xfs_bmbt_rec_host_t *r, xfs_fsblock_t v);
 extern void xfs_bmbt_set_startoff(xfs_bmbt_rec_host_t *r, xfs_fileoff_t v);
 extern void xfs_bmbt_set_state(xfs_bmbt_rec_host_t *r, xfs_exntst_t v);
 
-extern void xfs_bmbt_disk_set_all(xfs_bmbt_rec_t *r, xfs_bmbt_irec_t *s);
 extern void xfs_bmbt_disk_set_allf(xfs_bmbt_rec_t *r, xfs_fileoff_t o,
 			xfs_fsblock_t b, xfs_filblks_t c, xfs_exntst_t v);
 

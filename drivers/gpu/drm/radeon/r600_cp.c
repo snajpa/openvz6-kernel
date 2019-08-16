@@ -24,11 +24,14 @@
  * Authors:
  *     Dave Airlie <airlied@redhat.com>
  *     Alex Deucher <alexander.deucher@amd.com>
+ *
+ * ------------------------ This file is DEPRECATED! -------------------------
  */
 
-#include "drmP.h"
-#include "drm.h"
-#include "radeon_drm.h"
+#include <linux/module.h>
+
+#include <drm/drmP.h>
+#include <drm/radeon_drm.h>
 #include "radeon_drv.h"
 
 #define PFP_UCODE_SIZE 576
@@ -200,7 +203,7 @@ int r600_page_table_init(struct drm_device *dev)
 						 entry->pagelist[i], 0,
 						 PAGE_SIZE,
 						 PCI_DMA_BIDIRECTIONAL);
-		if (entry->busaddr[i] == 0) {
+		if (pci_dma_mapping_error(dev->pdev, entry->busaddr[i])) {
 			DRM_ERROR("unable to map PCIGART pages!\n");
 			r600_page_table_cleanup(dev, gart_info);
 			goto done;
@@ -396,13 +399,16 @@ static void r600_cp_load_microcode(drm_radeon_private_t *dev_priv)
 	r600_do_cp_stop(dev_priv);
 
 	RADEON_WRITE(R600_CP_RB_CNTL,
+#ifdef __BIG_ENDIAN
+		     R600_BUF_SWAP_32BIT |
+#endif
 		     R600_RB_NO_UPDATE |
 		     R600_RB_BLKSZ(15) |
 		     R600_RB_BUFSZ(3));
 
 	RADEON_WRITE(R600_GRBM_SOFT_RESET, R600_SOFT_RESET_CP);
 	RADEON_READ(R600_GRBM_SOFT_RESET);
-	DRM_UDELAY(15000);
+	mdelay(15);
 	RADEON_WRITE(R600_GRBM_SOFT_RESET, 0);
 
 	fw_data = (const __be32 *)dev_priv->me_fw->data;
@@ -486,13 +492,16 @@ static void r700_cp_load_microcode(drm_radeon_private_t *dev_priv)
 	r600_do_cp_stop(dev_priv);
 
 	RADEON_WRITE(R600_CP_RB_CNTL,
+#ifdef __BIG_ENDIAN
+		     R600_BUF_SWAP_32BIT |
+#endif
 		     R600_RB_NO_UPDATE |
-		     (15 << 8) |
-		     (3 << 0));
+		     R600_RB_BLKSZ(15) |
+		     R600_RB_BUFSZ(3));
 
 	RADEON_WRITE(R600_GRBM_SOFT_RESET, R600_SOFT_RESET_CP);
 	RADEON_READ(R600_GRBM_SOFT_RESET);
-	DRM_UDELAY(15000);
+	mdelay(15);
 	RADEON_WRITE(R600_GRBM_SOFT_RESET, 0);
 
 	fw_data = (const __be32 *)dev_priv->pfp_fw->data;
@@ -550,8 +559,12 @@ static void r600_test_writeback(drm_radeon_private_t *dev_priv)
 
 	if (!dev_priv->writeback_works) {
 		/* Disable writeback to avoid unnecessary bus master transfer */
-		RADEON_WRITE(R600_CP_RB_CNTL, RADEON_READ(R600_CP_RB_CNTL) |
-			     RADEON_RB_NO_UPDATE);
+		RADEON_WRITE(R600_CP_RB_CNTL,
+#ifdef __BIG_ENDIAN
+			     R600_BUF_SWAP_32BIT |
+#endif
+			     RADEON_READ(R600_CP_RB_CNTL) |
+			     R600_RB_NO_UPDATE);
 		RADEON_WRITE(R600_SCRATCH_UMSK, 0);
 	}
 }
@@ -575,7 +588,11 @@ int r600_do_engine_reset(struct drm_device *dev)
 
 	RADEON_WRITE(R600_CP_RB_WPTR_DELAY, 0);
 	cp_rb_cntl = RADEON_READ(R600_CP_RB_CNTL);
-	RADEON_WRITE(R600_CP_RB_CNTL, R600_RB_RPTR_WR_ENA);
+	RADEON_WRITE(R600_CP_RB_CNTL,
+#ifdef __BIG_ENDIAN
+		     R600_BUF_SWAP_32BIT |
+#endif
+		     R600_RB_RPTR_WR_ENA);
 
 	RADEON_WRITE(R600_CP_RB_RPTR_WR, cp_ptr);
 	RADEON_WRITE(R600_CP_RB_WPTR, cp_ptr);
@@ -706,12 +723,7 @@ static u32 r600_get_tile_pipe_to_backend_map(u32 num_tile_pipes,
 
 static int r600_count_pipe_bits(uint32_t val)
 {
-	int i, ret = 0;
-	for (i = 0; i < 32; i++) {
-		ret += val & 1;
-		val >>= 1;
-	}
-	return ret;
+	return hweight32(val);
 }
 
 static void r600_gfx_init(struct drm_device *dev,
@@ -734,8 +746,8 @@ static void r600_gfx_init(struct drm_device *dev,
 	u32 hdp_host_path_cntl;
 	u32 backend_map;
 	u32 gb_tiling_config = 0;
-	u32 cc_rb_backend_disable = 0;
-	u32 cc_gc_shader_pipe_config = 0;
+	u32 cc_rb_backend_disable;
+	u32 cc_gc_shader_pipe_config;
 	u32 ramcfg;
 
 	/* setup chip specs */
@@ -857,29 +869,44 @@ static void r600_gfx_init(struct drm_device *dev,
 
 	gb_tiling_config |= R600_BANK_SWAPS(1);
 
-	backend_map = r600_get_tile_pipe_to_backend_map(dev_priv->r600_max_tile_pipes,
-							dev_priv->r600_max_backends,
-							(0xff << dev_priv->r600_max_backends) & 0xff);
-	gb_tiling_config |= R600_BACKEND_MAP(backend_map);
+	cc_rb_backend_disable = RADEON_READ(R600_CC_RB_BACKEND_DISABLE) & 0x00ff0000;
+	cc_rb_backend_disable |=
+		R600_BACKEND_DISABLE((R6XX_MAX_BACKENDS_MASK << dev_priv->r600_max_backends) & R6XX_MAX_BACKENDS_MASK);
 
-	cc_gc_shader_pipe_config =
+	cc_gc_shader_pipe_config = RADEON_READ(R600_CC_GC_SHADER_PIPE_CONFIG) & 0xffffff00;
+	cc_gc_shader_pipe_config |=
 		R600_INACTIVE_QD_PIPES((R6XX_MAX_PIPES_MASK << dev_priv->r600_max_pipes) & R6XX_MAX_PIPES_MASK);
 	cc_gc_shader_pipe_config |=
 		R600_INACTIVE_SIMDS((R6XX_MAX_SIMDS_MASK << dev_priv->r600_max_simds) & R6XX_MAX_SIMDS_MASK);
 
-	cc_rb_backend_disable =
-		R600_BACKEND_DISABLE((R6XX_MAX_BACKENDS_MASK << dev_priv->r600_max_backends) & R6XX_MAX_BACKENDS_MASK);
+	backend_map = r600_get_tile_pipe_to_backend_map(dev_priv->r600_max_tile_pipes,
+							(R6XX_MAX_BACKENDS -
+							 r600_count_pipe_bits((cc_rb_backend_disable &
+									       R6XX_MAX_BACKENDS_MASK) >> 16)),
+							(cc_rb_backend_disable >> 16));
+	gb_tiling_config |= R600_BACKEND_MAP(backend_map);
 
 	RADEON_WRITE(R600_GB_TILING_CONFIG,      gb_tiling_config);
 	RADEON_WRITE(R600_DCP_TILING_CONFIG,    (gb_tiling_config & 0xffff));
 	RADEON_WRITE(R600_HDP_TILING_CONFIG,    (gb_tiling_config & 0xffff));
+	if (gb_tiling_config & 0xc0) {
+		dev_priv->r600_group_size = 512;
+	} else {
+		dev_priv->r600_group_size = 256;
+	}
+	dev_priv->r600_npipes = 1 << ((gb_tiling_config >> 1) & 0x7);
+	if (gb_tiling_config & 0x30) {
+		dev_priv->r600_nbanks = 8;
+	} else {
+		dev_priv->r600_nbanks = 4;
+	}
 
 	RADEON_WRITE(R600_CC_RB_BACKEND_DISABLE,      cc_rb_backend_disable);
 	RADEON_WRITE(R600_CC_GC_SHADER_PIPE_CONFIG,   cc_gc_shader_pipe_config);
 	RADEON_WRITE(R600_GC_USER_SHADER_PIPE_CONFIG, cc_gc_shader_pipe_config);
 
 	num_qd_pipes =
-		R6XX_MAX_BACKENDS - r600_count_pipe_bits(cc_gc_shader_pipe_config & R600_INACTIVE_QD_PIPES_MASK);
+		R6XX_MAX_PIPES - r600_count_pipe_bits((cc_gc_shader_pipe_config & R600_INACTIVE_QD_PIPES_MASK) >> 8);
 	RADEON_WRITE(R600_VGT_OUT_DEALLOC_CNTL, (num_qd_pipes * 4) & R600_DEALLOC_DIST_MASK);
 	RADEON_WRITE(R600_VGT_VERTEX_REUSE_BLOCK_CNTL, ((num_qd_pipes * 4) - 2) & R600_VTX_REUSE_DEPTH_MASK);
 
@@ -1151,7 +1178,8 @@ static void r600_gfx_init(struct drm_device *dev,
 
 }
 
-static u32 r700_get_tile_pipe_to_backend_map(u32 num_tile_pipes,
+static u32 r700_get_tile_pipe_to_backend_map(drm_radeon_private_t *dev_priv,
+					     u32 num_tile_pipes,
 					     u32 num_backends,
 					     u32 backend_disable_mask)
 {
@@ -1162,6 +1190,7 @@ static u32 r700_get_tile_pipe_to_backend_map(u32 num_tile_pipes,
 	u32 swizzle_pipe[R7XX_MAX_PIPES];
 	u32 cur_backend;
 	u32 i;
+	bool force_no_swizzle;
 
 	if (num_tile_pipes > R7XX_MAX_PIPES)
 		num_tile_pipes = R7XX_MAX_PIPES;
@@ -1191,6 +1220,18 @@ static u32 r700_get_tile_pipe_to_backend_map(u32 num_tile_pipes,
 	if (enabled_backends_count != num_backends)
 		num_backends = enabled_backends_count;
 
+	switch (dev_priv->flags & RADEON_FAMILY_MASK) {
+	case CHIP_RV770:
+	case CHIP_RV730:
+		force_no_swizzle = false;
+		break;
+	case CHIP_RV710:
+	case CHIP_RV740:
+	default:
+		force_no_swizzle = true;
+		break;
+	}
+
 	memset((uint8_t *)&swizzle_pipe[0], 0, sizeof(u32) * R7XX_MAX_PIPES);
 	switch (num_tile_pipes) {
 	case 1:
@@ -1201,49 +1242,100 @@ static u32 r700_get_tile_pipe_to_backend_map(u32 num_tile_pipes,
 		swizzle_pipe[1] = 1;
 		break;
 	case 3:
-		swizzle_pipe[0] = 0;
-		swizzle_pipe[1] = 2;
-		swizzle_pipe[2] = 1;
+		if (force_no_swizzle) {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 1;
+			swizzle_pipe[2] = 2;
+		} else {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 2;
+			swizzle_pipe[2] = 1;
+		}
 		break;
 	case 4:
-		swizzle_pipe[0] = 0;
-		swizzle_pipe[1] = 2;
-		swizzle_pipe[2] = 3;
-		swizzle_pipe[3] = 1;
+		if (force_no_swizzle) {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 1;
+			swizzle_pipe[2] = 2;
+			swizzle_pipe[3] = 3;
+		} else {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 2;
+			swizzle_pipe[2] = 3;
+			swizzle_pipe[3] = 1;
+		}
 		break;
 	case 5:
-		swizzle_pipe[0] = 0;
-		swizzle_pipe[1] = 2;
-		swizzle_pipe[2] = 4;
-		swizzle_pipe[3] = 1;
-		swizzle_pipe[4] = 3;
+		if (force_no_swizzle) {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 1;
+			swizzle_pipe[2] = 2;
+			swizzle_pipe[3] = 3;
+			swizzle_pipe[4] = 4;
+		} else {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 2;
+			swizzle_pipe[2] = 4;
+			swizzle_pipe[3] = 1;
+			swizzle_pipe[4] = 3;
+		}
 		break;
 	case 6:
-		swizzle_pipe[0] = 0;
-		swizzle_pipe[1] = 2;
-		swizzle_pipe[2] = 4;
-		swizzle_pipe[3] = 5;
-		swizzle_pipe[4] = 3;
-		swizzle_pipe[5] = 1;
+		if (force_no_swizzle) {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 1;
+			swizzle_pipe[2] = 2;
+			swizzle_pipe[3] = 3;
+			swizzle_pipe[4] = 4;
+			swizzle_pipe[5] = 5;
+		} else {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 2;
+			swizzle_pipe[2] = 4;
+			swizzle_pipe[3] = 5;
+			swizzle_pipe[4] = 3;
+			swizzle_pipe[5] = 1;
+		}
 		break;
 	case 7:
-		swizzle_pipe[0] = 0;
-		swizzle_pipe[1] = 2;
-		swizzle_pipe[2] = 4;
-		swizzle_pipe[3] = 6;
-		swizzle_pipe[4] = 3;
-		swizzle_pipe[5] = 1;
-		swizzle_pipe[6] = 5;
+		if (force_no_swizzle) {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 1;
+			swizzle_pipe[2] = 2;
+			swizzle_pipe[3] = 3;
+			swizzle_pipe[4] = 4;
+			swizzle_pipe[5] = 5;
+			swizzle_pipe[6] = 6;
+		} else {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 2;
+			swizzle_pipe[2] = 4;
+			swizzle_pipe[3] = 6;
+			swizzle_pipe[4] = 3;
+			swizzle_pipe[5] = 1;
+			swizzle_pipe[6] = 5;
+		}
 		break;
 	case 8:
-		swizzle_pipe[0] = 0;
-		swizzle_pipe[1] = 2;
-		swizzle_pipe[2] = 4;
-		swizzle_pipe[3] = 6;
-		swizzle_pipe[4] = 3;
-		swizzle_pipe[5] = 1;
-		swizzle_pipe[6] = 7;
-		swizzle_pipe[7] = 5;
+		if (force_no_swizzle) {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 1;
+			swizzle_pipe[2] = 2;
+			swizzle_pipe[3] = 3;
+			swizzle_pipe[4] = 4;
+			swizzle_pipe[5] = 5;
+			swizzle_pipe[6] = 6;
+			swizzle_pipe[7] = 7;
+		} else {
+			swizzle_pipe[0] = 0;
+			swizzle_pipe[1] = 2;
+			swizzle_pipe[2] = 4;
+			swizzle_pipe[3] = 6;
+			swizzle_pipe[4] = 3;
+			swizzle_pipe[5] = 1;
+			swizzle_pipe[6] = 7;
+			swizzle_pipe[7] = 5;
+		}
 		break;
 	}
 
@@ -1264,8 +1356,10 @@ static void r700_gfx_init(struct drm_device *dev,
 			  drm_radeon_private_t *dev_priv)
 {
 	int i, j, num_qd_pipes;
+	u32 ta_aux_cntl;
 	u32 sx_debug_1;
 	u32 smx_dc_ctl0;
+	u32 db_debug3;
 	u32 num_gs_verts_per_thread;
 	u32 vgt_gs_per_es;
 	u32 gs_prim_buffer_depth = 0;
@@ -1276,8 +1370,8 @@ static void r700_gfx_init(struct drm_device *dev,
 	u32 sq_dyn_gpr_size_simd_ab_0;
 	u32 backend_map;
 	u32 gb_tiling_config = 0;
-	u32 cc_rb_backend_disable = 0;
-	u32 cc_gc_shader_pipe_config = 0;
+	u32 cc_rb_backend_disable;
+	u32 cc_gc_shader_pipe_config;
 	u32 mc_arb_ramcfg;
 	u32 db_debug4;
 
@@ -1428,22 +1522,41 @@ static void r700_gfx_init(struct drm_device *dev,
 
 	gb_tiling_config |= R600_BANK_SWAPS(1);
 
-	backend_map = r700_get_tile_pipe_to_backend_map(dev_priv->r600_max_tile_pipes,
-							dev_priv->r600_max_backends,
-							(0xff << dev_priv->r600_max_backends) & 0xff);
-	gb_tiling_config |= R600_BACKEND_MAP(backend_map);
+	cc_rb_backend_disable = RADEON_READ(R600_CC_RB_BACKEND_DISABLE) & 0x00ff0000;
+	cc_rb_backend_disable |=
+		R600_BACKEND_DISABLE((R7XX_MAX_BACKENDS_MASK << dev_priv->r600_max_backends) & R7XX_MAX_BACKENDS_MASK);
 
-	cc_gc_shader_pipe_config =
+	cc_gc_shader_pipe_config = RADEON_READ(R600_CC_GC_SHADER_PIPE_CONFIG) & 0xffffff00;
+	cc_gc_shader_pipe_config |=
 		R600_INACTIVE_QD_PIPES((R7XX_MAX_PIPES_MASK << dev_priv->r600_max_pipes) & R7XX_MAX_PIPES_MASK);
 	cc_gc_shader_pipe_config |=
 		R600_INACTIVE_SIMDS((R7XX_MAX_SIMDS_MASK << dev_priv->r600_max_simds) & R7XX_MAX_SIMDS_MASK);
 
-	cc_rb_backend_disable =
-		R600_BACKEND_DISABLE((R7XX_MAX_BACKENDS_MASK << dev_priv->r600_max_backends) & R7XX_MAX_BACKENDS_MASK);
+	if ((dev_priv->flags & RADEON_FAMILY_MASK) == CHIP_RV740)
+		backend_map = 0x28;
+	else
+		backend_map = r700_get_tile_pipe_to_backend_map(dev_priv,
+								dev_priv->r600_max_tile_pipes,
+								(R7XX_MAX_BACKENDS -
+								 r600_count_pipe_bits((cc_rb_backend_disable &
+										       R7XX_MAX_BACKENDS_MASK) >> 16)),
+								(cc_rb_backend_disable >> 16));
+	gb_tiling_config |= R600_BACKEND_MAP(backend_map);
 
 	RADEON_WRITE(R600_GB_TILING_CONFIG,      gb_tiling_config);
 	RADEON_WRITE(R600_DCP_TILING_CONFIG,    (gb_tiling_config & 0xffff));
 	RADEON_WRITE(R600_HDP_TILING_CONFIG,    (gb_tiling_config & 0xffff));
+	if (gb_tiling_config & 0xc0) {
+		dev_priv->r600_group_size = 512;
+	} else {
+		dev_priv->r600_group_size = 256;
+	}
+	dev_priv->r600_npipes = 1 << ((gb_tiling_config >> 1) & 0x7);
+	if (gb_tiling_config & 0x30) {
+		dev_priv->r600_nbanks = 8;
+	} else {
+		dev_priv->r600_nbanks = 4;
+	}
 
 	RADEON_WRITE(R600_CC_RB_BACKEND_DISABLE,      cc_rb_backend_disable);
 	RADEON_WRITE(R600_CC_GC_SHADER_PIPE_CONFIG,   cc_gc_shader_pipe_config);
@@ -1456,7 +1569,7 @@ static void r700_gfx_init(struct drm_device *dev,
 	RADEON_WRITE(R700_CGTS_USER_TCC_DISABLE, 0);
 
 	num_qd_pipes =
-		R7XX_MAX_BACKENDS - r600_count_pipe_bits(cc_gc_shader_pipe_config & R600_INACTIVE_QD_PIPES_MASK);
+		R7XX_MAX_PIPES - r600_count_pipe_bits((cc_gc_shader_pipe_config & R600_INACTIVE_QD_PIPES_MASK) >> 8);
 	RADEON_WRITE(R600_VGT_OUT_DEALLOC_CNTL, (num_qd_pipes * 4) & R600_DEALLOC_DIST_MASK);
 	RADEON_WRITE(R600_VGT_VERTEX_REUSE_BLOCK_CNTL, ((num_qd_pipes * 4) - 2) & R600_VTX_REUSE_DEPTH_MASK);
 
@@ -1466,10 +1579,8 @@ static void r700_gfx_init(struct drm_device *dev,
 
 	RADEON_WRITE(R600_CP_MEQ_THRESHOLDS, R700_STQ_SPLIT(0x30));
 
-	RADEON_WRITE(R600_TA_CNTL_AUX, (R600_DISABLE_CUBE_ANISO |
-					R600_SYNC_GRADIENT |
-					R600_SYNC_WALKER |
-					R600_SYNC_ALIGNER));
+	ta_aux_cntl = RADEON_READ(R600_TA_CNTL_AUX);
+	RADEON_WRITE(R600_TA_CNTL_AUX, ta_aux_cntl | R600_DISABLE_CUBE_ANISO);
 
 	sx_debug_1 = RADEON_READ(R700_SX_DEBUG_1);
 	sx_debug_1 |= R700_ENABLE_NEW_SMX_ADDRESS;
@@ -1480,14 +1591,28 @@ static void r700_gfx_init(struct drm_device *dev,
 	smx_dc_ctl0 |= R700_CACHE_DEPTH((dev_priv->r700_sx_num_of_sets * 64) - 1);
 	RADEON_WRITE(R600_SMX_DC_CTL0, smx_dc_ctl0);
 
-	RADEON_WRITE(R700_SMX_EVENT_CTL, (R700_ES_FLUSH_CTL(4) |
-					  R700_GS_FLUSH_CTL(4) |
-					  R700_ACK_FLUSH_CTL(3) |
-					  R700_SYNC_FLUSH_CTL));
+	if ((dev_priv->flags & RADEON_FAMILY_MASK) != CHIP_RV740)
+		RADEON_WRITE(R700_SMX_EVENT_CTL, (R700_ES_FLUSH_CTL(4) |
+						  R700_GS_FLUSH_CTL(4) |
+						  R700_ACK_FLUSH_CTL(3) |
+						  R700_SYNC_FLUSH_CTL));
 
-	if ((dev_priv->flags & RADEON_FAMILY_MASK) == CHIP_RV770)
-		RADEON_WRITE(R700_DB_DEBUG3, R700_DB_CLK_OFF_DELAY(0x1f));
-	else {
+	db_debug3 = RADEON_READ(R700_DB_DEBUG3);
+	db_debug3 &= ~R700_DB_CLK_OFF_DELAY(0x1f);
+	switch (dev_priv->flags & RADEON_FAMILY_MASK) {
+	case CHIP_RV770:
+	case CHIP_RV740:
+		db_debug3 |= R700_DB_CLK_OFF_DELAY(0x1f);
+		break;
+	case CHIP_RV710:
+	case CHIP_RV730:
+	default:
+		db_debug3 |= R700_DB_CLK_OFF_DELAY(2);
+		break;
+	}
+	RADEON_WRITE(R700_DB_DEBUG3, db_debug3);
+
+	if ((dev_priv->flags & RADEON_FAMILY_MASK) != CHIP_RV770) {
 		db_debug4 = RADEON_READ(RV700_DB_DEBUG4);
 		db_debug4 |= RV700_DISABLE_TILE_COVERED_FOR_PS_ITER;
 		RADEON_WRITE(RV700_DB_DEBUG4, db_debug4);
@@ -1516,10 +1641,10 @@ static void r700_gfx_init(struct drm_device *dev,
 			    R600_ALU_UPDATE_FIFO_HIWATER(0x8));
 	switch (dev_priv->flags & RADEON_FAMILY_MASK) {
 	case CHIP_RV770:
-		sq_ms_fifo_sizes |= R600_FETCH_FIFO_HIWATER(0x1);
-		break;
 	case CHIP_RV730:
 	case CHIP_RV710:
+		sq_ms_fifo_sizes |= R600_FETCH_FIFO_HIWATER(0x1);
+		break;
 	case CHIP_RV740:
 	default:
 		sq_ms_fifo_sizes |= R600_FETCH_FIFO_HIWATER(0x4);
@@ -1668,15 +1793,15 @@ static void r600_cp_init_ring_buffer(struct drm_device *dev,
 
 	RADEON_WRITE(R600_GRBM_SOFT_RESET, R600_SOFT_RESET_CP);
 	RADEON_READ(R600_GRBM_SOFT_RESET);
-	DRM_UDELAY(15000);
+	mdelay(15);
 	RADEON_WRITE(R600_GRBM_SOFT_RESET, 0);
 
 
 	/* Set ring buffer size */
 #ifdef __BIG_ENDIAN
 	RADEON_WRITE(R600_CP_RB_CNTL,
-		     RADEON_BUF_SWAP_32BIT |
-		     RADEON_RB_NO_UPDATE |
+		     R600_BUF_SWAP_32BIT |
+		     R600_RB_NO_UPDATE |
 		     (dev_priv->ring.rptr_update_l2qw << 8) |
 		     dev_priv->ring.size_l2qw);
 #else
@@ -1686,22 +1811,22 @@ static void r600_cp_init_ring_buffer(struct drm_device *dev,
 		     dev_priv->ring.size_l2qw);
 #endif
 
-	RADEON_WRITE(R600_CP_SEM_WAIT_TIMER, 0x4);
+	RADEON_WRITE(R600_CP_SEM_WAIT_TIMER, 0x0);
 
 	/* Set the write pointer delay */
 	RADEON_WRITE(R600_CP_RB_WPTR_DELAY, 0);
 
 #ifdef __BIG_ENDIAN
 	RADEON_WRITE(R600_CP_RB_CNTL,
-		     RADEON_BUF_SWAP_32BIT |
-		     RADEON_RB_NO_UPDATE |
-		     RADEON_RB_RPTR_WR_ENA |
+		     R600_BUF_SWAP_32BIT |
+		     R600_RB_NO_UPDATE |
+		     R600_RB_RPTR_WR_ENA |
 		     (dev_priv->ring.rptr_update_l2qw << 8) |
 		     dev_priv->ring.size_l2qw);
 #else
 	RADEON_WRITE(R600_CP_RB_CNTL,
-		     RADEON_RB_NO_UPDATE |
-		     RADEON_RB_RPTR_WR_ENA |
+		     R600_RB_NO_UPDATE |
+		     R600_RB_RPTR_WR_ENA |
 		     (dev_priv->ring.rptr_update_l2qw << 8) |
 		     dev_priv->ring.size_l2qw);
 #endif
@@ -1712,7 +1837,7 @@ static void r600_cp_init_ring_buffer(struct drm_device *dev,
 	SET_RING_HEAD(dev_priv, 0);
 	dev_priv->ring.tail = 0;
 
-#if __OS_HAS_AGP
+#if IS_ENABLED(CONFIG_AGP)
 	if (dev_priv->flags & RADEON_IS_AGP) {
 		rptr_addr = dev_priv->ring_rptr->offset
 			- dev->agp->base +
@@ -1724,10 +1849,8 @@ static void r600_cp_init_ring_buffer(struct drm_device *dev,
 			- ((unsigned long) dev->sg->virtual)
 			+ dev_priv->gart_vm_start;
 	}
-	RADEON_WRITE(R600_CP_RB_RPTR_ADDR,
-		     rptr_addr & 0xffffffff);
-	RADEON_WRITE(R600_CP_RB_RPTR_ADDR_HI,
-		     upper_32_bits(rptr_addr));
+	RADEON_WRITE(R600_CP_RB_RPTR_ADDR, (rptr_addr & 0xfffffffc));
+	RADEON_WRITE(R600_CP_RB_RPTR_ADDR_HI, upper_32_bits(rptr_addr));
 
 #ifdef __BIG_ENDIAN
 	RADEON_WRITE(R600_CP_RB_CNTL,
@@ -1740,7 +1863,7 @@ static void r600_cp_init_ring_buffer(struct drm_device *dev,
 		     dev_priv->ring.size_l2qw);
 #endif
 
-#if __OS_HAS_AGP
+#if IS_ENABLED(CONFIG_AGP)
 	if (dev_priv->flags & RADEON_IS_AGP) {
 		/* XXX */
 		radeon_write_agp_base(dev_priv, dev->agp->base);
@@ -1776,7 +1899,7 @@ static void r600_cp_init_ring_buffer(struct drm_device *dev,
 	{
 		u64 scratch_addr;
 
-		scratch_addr = RADEON_READ(R600_CP_RB_RPTR_ADDR);
+		scratch_addr = RADEON_READ(R600_CP_RB_RPTR_ADDR) & 0xFFFFFFFC;
 		scratch_addr |= ((u64)RADEON_READ(R600_CP_RB_RPTR_ADDR_HI)) << 32;
 		scratch_addr += R600_SCRATCH_REG_OFFSET;
 		scratch_addr >>= 8;
@@ -1823,18 +1946,18 @@ int r600_do_cleanup_cp(struct drm_device *dev)
 	if (dev->irq_enabled)
 		drm_irq_uninstall(dev);
 
-#if __OS_HAS_AGP
+#if IS_ENABLED(CONFIG_AGP)
 	if (dev_priv->flags & RADEON_IS_AGP) {
 		if (dev_priv->cp_ring != NULL) {
-			drm_core_ioremapfree(dev_priv->cp_ring, dev);
+			drm_legacy_ioremapfree(dev_priv->cp_ring, dev);
 			dev_priv->cp_ring = NULL;
 		}
 		if (dev_priv->ring_rptr != NULL) {
-			drm_core_ioremapfree(dev_priv->ring_rptr, dev);
+			drm_legacy_ioremapfree(dev_priv->ring_rptr, dev);
 			dev_priv->ring_rptr = NULL;
 		}
 		if (dev->agp_buffer_map != NULL) {
-			drm_core_ioremapfree(dev->agp_buffer_map, dev);
+			drm_legacy_ioremapfree(dev->agp_buffer_map, dev);
 			dev->agp_buffer_map = NULL;
 		}
 	} else
@@ -1845,7 +1968,7 @@ int r600_do_cleanup_cp(struct drm_device *dev)
 			r600_page_table_cleanup(dev, &dev_priv->gart_info);
 
 		if (dev_priv->gart_info.gart_table_location == DRM_ATI_GART_FB) {
-			drm_core_ioremapfree(&dev_priv->gart_info.mapping, dev);
+			drm_legacy_ioremapfree(&dev_priv->gart_info.mapping, dev);
 			dev_priv->gart_info.addr = NULL;
 		}
 	}
@@ -1929,27 +2052,27 @@ int r600_do_init_cp(struct drm_device *dev, drm_radeon_init_t *init,
 	dev_priv->buffers_offset = init->buffers_offset;
 	dev_priv->gart_textures_offset = init->gart_textures_offset;
 
-	master_priv->sarea = drm_getsarea(dev);
+	master_priv->sarea = drm_legacy_getsarea(dev);
 	if (!master_priv->sarea) {
 		DRM_ERROR("could not find sarea!\n");
 		r600_do_cleanup_cp(dev);
 		return -EINVAL;
 	}
 
-	dev_priv->cp_ring = drm_core_findmap(dev, init->ring_offset);
+	dev_priv->cp_ring = drm_legacy_findmap(dev, init->ring_offset);
 	if (!dev_priv->cp_ring) {
 		DRM_ERROR("could not find cp ring region!\n");
 		r600_do_cleanup_cp(dev);
 		return -EINVAL;
 	}
-	dev_priv->ring_rptr = drm_core_findmap(dev, init->ring_rptr_offset);
+	dev_priv->ring_rptr = drm_legacy_findmap(dev, init->ring_rptr_offset);
 	if (!dev_priv->ring_rptr) {
 		DRM_ERROR("could not find ring read pointer!\n");
 		r600_do_cleanup_cp(dev);
 		return -EINVAL;
 	}
 	dev->agp_buffer_token = init->buffers_offset;
-	dev->agp_buffer_map = drm_core_findmap(dev, init->buffers_offset);
+	dev->agp_buffer_map = drm_legacy_findmap(dev, init->buffers_offset);
 	if (!dev->agp_buffer_map) {
 		DRM_ERROR("could not find dma buffer region!\n");
 		r600_do_cleanup_cp(dev);
@@ -1958,7 +2081,7 @@ int r600_do_init_cp(struct drm_device *dev, drm_radeon_init_t *init,
 
 	if (init->gart_textures_offset) {
 		dev_priv->gart_textures =
-		    drm_core_findmap(dev, init->gart_textures_offset);
+		    drm_legacy_findmap(dev, init->gart_textures_offset);
 		if (!dev_priv->gart_textures) {
 			DRM_ERROR("could not find GART texture region!\n");
 			r600_do_cleanup_cp(dev);
@@ -1966,12 +2089,12 @@ int r600_do_init_cp(struct drm_device *dev, drm_radeon_init_t *init,
 		}
 	}
 
-#if __OS_HAS_AGP
+#if IS_ENABLED(CONFIG_AGP)
 	/* XXX */
 	if (dev_priv->flags & RADEON_IS_AGP) {
-		drm_core_ioremap_wc(dev_priv->cp_ring, dev);
-		drm_core_ioremap_wc(dev_priv->ring_rptr, dev);
-		drm_core_ioremap_wc(dev->agp_buffer_map, dev);
+		drm_legacy_ioremap_wc(dev_priv->cp_ring, dev);
+		drm_legacy_ioremap_wc(dev_priv->ring_rptr, dev);
+		drm_legacy_ioremap_wc(dev->agp_buffer_map, dev);
 		if (!dev_priv->cp_ring->handle ||
 		    !dev_priv->ring_rptr->handle ||
 		    !dev->agp_buffer_map->handle) {
@@ -2025,7 +2148,7 @@ int r600_do_init_cp(struct drm_device *dev, drm_radeon_init_t *init,
 		 * location in the card and on the bus, though we have to
 		 * align it down.
 		 */
-#if __OS_HAS_AGP
+#if IS_ENABLED(CONFIG_AGP)
 		/* XXX */
 		if (dev_priv->flags & RADEON_IS_AGP) {
 			base = dev->agp->base;
@@ -2052,7 +2175,7 @@ int r600_do_init_cp(struct drm_device *dev, drm_radeon_init_t *init,
 				 base, dev_priv->gart_vm_start);
 	}
 
-#if __OS_HAS_AGP
+#if IS_ENABLED(CONFIG_AGP)
 	/* XXX */
 	if (dev_priv->flags & RADEON_IS_AGP)
 		dev_priv->gart_buffers_offset = (dev->agp_buffer_map->offset
@@ -2077,19 +2200,19 @@ int r600_do_init_cp(struct drm_device *dev, drm_radeon_init_t *init,
 	dev_priv->ring.end = ((u32 *) dev_priv->cp_ring->handle
 			      + init->ring_size / sizeof(u32));
 	dev_priv->ring.size = init->ring_size;
-	dev_priv->ring.size_l2qw = drm_order(init->ring_size / 8);
+	dev_priv->ring.size_l2qw = order_base_2(init->ring_size / 8);
 
 	dev_priv->ring.rptr_update = /* init->rptr_update */ 4096;
-	dev_priv->ring.rptr_update_l2qw = drm_order(/* init->rptr_update */ 4096 / 8);
+	dev_priv->ring.rptr_update_l2qw = order_base_2(/* init->rptr_update */ 4096 / 8);
 
 	dev_priv->ring.fetch_size = /* init->fetch_size */ 32;
-	dev_priv->ring.fetch_size_l2ow = drm_order(/* init->fetch_size */ 32 / 16);
+	dev_priv->ring.fetch_size_l2ow = order_base_2(/* init->fetch_size */ 32 / 16);
 
 	dev_priv->ring.tail_mask = (dev_priv->ring.size / sizeof(u32)) - 1;
 
 	dev_priv->ring.high_mark = RADEON_RING_HIGH_MARK;
 
-#if __OS_HAS_AGP
+#if IS_ENABLED(CONFIG_AGP)
 	if (dev_priv->flags & RADEON_IS_AGP) {
 		/* XXX turn off pcie gart */
 	} else
@@ -2112,7 +2235,7 @@ int r600_do_init_cp(struct drm_device *dev, drm_radeon_init_t *init,
 		dev_priv->gart_info.mapping.size =
 			dev_priv->gart_info.table_size;
 
-		drm_core_ioremap_wc(&dev_priv->gart_info.mapping, dev);
+		drm_legacy_ioremap_wc(&dev_priv->gart_info.mapping, dev);
 		if (!dev_priv->gart_info.mapping.handle) {
 			DRM_ERROR("ioremap failed.\n");
 			r600_do_cleanup_cp(dev);
@@ -2360,7 +2483,7 @@ int r600_cp_dispatch_texture(struct drm_device *dev,
 	struct drm_buf *buf;
 	u32 *buffer;
 	const u8 __user *data;
-	int size, pass_size;
+	unsigned int size, pass_size;
 	u64 src_offset, dst_offset;
 
 	if (!radeon_check_offset(dev_priv, tex->offset)) {
@@ -2392,7 +2515,7 @@ int r600_cp_dispatch_texture(struct drm_device *dev,
 		buf = radeon_freelist_get(dev);
 		if (!buf) {
 			DRM_DEBUG("EAGAIN\n");
-			if (DRM_COPY_TO_USER(tex->image, image, sizeof(*image)))
+			if (copy_to_user(tex->image, image, sizeof(*image)))
 				return -EFAULT;
 			return -EAGAIN;
 		}
@@ -2405,7 +2528,7 @@ int r600_cp_dispatch_texture(struct drm_device *dev,
 		buffer =
 		    (u32 *) ((char *)dev->agp_buffer_map->handle + buf->offset);
 
-		if (DRM_COPY_FROM_USER(buffer, data, pass_size)) {
+		if (copy_from_user(buffer, data, pass_size)) {
 			DRM_ERROR("EFAULT on pad, %d bytes\n", pass_size);
 			return -EFAULT;
 		}
@@ -2525,4 +2648,13 @@ out:
 	cs->cs_id = cs_id;
 	mutex_unlock(&dev_priv->cs_mutex);
 	return r;
+}
+
+void r600_cs_legacy_get_tiling_conf(struct drm_device *dev, u32 *npipes, u32 *nbanks, u32 *group_size)
+{
+	struct drm_radeon_private *dev_priv = dev->dev_private;
+
+	*npipes = dev_priv->r600_npipes;
+	*nbanks = dev_priv->r600_nbanks;
+	*group_size = dev_priv->r600_group_size;
 }

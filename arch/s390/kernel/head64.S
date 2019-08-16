@@ -39,7 +39,7 @@ startup_continue:
 
 	# store all prefix registers in case of load with dump:
 
-	la	%r7,0			# base register for 0 page
+	lhi	%r7,0x1000		# base register for 0x1000 page
 	la	%r8,0			# first cpu
 	l	%r11,.Lpref_arr_ptr-.LPG1(%r13)	# address of prefix array
 	ahi	%r11,4			# skip boot cpu
@@ -57,7 +57,7 @@ startup_continue:
 	brc	2,2b			# busy: 	 try again
 	brc	1,4f			# not op:	 next cpu
 3:
-	mvc	0(4,%r11),264(%r7)	# copy prefix register to prefix array
+	mvc	0(4,%r11),0x318(%r7)	# copy prefix register to prefix array
 	ahi	%r11,4			# next element in prefix array
 	clr	%r11,%r12
 	je	5f			# no more space in prefix array
@@ -79,10 +79,10 @@ startup_continue:
 #else
 	lhi	%r1,1			# mode 1 = esame (normal ipl)
 #endif /* CONFIG_ZFCPDUMP */
-	mvi	__LC_AR_MODE_ID,1	# set esame flag
-	slr	%r0,%r0 		# set cpuid to zero
-	sigp	%r1,%r0,0x12		# switch to esame mode
+	/* Continue with 64bit startup code in head64.S */
 	sam64				# switch to 64 bit mode
+	llgfr	%r13,%r13		# clear high-order half of base reg
+	lmh	%r0,%r15,.Lzero64-.LPG1(%r13)	# clear high-order half
 	lctlg	%c0,%c15,.Lctl-.LPG1(%r13)	# load control registers
 	lg	%r12,.Lparmaddr-.LPG1(%r13)	# pointer to parameter area
 					# move IPL device to lowcore
@@ -107,7 +107,7 @@ startup_continue:
 					# virtual and never return ...
 	.align	16
 .Lentry:.quad	0x0000000180000000,_stext
-.Lctl:	.quad	0x04350002		# cr0: various things
+.Lctl:	.quad	0x04040002		# cr0: various things
 	.quad	0			# cr1: primary space segment table
 	.quad	.Lduct			# cr2: dispatchable unit control table
 	.quad	0			# cr3: instruction authorization
@@ -122,11 +122,12 @@ startup_continue:
 	.quad	0			# cr12: tracing off
 	.quad	0			# cr13: home space segment table
 	.quad	0xc0000000		# cr14: machine check handling off
-	.quad	0			# cr15: linkage stack operations
+	.quad	.Llinkage_stack		# cr15: linkage stack operations
 .Lpcmsk:.quad	0x0000000180000000
 .L4malign:.quad 0xffffffffffc00000
 .Lscan2g:.quad	0x80000000 + 0x20000 - 8	# 2GB + 128K - 8
 .Lnop:	.long	0x07000700
+.Lzero64:.fill	16,4,0x0
 #ifdef CONFIG_ZFCPDUMP
 .Lcurrent_cpu:
 	.long 0x0
@@ -136,12 +137,15 @@ startup_continue:
 .Lparmaddr:
 	.quad	PARMAREA
 	.align	64
-.Lduct: .long	0,0,0,0,.Lduald,0,0,0
+.Lduct: .long	0,.Laste,.Laste,0,.Lduald,0,0,0
 	.long	0,0,0,0,0,0,0,0
+.Laste:	.quad	0,0xffffffffffffffff,0,0,0,0,0,0
 	.align	128
 .Lduald:.rept	8
 	.long	0x80000000,0,0,0	# invalid access-list entries
 	.endr
+.Llinkage_stack:
+	.long	0,0,0x89000000,0,0,0,0x8a000000,0
 
 	.org	0x12000
 	.globl	_ehead

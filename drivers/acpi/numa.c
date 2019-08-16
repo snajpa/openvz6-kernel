@@ -58,7 +58,7 @@ int node_to_pxm(int node)
 	return node_to_pxm_map[node];
 }
 
-void __acpi_map_pxm_to_node(int pxm, int node)
+static void __acpi_map_pxm_to_node(int pxm, int node)
 {
 	pxm_to_node_map[pxm] = node;
 	node_to_pxm_map[node] = pxm;
@@ -197,7 +197,7 @@ static int __init acpi_parse_slit(struct acpi_table_header *table)
 	return 0;
 }
 
-void __init __attribute__ ((weak))
+void __init __weak
 acpi_numa_x2apic_affinity_init(struct acpi_srat_x2apic_cpu_affinity *pa)
 {
 	printk(KERN_WARNING PREFIX
@@ -283,12 +283,26 @@ acpi_table_parse_srat(enum acpi_srat_type id,
 
 int __init acpi_numa_init(void)
 {
+	/*
+	 * Should not limit number with cpu num that is from NR_CPUS or nr_cpus=
+	 * SRAT cpu entries could have different order with that in MADT.
+	 * So go over all cpu entries in SRAT to get apicid to node mapping.
+	 */
+
 	/* SRAT: Static Resource Affinity Table */
 	if (!acpi_table_parse(ACPI_SIG_SRAT, acpi_parse_srat)) {
-		acpi_table_parse_srat(ACPI_SRAT_TYPE_X2APIC_CPU_AFFINITY,
-				      acpi_parse_x2apic_affinity, NR_CPUS);
-		acpi_table_parse_srat(ACPI_SRAT_TYPE_CPU_AFFINITY,
-				      acpi_parse_processor_affinity, NR_CPUS);
+		struct acpi_subtable_proc srat_proc[2];
+
+		memset(srat_proc, 0, sizeof(srat_proc));
+		srat_proc[0].id = ACPI_SRAT_TYPE_CPU_AFFINITY;
+		srat_proc[0].handler = acpi_parse_processor_affinity;
+		srat_proc[1].id = ACPI_SRAT_TYPE_X2APIC_CPU_AFFINITY;
+		srat_proc[1].handler = acpi_parse_x2apic_affinity;
+
+		acpi_table_parse_entries_array(ACPI_SIG_SRAT,
+					sizeof(struct acpi_table_srat),
+					srat_proc, ARRAY_SIZE(srat_proc), 0);
+
 		acpi_table_parse_srat(ACPI_SRAT_TYPE_MEMORY_AFFINITY,
 				      acpi_parse_memory_affinity,
 				      NR_NODE_MEMBLKS);
@@ -301,7 +315,7 @@ int __init acpi_numa_init(void)
 	return 0;
 }
 
-int acpi_get_pxm(acpi_handle h)
+static int acpi_get_pxm(acpi_handle h)
 {
 	unsigned long long pxm;
 	acpi_status status;
@@ -318,14 +332,14 @@ int acpi_get_pxm(acpi_handle h)
 	return -1;
 }
 
-int acpi_get_node(acpi_handle *handle)
+int acpi_get_node(acpi_handle handle)
 {
-	int pxm, node = -1;
+	int pxm;
 
 	pxm = acpi_get_pxm(handle);
-	if (pxm >= 0 && pxm < MAX_PXM_DOMAINS)
-		node = acpi_map_pxm_to_node(pxm);
+	if (pxm < 0 || pxm >= MAX_PXM_DOMAINS)
+		return NUMA_NO_NODE;
 
-	return node;
+	return acpi_map_pxm_to_node(pxm);
 }
 EXPORT_SYMBOL(acpi_get_node);

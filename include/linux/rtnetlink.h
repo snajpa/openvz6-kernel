@@ -7,6 +7,12 @@
 #include <linux/if_addr.h>
 #include <linux/neighbour.h>
 
+/* rtnetlink families. Values up to 127 are reserved for real address
+ * families, values above 128 may be used arbitrarily.
+ */
+#define RTNL_FAMILY_IPMR		128
+#define RTNL_FAMILY_MAX			128
+
 /****
  *		Routing/neighbour discovery messages.
  ****/
@@ -112,6 +118,9 @@ enum {
 #define RTM_GETDCB RTM_GETDCB
 	RTM_SETDCB,
 #define RTM_SETDCB RTM_SETDCB
+
+	RTM_GETMDB = 86,
+#define RTM_GETMDB RTM_GETMDB
 
 	__RTM_MAX,
 #define RTM_MAX		(((__RTM_MAX + 3) & ~3) - 1)
@@ -371,10 +380,18 @@ enum
 #define RTAX_FEATURES RTAX_FEATURES
 	RTAX_RTO_MIN,
 #define RTAX_RTO_MIN RTAX_RTO_MIN
-	__RTAX_MAX
+	__RTAX_MAX,
+#define RTAX_INITRWND __RTAX_MAX /* Red Hat kABI workaround for dst_entry */
+	__RTAX_NEW_MAX
 };
 
-#define RTAX_MAX (__RTAX_MAX - 1)
+/* This Red Hat kABI workaround, requires some subtle details to understand.
+ * We MUST keep the exact string expansion "(__RTAX_MAX - 1)" else the kABI
+ * checker will miss-fire, as its based on gcc's preprocessor and it keeps
+ * the enum literals (not like real defines that gets macro expanded).
+ */
+#define RTAX_MAX_ORIG (__RTAX_MAX - 1)
+#define RTAX_MAX (__RTAX_NEW_MAX - 1)
 
 #define RTAX_FEATURE_ECN	0x00000001
 #define RTAX_FEATURE_SACK	0x00000002
@@ -593,6 +610,8 @@ enum rtnetlink_groups {
 #define RTNLGRP_PHONET_IFADDR	RTNLGRP_PHONET_IFADDR
 	RTNLGRP_PHONET_ROUTE,
 #define RTNLGRP_PHONET_ROUTE	RTNLGRP_PHONET_ROUTE
+	RTNLGRP_DCB,
+#define RTNLGRP_DCB		RTNLGRP_DCB
 	__RTNLGRP_MAX
 };
 #define RTNLGRP_MAX	(__RTNLGRP_MAX - 1)
@@ -609,11 +628,15 @@ struct tcamsg
 #define TCA_ACT_TAB 1 /* attr type must be >=1 */	
 #define TCAA_MAX 1
 
+/* New extended info filters for IFLA_EXT_MASK */
+#define RTEXT_FILTER_VF		(1 << 0)
+
 /* End of information exported to user level */
 
 #ifdef __KERNEL__
 
 #include <linux/mutex.h>
+#include <linux/wait.h>
 
 static __inline__ int rtattr_strcmp(const struct rtattr *rta, const char *str)
 {
@@ -755,6 +778,32 @@ extern void rtnl_unlock(void);
 extern int rtnl_trylock(void);
 extern int rtnl_is_locked(void);
 
+extern wait_queue_head_t netdev_unregistering_wq;
+extern struct mutex net_mutex;
+
+#ifdef CONFIG_PROVE_LOCKING
+extern int lockdep_rtnl_is_held(void);
+#endif /* #ifdef CONFIG_PROVE_LOCKING */
+
+/**
+ * rcu_dereference_rtnl - rcu_dereference with debug checking
+ * @p: The pointer to read, prior to dereferencing
+ *
+ * Do an rcu_dereference(p), but check caller either holds rcu_read_lock()
+ * or RTNL
+ */
+#define rcu_dereference_rtnl(p)					\
+	rcu_dereference(p)
+
+/**
+ * rtnl_dereference - rcu_dereference with debug checking
+ * @p: The pointer to read, prior to dereferencing
+ *
+ * Do an rcu_dereference(p), but check caller holds RTNL
+ */
+#define rtnl_dereference(p)					\
+	rcu_dereference_check(p, lockdep_rtnl_is_held())
+
 extern void rtnetlink_init(void);
 extern void __rtnl_unlock(void);
 
@@ -773,6 +822,10 @@ rtattr_failure:
 	return table;
 }
 
+extern int ndo_dflt_fdb_dump(struct sk_buff *skb,
+			     struct netlink_callback *cb,
+			     struct net_device *dev,
+			     int idx);
 #endif /* __KERNEL__ */
 
 

@@ -81,7 +81,11 @@ struct gfs2_meta_header {
 	__be32 mh_type;
 	__be64 __pad0;		/* Was generation number in gfs1 */
 	__be32 mh_format;
-	__be32 __pad1;		/* Was incarnation number in gfs1 */
+	/* This union is to keep userspace happy */
+	union {
+		__be32 mh_jid;		/* Was incarnation number in gfs1 */
+		__be32 __pad1;
+	};
 };
 
 /*
@@ -162,6 +166,7 @@ struct gfs2_rindex {
 #define GFS2_RGF_METAONLY	0x00000002
 #define GFS2_RGF_DATAONLY	0x00000004
 #define GFS2_RGF_NOALLOC	0x00000008
+#define GFS2_RGF_TRIMMED	0x00000010
 
 struct gfs2_rgrp {
 	struct gfs2_meta_header rg_header;
@@ -175,43 +180,11 @@ struct gfs2_rgrp {
 	__u8 rg_reserved[80]; /* Several fields from gfs1 now reserved */
 };
 
-/*
- * quota linked list: user quotas and group quotas form two separate 
- * singly linked lists. ll_next stores uids or gids of next quotas in the 
- * linked list.
-
-Given the uid/gid, how to calculate the quota file offsets for the corresponding
-gfs2_quota structures on disk:
-
-for user quotas, given uid,
-offset = uid * sizeof(struct gfs2_quota);
-
-for group quotas, given gid,
-offset = (gid * sizeof(struct gfs2_quota)) + sizeof(struct gfs2_quota);
-
-
-  uid:0   gid:0       uid:12   gid:12      uid:17   gid:17     uid:5142 gid:5142
-+-------+-------+    +-------+-------+    +-------+- - - -+    +- - - -+-------+
-| valid | valid | :: | valid | valid | :: | valid | inval | :: | inval | valid |
-+-------+-------+    +-------+-------+    +-------+- - - -+    +- - - -+-------+
-next:12   next:12    next:17 next:5142    next:NULL                    next:NULL
-    |       |            |       |            |<-- user quota list         |
-     \______|___________/ \______|___________/         group quota list -->|
-            |                    |                                         |
-             \__________________/ \_______________________________________/
-
-*/
-
-/*
- * quota structure
- */
-
 struct gfs2_quota {
 	__be64 qu_limit;
 	__be64 qu_warn;
 	__be64 qu_value;
-	__be32 qu_ll_next; /* location of next quota in list */
-	__u8 qu_reserved[60];
+	__u8 qu_reserved[64];
 };
 
 /*
@@ -235,6 +208,7 @@ enum {
 	gfs2fl_NoAtime		= 7,
 	gfs2fl_Sync		= 8,
 	gfs2fl_System		= 9,
+	gfs2fl_TopLevel         = 10,
 	gfs2fl_TruncInProg	= 29,
 	gfs2fl_InheritDirectio	= 30,
 	gfs2fl_InheritJdata	= 31,
@@ -251,8 +225,9 @@ enum {
 #define GFS2_DIF_NOATIME		0x00000080
 #define GFS2_DIF_SYNC			0x00000100
 #define GFS2_DIF_SYSTEM			0x00000200 /* New in gfs2 */
+#define GFS2_DIF_TOPDIR			0x00000400 /* New in gfs2 */
 #define GFS2_DIF_TRUNC_IN_PROG		0x20000000 /* New in gfs2 */
-#define GFS2_DIF_INHERIT_DIRECTIO	0x40000000
+#define GFS2_DIF_INHERIT_DIRECTIO	0x40000000 /* only in gfs1 */
 #define GFS2_DIF_INHERIT_JDATA		0x80000000
 
 struct gfs2_dinode {
@@ -306,6 +281,7 @@ struct gfs2_dinode {
 
 #define GFS2_FNAMESIZE		255
 #define GFS2_DIRENT_SIZE(name_len) ((sizeof(struct gfs2_dirent) + (name_len) + 7) & ~7)
+#define GFS2_MIN_DIRENT_SIZE (GFS2_DIRENT_SIZE(1))
 
 struct gfs2_dirent {
 	struct gfs2_inum de_inum;
@@ -313,7 +289,14 @@ struct gfs2_dirent {
 	__be16 de_rec_len;
 	__be16 de_name_len;
 	__be16 de_type;
-	__u8 __pad[14];
+	__be16 de_rahead;
+	union {
+		__u8 __pad[12];
+		struct {
+			__u32 de_cookie; /* ondisk value not used */
+			__u8 pad3[8];
+		};
+	};
 };
 
 /*

@@ -123,10 +123,12 @@ static inline cputime64_t get_cpu_idle_time_jiffy(unsigned int cpu,
 
 static inline cputime64_t get_cpu_idle_time(unsigned int cpu, cputime64_t *wall)
 {
-	u64 idle_time = get_cpu_idle_time_us(cpu, wall);
+	u64 idle_time = get_cpu_idle_time_us(cpu, NULL);
 
 	if (idle_time == -1ULL)
 		return get_cpu_idle_time_jiffy(cpu, wall);
+	else
+		idle_time += get_cpu_iowait_time_us(cpu, wall);
 
 	return idle_time;
 }
@@ -180,8 +182,8 @@ static ssize_t show_sampling_rate_min(struct cpufreq_policy *policy, char *buf)
 static struct freq_attr _name =		\
 __ATTR(_name, 0444, show_##_name, NULL)
 
-define_one_ro(sampling_rate_max);
-define_one_ro(sampling_rate_min);
+cpufreq_freq_attr_ro(sampling_rate_max);
+cpufreq_freq_attr_ro(sampling_rate_min);
 
 /* cpufreq_conservative Governor Tunables */
 #define show_one(file_name, object)					\
@@ -330,16 +332,12 @@ static ssize_t store_freq_step(struct cpufreq_policy *policy,
 	return count;
 }
 
-#define define_one_rw(_name) \
-static struct freq_attr _name = \
-__ATTR(_name, 0644, show_##_name, store_##_name)
-
-define_one_rw(sampling_rate);
-define_one_rw(sampling_down_factor);
-define_one_rw(up_threshold);
-define_one_rw(down_threshold);
-define_one_rw(ignore_nice_load);
-define_one_rw(freq_step);
+cpufreq_freq_attr_rw(sampling_rate);
+cpufreq_freq_attr_rw(sampling_down_factor);
+cpufreq_freq_attr_rw(up_threshold);
+cpufreq_freq_attr_rw(down_threshold);
+cpufreq_freq_attr_rw(ignore_nice_load);
+cpufreq_freq_attr_rw(freq_step);
 
 static struct attribute *dbs_attributes[] = {
 	&sampling_rate_max.attr,

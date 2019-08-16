@@ -21,11 +21,20 @@
 /* size of the nodename buffer */
 #define UNX_MAXNODENAME	32
 
+/* auth_cred ac_flags bits */
+enum {
+	RPC_CRED_KEY_EXPIRE_SOON = 1, /* underlying cred key will expire soon */
+	RPC_CRED_NOTIFY_TIMEOUT = 2,   /* nofity generic cred when underlying
+					key will expire soon */
+};
+
 /* Work around the lack of a VFS credential */
 struct auth_cred {
 	uid_t	uid;
 	gid_t	gid;
 	struct group_info *group_info;
+	const char *principal;
+	unsigned long ac_flags;
 	unsigned char machine_cred : 1;
 };
 
@@ -54,19 +63,17 @@ struct rpc_cred {
 #define RPCAUTH_CRED_NEW	0
 #define RPCAUTH_CRED_UPTODATE	1
 #define RPCAUTH_CRED_HASHED	2
+#define RPCAUTH_CRED_NEGATIVE	3
 
 #define RPCAUTH_CRED_MAGIC	0x0f4aa4f0
+
+/* rpc_auth au_flags */
+#define RPCAUTH_AUTH_NO_CRKEY_TIMEOUT	0x0001 /* underlying cred has no key timeout */
 
 /*
  * Client authentication handle
  */
-#define RPC_CREDCACHE_HASHBITS	4
-#define RPC_CREDCACHE_NR	(1 << RPC_CREDCACHE_HASHBITS)
-struct rpc_cred_cache {
-	struct hlist_head	hashtable[RPC_CREDCACHE_NR];
-	spinlock_t		lock;
-};
-
+struct rpc_cred_cache;
 struct rpc_authops;
 struct rpc_auth {
 	unsigned int		au_cslack;	/* call cred size estimate */
@@ -103,6 +110,8 @@ struct rpc_authops {
 
 	struct rpc_cred *	(*lookup_cred)(struct rpc_auth *, struct auth_cred *, int);
 	struct rpc_cred *	(*crcreate)(struct rpc_auth*, struct auth_cred *, int);
+	int			(*key_timeout)(struct rpc_auth *,
+						struct rpc_cred *);
 };
 
 struct rpc_credops {
@@ -111,7 +120,7 @@ struct rpc_credops {
 	void			(*crdestroy)(struct rpc_cred *);
 
 	int			(*crmatch)(struct auth_cred *, struct rpc_cred *, int);
-	void			(*crbind)(struct rpc_task *, struct rpc_cred *, int);
+	struct rpc_cred *	(*crbind)(struct rpc_task *, struct rpc_cred *, int);
 	__be32 *		(*crmarshal)(struct rpc_task *, __be32 *);
 	int			(*crrefresh)(struct rpc_task *);
 	__be32 *		(*crvalidate)(struct rpc_task *, __be32 *);
@@ -119,19 +128,22 @@ struct rpc_credops {
 						void *, __be32 *, void *);
 	int			(*crunwrap_resp)(struct rpc_task *, kxdrproc_t,
 						void *, __be32 *, void *);
+	int			(*crkey_timeout)(struct rpc_cred *);
+	bool			(*crkey_to_expire)(struct rpc_cred *);
 };
 
 extern const struct rpc_authops	authunix_ops;
 extern const struct rpc_authops	authnull_ops;
 
-void __init		rpc_init_authunix(void);
-void __init		rpc_init_generic_auth(void);
-void __init		rpcauth_init_module(void);
-void __exit		rpcauth_remove_module(void);
-void __exit		rpc_destroy_generic_auth(void);
+int __init		rpc_init_authunix(void);
+int __init		rpc_init_generic_auth(void);
+int __init		rpcauth_init_module(void);
+void			rpcauth_remove_module(void);
+void			rpc_destroy_generic_auth(void);
+void 			rpc_destroy_authunix(void);
 
 struct rpc_cred *	rpc_lookup_cred(void);
-struct rpc_cred *	rpc_lookup_machine_cred(void);
+struct rpc_cred *	rpc_lookup_machine_cred(const char *service_name);
 int			rpcauth_register(const struct rpc_authops *);
 int			rpcauth_unregister(const struct rpc_authops *);
 struct rpc_auth *	rpcauth_create(rpc_authflavor_t, struct rpc_clnt *);
@@ -139,10 +151,8 @@ void			rpcauth_release(struct rpc_auth *);
 struct rpc_cred *	rpcauth_lookup_credcache(struct rpc_auth *, struct auth_cred *, int);
 void			rpcauth_init_cred(struct rpc_cred *, const struct auth_cred *, struct rpc_auth *, const struct rpc_credops *);
 struct rpc_cred *	rpcauth_lookupcred(struct rpc_auth *, int);
-void			rpcauth_bindcred(struct rpc_task *, struct rpc_cred *, int);
-void			rpcauth_generic_bind_cred(struct rpc_task *, struct rpc_cred *, int);
+struct rpc_cred *	rpcauth_generic_bind_cred(struct rpc_task *, struct rpc_cred *, int);
 void			put_rpccred(struct rpc_cred *);
-void			rpcauth_unbindcred(struct rpc_task *);
 __be32 *		rpcauth_marshcred(struct rpc_task *, __be32 *);
 __be32 *		rpcauth_checkverf(struct rpc_task *, __be32 *);
 int			rpcauth_wrap_req(struct rpc_task *task, kxdrproc_t encode, void *rqstp, __be32 *data, void *obj);
@@ -153,6 +163,9 @@ int			rpcauth_uptodatecred(struct rpc_task *);
 int			rpcauth_init_credcache(struct rpc_auth *);
 void			rpcauth_destroy_credcache(struct rpc_auth *);
 void			rpcauth_clear_credcache(struct rpc_cred_cache *);
+int			rpcauth_key_timeout_notify(struct rpc_auth *,
+						struct rpc_cred *);
+bool			rpcauth_cred_key_to_expire(struct rpc_auth *, struct rpc_cred *);
 
 static inline
 struct rpc_cred *	get_rpccred(struct rpc_cred *cred)

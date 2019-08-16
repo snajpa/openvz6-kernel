@@ -459,7 +459,7 @@ static struct sk_buff *sched_skb(struct sge *sge, struct sk_buff *skb,
 
 again:
 	for (i = 0; i < MAX_NPORTS; i++) {
-		s->port = ++s->port & (MAX_NPORTS - 1);
+		s->port = (s->port + 1) & (MAX_NPORTS - 1);
 		skbq = &s->p[s->port].skbq;
 
 		skb = skb_peek(skbq);
@@ -1828,8 +1828,8 @@ netdev_tx_t t1_start_xmit(struct sk_buff *skb, struct net_device *dev)
 		 */
 		if (unlikely(skb->len < ETH_HLEN ||
 			     skb->len > dev->mtu + eth_hdr_len(skb->data))) {
-			pr_debug("%s: packet size %d hdr %d mtu%d\n", dev->name,
-				 skb->len, eth_hdr_len(skb->data), dev->mtu);
+			netdev_dbg(dev, "packet size %d hdr %d mtu%d\n",
+				   skb->len, eth_hdr_len(skb->data), dev->mtu);
 			dev_kfree_skb_any(skb);
 			return NETDEV_TX_OK;
 		}
@@ -1838,7 +1838,7 @@ netdev_tx_t t1_start_xmit(struct sk_buff *skb, struct net_device *dev)
 		    skb->ip_summed == CHECKSUM_PARTIAL &&
 		    ip_hdr(skb)->protocol == IPPROTO_UDP) {
 			if (unlikely(skb_checksum_help(skb))) {
-				pr_debug("%s: unable to do udp checksum\n", dev->name);
+				netdev_dbg(dev, "unable to do udp checksum\n");
 				dev_kfree_skb_any(skb);
 				return NETDEV_TX_OK;
 			}
@@ -1870,9 +1870,9 @@ netdev_tx_t t1_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	cpl->iff = dev->if_port;
 
 #if defined(CONFIG_VLAN_8021Q) || defined(CONFIG_VLAN_8021Q_MODULE)
-	if (adapter->vlan_grp && vlan_tx_tag_present(skb)) {
+	if (adapter->vlan_grp && skb_vlan_tag_present(skb)) {
 		cpl->vlan_valid = 1;
-		cpl->vlan = htons(vlan_tx_tag_get(skb));
+		cpl->vlan = htons(skb_vlan_tag_get(skb));
 		st->vlan_insert++;
 	} else
 #endif

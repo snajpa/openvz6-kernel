@@ -29,6 +29,7 @@ int sysctl_tcp_keepalive_intvl __read_mostly = TCP_KEEPALIVE_INTVL;
 int sysctl_tcp_retries1 __read_mostly = TCP_RETR1;
 int sysctl_tcp_retries2 __read_mostly = TCP_RETR2;
 int sysctl_tcp_orphan_retries __read_mostly;
+int sysctl_tcp_thin_linear_timeouts __read_mostly;
 
 static void tcp_write_timer(unsigned long);
 static void tcp_delack_timer(unsigned long);
@@ -137,14 +138,15 @@ static int tcp_write_timeout(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	int retry_until;
-	bool do_reset;
+	bool do_reset, syn_set = 0;
 
 	if ((1 << sk->sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV)) {
 		if (icsk->icsk_retransmits)
 			dst_negative_advice(&sk->sk_dst_cache);
 		retry_until = icsk->icsk_syn_retries ? : sysctl_tcp_syn_retries;
+		syn_set = 1;
 	} else {
-		if (retransmits_timed_out(sk, sysctl_tcp_retries1)) {
+		if (retransmits_timed_out(sk, sysctl_tcp_retries1, 0, 0)) {
 			/* Black hole detection */
 			tcp_mtu_probing(icsk, sk);
 
@@ -157,14 +159,15 @@ static int tcp_write_timeout(struct sock *sk)
 
 			retry_until = tcp_orphan_retries(sk, alive);
 			do_reset = alive ||
-				   !retransmits_timed_out(sk, retry_until);
+				   !retransmits_timed_out(sk, retry_until, 0, 0);
 
 			if (tcp_out_of_resources(sk, do_reset))
 				return 1;
 		}
 	}
 
-	if (retransmits_timed_out(sk, retry_until)) {
+	if (retransmits_timed_out(sk, retry_until,
+				  syn_set ? 0 : sk_extended(sk)->icsk_user_timeout, syn_set)) {
 		/* Has it gone just too far? */
 		tcp_write_err(sk);
 		return 1;
@@ -386,9 +389,27 @@ void tcp_retransmit_timer(struct sock *sk)
 	icsk->icsk_retransmits++;
 
 out_reset_timer:
-	icsk->icsk_rto = min(icsk->icsk_rto << 1, TCP_RTO_MAX);
+	/* If stream is thin, use linear timeouts. Since 'icsk_backoff' is
+	 * used to reset timer, set to 0. Recalculate 'icsk_rto' as this
+	 * might be increased if the stream oscillates between thin and thick,
+	 * thus the old value might already be too high compared to the value
+	 * set by 'tcp_set_rto' in tcp_input.c which resets the rto without
+	 * backoff. Limit to TCP_THIN_LINEAR_RETRIES before initiating
+	 * exponential backoff behaviour to avoid continue hammering
+	 * linear-timeout retransmissions into a black hole
+	 */
+	if (sk->sk_state == TCP_ESTABLISHED &&
+	    (tp->thin_lto || sysctl_tcp_thin_linear_timeouts) &&
+	    tcp_stream_is_thin(tp) &&
+	    icsk->icsk_retransmits <= TCP_THIN_LINEAR_RETRIES) {
+		icsk->icsk_backoff = 0;
+		icsk->icsk_rto = min(__tcp_set_rto(tp), TCP_RTO_MAX);
+	} else {
+		/* Use normal (exponential) backoff */
+		icsk->icsk_rto = min(icsk->icsk_rto << 1, TCP_RTO_MAX);
+	}
 	inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS, icsk->icsk_rto, TCP_RTO_MAX);
-	if (retransmits_timed_out(sk, sysctl_tcp_retries1 + 1))
+	if (retransmits_timed_out(sk, sysctl_tcp_retries1 + 1, 0, 0))
 		__sk_dst_reset(sk);
 
 out:;
@@ -462,7 +483,7 @@ static void tcp_keepalive_timer (unsigned long data)
 	struct sock *sk = (struct sock *) data;
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	__u32 elapsed;
+	u32 elapsed;
 
 	/* Only process if socket is not in use. */
 	bh_lock_sock(sk);
@@ -499,10 +520,19 @@ static void tcp_keepalive_timer (unsigned long data)
 	if (tp->packets_out || tcp_send_head(sk))
 		goto resched;
 
-	elapsed = tcp_time_stamp - tp->rcv_tstamp;
+	elapsed = keepalive_time_elapsed(tp);
 
 	if (elapsed >= keepalive_time_when(tp)) {
-		if (icsk->icsk_probes_out >= keepalive_probes(tp)) {
+		u32 icsk_user_timeout = sk_extended(sk)->icsk_user_timeout;
+
+		/* If the TCP_USER_TIMEOUT option is enabled, use that
+		 * to determine when to timeout instead.
+		 */
+		if ((icsk_user_timeout != 0 &&
+		    elapsed >= icsk_user_timeout &&
+		    icsk->icsk_probes_out > 0) ||
+		    (icsk_user_timeout == 0 &&
+		    icsk->icsk_probes_out >= keepalive_probes(tp))) {
 			tcp_send_active_reset(sk, GFP_ATOMIC);
 			tcp_write_err(sk);
 			goto out;

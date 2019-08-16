@@ -61,16 +61,9 @@ static const char mlx4_en_version[] =
  * Device scope module parameters
  */
 
-
-/* Use a XOR rathern than Toeplitz hash function for RSS */
-MLX4_EN_PARM_INT(rss_xor, 0, "Use XOR hash function for RSS");
-
-/* RSS hash type mask - default to <saddr, daddr, sport, dport> */
-MLX4_EN_PARM_INT(rss_mask, 0xf, "RSS hash type bitmask");
-
-/* Number of LRO sessions per Rx ring (rounded up to a power of two) */
-MLX4_EN_PARM_INT(num_lro, MLX4_EN_MAX_LRO_DESCRIPTORS,
-		 "Number of LRO sessions per ring or disabled (0)");
+/* Enable RSS UDP traffic */
+MLX4_EN_PARM_INT(udp_rss, 1,
+		 "Enable RSS for incomming UDP traffic or disabled (0)");
 
 /* Priority pausing */
 MLX4_EN_PARM_INT(pfctx, 0, "Priority based Flow Control policy on TX[7:0]."
@@ -78,14 +71,71 @@ MLX4_EN_PARM_INT(pfctx, 0, "Priority based Flow Control policy on TX[7:0]."
 MLX4_EN_PARM_INT(pfcrx, 0, "Priority based Flow Control policy on RX[7:0]."
 			   " Per priority bit mask");
 
+MLX4_EN_PARM_INT(num_lro, ~0, "Dummy parameter for backward compatibility" );
+MLX4_EN_PARM_INT(rss_mask, ~0, "Dummy parameter for backward compatibility" );
+MLX4_EN_PARM_INT(rss_xor, ~0, "Dummy parameter for backward compatibility" );
+MLX4_EN_PARM_INT(enable_tc, 0, "Enable separate queues for traffic classes" );
+MLX4_EN_PARM_INT(inline_thold, MAX_INLINE,
+		 "Threshold for using inline data (range: 17-104, default: 104)");
+
+#define MAX_PFC_TX     0xff
+#define MAX_PFC_RX     0xff
+
+void en_print(const char *level, const struct mlx4_en_priv *priv,
+	      const char *format, ...)
+{
+	va_list args;
+	struct va_format vaf;
+
+	va_start(args, format);
+	vaf.fmt = format;
+	vaf.va = &args;
+	if (priv->registered)
+		printk("%s%s: %s: %pV",
+		       level, DRV_NAME, priv->dev->name, &vaf);
+	else
+		printk("%s%s: %s: Port %d: %pV",
+		       level, DRV_NAME, dev_name(&priv->mdev->pdev->dev),
+		       priv->port, &vaf);
+	va_end(args);
+}
+
+void mlx4_en_update_loopback_state(struct net_device *dev, u32 features)
+{
+	struct mlx4_en_priv *priv = netdev_priv(dev);
+
+	priv->flags &= ~(MLX4_EN_FLAG_RX_FILTER_NEEDED|
+			MLX4_EN_FLAG_ENABLE_HW_LOOPBACK);
+
+	/* Drop the packet if SRIOV is not enabled
+	 * and not performing the selftest or flb disabled
+	 */
+	if (mlx4_is_mfunc(priv->mdev->dev) && !priv->validate_loopback)
+		priv->flags |= MLX4_EN_FLAG_RX_FILTER_NEEDED;
+
+	/* Set dmac in Tx WQE if we are in SRIOV mode or if loopback selftest
+	 * is requested
+	 */
+	if (mlx4_is_mfunc(priv->mdev->dev) || priv->validate_loopback)
+		priv->flags |= MLX4_EN_FLAG_ENABLE_HW_LOOPBACK;
+}
+
 static int mlx4_en_get_profile(struct mlx4_en_dev *mdev)
 {
 	struct mlx4_en_profile *params = &mdev->profile;
 	int i;
 
-	params->rss_xor = (rss_xor != 0);
-	params->rss_mask = rss_mask & 0x1f;
-	params->num_lro = min_t(int, num_lro , MLX4_EN_MAX_LRO_DESCRIPTORS);
+	params->udp_rss = udp_rss;
+	params->num_tx_rings_p_up = mlx4_low_memory_profile() ?
+		MLX4_EN_MIN_TX_RING_P_UP :
+		min_t(int, num_online_cpus(), MLX4_EN_MAX_TX_RING_P_UP);
+	params->enable_tc = enable_tc;
+
+	if (params->udp_rss && !(mdev->dev->caps.flags
+					& MLX4_DEV_CAP_FLAG_UDP_RSS)) {
+		mlx4_warn(mdev, "UDP RSS is not supported on this device\n");
+		params->udp_rss = 0;
+	}
 	for (i = 1; i <= MLX4_MAX_PORTS; i++) {
 		params->prof[i].rx_pause = 1;
 		params->prof[i].rx_ppp = pfcrx;
@@ -93,26 +143,36 @@ static int mlx4_en_get_profile(struct mlx4_en_dev *mdev)
 		params->prof[i].tx_ppp = pfctx;
 		params->prof[i].tx_ring_size = MLX4_EN_DEF_TX_RING_SIZE;
 		params->prof[i].rx_ring_size = MLX4_EN_DEF_RX_RING_SIZE;
-		params->prof[i].tx_ring_num = MLX4_EN_NUM_TX_RINGS +
-			(!!pfcrx) * MLX4_EN_NUM_PPP_RINGS;
+		params->prof[i].tx_ring_num = params->num_tx_rings_p_up *
+			MLX4_EN_NUM_UP;
+		params->prof[i].inline_thold = inline_thold;
+		params->prof[i].rss_rings = 0;
 	}
 
+	if ( num_lro != ~0 || rss_mask != ~0 || rss_xor != ~0 )
+		mlx4_warn(mdev, "Obsolete parameter passed, ignoring.\n");
 	return 0;
 }
 
+static void *mlx4_en_get_netdev(struct mlx4_dev *dev, void *ctx, u8 port)
+{
+	struct mlx4_en_dev *endev = ctx;
+
+	return endev->pndev[port];
+}
+
 static void mlx4_en_event(struct mlx4_dev *dev, void *endev_ptr,
-			  enum mlx4_dev_event event, int port)
+			  enum mlx4_dev_event event, unsigned long port)
 {
 	struct mlx4_en_dev *mdev = (struct mlx4_en_dev *) endev_ptr;
 	struct mlx4_en_priv *priv;
 
-	if (!mdev->pndev[port])
-		return;
-
-	priv = netdev_priv(mdev->pndev[port]);
 	switch (event) {
 	case MLX4_DEV_EVENT_PORT_UP:
 	case MLX4_DEV_EVENT_PORT_DOWN:
+		if (!mdev->pndev[port])
+			return;
+		priv = netdev_priv(mdev->pndev[port]);
 		/* To prevent races, we poll the link state in a separate
 		  task rather than changing it here */
 		priv->link_state = event;
@@ -123,8 +183,15 @@ static void mlx4_en_event(struct mlx4_dev *dev, void *endev_ptr,
 		mlx4_err(mdev, "Internal error detected, restarting device\n");
 		break;
 
+	case MLX4_DEV_EVENT_SLAVE_INIT:
+	case MLX4_DEV_EVENT_SLAVE_SHUTDOWN:
+		break;
 	default:
-		mlx4_warn(mdev, "Unhandled event: %d\n", event);
+		if (port < 1 || port > dev->caps.num_ports ||
+		    !mdev->pndev[port])
+			return;
+		mlx4_warn(mdev, "Unhandled event %d for port %d\n", event,
+			  (int) port);
 	}
 }
 
@@ -143,7 +210,8 @@ static void mlx4_en_remove(struct mlx4_dev *dev, void *endev_ptr)
 
 	flush_workqueue(mdev->workqueue);
 	destroy_workqueue(mdev->workqueue);
-	mlx4_mr_free(dev, &mdev->mr);
+	(void) mlx4_mr_free(dev, &mdev->mr);
+	iounmap(mdev->uar_map);
 	mlx4_uar_free(dev, &mdev->priv_uar);
 	mlx4_pd_free(dev, mdev->priv_pdn);
 	kfree(mdev);
@@ -154,20 +222,15 @@ static void *mlx4_en_add(struct mlx4_dev *dev)
 	static int mlx4_en_version_printed;
 	struct mlx4_en_dev *mdev;
 	int i;
-	int err;
 
 	if (!mlx4_en_version_printed) {
 		printk(KERN_INFO "%s", mlx4_en_version);
 		mlx4_en_version_printed++;
 	}
 
-	mdev = kzalloc(sizeof *mdev, GFP_KERNEL);
-	if (!mdev) {
-		dev_err(&dev->pdev->dev, "Device struct alloc failed, "
-			"aborting.\n");
-		err = -ENOMEM;
+	mdev = kzalloc(sizeof(*mdev), GFP_KERNEL);
+	if (!mdev)
 		goto err_free_res;
-	}
 
 	if (mlx4_pd_alloc(dev, &mdev->priv_pdn))
 		goto err_free_dev;
@@ -175,26 +238,26 @@ static void *mlx4_en_add(struct mlx4_dev *dev)
 	if (mlx4_uar_alloc(dev, &mdev->priv_uar))
 		goto err_pd;
 
-	mdev->uar_map = ioremap(mdev->priv_uar.pfn << PAGE_SHIFT, PAGE_SIZE);
+	mdev->uar_map = ioremap((phys_addr_t) mdev->priv_uar.pfn << PAGE_SHIFT,
+				PAGE_SIZE);
 	if (!mdev->uar_map)
 		goto err_uar;
 	spin_lock_init(&mdev->uar_lock);
 
 	mdev->dev = dev;
-	mdev->dma_device = &(dev->pdev->dev);
-	mdev->pdev = dev->pdev;
+	mdev->dma_device = &dev->persist->pdev->dev;
+	mdev->pdev = dev->persist->pdev;
 	mdev->device_up = false;
 
 	mdev->LSO_support = !!(dev->caps.flags & (1 << 15));
 	if (!mdev->LSO_support)
-		mlx4_warn(mdev, "LSO not supported, please upgrade to later "
-				"FW version to enable LSO\n");
+		mlx4_warn(mdev, "LSO not supported, please upgrade to later FW version to enable LSO\n");
 
 	if (mlx4_mr_alloc(mdev->dev, mdev->priv_pdn, 0, ~0ull,
 			 MLX4_PERM_LOCAL_WRITE |  MLX4_PERM_LOCAL_READ,
 			 0, 0, &mdev->mr)) {
 		mlx4_err(mdev, "Failed allocating memory region\n");
-		goto err_uar;
+		goto err_map;
 	}
 	if (mlx4_mr_enable(mdev->dev, &mdev->mr)) {
 		mlx4_err(mdev, "Failed enabling memory region\n");
@@ -202,37 +265,25 @@ static void *mlx4_en_add(struct mlx4_dev *dev)
 	}
 
 	/* Build device profile according to supplied module parameters */
-	err = mlx4_en_get_profile(mdev);
-	if (err) {
-		mlx4_err(mdev, "Bad module parameters, aborting.\n");
+	if (mlx4_en_get_profile(mdev)) {
+		mlx4_err(mdev, "Bad module parameters, aborting\n");
 		goto err_mr;
 	}
 
-	/* Configure wich ports to start according to module parameters */
+	/* Configure which ports to start according to module parameters */
 	mdev->port_cnt = 0;
 	mlx4_foreach_port(i, dev, MLX4_PORT_TYPE_ETH)
 		mdev->port_cnt++;
 
-	/* If we did not receive an explicit number of Rx rings, default to
-	 * the number of completion vectors populated by the mlx4_core */
-	mlx4_foreach_port(i, dev, MLX4_PORT_TYPE_ETH) {
-		mlx4_info(mdev, "Using %d tx rings for port:%d\n",
-			  mdev->profile.prof[i].tx_ring_num, i);
-		mdev->profile.prof[i].rx_ring_num = min_t(int,
-			roundup_pow_of_two(dev->caps.num_comp_vectors),
-			MAX_RX_RINGS);
-		mlx4_info(mdev, "Defaulting to %d rx rings for port:%d\n",
-			  mdev->profile.prof[i].rx_ring_num, i);
-	}
+	/* Set default number of RX rings*/
+	mlx4_en_set_num_rx_rings(mdev);
 
 	/* Create our own workqueue for reset/multicast tasks
 	 * Note: we cannot use the shared workqueue because of deadlocks caused
 	 *       by the rtnl lock */
 	mdev->workqueue = create_singlethread_workqueue("mlx4_en");
-	if (!mdev->workqueue) {
-		err = -ENOMEM;
+	if (!mdev->workqueue)
 		goto err_mr;
-	}
 
 	/* At this stage all non-port specific tasks are complete:
 	 * mark the card state as up */
@@ -247,10 +298,14 @@ static void *mlx4_en_add(struct mlx4_dev *dev)
 		if (mlx4_en_init_netdev(mdev, i, &mdev->profile.prof[i]))
 			mdev->pndev[i] = NULL;
 	}
+
 	return mdev;
 
 err_mr:
-	mlx4_mr_free(dev, &mdev->mr);
+	(void) mlx4_mr_free(dev, &mdev->mr);
+err_map:
+	if (mdev->uar_map)
+		iounmap(mdev->uar_map);
 err_uar:
 	mlx4_uar_free(dev, &mdev->priv_uar);
 err_pd:
@@ -262,13 +317,38 @@ err_free_res:
 }
 
 static struct mlx4_interface mlx4_en_interface = {
-	.add	= mlx4_en_add,
-	.remove	= mlx4_en_remove,
-	.event	= mlx4_en_event,
+	.add		= mlx4_en_add,
+	.remove		= mlx4_en_remove,
+	.event		= mlx4_en_event,
+	.get_dev	= mlx4_en_get_netdev,
+	.protocol	= MLX4_PROT_ETH,
 };
+
+static void mlx4_en_verify_params(void)
+{
+	if (pfctx > MAX_PFC_TX) {
+		pr_warn("mlx4_en: WARNING: illegal module parameter pfctx 0x%x - should be in range 0-0x%x, will be changed to default (0)\n",
+			pfctx, MAX_PFC_TX);
+		pfctx = 0;
+	}
+
+	if (pfcrx > MAX_PFC_RX) {
+		pr_warn("mlx4_en: WARNING: illegal module parameter pfcrx 0x%x - should be in range 0-0x%x, will be changed to default (0)\n",
+			pfcrx, MAX_PFC_RX);
+		pfcrx = 0;
+	}
+
+	if (inline_thold < MIN_PKT_LEN || inline_thold > MAX_INLINE) {
+		pr_warn("mlx4_en: WARNING: illegal module parameter inline_thold %d - should be in range %d-%d, will be changed to default (%d)\n",
+			inline_thold, MIN_PKT_LEN, MAX_INLINE, MAX_INLINE);
+		inline_thold = MAX_INLINE;
+	}
+}
 
 static int __init mlx4_en_init(void)
 {
+	mlx4_en_verify_params();
+
 	return mlx4_register_interface(&mlx4_en_interface);
 }
 

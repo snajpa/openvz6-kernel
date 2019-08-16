@@ -125,7 +125,9 @@ void __irq_entry do_extint(struct pt_regs *regs, unsigned short code)
 	if (S390_lowcore.int_clock >= S390_lowcore.clock_comparator)
 		/* Serve timer interrupts first. */
 		clock_comparator_work();
-	kstat_cpu(smp_processor_id()).irqs[EXTERNAL_INTERRUPT]++;
+	kstat_incr_irqs_this_cpu(EXTERNAL_INTERRUPT, NULL);
+	if (code != 0x1004)
+		__get_cpu_var(s390_idle).nohz_delay = 1;
         index = ext_hash(code);
 	for (p = ext_int_hash[index]; p; p = p->next) {
 		if (likely(p->code == code))
@@ -137,3 +139,26 @@ void __irq_entry do_extint(struct pt_regs *regs, unsigned short code)
 
 EXPORT_SYMBOL(register_external_interrupt);
 EXPORT_SYMBOL(unregister_external_interrupt);
+
+static DEFINE_SPINLOCK(ma_subclass_lock);
+static int ma_subclass_refcount;
+
+void measurement_alert_subclass_register(void)
+{
+	spin_lock(&ma_subclass_lock);
+	if (!ma_subclass_refcount)
+		ctl_set_bit(0, 5);
+	ma_subclass_refcount++;
+	spin_unlock(&ma_subclass_lock);
+}
+EXPORT_SYMBOL(measurement_alert_subclass_register);
+
+void measurement_alert_subclass_unregister(void)
+{
+	spin_lock(&ma_subclass_lock);
+	ma_subclass_refcount--;
+	if (!ma_subclass_refcount)
+		ctl_clear_bit(0, 5);
+	spin_unlock(&ma_subclass_lock);
+}
+EXPORT_SYMBOL(measurement_alert_subclass_unregister);

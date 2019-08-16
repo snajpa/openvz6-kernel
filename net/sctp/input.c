@@ -75,7 +75,7 @@ static struct sctp_association *__sctp_lookup_association(
 					const union sctp_addr *peer,
 					struct sctp_transport **pt);
 
-static void sctp_add_backlog(struct sock *sk, struct sk_buff *skb);
+static int sctp_add_backlog(struct sock *sk, struct sk_buff *skb);
 
 
 /* Calculate the SCTP checksum of an SCTP packet.  */
@@ -83,15 +83,7 @@ static inline int sctp_rcv_checksum(struct sk_buff *skb)
 {
 	struct sctphdr *sh = sctp_hdr(skb);
 	__le32 cmp = sh->checksum;
-	struct sk_buff *list;
-	__le32 val;
-	__u32 tmp = sctp_start_cksum((__u8 *)sh, skb_headlen(skb));
-
-	skb_walk_frags(skb, list)
-		tmp = sctp_update_cksum((__u8 *)list->data, skb_headlen(list),
-					tmp);
-
-	val = sctp_end_cksum(tmp);
+	__le32 val = sctp_compute_cksum(skb, 0);
 
 	if (val != cmp) {
 		/* CRC failure, dump it. */
@@ -265,8 +257,13 @@ int sctp_rcv(struct sk_buff *skb)
 	}
 
 	if (sock_owned_by_user(sk)) {
+		if (sctp_add_backlog(sk, skb)) {
+			sctp_bh_unlock_sock(sk);
+			sctp_chunk_free(chunk);
+			skb = NULL; /* sctp_chunk_free already freed the skb */
+			goto discard_release;
+		}
 		SCTP_INC_STATS_BH(SCTP_MIB_IN_PKT_BACKLOG);
-		sctp_add_backlog(sk, skb);
 	} else {
 		SCTP_INC_STATS_BH(SCTP_MIB_IN_PKT_SOFTIRQ);
 		sctp_inq_push(&chunk->rcvr->inqueue, chunk);
@@ -336,8 +333,10 @@ int sctp_backlog_rcv(struct sock *sk, struct sk_buff *skb)
 		sctp_bh_lock_sock(sk);
 
 		if (sock_owned_by_user(sk)) {
-			sk_add_backlog(sk, skb);
-			backloged = 1;
+			if (sk_add_backlog(sk, skb, sk->sk_rcvbuf))
+				sctp_chunk_free(chunk);
+			else
+				backloged = 1;
 		} else
 			sctp_inq_push(inqueue, chunk);
 
@@ -362,22 +361,27 @@ done:
 	return 0;
 }
 
-static void sctp_add_backlog(struct sock *sk, struct sk_buff *skb)
+static int sctp_add_backlog(struct sock *sk, struct sk_buff *skb)
 {
 	struct sctp_chunk *chunk = SCTP_INPUT_CB(skb)->chunk;
 	struct sctp_ep_common *rcvr = chunk->rcvr;
+	int ret;
 
-	/* Hold the assoc/ep while hanging on the backlog queue.
-	 * This way, we know structures we need will not disappear from us
-	 */
-	if (SCTP_EP_TYPE_ASSOCIATION == rcvr->type)
-		sctp_association_hold(sctp_assoc(rcvr));
-	else if (SCTP_EP_TYPE_SOCKET == rcvr->type)
-		sctp_endpoint_hold(sctp_ep(rcvr));
-	else
-		BUG();
+	ret = sk_add_backlog(sk, skb, sk->sk_rcvbuf);
+	if (!ret) {
+		/* Hold the assoc/ep while hanging on the backlog queue.
+		 * This way, we know structures we need will not disappear
+		 * from us
+		 */
+		if (SCTP_EP_TYPE_ASSOCIATION == rcvr->type)
+			sctp_association_hold(sctp_assoc(rcvr));
+		else if (SCTP_EP_TYPE_SOCKET == rcvr->type)
+			sctp_endpoint_hold(sctp_ep(rcvr));
+		else
+			BUG();
+	}
+	return ret;
 
-	sk_add_backlog(sk, skb);
 }
 
 /* Handle icmp frag needed error. */
@@ -427,11 +431,25 @@ void sctp_icmp_proto_unreachable(struct sock *sk,
 {
 	SCTP_DEBUG_PRINTK("%s\n",  __func__);
 
-	sctp_do_sm(SCTP_EVENT_T_OTHER,
-		   SCTP_ST_OTHER(SCTP_EVENT_ICMP_PROTO_UNREACH),
-		   asoc->state, asoc->ep, asoc, t,
-		   GFP_ATOMIC);
+	if (sock_owned_by_user(sk)) {
+		if (timer_pending(&t->proto_unreach_timer))
+			return;
+		else {
+			if (!mod_timer(&t->proto_unreach_timer,
+						jiffies + (HZ/20)))
+				sctp_association_hold(asoc);
+		}
+			
+	} else {
+		if (timer_pending(&t->proto_unreach_timer) &&
+		    del_timer(&t->proto_unreach_timer))
+			sctp_association_put(asoc);
 
+		sctp_do_sm(SCTP_EVENT_T_OTHER,
+			   SCTP_ST_OTHER(SCTP_EVENT_ICMP_PROTO_UNREACH),
+			   asoc->state, asoc->ep, asoc, t,
+			   GFP_ATOMIC);
+	}
 }
 
 /* Common lookup code for icmp/icmpv6 error handler. */
@@ -634,7 +652,6 @@ static int sctp_rcv_ootb(struct sk_buff *skb)
 {
 	sctp_chunkhdr_t *ch;
 	__u8 *ch_end;
-	sctp_errhdr_t *err;
 
 	ch = (sctp_chunkhdr_t *) skb->data;
 
@@ -669,20 +686,6 @@ static int sctp_rcv_ootb(struct sk_buff *skb)
 		 */
 		if (SCTP_CID_INIT == ch->type && (void *)ch != skb->data)
 			goto discard;
-
-		/* RFC 8.4, 7) If the packet contains a "Stale cookie" ERROR
-		 * or a COOKIE ACK the SCTP Packet should be silently
-		 * discarded.
-		 */
-		if (SCTP_CID_COOKIE_ACK == ch->type)
-			goto discard;
-
-		if (SCTP_CID_ERROR == ch->type) {
-			sctp_walk_errors(err, ch) {
-				if (SCTP_ERROR_STALE_COOKIE == err->cause)
-					goto discard;
-			}
-		}
 
 		ch = (sctp_chunkhdr_t *) ch_end;
 	} while (ch_end < skb_tail_pointer(skb));
@@ -725,15 +728,12 @@ static void __sctp_unhash_endpoint(struct sctp_endpoint *ep)
 
 	epb = &ep->base;
 
-	if (hlist_unhashed(&epb->node))
-		return;
-
 	epb->hashent = sctp_ep_hashfn(epb->bind_addr.port);
 
 	head = &sctp_ep_hashtable[epb->hashent];
 
 	sctp_write_lock(&head->lock);
-	__hlist_del(&epb->node);
+	hlist_del_init(&epb->node);
 	sctp_write_unlock(&head->lock);
 }
 
@@ -814,7 +814,7 @@ static void __sctp_unhash_established(struct sctp_association *asoc)
 	head = &sctp_assoc_hashtable[epb->hashent];
 
 	sctp_write_lock(&head->lock);
-	__hlist_del(&epb->node);
+	hlist_del_init(&epb->node);
 	sctp_write_unlock(&head->lock);
 }
 

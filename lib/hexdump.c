@@ -16,6 +16,24 @@ const char hex_asc[] = "0123456789abcdef";
 EXPORT_SYMBOL(hex_asc);
 
 /**
+ * hex_to_bin - convert a hex digit to its real value
+ * @ch: ascii character represents hex digit
+ *
+ * hex_to_bin() converts one hex digit to its actual value or -1 in case of bad
+ * input.
+ */
+int hex_to_bin(char ch)
+{
+	if ((ch >= '0') && (ch <= '9'))
+		return ch - '0';
+	ch = tolower(ch);
+	if ((ch >= 'a') && (ch <= 'f'))
+		return ch - 'a' + 10;
+	return -1;
+}
+EXPORT_SYMBOL(hex_to_bin);
+
+/**
  * hex_dump_to_buffer - convert a blob of data to "hex ASCII" in memory
  * @buf: data blob to dump
  * @len: number of bytes in the @buf
@@ -183,6 +201,14 @@ void print_hex_dump(const char *level, const char *prefix_str, int prefix_type,
 }
 EXPORT_SYMBOL(print_hex_dump);
 
+/*
+ * RHEL: We need to preserve print_hex_dump_bytes() as an exported function
+ * even with CONFIG_DYNAMIC_DEBUG=y, because it is in KABI.
+ * It won't be called by newly built modules though, because they will instead
+ * see print_hex_dump_bytes() as a macro (defined in include/linux/kernel.h).
+ */
+#undef print_hex_dump_bytes
+//#if !defined(CONFIG_DYNAMIC_DEBUG)
 /**
  * print_hex_dump_bytes - shorthand form of print_hex_dump() with default params
  * @prefix_str: string to prefix each line with;
@@ -202,3 +228,4 @@ void print_hex_dump_bytes(const char *prefix_str, int prefix_type,
 			buf, len, 1);
 }
 EXPORT_SYMBOL(print_hex_dump_bytes);
+//#endif /* !defined(CONFIG_DYNAMIC_DEBUG) */

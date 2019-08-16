@@ -126,7 +126,8 @@ int bt_sock_unregister(int proto)
 }
 EXPORT_SYMBOL(bt_sock_unregister);
 
-static int bt_sock_create(struct net *net, struct socket *sock, int proto)
+static int bt_sock_create(struct net *net, struct socket *sock, int proto,
+			  int kern)
 {
 	int err;
 
@@ -144,7 +145,7 @@ static int bt_sock_create(struct net *net, struct socket *sock, int proto)
 	read_lock(&bt_proto_lock);
 
 	if (bt_proto[proto] && try_module_get(bt_proto[proto]->owner)) {
-		err = bt_proto[proto]->create(net, sock, proto);
+		err = bt_proto[proto]->create(net, sock, proto, kern);
 		bt_sock_reclassify_lock(sock, proto);
 		module_put(bt_proto[proto]->owner);
 	}
@@ -240,13 +241,13 @@ int bt_sock_recvmsg(struct kiocb *iocb, struct socket *sock,
 	if (flags & (MSG_OOB))
 		return -EOPNOTSUPP;
 
+	msg->msg_namelen = 0;
+
 	if (!(skb = skb_recv_datagram(sk, flags, noblock, &err))) {
 		if (sk->sk_shutdown & RCV_SHUTDOWN)
 			return 0;
 		return err;
 	}
-
-	msg->msg_namelen = 0;
 
 	copied = skb->len;
 	if (len < copied) {
@@ -257,7 +258,7 @@ int bt_sock_recvmsg(struct kiocb *iocb, struct socket *sock,
 	skb_reset_transport_header(skb);
 	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
 	if (err == 0)
-		sock_recv_timestamp(msg, sk, skb);
+		sock_recv_ts_and_drops(msg, sk, skb);
 
 	skb_free_datagram(sk, skb);
 

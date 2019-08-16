@@ -35,11 +35,16 @@
 # endif
 #endif
 
-/* Node not present */
-#define NUMA_NO_NODE	(-1)
+/*
+ * to preserve the visibility of NUMA_NO_NODE definition,
+ * moved to there from here.  May be used independent of
+ * CONFIG_NUMA.
+ */
+#include <linux/numa.h>
 
 #ifdef CONFIG_NUMA
 #include <linux/cpumask.h>
+
 #include <asm/mpspec.h>
 
 #ifdef CONFIG_X86_32
@@ -194,25 +199,13 @@ static inline void arch_fix_phys_package_id(int num, u32 slot)
 }
 
 struct pci_bus;
-void x86_pci_root_bus_res_quirks(struct pci_bus *b);
+int x86_pci_root_bus_node(int bus);
+void x86_pci_root_bus_resources(int bus, struct list_head *resources);
 
 #ifdef CONFIG_SMP
 #define mc_capable()	((boot_cpu_data.x86_max_cores > 1) && \
 			(cpumask_weight(cpu_core_mask(0)) != nr_cpu_ids))
 #define smt_capable()			(smp_num_siblings > 1)
-#endif
-
-#ifdef CONFIG_NUMA
-extern int get_mp_bus_to_node(int busnum);
-extern void set_mp_bus_to_node(int busnum, int node);
-#else
-static inline int get_mp_bus_to_node(int busnum)
-{
-	return 0;
-}
-static inline void set_mp_bus_to_node(int busnum, int node)
-{
-}
 #endif
 
 #endif /* _ASM_X86_TOPOLOGY_H */

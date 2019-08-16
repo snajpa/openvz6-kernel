@@ -111,10 +111,12 @@ struct ipv6_txoptions *ipv6_update_options(struct sock *sk,
 			icsk->icsk_ext_hdr_len = opt->opt_flen + opt->opt_nflen;
 			icsk->icsk_sync_mss(sk, icsk->icsk_pmtu_cookie);
 		}
-		opt = xchg(&inet6_sk(sk)->opt, opt);
+		opt = xchg((__force struct ipv6_txoptions **)&inet6_sk(sk)->opt,
+			   opt);
 	} else {
 		write_lock(&sk->sk_dst_lock);
-		opt = xchg(&inet6_sk(sk)->opt, opt);
+		opt = xchg((__force struct ipv6_txoptions **)&inet6_sk(sk)->opt,
+			   opt);
 		write_unlock(&sk->sk_dst_lock);
 	}
 	sk_dst_reset(sk);
@@ -214,9 +216,12 @@ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
 				sk->sk_socket->ops = &inet_dgram_ops;
 				sk->sk_family = PF_INET;
 			}
-			opt = xchg(&np->opt, NULL);
-			if (opt)
-				sock_kfree_s(sk, opt, opt->tot_len);
+			opt = xchg((__force struct ipv6_txoptions **)&np->opt,
+				   NULL);
+			if (opt) {
+				atomic_sub(opt->tot_len, &sk->sk_omem_alloc);
+				txopt_put(opt);
+			}
 			pktopt = xchg(&np->pktoptions, NULL);
 			kfree_skb(pktopt);
 
@@ -336,6 +341,25 @@ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
 		retv = 0;
 		break;
 
+	case IPV6_TRANSPARENT:
+		if (!capable(CAP_NET_ADMIN)) {
+			retv = -EPERM;
+			break;
+		}
+		if (optlen < sizeof(int))
+			goto e_inval;
+		/* we don't have a separate transparent bit for IPV6 we use the one in the IPv4 socket */
+		inet_sk(sk)->transparent = valbool;
+		retv = 0;
+		break;
+
+	case IPV6_RECVORIGDSTADDR:
+		if (optlen < sizeof(int))
+			goto e_inval;
+		np->rxopt.bits.rxorigdstaddr = valbool;
+		retv = 0;
+		break;
+
 	case IPV6_HOPOPTS:
 	case IPV6_RTHDRDSTOPTS:
 	case IPV6_RTHDR:
@@ -359,7 +383,8 @@ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
 		if (optname != IPV6_RTHDR && !capable(CAP_NET_RAW))
 			break;
 
-		opt = ipv6_renew_options(sk, np->opt, optname,
+		opt = rcu_dereference_protected(np->opt, sock_owned_by_user(sk));
+		opt = ipv6_renew_options(sk, opt, optname,
 					 (struct ipv6_opt_hdr __user *)optval,
 					 optlen);
 		if (IS_ERR(opt)) {
@@ -388,8 +413,10 @@ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
 		retv = 0;
 		opt = ipv6_update_options(sk, opt);
 sticky_done:
-		if (opt)
-			sock_kfree_s(sk, opt, opt->tot_len);
+		if (opt) {
+			atomic_sub(opt->tot_len, &sk->sk_omem_alloc);
+			txopt_put(opt);
+		}
 		break;
 	}
 
@@ -441,6 +468,7 @@ sticky_done:
 			break;
 
 		memset(opt, 0, sizeof(*opt));
+		atomic_set(&opt->refcnt, 1);
 		opt->tot_len = sizeof(*opt) + optlen;
 		retv = -EFAULT;
 		if (copy_from_user(opt+1, optval, optlen))
@@ -456,8 +484,10 @@ update:
 		retv = 0;
 		opt = ipv6_update_options(sk, opt);
 done:
-		if (opt)
-			sock_kfree_s(sk, opt, opt->tot_len);
+		if (opt) {
+			atomic_sub(opt->tot_len, &sk->sk_omem_alloc);
+			txopt_put(opt);
+		}
 		break;
 	}
 	case IPV6_UNICAST_HOPS:
@@ -476,7 +506,7 @@ done:
 			goto e_inval;
 		if (val > 255 || val < -1)
 			goto e_inval;
-		np->mcast_hops = val;
+		np->mcast_hops = (val == -1 ? IPV6_DEFAULT_MCASTHOPS : val);
 		retv = 0;
 		break;
 
@@ -665,7 +695,7 @@ done:
 	case IPV6_MTU_DISCOVER:
 		if (optlen < sizeof(int))
 			goto e_inval;
-		if (val<0 || val>3)
+		if (val < IPV6_PMTUDISC_DONT || val > IPV6_PMTUDISC_OMIT)
 			goto e_inval;
 		np->pmtudisc = val;
 		retv = 0;
@@ -765,6 +795,14 @@ pref_skip_coa:
 
 		break;
 	    }
+	case IPV6_MINHOPCOUNT:
+		if (optlen < sizeof(int))
+			goto e_inval;
+		if (val < 0 || val > 255)
+			goto e_inval;
+		sk_set_min_hopcount(sk, val);
+		retv = 0;
+		break;
 	}
 
 	release_sock(sk);
@@ -950,6 +988,10 @@ static int do_ipv6_getsockopt(struct sock *sk, int level, int optname,
 				int hlim = np->mcast_hops;
 				put_cmsg(&msg, SOL_IPV6, IPV6_HOPLIMIT, sizeof(hlim), &hlim);
 			}
+			if (np->rxopt.bits.rxtclass) {
+				int tclass = sk_extended(sk)->rcv_tos;
+				put_cmsg(&msg, SOL_IPV6, IPV6_TCLASS, sizeof(tclass), &tclass);
+			}
 			if (np->rxopt.bits.rxoinfo) {
 				struct in6_pktinfo src_info;
 				src_info.ipi6_ifindex = np->mcast_oif ? np->mcast_oif :
@@ -1015,10 +1057,11 @@ static int do_ipv6_getsockopt(struct sock *sk, int level, int optname,
 	case IPV6_RTHDR:
 	case IPV6_DSTOPTS:
 	{
+		struct ipv6_txoptions *opt;
 
 		lock_sock(sk);
-		len = ipv6_getsockopt_sticky(sk, np->opt,
-					     optname, optval, len);
+		opt = rcu_dereference_protected(np->opt, sock_owned_by_user(sk));
+		len = ipv6_getsockopt_sticky(sk, opt, optname, optval, len);
 		release_sock(sk);
 		/* check if ipv6_getsockopt_sticky() returns err code */
 		if (len < 0)
@@ -1052,6 +1095,14 @@ static int do_ipv6_getsockopt(struct sock *sk, int level, int optname,
 
 	case IPV6_FLOWINFO:
 		val = np->rxopt.bits.rxflow;
+		break;
+
+	case IPV6_TRANSPARENT:
+		val = inet_sk(sk)->transparent;
+		break;
+
+	case IPV6_RECVORIGDSTADDR:
+		val = np->rxopt.bits.rxorigdstaddr;
 		break;
 
 	case IPV6_UNICAST_HOPS:
@@ -1111,6 +1162,9 @@ static int do_ipv6_getsockopt(struct sock *sk, int level, int optname,
 			val |= IPV6_PREFER_SRC_COA;
 		else
 			val |= IPV6_PREFER_SRC_HOME;
+		break;
+	case IPV6_MINHOPCOUNT:
+		val = sk_get_min_hopcount(sk);
 		break;
 
 	default:

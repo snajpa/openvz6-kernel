@@ -5,7 +5,8 @@
  * based on the old aacraid driver that is..
  * Adaptec aacraid device driver for Linux.
  *
- * Copyright (c) 2000-2007 Adaptec, Inc. (aacraid@adaptec.com)
+ * Copyright (c) 2011 PMC-Sierra, Inc. (aacraid@pmc-sierra.com)
+ *		  2000-2010 Adaptec, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -62,7 +63,7 @@ static int ioctl_send_fib(struct aac_dev * dev, void __user *arg)
 	struct fib *fibptr;
 	struct hw_fib * hw_fib = (struct hw_fib *)0;
 	dma_addr_t hw_fib_pa = (dma_addr_t)0LL;
-	unsigned size;
+	unsigned int size, osize;
 	int retval;
 
 	if (dev->in_reset) {
@@ -86,7 +87,8 @@ static int ioctl_send_fib(struct aac_dev * dev, void __user *arg)
 	 *	will not overrun the buffer when we copy the memory. Return
 	 *	an error if we would.
 	 */
-	size = le16_to_cpu(kfib->header.Size) + sizeof(struct aac_fibhdr);
+	osize = size = le16_to_cpu(kfib->header.Size) +
+		sizeof(struct aac_fibhdr);
 	if (size < le16_to_cpu(kfib->header.SenderSize))
 		size = le16_to_cpu(kfib->header.SenderSize);
 	if (size > dev->max_fib_size) {
@@ -114,6 +116,14 @@ static int ioctl_send_fib(struct aac_dev * dev, void __user *arg)
 
 	if (copy_from_user(kfib, arg, size)) {
 		retval = -EFAULT;
+		goto cleanup;
+	}
+
+	/* Sanity check the second copy */
+	if ((osize != le16_to_cpu(kfib->header.Size) +
+		sizeof(struct aac_fibhdr))
+		|| (size < le16_to_cpu(kfib->header.SenderSize))) {
+		retval = -EINVAL;
 		goto cleanup;
 	}
 
@@ -153,7 +163,7 @@ cleanup:
 		fibptr->hw_fib_pa = hw_fib_pa;
 		fibptr->hw_fib_va = hw_fib;
 	}
-	if (retval != -EINTR)
+	if (retval != -ERESTARTSYS)
 		aac_fib_free(fibptr);
 	return retval;
 }
@@ -317,12 +327,13 @@ return_fib:
 			kthread_stop(dev->thread);
 			ssleep(1);
 			dev->aif_thread = 0;
-			dev->thread = kthread_run(aac_command_thread, dev, dev->name);
+			dev->thread = kthread_run(aac_command_thread, dev,
+						  "%s", dev->name);
 			ssleep(1);
 		}
 		if (f.wait) {
 			if(down_interruptible(&fibctx->wait_sem) < 0) {
-				status = -EINTR;
+				status = -ERESTARTSYS;
 			} else {
 				/* Lock again and retry */
 				spin_lock_irqsave(&dev->fib_lock, flags);
@@ -497,6 +508,8 @@ static int aac_send_raw_srb(struct aac_dev* dev, void __user * arg)
 		return -ENOMEM;
 	}
 	aac_fib_init(srbfib);
+	/* raw_srb FIB is not FastResponseCapable */
+	srbfib->hw_fib_va->header.XferState &= ~cpu_to_le32(FastResponseCapable);
 
 	srbcmd = (struct aac_srb*) fib_data(srbfib);
 
@@ -507,7 +520,8 @@ static int aac_send_raw_srb(struct aac_dev* dev, void __user * arg)
 		goto cleanup;
 	}
 
-	if (fibsize > (dev->max_fib_size - sizeof(struct aac_fibhdr))) {
+	if ((fibsize < (sizeof(struct user_aac_srb) - sizeof(struct user_sgentry))) ||
+	    (fibsize > (dev->max_fib_size - sizeof(struct aac_fibhdr)))) {
 		rcode = -EINVAL;
 		goto cleanup;
 	}
@@ -593,10 +607,10 @@ static int aac_send_raw_srb(struct aac_dev* dev, void __user * arg)
 				u64 addr;
 				void* p;
 				if (upsg->sg[i].count >
-				    (dev->adapter_info.options &
+				    ((dev->adapter_info.options &
 				     AAC_OPT_NEW_COMM) ?
 				      (dev->scsi_host_ptr->max_sectors << 9) :
-				      65536) {
+				      65536)) {
 					rcode = -EINVAL;
 					goto cleanup;
 				}
@@ -645,19 +659,20 @@ static int aac_send_raw_srb(struct aac_dev* dev, void __user * arg)
 				u64 addr;
 				void* p;
 				if (usg->sg[i].count >
-				    (dev->adapter_info.options &
+				    ((dev->adapter_info.options &
 				     AAC_OPT_NEW_COMM) ?
 				      (dev->scsi_host_ptr->max_sectors << 9) :
-				      65536) {
+				      65536)) {
+					kfree(usg);
 					rcode = -EINVAL;
 					goto cleanup;
 				}
 				/* Does this really need to be GFP_DMA? */
 				p = kmalloc(usg->sg[i].count,GFP_KERNEL|__GFP_DMA);
 				if(!p) {
-					kfree (usg);
-					dprintk((KERN_DEBUG"aacraid: Could not allocate SG buffer - size = %d buffer number %d of %d\n",
+					dprintk((KERN_DEBUG "aacraid: Could not allocate SG buffer - size = %d buffer number %d of %d\n",
 					  usg->sg[i].count,i,usg->count));
+					kfree(usg);
 					rcode = -ENOMEM;
 					goto cleanup;
 				}
@@ -695,10 +710,10 @@ static int aac_send_raw_srb(struct aac_dev* dev, void __user * arg)
 				uintptr_t addr;
 				void* p;
 				if (usg->sg[i].count >
-				    (dev->adapter_info.options &
+				    ((dev->adapter_info.options &
 				     AAC_OPT_NEW_COMM) ?
 				      (dev->scsi_host_ptr->max_sectors << 9) :
-				      65536) {
+				      65536)) {
 					rcode = -EINVAL;
 					goto cleanup;
 				}
@@ -734,10 +749,10 @@ static int aac_send_raw_srb(struct aac_dev* dev, void __user * arg)
 				dma_addr_t addr;
 				void* p;
 				if (upsg->sg[i].count >
-				    (dev->adapter_info.options &
+				    ((dev->adapter_info.options &
 				     AAC_OPT_NEW_COMM) ?
 				      (dev->scsi_host_ptr->max_sectors << 9) :
-				      65536) {
+				      65536)) {
 					rcode = -EINVAL;
 					goto cleanup;
 				}
@@ -772,8 +787,8 @@ static int aac_send_raw_srb(struct aac_dev* dev, void __user * arg)
 		psg->count = cpu_to_le32(sg_indx+1);
 		status = aac_fib_send(ScsiPortCommand, srbfib, actual_fibsize, FsaNormal, 1, 1, NULL, NULL);
 	}
-	if (status == -EINTR) {
-		rcode = -EINTR;
+	if (status == -ERESTARTSYS) {
+		rcode = -ERESTARTSYS;
 		goto cleanup;
 	}
 
@@ -810,7 +825,7 @@ cleanup:
 	for(i=0; i <= sg_indx; i++){
 		kfree(sg_list[i]);
 	}
-	if (rcode != -EINTR) {
+	if (rcode != -ERESTARTSYS) {
 		aac_fib_complete(srbfib);
 		aac_fib_free(srbfib);
 	}
@@ -848,7 +863,7 @@ int aac_do_ioctl(struct aac_dev * dev, int cmd, void __user *arg)
 	 */
 
 	status = aac_dev_ioctl(dev, cmd, arg);
-	if(status != -ENOTTY)
+	if (status != -ENOTTY)
 		return status;
 
 	switch (cmd) {

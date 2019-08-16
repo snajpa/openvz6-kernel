@@ -95,6 +95,7 @@ enum sctp_optname {
 #define SCTP_GET_PEER_ADDR_INFO SCTP_GET_PEER_ADDR_INFO
 	SCTP_DELAYED_ACK,
 #define SCTP_DELAYED_ACK_TIME SCTP_DELAYED_ACK
+#define SCTP_DELAYED_SACK SCTP_DELAYED_ACK_TIME
 #define SCTP_DELAYED_ACK SCTP_DELAYED_ACK
 	SCTP_CONTEXT,	/* Receive Context */
 #define SCTP_CONTEXT SCTP_CONTEXT
@@ -120,7 +121,10 @@ enum sctp_optname {
 #define SCTP_LOCAL_AUTH_CHUNKS SCTP_LOCAL_AUTH_CHUNKS
 	SCTP_GET_ASSOC_NUMBER,		/* Read only */
 #define SCTP_GET_ASSOC_NUMBER SCTP_GET_ASSOC_NUMBER
-
+	SCTP_GET_ASSOC_ID_LIST,  	/* Read only */
+#define SCTP_GET_ASSOC_ID_LIST SCTP_GET_ASSOC_ID_LIST
+	SCTP_PEER_ADDR_THLDS = 31,
+#define SCTP_PEER_ADDR_THLDS SCTP_PEER_ADDR_THLDS
 
 	/* Internal Socket Options. Some of the sctp library functions are 
 	 * implemented using these socket options.
@@ -149,6 +153,8 @@ enum sctp_optname {
 #define SCTP_SOCKOPT_CONNECTX	SCTP_SOCKOPT_CONNECTX
 	SCTP_SOCKOPT_CONNECTX3, /* CONNECTX requests. (new implementation) */
 #define SCTP_SOCKOPT_CONNECTX3	SCTP_SOCKOPT_CONNECTX3
+	SCTP_GET_ASSOC_STATS,
+#define SCTP_GET_ASSOC_STATS SCTP_GET_ASSOC_STATS
 };
 
 /*
@@ -398,6 +404,20 @@ struct sctp_authkey_event {
 
 enum { SCTP_AUTH_NEWKEY = 0, };
 
+/*
+ * 6.1.9. SCTP_SENDER_DRY_EVENT
+ *
+ * When the SCTP stack has no more user data to send or retransmit, this
+ * notification is given to the user. Also, at the time when a user app
+ * subscribes to this event, if there is no data to be sent or
+ * retransmit, the stack will immediately send up this notification.
+ */
+struct sctp_sender_dry_event {
+	__u16 sender_dry_type;
+	__u16 sender_dry_flags;
+	__u32 sender_dry_length;
+	sctp_assoc_t sender_dry_assoc_id;
+};
 
 /*
  * Described in Section 7.3
@@ -413,6 +433,7 @@ struct sctp_event_subscribe {
 	__u8 sctp_partial_delivery_event;
 	__u8 sctp_adaptation_layer_event;
 	__u8 sctp_authentication_event;
+	__u8 sctp_sender_dry_event;
 };
 
 /*
@@ -436,6 +457,7 @@ union sctp_notification {
 	struct sctp_adaptation_event sn_adaptation_event;
 	struct sctp_pdapi_event sn_pdapi_event;
 	struct sctp_authkey_event sn_authkey_event;
+	struct sctp_sender_dry_event sn_sender_dry_event;
 };
 
 /* Section 5.3.1
@@ -453,6 +475,7 @@ enum sctp_sn_type {
 	SCTP_PARTIAL_DELIVERY_EVENT,
 	SCTP_ADAPTATION_INDICATION,
 	SCTP_AUTHENTICATION_INDICATION,
+	SCTP_SENDER_DRY_EVENT,
 };
 
 /* Notification error codes used to fill up the error fields in some
@@ -674,6 +697,7 @@ struct sctp_paddrinfo {
  */
 enum sctp_spinfo_state {
 	SCTP_INACTIVE,
+	SCTP_PF,
 	SCTP_ACTIVE,
 	SCTP_UNCONFIRMED,
 	SCTP_UNKNOWN = 0xffff  /* Value used for transport state unknown */
@@ -714,6 +738,18 @@ struct sctp_authchunks {
 };
 
 /*
+ * 8.2.6. Get the Current Identifiers of Associations
+ *        (SCTP_GET_ASSOC_ID_LIST)
+ *
+ * This option gets the current list of SCTP association identifiers of
+ * the SCTP associations handled by a one-to-many style socket.
+ */
+struct sctp_assoc_ids {
+	__u32		gaids_number_of_ids;
+	sctp_assoc_t	gaids_assoc_id[];
+};
+
+/*
  * 8.3, 8.5 get all peer/local addresses in an association.
  * This parameter struct is used by SCTP_GET_PEER_ADDRS and 
  * SCTP_GET_LOCAL_ADDRS socket options used internally to implement
@@ -728,6 +764,32 @@ struct sctp_getaddrs {
 	sctp_assoc_t		assoc_id; /*input*/
 	__u32			addr_num; /*output*/
 	__u8			addrs[0]; /*output, variable size*/
+};
+
+/* A socket user request obtained via SCTP_GET_ASSOC_STATS that retrieves
+ * association stats. All stats are counts except sas_maxrto and
+ * sas_obs_rto_ipaddr. maxrto is the max observed rto + transport since
+ * the last call. Will return 0 when RTO was not update since last call
+ */
+struct sctp_assoc_stats {
+	sctp_assoc_t	sas_assoc_id;    /* Input */
+					 /* Transport of observed max RTO */
+	struct sockaddr_storage sas_obs_rto_ipaddr;
+	__u64		sas_maxrto;      /* Maximum Observed RTO for period */
+	__u64		sas_isacks;	 /* SACKs received */
+	__u64		sas_osacks;	 /* SACKs sent */
+	__u64		sas_opackets;	 /* Packets sent */
+	__u64		sas_ipackets;	 /* Packets received */
+	__u64		sas_rtxchunks;   /* Retransmitted Chunks */
+	__u64		sas_outofseqtsns;/* TSN received > next expected */
+	__u64		sas_idupchunks;  /* Dups received (ordered+unordered) */
+	__u64		sas_gapcnt;      /* Gap Acknowledgements Received */
+	__u64		sas_ouodchunks;  /* Unordered data chunks sent */
+	__u64		sas_iuodchunks;  /* Unordered data chunks received */
+	__u64		sas_oodchunks;	 /* Ordered data chunks sent */
+	__u64		sas_iodchunks;	 /* Ordered data chunks received */
+	__u64		sas_octrlchunks; /* Control chunks sent */
+	__u64		sas_ictrlchunks; /* Control chunks received */
 };
 
 /* These are bit fields for msghdr->msg_flags.  See section 5.1.  */
@@ -754,4 +816,13 @@ typedef struct {
 	int sd;
 } sctp_peeloff_arg_t;
 
+/*
+ *  Peer Address Thresholds socket option
+ */
+struct sctp_paddrthlds {
+	sctp_assoc_t spt_assoc_id;
+	struct sockaddr_storage spt_address;
+	__u16 spt_pathmaxrxt;
+	__u16 spt_pathpfthld;
+};
 #endif /* __net_sctp_user_h__ */

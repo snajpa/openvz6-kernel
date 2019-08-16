@@ -20,6 +20,7 @@
 #include <linux/cpu.h>
 #include <linux/msi.h>
 #include <linux/of.h>
+#include <linux/percpu.h>
 
 #include <asm/firmware.h>
 #include <asm/io.h>
@@ -46,6 +47,12 @@ static struct irq_host *xics_host;
  */
 #define IPI_PRIORITY		4
 
+/* The least favored priority */
+#define LOWEST_PRIORITY		0xFF
+
+/* The number of priorities defined above */
+#define MAX_NUM_PRIORITIES	3
+
 static unsigned int default_server = 0xFF;
 static unsigned int default_distrib_server = 0;
 static unsigned int interrupt_server_size = 8;
@@ -56,6 +63,12 @@ static int ibm_set_xive;
 static int ibm_int_on;
 static int ibm_int_off;
 
+struct xics_cppr {
+	unsigned char stack[MAX_NUM_PRIORITIES];
+	int index;
+};
+
+static DEFINE_PER_CPU(struct xics_cppr, xics_cppr);
 
 /* Direct hardware low level accessors */
 
@@ -150,18 +163,17 @@ static inline void lpar_qirr_info(int n_cpu , u8 value)
 /* Interface to generic irq subsystem */
 
 #ifdef CONFIG_SMP
-static int get_irq_server(unsigned int virq, unsigned int strict_check)
+static int get_irq_server(unsigned int virq, cpumask_t cpumask,
+			  unsigned int strict_check)
 {
 	int server;
 	/* For the moment only implement delivery to all cpus or one cpu */
-	cpumask_t cpumask;
 	cpumask_t tmp = CPU_MASK_NONE;
 
-	cpumask_copy(&cpumask, irq_desc[virq].affinity);
 	if (!distribute_irqs)
 		return default_server;
 
-	if (!cpus_equal(cpumask, CPU_MASK_ALL)) {
+	if (!cpus_subset(cpu_possible_map, cpumask)) {
 		cpus_and(tmp, cpu_online_map, cpumask);
 
 		server = first_cpu(tmp);
@@ -179,7 +191,8 @@ static int get_irq_server(unsigned int virq, unsigned int strict_check)
 	return default_server;
 }
 #else
-static int get_irq_server(unsigned int virq, unsigned int strict_check)
+static int get_irq_server(unsigned int virq, cpumask_t cpumask,
+			  unsigned int strict_check)
 {
 	return default_server;
 }
@@ -198,7 +211,7 @@ static void xics_unmask_irq(unsigned int virq)
 	if (irq == XICS_IPI || irq == XICS_IRQ_SPURIOUS)
 		return;
 
-	server = get_irq_server(virq, 0);
+	server = get_irq_server(virq, *(irq_to_desc(virq)->affinity), 0);
 
 	call_status = rtas_call(ibm_set_xive, 3, 1, NULL, irq, server,
 				DEFAULT_PRIORITY);
@@ -284,6 +297,19 @@ static inline unsigned int xics_xirr_vector(unsigned int xirr)
 	return xirr & 0x00ffffff;
 }
 
+static void push_cppr(unsigned int vec)
+{
+	struct xics_cppr *os_cppr = &__get_cpu_var(xics_cppr);
+
+	if (WARN_ON(os_cppr->index >= MAX_NUM_PRIORITIES - 1))
+		return;
+
+	if (vec == XICS_IPI)
+		os_cppr->stack[++os_cppr->index] = IPI_PRIORITY;
+	else
+		os_cppr->stack[++os_cppr->index] = DEFAULT_PRIORITY;
+}
+
 static unsigned int xics_get_irq_direct(void)
 {
 	unsigned int xirr = direct_xirr_info_get();
@@ -294,8 +320,10 @@ static unsigned int xics_get_irq_direct(void)
 		return NO_IRQ;
 
 	irq = irq_radix_revmap_lookup(xics_host, vec);
-	if (likely(irq != NO_IRQ))
+	if (likely(irq != NO_IRQ)) {
+		push_cppr(vec);
 		return irq;
+	}
 
 	/* We don't have a linux mapping, so have rtas mask it. */
 	xics_mask_unknown_vec(vec);
@@ -315,8 +343,10 @@ static unsigned int xics_get_irq_lpar(void)
 		return NO_IRQ;
 
 	irq = irq_radix_revmap_lookup(xics_host, vec);
-	if (likely(irq != NO_IRQ))
+	if (likely(irq != NO_IRQ)) {
+		push_cppr(vec);
 		return irq;
+	}
 
 	/* We don't have a linux mapping, so have RTAS mask it. */
 	xics_mask_unknown_vec(vec);
@@ -326,12 +356,22 @@ static unsigned int xics_get_irq_lpar(void)
 	return NO_IRQ;
 }
 
+static unsigned char pop_cppr(void)
+{
+	struct xics_cppr *os_cppr = &__get_cpu_var(xics_cppr);
+
+	if (WARN_ON(os_cppr->index < 1))
+		return LOWEST_PRIORITY;
+
+	return os_cppr->stack[--os_cppr->index];
+}
+
 static void xics_eoi_direct(unsigned int virq)
 {
 	unsigned int irq = (unsigned int)irq_map[virq].hwirq;
 
 	iosync();
-	direct_xirr_info_set((0xff << 24) | irq);
+	direct_xirr_info_set((pop_cppr() << 24) | irq);
 }
 
 static void xics_eoi_lpar(unsigned int virq)
@@ -339,7 +379,7 @@ static void xics_eoi_lpar(unsigned int virq)
 	unsigned int irq = (unsigned int)irq_map[virq].hwirq;
 
 	iosync();
-	lpar_xirr_info_set((0xff << 24) | irq);
+	lpar_xirr_info_set((pop_cppr() << 24) | irq);
 }
 
 static int xics_set_affinity(unsigned int virq, const struct cpumask *cpumask)
@@ -365,7 +405,7 @@ static int xics_set_affinity(unsigned int virq, const struct cpumask *cpumask)
 	 * For the moment only implement delivery to all cpus or one cpu.
 	 * Get current irq_server for the given irq
 	 */
-	irq_server = get_irq_server(virq, 1);
+	irq_server = get_irq_server(virq, *cpumask, 1);
 	if (irq_server == -1) {
 		char cpulist[128];
 		cpumask_scnprintf(cpulist, sizeof(cpulist), cpumask);
@@ -508,8 +548,6 @@ void smp_xics_message_pass(int target, int msg)
 
 static irqreturn_t xics_ipi_dispatch(int cpu)
 {
-	WARN_ON(cpu_is_offline(cpu));
-
 	mb();	/* order mmio clearing qirr */
 	while (xics_ipi_message[cpu].value) {
 		if (test_and_clear_bit(PPC_MSG_CALL_FUNCTION,
@@ -746,6 +784,16 @@ void __init xics_init_IRQ(void)
 
 static void xics_set_cpu_priority(unsigned char cppr)
 {
+	struct xics_cppr *os_cppr = &__get_cpu_var(xics_cppr);
+
+	/*
+	 * we only really want to set the priority when there's
+	 * just one cppr value on the stack
+	 */
+	WARN_ON(os_cppr->index != 0);
+
+	os_cppr->stack[0] = cppr;
+
 	if (firmware_has_feature(FW_FEATURE_LPAR))
 		lpar_cppr_info(cppr);
 	else
@@ -772,15 +820,21 @@ static void xics_set_cpu_giq(unsigned int gserver, unsigned int join)
 
 void xics_setup_cpu(void)
 {
-	xics_set_cpu_priority(0xff);
+	xics_set_cpu_priority(LOWEST_PRIORITY);
 
 	xics_set_cpu_giq(default_distrib_server, 1);
 }
 
 void xics_teardown_cpu(void)
 {
+	struct xics_cppr *os_cppr = &__get_cpu_var(xics_cppr);
 	int cpu = smp_processor_id();
 
+	/*
+	 * we have to reset the cppr index to 0 because we're
+	 * not going to return from the IPI
+	 */
+	os_cppr->index = 0;
 	xics_set_cpu_priority(0);
 
 	/* Clear any pending IPI request */

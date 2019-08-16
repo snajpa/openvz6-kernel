@@ -104,6 +104,8 @@ cpuidle/
 	- info on CPU_IDLE, CPU idle state management subsystem.
 cputopology.txt
 	- documentation on how CPU topology info is exported via sysfs.
+crc32.txt
+	- brief tutorial on CRC computation
 cris/
 	- directory with info about Linux on CRIS architecture.
 crypto/
@@ -232,6 +234,8 @@ memory.txt
 	- info on typical Linux memory problems.
 mips/
 	- directory with info about Linux on MIPS architecture.
+mmc/
+	- directory with info about the MMC subsystem
 mono.txt
 	- how to execute Mono-based .NET binaries with the help of BINFMT_MISC.
 mutex-design.txt

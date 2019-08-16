@@ -142,9 +142,9 @@ static int hfs_show_options(struct seq_file *seq, struct vfsmount *mnt)
 	struct hfs_sb_info *sbi = HFS_SB(mnt->mnt_sb);
 
 	if (sbi->s_creator != cpu_to_be32(0x3f3f3f3f))
-		seq_printf(seq, ",creator=%.4s", (char *)&sbi->s_creator);
+		seq_show_option_n(seq, "creator", (char *)&sbi->s_creator, 4);
 	if (sbi->s_type != cpu_to_be32(0x3f3f3f3f))
-		seq_printf(seq, ",type=%.4s", (char *)&sbi->s_type);
+		seq_show_option_n(seq, "type", (char *)&sbi->s_type, 4);
 	seq_printf(seq, ",uid=%u,gid=%u", sbi->s_uid, sbi->s_gid);
 	if (sbi->s_file_umask != 0133)
 		seq_printf(seq, ",file_umask=%o", sbi->s_file_umask);
@@ -409,8 +409,13 @@ static int hfs_fill_super(struct super_block *sb, void *data, int silent)
 	/* try to get the root inode */
 	hfs_find_init(HFS_SB(sb)->cat_tree, &fd);
 	res = hfs_cat_find_brec(sb, HFS_ROOT_CNID, &fd);
-	if (!res)
+	if (!res) {
+		if (fd.entrylength > sizeof(rec) || fd.entrylength < 0) {
+			res =  -EIO;
+			goto bail;
+		}
 		hfs_bnode_read(fd.bnode, &rec, fd.entryoffset, fd.entrylength);
+	}
 	if (res) {
 		hfs_find_exit(&fd);
 		goto bail_no_root;

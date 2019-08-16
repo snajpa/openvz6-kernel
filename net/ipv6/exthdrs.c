@@ -47,50 +47,6 @@
 
 #include <asm/uaccess.h>
 
-int ipv6_find_tlv(struct sk_buff *skb, int offset, int type)
-{
-	const unsigned char *nh = skb_network_header(skb);
-	int packet_len = skb->tail - skb->network_header;
-	struct ipv6_opt_hdr *hdr;
-	int len;
-
-	if (offset + 2 > packet_len)
-		goto bad;
-	hdr = (struct ipv6_opt_hdr *)(nh + offset);
-	len = ((hdr->hdrlen + 1) << 3);
-
-	if (offset + len > packet_len)
-		goto bad;
-
-	offset += 2;
-	len -= 2;
-
-	while (len > 0) {
-		int opttype = nh[offset];
-		int optlen;
-
-		if (opttype == type)
-			return offset;
-
-		switch (opttype) {
-		case IPV6_TLV_PAD0:
-			optlen = 1;
-			break;
-		default:
-			optlen = nh[offset + 1] + 2;
-			if (optlen > len)
-				goto bad;
-			break;
-		}
-		offset += optlen;
-		len -= optlen;
-	}
-	/* not_found */
- bad:
-	return -1;
-}
-EXPORT_SYMBOL_GPL(ipv6_find_tlv);
-
 /*
  *	Parsing tlv encoded headers.
  *
@@ -502,12 +458,12 @@ unknown_rh:
 
 static const struct inet6_protocol rthdr_protocol = {
 	.handler	=	ipv6_rthdr_rcv,
-	.flags		=	INET6_PROTO_NOPOLICY | INET6_PROTO_GSO_EXTHDR,
+	.flags		=	INET6_PROTO_NOPOLICY,
 };
 
 static const struct inet6_protocol destopt_protocol = {
 	.handler	=	ipv6_destopt_rcv,
-	.flags		=	INET6_PROTO_NOPOLICY | INET6_PROTO_GSO_EXTHDR,
+	.flags		=	INET6_PROTO_NOPOLICY,
 };
 
 static const struct inet6_protocol nodata_protocol = {
@@ -533,10 +489,10 @@ int __init ipv6_exthdrs_init(void)
 
 out:
 	return ret;
-out_rthdr:
-	inet6_del_protocol(&rthdr_protocol, IPPROTO_ROUTING);
 out_destopt:
 	inet6_del_protocol(&destopt_protocol, IPPROTO_DSTOPTS);
+out_rthdr:
+	inet6_del_protocol(&rthdr_protocol, IPPROTO_ROUTING);
 	goto out;
 };
 
@@ -557,6 +513,11 @@ void ipv6_exthdrs_exit(void)
 static inline struct inet6_dev *ipv6_skb_idev(struct sk_buff *skb)
 {
 	return skb_dst(skb) ? ip6_dst_idev(skb_dst(skb)) : __in6_dev_get(skb->dev);
+}
+
+static inline struct net *ipv6_skb_net(struct sk_buff *skb)
+{
+	return skb_dst(skb) ? dev_net(skb_dst(skb)->dev) : dev_net(skb->dev);
 }
 
 /* Router Alert as of RFC 2711 */
@@ -580,8 +541,8 @@ static int ipv6_hop_ra(struct sk_buff *skb, int optoff)
 static int ipv6_hop_jumbo(struct sk_buff *skb, int optoff)
 {
 	const unsigned char *nh = skb_network_header(skb);
+	struct net *net = ipv6_skb_net(skb);
 	u32 pkt_len;
-	struct net *net = dev_net(skb_dst(skb)->dev);
 
 	if (nh[optoff + 1] != 4 || (optoff & 3) != 2) {
 		LIMIT_NETDEBUG(KERN_DEBUG "ipv6_hop_jumbo: wrong jumbo opt length/alignment %d\n",
@@ -746,6 +707,7 @@ ipv6_dup_options(struct sock *sk, struct ipv6_txoptions *opt)
 			*((char**)&opt2->dst1opt) += dif;
 		if (opt2->srcrt)
 			*((char**)&opt2->srcrt) += dif;
+		atomic_set(&opt2->refcnt, 1);
 	}
 	return opt2;
 }
@@ -810,7 +772,7 @@ ipv6_renew_options(struct sock *sk, struct ipv6_txoptions *opt,
 		return ERR_PTR(-ENOBUFS);
 
 	memset(opt2, 0, tot_len);
-
+	atomic_set(&opt2->refcnt, 1);
 	opt2->tot_len = tot_len;
 	p = (char *)(opt2 + 1);
 
@@ -868,3 +830,27 @@ struct ipv6_txoptions *ipv6_fixup_options(struct ipv6_txoptions *opt_space,
 	return opt;
 }
 
+/**
+ * fl6_update_dst - update flowi destination address with info given
+ *                  by srcrt option, if any.
+ *
+ * @fl: flowi for which fl6_dst is to be updated
+ * @opt: struct ipv6_txoptions in which to look for srcrt opt
+ * @orig: copy of original fl6_dst address if modified
+ *
+ * Returns NULL if no txoptions or no srcrt, otherwise returns orig
+ * and initial value of fl->fl6_dst set in orig
+ */
+struct in6_addr *fl6_update_dst(struct flowi *fl,
+				const struct ipv6_txoptions *opt,
+				struct in6_addr *orig)
+{
+	if (!opt || !opt->srcrt)
+		return NULL;
+
+	ipv6_addr_copy(orig, &fl->fl6_dst);
+	ipv6_addr_copy(&fl->fl6_dst, ((struct rt0_hdr *)opt->srcrt)->addr);
+	return orig;
+}
+
+EXPORT_SYMBOL_GPL(fl6_update_dst);

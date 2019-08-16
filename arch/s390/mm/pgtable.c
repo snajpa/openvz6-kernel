@@ -51,17 +51,6 @@ void clear_table_pgstes(unsigned long *table)
 
 #endif
 
-unsigned long VMALLOC_START = VMALLOC_END - VMALLOC_SIZE;
-EXPORT_SYMBOL(VMALLOC_START);
-
-static int __init parse_vmalloc(char *arg)
-{
-	if (!arg)
-		return -EINVAL;
-	VMALLOC_START = (VMALLOC_END - memparse(arg, &arg)) & PAGE_MASK;
-	return 0;
-}
-early_param("vmalloc", parse_vmalloc);
 
 unsigned long *crst_table_alloc(struct mm_struct *mm, int noexec)
 {
@@ -98,77 +87,61 @@ void crst_table_free(struct mm_struct *mm, unsigned long *table)
 }
 
 #ifdef CONFIG_64BIT
-int crst_table_upgrade(struct mm_struct *mm, unsigned long limit)
+static void __crst_table_upgrade(void *arg)
+{
+	struct mm_struct *mm = arg;
+
+	if (current->active_mm == mm)
+		update_mm(mm, current);
+	__tlb_flush_local();
+}
+
+int crst_table_upgrade(struct mm_struct *mm)
 {
 	unsigned long *table, *pgd;
-	unsigned long entry;
 
-	BUG_ON(limit > (1UL << 53));
-repeat:
+	/* upgrade should only happen from 3 to 4 levels */
+	BUG_ON(mm->context.asce_limit != (1UL << 42));
+
 	table = crst_table_alloc(mm, mm->context.noexec);
 	if (!table)
 		return -ENOMEM;
+
 	spin_lock(&mm->page_table_lock);
-	if (mm->context.asce_limit < limit) {
-		pgd = (unsigned long *) mm->pgd;
-		if (mm->context.asce_limit <= (1UL << 31)) {
-			entry = _REGION3_ENTRY_EMPTY;
-			mm->context.asce_limit = 1UL << 42;
-			mm->context.asce_bits = _ASCE_TABLE_LENGTH |
-						_ASCE_USER_BITS |
-						_ASCE_TYPE_REGION3;
-		} else {
-			entry = _REGION2_ENTRY_EMPTY;
-			mm->context.asce_limit = 1UL << 53;
-			mm->context.asce_bits = _ASCE_TABLE_LENGTH |
-						_ASCE_USER_BITS |
-						_ASCE_TYPE_REGION2;
-		}
-		crst_table_init(table, entry);
-		pgd_populate(mm, (pgd_t *) table, (pud_t *) pgd);
-		mm->pgd = (pgd_t *) table;
-		mm->task_size = mm->context.asce_limit;
-		table = NULL;
-	}
+	pgd = (unsigned long *) mm->pgd;
+	crst_table_init(table, _REGION2_ENTRY_EMPTY);
+	pgd_populate(mm, (pgd_t *) table, (pud_t *) pgd);
+	mm->pgd = (pgd_t *) table;
+	mm->context.asce_limit = 1UL << 53;
+	mm->context.asce = __pa(mm->pgd) | _ASCE_TABLE_LENGTH |
+			   _ASCE_USER_BITS | _ASCE_TYPE_REGION2;
+	mm->task_size = mm->context.asce_limit;
 	spin_unlock(&mm->page_table_lock);
-	if (table)
-		crst_table_free(mm, table);
-	if (mm->context.asce_limit < limit)
-		goto repeat;
-	update_mm(mm, current);
+
+	on_each_cpu(__crst_table_upgrade, mm, 0);
 	return 0;
 }
 
-void crst_table_downgrade(struct mm_struct *mm, unsigned long limit)
+void crst_table_downgrade(struct mm_struct *mm)
 {
 	pgd_t *pgd;
 
-	if (mm->context.asce_limit <= limit)
-		return;
-	__tlb_flush_mm(mm);
-	while (mm->context.asce_limit > limit) {
-		pgd = mm->pgd;
-		switch (pgd_val(*pgd) & _REGION_ENTRY_TYPE_MASK) {
-		case _REGION_ENTRY_TYPE_R2:
-			mm->context.asce_limit = 1UL << 42;
-			mm->context.asce_bits = _ASCE_TABLE_LENGTH |
-						_ASCE_USER_BITS |
-						_ASCE_TYPE_REGION3;
-			break;
-		case _REGION_ENTRY_TYPE_R3:
-			mm->context.asce_limit = 1UL << 31;
-			mm->context.asce_bits = _ASCE_TABLE_LENGTH |
-						_ASCE_USER_BITS |
-						_ASCE_TYPE_SEGMENT;
-			break;
-		default:
-			BUG();
-		}
-		mm->pgd = (pgd_t *) (pgd_val(*pgd) & _REGION_ENTRY_ORIGIN);
-		mm->task_size = mm->context.asce_limit;
-		crst_table_free(mm, (unsigned long *) pgd);
-	}
-	update_mm(mm, current);
+	/* downgrade should only happen from 3 to 2 levels (compat only) */
+	BUG_ON(mm->context.asce_limit != (1UL << 42));
+
+	if (current->active_mm == mm)
+		__tlb_flush_mm(mm);
+
+	pgd = mm->pgd;
+	mm->pgd = (pgd_t *) (pgd_val(*pgd) & _REGION_ENTRY_ORIGIN);
+	mm->context.asce_limit = 1UL << 31;
+	mm->context.asce = __pa(mm->pgd) | _ASCE_TABLE_LENGTH |
+			   _ASCE_USER_BITS | _ASCE_TYPE_SEGMENT;
+	mm->task_size = mm->context.asce_limit;
+	crst_table_free(mm, (unsigned long *) pgd);
+
+	if (current->active_mm == mm)
+		update_mm(mm, current);
 }
 #endif
 
@@ -269,7 +242,7 @@ int s390_enable_sie(void)
 	struct mm_struct *mm, *old_mm;
 
 	/* Do we have switched amode? If no, we cannot do sie */
-	if (!switch_amode)
+	if (user_mode == HOME_SPACE_MODE)
 		return -EINVAL;
 
 	/* Do we have pgstes? if yes, we are done */

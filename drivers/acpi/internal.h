@@ -18,6 +18,9 @@
  * 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
+#ifndef _ACPI_INTERNAL_H_
+#define _ACPI_INTERNAL_H_
+
 #define PREFIX "ACPI: "
 
 int init_acpi_device_notify(void);
@@ -44,6 +47,12 @@ extern int acpi_power_nocheck;
 
 int acpi_wakeup_device_init(void);
 
+#ifdef CONFIG_X86
+void acpi_early_processor_osc(void);
+#else
+static inline void acpi_early_processor_osc(void) {}
+#endif
+
 /* --------------------------------------------------------------------------
                                   Embedded Controller
    -------------------------------------------------------------------------- */
@@ -61,3 +70,17 @@ int acpi_sleep_proc_init(void);
 #else
 static inline int acpi_sleep_proc_init(void) { return 0; }
 #endif
+
+/*--------------------------------------------------------------------------
+                                  Internal Dependencies
+  -------------------------------------------------------------------------- */
+extern int acpi_ipmi_loaded;
+
+/*--------------------------------------------------------------------------
+					Video
+  -------------------------------------------------------------------------- */
+#if defined(CONFIG_ACPI_VIDEO) || defined(CONFIG_ACPI_VIDEO_MODULE)
+bool acpi_osi_is_win8(void);
+#endif
+
+#endif /* _ACPI_INTERNAL_H_ */

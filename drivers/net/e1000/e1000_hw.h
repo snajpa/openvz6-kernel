@@ -35,12 +35,13 @@
 
 #include "e1000_osdep.h"
 
+
 /* Forward declarations of structures used by the shared code */
 struct e1000_hw;
 struct e1000_hw_stats;
 
 /* Enumerated types specific to the e1000 hardware */
-/* Media Access Controlers */
+/* Media Access Controllers */
 typedef enum {
 	e1000_undefined = 0,
 	e1000_82542_rev2_0,
@@ -51,6 +52,7 @@ typedef enum {
 	e1000_82545,
 	e1000_82545_rev_3,
 	e1000_82546,
+	e1000_ce4100,
 	e1000_82546_rev_3,
 	e1000_82541,
 	e1000_82541_rev_2,
@@ -208,9 +210,11 @@ typedef enum {
 } e1000_1000t_rx_status;
 
 typedef enum {
-    e1000_phy_m88 = 0,
-    e1000_phy_igp,
-    e1000_phy_undefined = 0xFF
+	e1000_phy_m88 = 0,
+	e1000_phy_igp,
+	e1000_phy_8211,
+	e1000_phy_8201,
+	e1000_phy_undefined = 0xFF
 } e1000_phy_type;
 
 typedef enum {
@@ -389,8 +393,6 @@ s32 e1000_blink_led_start(struct e1000_hw *hw);
 /* Everything else */
 void e1000_reset_adaptive(struct e1000_hw *hw);
 void e1000_update_adaptive(struct e1000_hw *hw);
-void e1000_tbi_adjust_stats(struct e1000_hw *hw, struct e1000_hw_stats *stats,
-			    u32 frame_len, u8 * mac_addr);
 void e1000_get_bus_info(struct e1000_hw *hw);
 void e1000_pci_set_mwi(struct e1000_hw *hw);
 void e1000_pci_clear_mwi(struct e1000_hw *hw);
@@ -441,9 +443,9 @@ void e1000_io_write(struct e1000_hw *hw, unsigned long port, u32 value);
 #define E1000_DEV_ID_82547EI             0x1019
 #define E1000_DEV_ID_82547EI_MOBILE      0x101A
 #define E1000_DEV_ID_82546GB_QUAD_COPPER_KSP3 0x10B5
+#define E1000_DEV_ID_INTEL_CE4100_GBE    0x2E6E
 
 #define NODE_ADDRESS_SIZE 6
-#define ETH_LENGTH_OF_ADDRESS 6
 
 /* MAC decode size is 128K - This is the size of BAR0 */
 #define MAC_DECODE_SIZE (128 * 1024)
@@ -807,6 +809,15 @@ struct e1000_ffvt_entry {
 #define E1000_CTRL_EXT 0x00018	/* Extended Device Control - RW */
 #define E1000_FLA      0x0001C	/* Flash Access - RW */
 #define E1000_MDIC     0x00020	/* MDI Control - RW */
+
+#define INTEL_CE_GBE_MDIO_RCOMP_BASE    (hw->ce4100_gbe_mdio_base_virt)
+#define E1000_MDIO_STS  (INTEL_CE_GBE_MDIO_RCOMP_BASE + 0)
+#define E1000_MDIO_CMD  (INTEL_CE_GBE_MDIO_RCOMP_BASE + 4)
+#define E1000_MDIO_DRV  (INTEL_CE_GBE_MDIO_RCOMP_BASE + 8)
+#define E1000_MDC_CMD   (INTEL_CE_GBE_MDIO_RCOMP_BASE + 0xC)
+#define E1000_RCOMP_CTL (INTEL_CE_GBE_MDIO_RCOMP_BASE + 0x20)
+#define E1000_RCOMP_STS (INTEL_CE_GBE_MDIO_RCOMP_BASE + 0x24)
+
 #define E1000_SCTL     0x00024	/* SerDes Control - RW */
 #define E1000_FEXTNVM  0x00028	/* Future Extended NVM register */
 #define E1000_FCAL     0x00028	/* Flow Control Address Low - RW */
@@ -819,6 +830,34 @@ struct e1000_ffvt_entry {
 #define E1000_IMS      0x000D0	/* Interrupt Mask Set - RW */
 #define E1000_IMC      0x000D8	/* Interrupt Mask Clear - WO */
 #define E1000_IAM      0x000E0	/* Interrupt Acknowledge Auto Mask */
+
+/* Auxiliary Control Register. This register is CE4100 specific,
+ * RMII/RGMII function is switched by this register - RW
+ * Following are bits definitions of the Auxiliary Control Register
+ */
+#define E1000_CTL_AUX  0x000E0
+#define E1000_CTL_AUX_END_SEL_SHIFT     10
+#define E1000_CTL_AUX_ENDIANESS_SHIFT   8
+#define E1000_CTL_AUX_RGMII_RMII_SHIFT  0
+
+/* descriptor and packet transfer use CTL_AUX.ENDIANESS */
+#define E1000_CTL_AUX_DES_PKT   (0x0 << E1000_CTL_AUX_END_SEL_SHIFT)
+/* descriptor use CTL_AUX.ENDIANESS, packet use default */
+#define E1000_CTL_AUX_DES       (0x1 << E1000_CTL_AUX_END_SEL_SHIFT)
+/* descriptor use default, packet use CTL_AUX.ENDIANESS */
+#define E1000_CTL_AUX_PKT       (0x2 << E1000_CTL_AUX_END_SEL_SHIFT)
+/* all use CTL_AUX.ENDIANESS */
+#define E1000_CTL_AUX_ALL       (0x3 << E1000_CTL_AUX_END_SEL_SHIFT)
+
+#define E1000_CTL_AUX_RGMII     (0x0 << E1000_CTL_AUX_RGMII_RMII_SHIFT)
+#define E1000_CTL_AUX_RMII      (0x1 << E1000_CTL_AUX_RGMII_RMII_SHIFT)
+
+/* LW little endian, Byte big endian */
+#define E1000_CTL_AUX_LWLE_BBE  (0x0 << E1000_CTL_AUX_ENDIANESS_SHIFT)
+#define E1000_CTL_AUX_LWLE_BLE  (0x1 << E1000_CTL_AUX_ENDIANESS_SHIFT)
+#define E1000_CTL_AUX_LWBE_BBE  (0x2 << E1000_CTL_AUX_ENDIANESS_SHIFT)
+#define E1000_CTL_AUX_LWBE_BLE  (0x3 << E1000_CTL_AUX_ENDIANESS_SHIFT)
+
 #define E1000_RCTL     0x00100	/* RX Control - RW */
 #define E1000_RDTR1    0x02820	/* RX Delay Timer (1) - RW */
 #define E1000_RDBAL1   0x02900	/* RX Descriptor Base Address Low (1) - RW */
@@ -854,6 +893,11 @@ struct e1000_ffvt_entry {
 #define E1000_FCRTL    0x02160	/* Flow Control Receive Threshold Low - RW */
 #define E1000_FCRTH    0x02168	/* Flow Control Receive Threshold High - RW */
 #define E1000_PSRCTL   0x02170	/* Packet Split Receive Control - RW */
+#define E1000_RDFH     0x02410  /* RX Data FIFO Head - RW */
+#define E1000_RDFT     0x02418  /* RX Data FIFO Tail - RW */
+#define E1000_RDFHS    0x02420  /* RX Data FIFO Head Saved - RW */
+#define E1000_RDFTS    0x02428  /* RX Data FIFO Tail Saved - RW */
+#define E1000_RDFPC    0x02430  /* RX Data FIFO Packet Count - RW */
 #define E1000_RDBAL    0x02800	/* RX Descriptor Base Address Low - RW */
 #define E1000_RDBAH    0x02804	/* RX Descriptor Base Address High - RW */
 #define E1000_RDLEN    0x02808	/* RX Descriptor Length - RW */
@@ -983,7 +1027,7 @@ struct e1000_ffvt_entry {
 
 #define E1000_KUMCTRLSTA 0x00034	/* MAC-PHY interface - RW */
 #define E1000_MDPHYA     0x0003C	/* PHY address - RW */
-#define E1000_MANC2H     0x05860	/* Managment Control To Host - RW */
+#define E1000_MANC2H     0x05860	/* Management Control To Host - RW */
 #define E1000_SW_FW_SYNC 0x05B5C	/* Software-Firmware Synchronization - RW */
 
 #define E1000_GCR       0x05B00	/* PCI-Ex Control */
@@ -1010,6 +1054,7 @@ struct e1000_ffvt_entry {
  * in more current versions of the 8254x. Despite the difference in location,
  * the registers function in the same manner.
  */
+#define E1000_82542_CTL_AUX  E1000_CTL_AUX
 #define E1000_82542_CTRL     E1000_CTRL
 #define E1000_82542_CTRL_DUP E1000_CTRL_DUP
 #define E1000_82542_STATUS   E1000_STATUS
@@ -1032,6 +1077,11 @@ struct e1000_ffvt_entry {
 #define E1000_82542_IMC      E1000_IMC
 #define E1000_82542_RCTL     E1000_RCTL
 #define E1000_82542_RDTR     0x00108
+#define E1000_82542_RDFH     E1000_RDFH
+#define E1000_82542_RDFT     E1000_RDFT
+#define E1000_82542_RDFHS    E1000_RDFHS
+#define E1000_82542_RDFTS    E1000_RDFTS
+#define E1000_82542_RDFPC    E1000_RDFPC
 #define E1000_82542_RDBAL    0x00110
 #define E1000_82542_RDBAH    0x00114
 #define E1000_82542_RDLEN    0x00118
@@ -1300,6 +1350,7 @@ struct e1000_hw_stats {
 struct e1000_hw {
 	u8 __iomem *hw_addr;
 	u8 __iomem *flash_address;
+	void __iomem *ce4100_gbe_mdio_base_virt;
 	e1000_mac_type mac_type;
 	e1000_phy_type phy_type;
 	u32 phy_init_script;
@@ -1569,6 +1620,11 @@ struct e1000_hw {
 #define E1000_MDIC_READY     0x10000000
 #define E1000_MDIC_INT_EN    0x20000000
 #define E1000_MDIC_ERROR     0x40000000
+
+#define INTEL_CE_GBE_MDIC_OP_WRITE      0x04000000
+#define INTEL_CE_GBE_MDIC_OP_READ       0x00000000
+#define INTEL_CE_GBE_MDIC_GO            0x80000000
+#define INTEL_CE_GBE_MDIC_READ_ERROR    0x80000000
 
 #define E1000_KUMCTRLSTA_MASK           0x0000FFFF
 #define E1000_KUMCTRLSTA_OFFSET         0x001F0000
@@ -2868,7 +2924,13 @@ struct e1000_host_command_info {
 #define M88E1000_14_PHY_ID M88E1000_E_PHY_ID
 #define M88E1011_I_REV_4   0x04
 #define M88E1111_I_PHY_ID  0x01410CC0
+#define M88E1118_E_PHY_ID  0x01410E40
 #define L1LXT971A_PHY_ID   0x001378E0
+
+#define RTL8211B_PHY_ID    0x001CC910
+#define RTL8201N_PHY_ID    0x8200
+#define RTL_PHY_CTRL_FD    0x0100 /* Full duplex.0=half; 1=full */
+#define RTL_PHY_CTRL_SPD_100    0x200000 /* Force 100Mb */
 
 /* Bits...
  * 15-5: page

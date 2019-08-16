@@ -91,6 +91,14 @@ struct x86_init_timers {
 };
 
 /**
+ * struct x86_init_iommu - platform specific iommu setup
+ * @iommu_init:			platform specific iommu setup
+ */
+struct x86_init_iommu {
+	int (*iommu_init)(void);
+};
+
+/**
  * struct x86_init_ops - functions for platform specific setup
  *
  */
@@ -101,14 +109,17 @@ struct x86_init_ops {
 	struct x86_init_oem		oem;
 	struct x86_init_paging		paging;
 	struct x86_init_timers		timers;
+	struct x86_init_iommu		iommu;
 };
 
 /**
  * struct x86_cpuinit_ops - platform specific cpu hotplug setups
  * @setup_percpu_clockev:	set up the per cpu clock event device
+ * @early_percpu_clock_init:	early init of the per cpu clock event device
  */
 struct x86_cpuinit_ops {
 	void (*setup_percpu_clockev)(void);
+	void (*early_percpu_clock_init)(void);
 };
 
 /**
@@ -116,11 +127,22 @@ struct x86_cpuinit_ops {
  * @calibrate_tsc:		calibrate TSC
  * @get_wallclock:		get time from HW clock like RTC etc.
  * @set_wallclock:		set time back to HW clock
+ * @is_untracked_pat_range	exclude from PAT logic
+ * @nmi_init			enable NMI on cpus
+ * @save_sched_clock_state:	save state for sched_clock() on suspend
+ * @restore_sched_clock_state:	restore state for sched_clock() on resume
+ *
  */
 struct x86_platform_ops {
 	unsigned long (*calibrate_tsc)(void);
 	unsigned long (*get_wallclock)(void);
 	int (*set_wallclock)(unsigned long nowtime);
+	void (*iommu_shutdown)(void);
+	bool (*is_untracked_pat_range)(u64 start, u64 end);
+	void (*nmi_init)(void);
+	unsigned char (*get_nmi_reason)(void);
+	void (*save_sched_clock_state)(void);
+	void (*restore_sched_clock_state)(void);
 };
 
 extern struct x86_init_ops x86_init;

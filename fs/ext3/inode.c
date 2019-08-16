@@ -38,6 +38,7 @@
 #include <linux/bio.h>
 #include <linux/fiemap.h>
 #include <linux/namei.h>
+#include <trace/events/ext3.h>
 #include "xattr.h"
 #include "acl.h"
 
@@ -70,6 +71,7 @@ int ext3_forget(handle_t *handle, int is_metadata, struct inode *inode,
 
 	might_sleep();
 
+	trace_ext3_forget(inode, is_metadata, blocknr);
 	BUFFER_TRACE(bh, "enter");
 
 	jbd_debug(4, "forgetting bh %p: is_metadata = %d, mode %o, "
@@ -201,6 +203,7 @@ void ext3_delete_inode (struct inode * inode)
 	if (is_bad_inode(inode))
 		goto no_delete;
 
+	trace_ext3_delete_inode(inode);
 	handle = start_transaction(inode);
 	if (IS_ERR(handle)) {
 		/*
@@ -629,6 +632,10 @@ static int ext3_alloc_branch(handle_t *handle, struct inode *inode,
 		 * parent to disk.
 		 */
 		bh = sb_getblk(inode->i_sb, new_blocks[n-1]);
+		if (unlikely(!bh)) {
+			err = -ENOMEM;
+			goto failed;
+		}
 		branch[n].bh = bh;
 		lock_buffer(bh);
 		BUFFER_TRACE(bh, "call get_create_access");
@@ -670,7 +677,7 @@ failed:
 		BUFFER_TRACE(branch[i].bh, "call journal_forget");
 		ext3_journal_forget(handle, branch[i].bh);
 	}
-	for (i = 0; i <indirect_blks; i++)
+	for (i = 0; i < indirect_blks; i++)
 		ext3_free_blocks(handle, inode, new_blocks[i], 1);
 
 	ext3_free_blocks(handle, inode, new_blocks[i], num);
@@ -700,6 +707,7 @@ static int ext3_splice_branch(handle_t *handle, struct inode *inode,
 	struct ext3_block_alloc_info *block_i;
 	ext3_fsblk_t current_block;
 	struct ext3_inode_info *ei = EXT3_I(inode);
+	struct timespec now;
 
 	block_i = ei->i_block_alloc_info;
 	/*
@@ -739,9 +747,11 @@ static int ext3_splice_branch(handle_t *handle, struct inode *inode,
 	}
 
 	/* We are done with atomic stuff, now do the rest of housekeeping */
-
-	inode->i_ctime = CURRENT_TIME_SEC;
-	ext3_mark_inode_dirty(handle, inode);
+	now = CURRENT_TIME_SEC;
+	if (!timespec_equal(&inode->i_ctime, &now) || !where->bh) {
+		inode->i_ctime = now;
+		ext3_mark_inode_dirty(handle, inode);
+	}
 	/* ext3_mark_inode_dirty already updated i_sync_tid */
 	atomic_set(&ei->i_datasync_tid, handle->h_transaction->t_tid);
 
@@ -817,6 +827,7 @@ int ext3_get_blocks_handle(handle_t *handle, struct inode *inode,
 	ext3_fsblk_t first_block = 0;
 
 
+	trace_ext3_get_blocks_enter(inode, iblock, maxblocks, create);
 	J_ASSERT(handle != NULL || create == 0);
 	depth = ext3_block_to_path(inode,iblock,offsets,&blocks_to_boundary);
 
@@ -945,6 +956,9 @@ cleanup:
 	}
 	BUFFER_TRACE(bh_result, "returned");
 out:
+	trace_ext3_get_blocks_exit(inode, iblock,
+				   depth ? le32_to_cpu(chain[depth-1].key) : 0,
+				   count, err);
 	return err;
 }
 
@@ -986,6 +1000,43 @@ static int ext3_get_block(struct inode *inode, sector_t iblock,
 	}
 	if (started)
 		ext3_journal_stop(handle);
+out:
+	return ret;
+}
+
+static int ext3_journalled_get_block(struct inode *inode, sector_t iblock,
+				     struct buffer_head *bh, int create)
+{
+	handle_t *handle = ext3_journal_current_handle();
+	int ret;
+
+	/* This function should ever be used only for real buffers */
+	BUG_ON(!bh->b_page);
+
+	ret = ext3_get_blocks_handle(handle, inode, iblock, 1, bh, create);
+	if (ret > 0) {
+		if (buffer_new(bh)) {
+			struct page *page = bh->b_page;
+
+			/*
+			 * This is a terrible hack to avoid block_prepare_write
+			 * marking our buffer as dirty
+			 */
+			if (PageUptodate(page)) {
+				ret = ext3_journal_get_write_access(handle, bh);
+				if (ret < 0)
+					goto out;
+				unmap_underlying_metadata(bh->b_bdev,
+							  bh->b_blocknr);
+				clear_buffer_new(bh);
+				set_buffer_uptodate(bh);
+				ret = ext3_journal_dirty_metadata(handle, bh);
+				if (ret < 0)
+					goto out;
+			}
+		}
+		ret = 0;
+	}
 out:
 	return ret;
 }
@@ -1151,6 +1202,16 @@ static int do_journal_get_write_access(handle_t *handle,
 	return ext3_journal_get_write_access(handle, bh);
 }
 
+/*
+ * Truncate blocks that were not used by write. We have to truncate the
+ * pagecache as well so that corresponding buffers get properly unmapped.
+ */
+static void ext3_truncate_failed_write(struct inode *inode)
+{
+	truncate_inode_pages(inode->i_mapping, inode->i_size);
+	ext3_truncate(inode);
+}
+
 static int ext3_write_begin(struct file *file, struct address_space *mapping,
 				loff_t pos, unsigned len, unsigned flags,
 				struct page **pagep, void **fsdata)
@@ -1165,6 +1226,8 @@ static int ext3_write_begin(struct file *file, struct address_space *mapping,
 	/* Reserve one block more for addition to orphan list in case
 	 * we allocate blocks but write fails for some reason */
 	int needed_blocks = ext3_writepage_trans_blocks(inode) + 1;
+
+	trace_ext3_write_begin(inode, pos, len, flags);
 
 	index = pos >> PAGE_CACHE_SHIFT;
 	from = pos & (PAGE_CACHE_SIZE - 1);
@@ -1183,15 +1246,18 @@ retry:
 		ret = PTR_ERR(handle);
 		goto out;
 	}
-	ret = block_write_begin(file, mapping, pos, len, flags, pagep, fsdata,
-							ext3_get_block);
-	if (ret)
-		goto write_begin_failed;
-
 	if (ext3_should_journal_data(inode)) {
-		ret = walk_page_buffers(handle, page_buffers(page),
-				from, to, NULL, do_journal_get_write_access);
+		ret = block_write_begin(file, mapping, pos, len, flags, pagep,
+					fsdata, ext3_journalled_get_block);
+		if (ret)
+			goto write_begin_failed;
+		ret = walk_page_buffers(handle, page_buffers(page), from, to,
+					NULL, do_journal_get_write_access);
+	} else {
+		ret = block_write_begin(file, mapping, pos, len, flags, pagep,
+					fsdata, ext3_get_block);
 	}
+
 write_begin_failed:
 	if (ret) {
 		/*
@@ -1209,7 +1275,7 @@ write_begin_failed:
 		unlock_page(page);
 		page_cache_release(page);
 		if (pos + len > inode->i_size)
-			ext3_truncate(inode);
+			ext3_truncate_failed_write(inode);
 	}
 	if (ret == -ENOSPC && ext3_should_retry_alloc(inode->i_sb, &retries))
 		goto retry;
@@ -1282,6 +1348,7 @@ static int ext3_ordered_write_end(struct file *file,
 	unsigned from, to;
 	int ret = 0, ret2;
 
+	trace_ext3_ordered_write_end(inode, pos, len, copied);
 	copied = block_write_end(file, mapping, pos, len, copied, page, fsdata);
 
 	from = pos & (PAGE_CACHE_SIZE - 1);
@@ -1304,7 +1371,7 @@ static int ext3_ordered_write_end(struct file *file,
 	page_cache_release(page);
 
 	if (pos + len > inode->i_size)
-		ext3_truncate(inode);
+		ext3_truncate_failed_write(inode);
 	return ret ? ret : copied;
 }
 
@@ -1317,6 +1384,7 @@ static int ext3_writeback_write_end(struct file *file,
 	struct inode *inode = file->f_mapping->host;
 	int ret;
 
+	trace_ext3_writeback_write_end(inode, pos, len, copied);
 	copied = block_write_end(file, mapping, pos, len, copied, page, fsdata);
 	update_file_sizes(inode, pos, copied);
 	/*
@@ -1330,7 +1398,7 @@ static int ext3_writeback_write_end(struct file *file,
 	page_cache_release(page);
 
 	if (pos + len > inode->i_size)
-		ext3_truncate(inode);
+		ext3_truncate_failed_write(inode);
 	return ret ? ret : copied;
 }
 
@@ -1345,6 +1413,7 @@ static int ext3_journalled_write_end(struct file *file,
 	int partial = 0;
 	unsigned from, to;
 
+	trace_ext3_journalled_write_end(inode, pos, len, copied);
 	from = pos & (PAGE_CACHE_SIZE - 1);
 	to = from + len;
 
@@ -1383,7 +1452,7 @@ static int ext3_journalled_write_end(struct file *file,
 	page_cache_release(page);
 
 	if (pos + len > inode->i_size)
-		ext3_truncate(inode);
+		ext3_truncate_failed_write(inode);
 	return ret ? ret : copied;
 }
 
@@ -1526,6 +1595,7 @@ static int ext3_ordered_writepage(struct page *page,
 	if (ext3_journal_current_handle())
 		goto out_fail;
 
+	trace_ext3_ordered_writepage(page);
 	if (!page_has_buffers(page)) {
 		create_empty_buffers(page, inode->i_sb->s_blocksize,
 				(1 << BH_Dirty)|(1 << BH_Uptodate));
@@ -1593,6 +1663,7 @@ static int ext3_writeback_writepage(struct page *page,
 	if (ext3_journal_current_handle())
 		goto out_fail;
 
+	trace_ext3_writeback_writepage(page);
 	if (page_has_buffers(page)) {
 		if (!walk_page_buffers(NULL, page_buffers(page), 0,
 				      PAGE_CACHE_SIZE, NULL, buffer_unmapped)) {
@@ -1635,6 +1706,7 @@ static int ext3_journalled_writepage(struct page *page,
 	if (ext3_journal_current_handle())
 		goto no_write;
 
+	trace_ext3_journalled_writepage(page);
 	handle = ext3_journal_start(inode, ext3_writepage_trans_blocks(inode));
 	if (IS_ERR(handle)) {
 		ret = PTR_ERR(handle);
@@ -1648,7 +1720,7 @@ static int ext3_journalled_writepage(struct page *page,
 		 */
 		ClearPageChecked(page);
 		ret = block_prepare_write(page, 0, PAGE_CACHE_SIZE,
-					ext3_get_block);
+					ext3_journalled_get_block);
 		if (ret != 0) {
 			ext3_journal_stop(handle);
 			goto out_unlock;
@@ -1685,6 +1757,7 @@ out_unlock:
 
 static int ext3_readpage(struct file *file, struct page *page)
 {
+	trace_ext3_readpage(page);
 	return mpage_readpage(page, ext3_get_block);
 }
 
@@ -1699,6 +1772,8 @@ static void ext3_invalidatepage(struct page *page, unsigned long offset)
 {
 	journal_t *journal = EXT3_JOURNAL(page->mapping->host);
 
+	trace_ext3_invalidatepage(page, offset);
+
 	/*
 	 * If it's a full truncate we just forget about the pending dirtying
 	 */
@@ -1712,6 +1787,7 @@ static int ext3_releasepage(struct page *page, gfp_t wait)
 {
 	journal_t *journal = EXT3_JOURNAL(page->mapping->host);
 
+	trace_ext3_releasepage(page);
 	WARN_ON(PageChecked(page));
 	if (!page_has_buffers(page))
 		return 0;
@@ -1739,6 +1815,8 @@ static ssize_t ext3_direct_IO(int rw, struct kiocb *iocb,
 	int orphan = 0;
 	size_t count = iov_length(iov, nr_segs);
 	int retries = 0;
+
+	trace_ext3_direct_IO_enter(inode, offset, iov_length(iov, nr_segs), rw);
 
 	if (rw == WRITE) {
 		loff_t final_size = offset + count;
@@ -1802,6 +1880,8 @@ retry:
 			ret = err;
 	}
 out:
+	trace_ext3_direct_IO_exit(inode, offset,
+				iov_length(iov, nr_segs), rw, ret);
 	return ret;
 }
 
@@ -2263,27 +2343,6 @@ static void ext3_free_branches(handle_t *handle, struct inode *inode,
 					   depth);
 
 			/*
-			 * We've probably journalled the indirect block several
-			 * times during the truncate.  But it's no longer
-			 * needed and we now drop it from the transaction via
-			 * journal_revoke().
-			 *
-			 * That's easy if it's exclusively part of this
-			 * transaction.  But if it's part of the committing
-			 * transaction then journal_forget() will simply
-			 * brelse() it.  That means that if the underlying
-			 * block is reallocated in ext3_get_block(),
-			 * unmap_underlying_metadata() will find this block
-			 * and will try to get rid of it.  damn, damn.
-			 *
-			 * If this block has already been committed to the
-			 * journal, a revoke record will be written.  And
-			 * revoke records must be emitted *before* clearing
-			 * this block's bit in the bitmaps.
-			 */
-			ext3_forget(handle, 1, inode, bh, bh->b_blocknr);
-
-			/*
 			 * Everything below this this pointer has been
 			 * released.  Now let this top-of-subtree go.
 			 *
@@ -2305,6 +2364,31 @@ static void ext3_free_branches(handle_t *handle, struct inode *inode,
 				ext3_mark_inode_dirty(handle, inode);
 				truncate_restart_transaction(handle, inode);
 			}
+
+			/*
+			 * We've probably journalled the indirect block several
+			 * times during the truncate.  But it's no longer
+			 * needed and we now drop it from the transaction via
+			 * journal_revoke().
+			 *
+			 * That's easy if it's exclusively part of this
+			 * transaction.  But if it's part of the committing
+			 * transaction then journal_forget() will simply
+			 * brelse() it.  That means that if the underlying
+			 * block is reallocated in ext3_get_block(),
+			 * unmap_underlying_metadata() will find this block
+			 * and will try to get rid of it.  damn, damn. Thus
+			 * we don't allow a block to be reallocated until
+			 * a transaction freeing it has fully committed.
+			 *
+			 * We also have to make sure journal replay after a
+			 * crash does not overwrite non-journaled data blocks
+			 * with old metadata when the block got reallocated for
+			 * data.  Thus we have to store a revoke record for a
+			 * block in the same transaction in which we free the
+			 * block.
+			 */
+			ext3_forget(handle, 1, inode, bh, bh->b_blocknr);
 
 			ext3_free_blocks(handle, inode, nr, 1);
 
@@ -2387,6 +2471,8 @@ void ext3_truncate(struct inode *inode)
 	long last_block;
 	unsigned blocksize = inode->i_sb->s_blocksize;
 	struct page *page;
+
+	trace_ext3_truncate_enter(inode);
 
 	if (!ext3_can_truncate(inode))
 		goto out_notrans;
@@ -2540,6 +2626,7 @@ out_stop:
 		ext3_orphan_del(handle, inode);
 
 	ext3_journal_stop(handle);
+	trace_ext3_truncate_exit(inode);
 	return;
 out_notrans:
 	/*
@@ -2548,6 +2635,7 @@ out_notrans:
 	 */
 	if (inode->i_nlink)
 		ext3_orphan_del(NULL, inode);
+	trace_ext3_truncate_exit(inode);
 }
 
 static ext3_fsblk_t ext3_get_inode_block(struct super_block *sb,
@@ -2689,6 +2777,7 @@ make_io:
 		 * has in-inode xattrs, or we don't have this inode in memory.
 		 * Read the block from disk.
 		 */
+		trace_ext3_load_inode(inode);
 		get_bh(bh);
 		bh->b_end_io = end_buffer_read_sync;
 		submit_bh(READ_META, bh);
@@ -2938,6 +3027,8 @@ static int ext3_do_update_inode(handle_t *handle,
 	struct ext3_inode_info *ei = EXT3_I(inode);
 	struct buffer_head *bh = iloc->bh;
 	int err = 0, rc, block;
+	int need_datasync = 0;
+	__le32 disksize;
 
 again:
 	/* we can't allow multiple procs in here at once, its a bit racey */
@@ -2975,7 +3066,11 @@ again:
 		raw_inode->i_gid_high = 0;
 	}
 	raw_inode->i_links_count = cpu_to_le16(inode->i_nlink);
-	raw_inode->i_size = cpu_to_le32(ei->i_disksize);
+	disksize = cpu_to_le32(ei->i_disksize);
+	if (disksize != raw_inode->i_size) {
+		need_datasync = 1;
+		raw_inode->i_size = disksize;
+	}
 	raw_inode->i_atime = cpu_to_le32(inode->i_atime.tv_sec);
 	raw_inode->i_ctime = cpu_to_le32(inode->i_ctime.tv_sec);
 	raw_inode->i_mtime = cpu_to_le32(inode->i_mtime.tv_sec);
@@ -2991,8 +3086,11 @@ again:
 	if (!S_ISREG(inode->i_mode)) {
 		raw_inode->i_dir_acl = cpu_to_le32(ei->i_dir_acl);
 	} else {
-		raw_inode->i_size_high =
-			cpu_to_le32(ei->i_disksize >> 32);
+		disksize = cpu_to_le32(ei->i_disksize >> 32);
+		if (disksize != raw_inode->i_size_high) {
+			raw_inode->i_size_high = disksize;
+			need_datasync = 1;
+		}
 		if (ei->i_disksize > 0x7fffffffULL) {
 			struct super_block *sb = inode->i_sb;
 			if (!EXT3_HAS_RO_COMPAT_FEATURE(sb,
@@ -3045,6 +3143,8 @@ again:
 	ei->i_state &= ~EXT3_STATE_NEW;
 
 	atomic_set(&ei->i_sync_tid, handle->h_transaction->t_tid);
+	if (need_datasync)
+		atomic_set(&ei->i_datasync_tid, handle->h_transaction->t_tid);
 out_brelse:
 	brelse (bh);
 	ext3_std_error(inode->i_sb, err);
@@ -3086,7 +3186,7 @@ out_brelse:
  * `stuff()' is running, and the new i_size will be lost.  Plus the inode
  * will no longer be on the superblock's dirty inode list.
  */
-int ext3_write_inode(struct inode *inode, int wait)
+int ext3_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
 	if (current->flags & PF_MEMALLOC)
 		return 0;
@@ -3097,7 +3197,7 @@ int ext3_write_inode(struct inode *inode, int wait)
 		return -EIO;
 	}
 
-	if (!wait)
+	if (wbc->sync_mode != WB_SYNC_ALL)
 		return 0;
 
 	return ext3_force_commit(inode->i_sb);
@@ -3305,6 +3405,7 @@ int ext3_mark_inode_dirty(handle_t *handle, struct inode *inode)
 	int err;
 
 	might_sleep();
+	trace_ext3_mark_inode_dirty(inode, _RET_IP_);
 	err = ext3_reserve_inode_write(handle, inode, &iloc);
 	if (!err)
 		err = ext3_mark_iloc_dirty(handle, inode, &iloc);

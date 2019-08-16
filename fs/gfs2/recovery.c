@@ -337,7 +337,7 @@ static int foreach_descriptor(struct gfs2_jdesc *jd, unsigned int start,
 			struct gfs2_log_header_host lh;
 			error = get_log_header(jd, start, &lh);
 			if (!error) {
-				gfs2_replay_incr_blk(sdp, &start);
+				gfs2_replay_incr_blk(jd, &start);
 				brelse(bh);
 				continue;
 			}
@@ -359,7 +359,7 @@ static int foreach_descriptor(struct gfs2_jdesc *jd, unsigned int start,
 		}
 
 		while (length--)
-			gfs2_replay_incr_blk(sdp, &start);
+			gfs2_replay_incr_blk(jd, &start);
 
 		brelse(bh);
 	}
@@ -389,7 +389,7 @@ static int clean_journal(struct gfs2_jdesc *jd, struct gfs2_log_header_host *hea
 	struct buffer_head bh_map = { .b_state = 0, .b_blocknr = 0 };
 
 	lblock = head->lh_blkno;
-	gfs2_replay_incr_blk(sdp, &lblock);
+	gfs2_replay_incr_blk(jd, &lblock);
 	bh_map.b_size = 1 << ip->i_inode.i_blkbits;
 	error = gfs2_block_map(&ip->i_inode, lblock, &bh_map, 0);
 	if (error)
@@ -410,7 +410,9 @@ static int clean_journal(struct gfs2_jdesc *jd, struct gfs2_log_header_host *hea
 	memset(lh, 0, sizeof(struct gfs2_log_header));
 	lh->lh_header.mh_magic = cpu_to_be32(GFS2_MAGIC);
 	lh->lh_header.mh_type = cpu_to_be32(GFS2_METATYPE_LH);
+	lh->lh_header.__pad0 = cpu_to_be64(0);
 	lh->lh_header.mh_format = cpu_to_be32(GFS2_FORMAT_LH);
+	lh->lh_header.mh_jid = cpu_to_be32(sdp->sd_jdesc->jd_jid);
 	lh->lh_sequence = cpu_to_be64(head->lh_sequence + 1);
 	lh->lh_flags = cpu_to_be32(GFS2_LOG_HEAD_UNMOUNT);
 	lh->lh_blkno = cpu_to_be32(lblock);
@@ -467,14 +469,14 @@ static void gfs2_recover_work(struct slow_work *work)
 	unsigned long t;
 	int ro = 0;
 	unsigned int pass;
-	int error;
+	int error, retries = 3;
 
 	if (jd->jd_jid != sdp->sd_lockstruct.ls_jid) {
 		fs_info(sdp, "jid=%u: Trying to acquire journal lock...\n",
 			jd->jd_jid);
 
 		/* Acquire the journal lock so we can do recovery */
-
+retry:
 		error = gfs2_glock_nq_num(sdp, jd->jd_jid, &gfs2_journal_glops,
 					  LM_ST_EXCLUSIVE,
 					  LM_FLAG_NOEXP | LM_FLAG_TRY | GL_NOCACHE,
@@ -484,7 +486,14 @@ static void gfs2_recover_work(struct slow_work *work)
 			break;
 
 		case GLR_TRYFAILED:
-			fs_info(sdp, "jid=%u: Busy\n", jd->jd_jid);
+			if (retries > 0) {
+				retries--;
+				fs_info(sdp, "jid=%u: Busy, retrying...\n",
+					jd->jd_jid);
+				msleep(1000);
+				goto retry;
+			}
+			fs_info(sdp, "jid=%u: Busy, gave up.\n", jd->jd_jid);
 			error = 0;
 
 		default:

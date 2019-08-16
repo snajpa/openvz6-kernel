@@ -18,6 +18,8 @@
 #include <linux/capability.h>
 #include <linux/quotaops.h>
 #include <linux/types.h>
+#include <net/netlink.h>
+#include <net/genetlink.h>
 
 /* Check validity of generic quotactl commands */
 static int generic_quotactl_valid(struct super_block *sb, int type, int cmd,
@@ -240,12 +242,12 @@ static int do_quotactl(struct super_block *sb, int type, int cmd, qid_t id,
 
 	switch (cmd) {
 		case Q_QUOTAON: {
-			char *pathname;
+			struct filename *pathname;
 
 			pathname = getname(addr);
 			if (IS_ERR(pathname))
 				return PTR_ERR(pathname);
-			ret = sb->s_qcop->quota_on(sb, type, id, pathname, 0);
+			ret = sb->s_qcop->quota_on(sb, type, id, (char *)pathname->name, 0);
 			putname(pathname);
 			return ret;
 		}
@@ -351,24 +353,42 @@ static int do_quotactl(struct super_block *sb, int type, int cmd, qid_t id,
 	return 0;
 }
 
+/* Return 1 if 'cmd' will block on frozen filesystem */
+static int quotactl_cmd_write(int cmd)
+{
+	switch (cmd) {
+	case Q_GETFMT:
+	case Q_GETINFO:
+	case Q_SYNC:
+	case Q_XGETQSTAT:
+	case Q_XGETQUOTA:
+	case Q_XQUOTASYNC:
+		return 0;
+	}
+	return 1;
+}
+
 /*
  * look up a superblock on which quota ops will be performed
  * - use the name of a block device to find the superblock thereon
  */
-static struct super_block *quotactl_block(const char __user *special)
+static struct super_block *quotactl_block(const char __user *special, int cmd)
 {
 #ifdef CONFIG_BLOCK
 	struct block_device *bdev;
 	struct super_block *sb;
-	char *tmp = getname(special);
+	struct filename *tmp = getname(special);
 
 	if (IS_ERR(tmp))
 		return ERR_CAST(tmp);
-	bdev = lookup_bdev(tmp);
+	bdev = lookup_bdev(tmp->name);
 	putname(tmp);
 	if (IS_ERR(bdev))
 		return ERR_CAST(bdev);
-	sb = get_super(bdev);
+	if (quotactl_cmd_write(cmd))
+		sb = get_super_thawed(bdev);
+	else
+		sb = get_super(bdev);
 	bdput(bdev);
 	if (!sb)
 		return ERR_PTR(-ENODEV);
@@ -396,7 +416,7 @@ SYSCALL_DEFINE4(quotactl, unsigned int, cmd, const char __user *, special,
 	type = cmd & SUBCMDMASK;
 
 	if (cmds != Q_SYNC || special) {
-		sb = quotactl_block(special);
+		sb = quotactl_block(special, cmds);
 		if (IS_ERR(sb))
 			return PTR_ERR(sb);
 	}
@@ -525,3 +545,94 @@ asmlinkage long sys32_quotactl(unsigned int cmd, const char __user *special,
 	return ret;
 }
 #endif
+
+
+#ifdef CONFIG_QUOTA_NETLINK_INTERFACE
+
+/* Netlink family structure for quota */
+static struct genl_family quota_genl_family = {
+	.id = GENL_ID_GENERATE,
+	.hdrsize = 0,
+	.name = "VFS_DQUOT",
+	.version = 1,
+	.maxattr = QUOTA_NL_A_MAX,
+};
+
+/**
+ * quota_send_warning - Send warning to userspace about exceeded quota
+ * @type: The quota type: USRQQUOTA, GRPQUOTA,...
+ * @id: The user or group id of the quota that was exceeded
+ * @dev: The device on which the fs is mounted (sb->s_dev)
+ * @warntype: The type of the warning: QUOTA_NL_...
+ *
+ * This can be used by filesystems (including those which don't use
+ * dquot) to send a message to userspace relating to quota limits.
+ *
+ */
+
+void quota_send_warning(short type, unsigned int id, dev_t dev,
+			const char warntype)
+{
+	static atomic_t seq;
+	struct sk_buff *skb;
+	void *msg_head;
+	int ret;
+	int msg_size = 4 * nla_total_size(sizeof(u32)) +
+		       2 * nla_total_size(sizeof(u64));
+
+	/* We have to allocate using GFP_NOFS as we are called from a
+	 * filesystem performing write and thus further recursion into
+	 * the fs to free some data could cause deadlocks. */
+	skb = genlmsg_new(msg_size, GFP_NOFS);
+	if (!skb) {
+		printk(KERN_ERR
+		  "VFS: Not enough memory to send quota warning.\n");
+		return;
+	}
+	msg_head = genlmsg_put(skb, 0, atomic_add_return(1, &seq),
+			&quota_genl_family, 0, QUOTA_NL_C_WARNING);
+	if (!msg_head) {
+		printk(KERN_ERR
+		  "VFS: Cannot store netlink header in quota warning.\n");
+		goto err_out;
+	}
+	ret = nla_put_u32(skb, QUOTA_NL_A_QTYPE, type);
+	if (ret)
+		goto attr_err_out;
+	ret = nla_put_u64(skb, QUOTA_NL_A_EXCESS_ID, id);
+	if (ret)
+		goto attr_err_out;
+	ret = nla_put_u32(skb, QUOTA_NL_A_WARNING, warntype);
+	if (ret)
+		goto attr_err_out;
+	ret = nla_put_u32(skb, QUOTA_NL_A_DEV_MAJOR, MAJOR(dev));
+	if (ret)
+		goto attr_err_out;
+	ret = nla_put_u32(skb, QUOTA_NL_A_DEV_MINOR, MINOR(dev));
+	if (ret)
+		goto attr_err_out;
+	ret = nla_put_u64(skb, QUOTA_NL_A_CAUSED_ID, current_uid());
+	if (ret)
+		goto attr_err_out;
+	genlmsg_end(skb, msg_head);
+
+	genlmsg_multicast(skb, 0, quota_genl_family.id, GFP_NOFS);
+	return;
+attr_err_out:
+	printk(KERN_ERR "VFS: Not enough space to compose quota message!\n");
+err_out:
+	kfree_skb(skb);
+}
+EXPORT_SYMBOL(quota_send_warning);
+
+static int __init quota_init(void)
+{
+	if (genl_register_family(&quota_genl_family) != 0)
+		printk(KERN_ERR
+		       "VFS: Failed to create quota netlink interface.\n");
+	return 0;
+};
+
+module_init(quota_init);
+#endif
+

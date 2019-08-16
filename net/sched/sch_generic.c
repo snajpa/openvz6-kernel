@@ -26,6 +26,10 @@
 #include <linux/list.h>
 #include <net/pkt_sched.h>
 
+/* Qdisc to use by default */
+struct Qdisc_ops *default_qdisc_ops = &pfifo_fast_ops;
+EXPORT_SYMBOL(default_qdisc_ops);
+
 /* Main transmission queue. */
 
 /* Modifications to data participating in scheduling must be protected with
@@ -330,6 +334,24 @@ void netif_carrier_off(struct net_device *dev)
 }
 EXPORT_SYMBOL(netif_carrier_off);
 
+/**
+ * 	netif_notify_peers - notify network peers about existence of @dev
+ * 	@dev: network device
+ *
+ * Generate traffic such that interested network peers are aware of
+ * @dev, such as by generating a gratuitous ARP. This may be used when
+ * a device wants to inform the rest of the network about some sort of
+ * reconfiguration such as a failover event or virtual machine
+ * migration.
+ */
+void netif_notify_peers(struct net_device *dev)
+{
+	rtnl_lock();
+	call_netdevice_notifiers(NETDEV_NOTIFY_PEERS, dev);
+	rtnl_unlock();
+}
+EXPORT_SYMBOL(netif_notify_peers);
+
 /* "NOOP" scheduler: the best scheduler, recommended for all interfaces
    under all circumstances. It is difficult to invent anything faster or
    cheaper.
@@ -565,6 +587,9 @@ struct Qdisc * qdisc_create_dflt(struct net_device *dev,
 {
 	struct Qdisc *sch;
 
+	if (!try_module_get(ops->owner))
+		goto errout;
+
 	sch = qdisc_alloc(dev_queue, ops);
 	if (IS_ERR(sch))
 		goto errout;
@@ -647,6 +672,7 @@ struct Qdisc *dev_graft_qdisc(struct netdev_queue *dev_queue,
 
 	return oqdisc;
 }
+EXPORT_SYMBOL(dev_graft_qdisc);
 
 static void attach_one_default_qdisc(struct net_device *dev,
 				     struct netdev_queue *dev_queue,
@@ -656,7 +682,7 @@ static void attach_one_default_qdisc(struct net_device *dev,
 
 	if (dev->tx_queue_len) {
 		qdisc = qdisc_create_dflt(dev, dev_queue,
-					  &pfifo_fast_ops, TC_H_ROOT);
+					  default_qdisc_ops, TC_H_ROOT);
 		if (!qdisc) {
 			printk(KERN_INFO "%s: activation failed\n", dev->name);
 			return;
@@ -684,8 +710,8 @@ static void attach_default_qdiscs(struct net_device *dev)
 	} else {
 		qdisc = qdisc_create_dflt(dev, txq, &mq_qdisc_ops, TC_H_ROOT);
 		if (qdisc) {
-			qdisc->ops->attach(qdisc);
 			dev->qdisc = qdisc;
+			qdisc->ops->attach(qdisc);
 		}
 	}
 }
@@ -712,9 +738,8 @@ void dev_activate(struct net_device *dev)
 	int need_watchdog;
 
 	/* No queueing discipline is attached to device;
-	   create default one i.e. pfifo_fast for devices,
-	   which need queueing and noqueue_qdisc for
-	   virtual interfaces
+	 * create default one for devices, which need queueing
+	 * and noqueue_qdisc for virtual interfaces
 	 */
 
 	if (dev->qdisc == &noop_qdisc)
@@ -733,6 +758,7 @@ void dev_activate(struct net_device *dev)
 		dev_watchdog_up(dev);
 	}
 }
+EXPORT_SYMBOL(dev_activate);
 
 static void dev_deactivate_queue(struct net_device *dev,
 				 struct netdev_queue *dev_queue,
@@ -782,20 +808,37 @@ static bool some_qdisc_is_busy(struct net_device *dev)
 	return false;
 }
 
-void dev_deactivate(struct net_device *dev)
+void dev_deactivate_many(struct list_head *head)
 {
-	netdev_for_each_tx_queue(dev, dev_deactivate_queue, &noop_qdisc);
-	dev_deactivate_queue(dev, &dev->rx_queue, &noop_qdisc);
+	struct net_device *dev;
+	struct net_device_extended *nde;
 
-	dev_watchdog_down(dev);
+	list_for_each_entry(nde, head, unreg_list) {
+		dev = nde->dev;
+		netdev_for_each_tx_queue(dev, dev_deactivate_queue,
+					 &noop_qdisc);
+		dev_deactivate_queue(dev, &dev->rx_queue, &noop_qdisc);
+		dev_watchdog_down(dev);
+	}
 
 	/* Wait for outstanding qdisc-less dev_queue_xmit calls. */
 	synchronize_rcu();
 
 	/* Wait for outstanding qdisc_run calls. */
-	while (some_qdisc_is_busy(dev))
-		yield();
+	list_for_each_entry(nde, head, unreg_list)
+		while (some_qdisc_is_busy(nde->dev))
+			yield();
 }
+
+void dev_deactivate(struct net_device *dev)
+{
+	LIST_HEAD(single);
+
+	list_add(&netdev_extended(dev)->unreg_list, &single);
+	dev_deactivate_many(&single);
+	list_del(&single);
+}
+EXPORT_SYMBOL(dev_deactivate);
 
 static void dev_init_scheduler_queue(struct net_device *dev,
 				     struct netdev_queue *dev_queue,

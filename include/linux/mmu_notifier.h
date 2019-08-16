@@ -4,6 +4,7 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/mm_types.h>
+#include <linux/srcu.h>
 
 struct mmu_notifier;
 struct mmu_notifier_ops;
@@ -19,6 +20,8 @@ struct mmu_notifier_ops;
 struct mmu_notifier_mm {
 	/* all mmu notifiers registerd in this mm are queued in this list */
 	struct hlist_head list;
+	/* srcu structure for this mm */
+	struct srcu_struct srcu;
 	/* to serialize the list modifications and hlist_unhashed */
 	spinlock_t lock;
 };
@@ -60,6 +63,16 @@ struct mmu_notifier_ops {
 	int (*clear_flush_young)(struct mmu_notifier *mn,
 				 struct mm_struct *mm,
 				 unsigned long address);
+
+	/*
+	 * test_young is called to check the young/accessed bitflag in
+	 * the secondary pte. This is used to know if the page is
+	 * frequently used without actually clearing the flag or tearing
+	 * down the secondary mapping on the page.
+	 */
+	int (*test_young)(struct mmu_notifier *mn,
+			  struct mm_struct *mm,
+			  unsigned long address);
 
 	/*
 	 * change_pte is called in cases that pte mapping to page is changed:
@@ -243,6 +256,32 @@ static inline void mmu_notifier_mm_destroy(struct mm_struct *mm)
 	__pte;								\
 })
 
+#define pmdp_clear_flush_notify(__vma, __address, __pmdp)		\
+({									\
+	pmd_t __pmd;							\
+	struct vm_area_struct *___vma = __vma;				\
+	unsigned long ___address = __address;				\
+	VM_BUG_ON(__address & ~HPAGE_PMD_MASK);				\
+	mmu_notifier_invalidate_range_start(___vma->vm_mm, ___address,	\
+					    (__address)+HPAGE_PMD_SIZE);\
+	__pmd = pmdp_clear_flush(___vma, ___address, __pmdp);		\
+	mmu_notifier_invalidate_range_end(___vma->vm_mm, ___address,	\
+					  (__address)+HPAGE_PMD_SIZE);	\
+	__pmd;								\
+})
+
+#define pmdp_splitting_flush_notify(__vma, __address, __pmdp)		\
+({									\
+	struct vm_area_struct *___vma = __vma;				\
+	unsigned long ___address = __address;				\
+	VM_BUG_ON(__address & ~HPAGE_PMD_MASK);				\
+	mmu_notifier_invalidate_range_start(___vma->vm_mm, ___address,	\
+					    (__address)+HPAGE_PMD_SIZE);\
+	pmdp_splitting_flush(___vma, ___address, __pmdp);		\
+	mmu_notifier_invalidate_range_end(___vma->vm_mm, ___address,	\
+					  (__address)+HPAGE_PMD_SIZE);	\
+})
+
 #define ptep_clear_flush_young_notify(__vma, __address, __ptep)		\
 ({									\
 	int __young;							\
@@ -254,14 +293,35 @@ static inline void mmu_notifier_mm_destroy(struct mm_struct *mm)
 	__young;							\
 })
 
+#define pmdp_clear_flush_young_notify(__vma, __address, __pmdp)		\
+({									\
+	int __young;							\
+	struct vm_area_struct *___vma = __vma;				\
+	unsigned long ___address = __address;				\
+	__young = pmdp_clear_flush_young(___vma, ___address, __pmdp);	\
+	__young |= mmu_notifier_clear_flush_young(___vma->vm_mm,	\
+						  ___address);		\
+	__young;							\
+})
+
+/*
+ * set_pte_at_notify() sets the pte _after_ running the notifier.
+ * This is safe to start by updating the secondary MMUs, because the primary MMU
+ * pte invalidate must have already happened with a ptep_clear_flush() before
+ * set_pte_at_notify() has been invoked.  Updating the secondary MMUs first is
+ * required when we change both the protection of the mapping from read-only to
+ * read-write and the pfn (like during copy on write page faults). Otherwise the
+ * old page would remain mapped readonly in the secondary MMUs after the new
+ * page is already writable by some CPU through the primary MMU.
+ */
 #define set_pte_at_notify(__mm, __address, __ptep, __pte)		\
 ({									\
 	struct mm_struct *___mm = __mm;					\
 	unsigned long ___address = __address;				\
 	pte_t ___pte = __pte;						\
 									\
-	set_pte_at(___mm, ___address, __ptep, ___pte);			\
 	mmu_notifier_change_pte(___mm, ___address, ___pte);		\
+	set_pte_at(___mm, ___address, __ptep, ___pte);			\
 })
 
 #else /* CONFIG_MMU_NOTIFIER */
@@ -305,7 +365,10 @@ static inline void mmu_notifier_mm_destroy(struct mm_struct *mm)
 }
 
 #define ptep_clear_flush_young_notify ptep_clear_flush_young
+#define pmdp_clear_flush_young_notify pmdp_clear_flush_young
 #define ptep_clear_flush_notify ptep_clear_flush
+#define pmdp_clear_flush_notify pmdp_clear_flush
+#define pmdp_splitting_flush_notify pmdp_splitting_flush
 #define set_pte_at_notify set_pte_at
 
 #endif /* CONFIG_MMU_NOTIFIER */

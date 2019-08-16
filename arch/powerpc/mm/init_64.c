@@ -77,7 +77,9 @@
 #endif /* CONFIG_PPC_STD_MMU_64 */
 
 phys_addr_t memstart_addr = ~0;
+EXPORT_SYMBOL_GPL(memstart_addr);
 phys_addr_t kernstart_addr;
+EXPORT_SYMBOL_GPL(kernstart_addr);
 
 void free_initmem(void)
 {
@@ -217,19 +219,55 @@ static void __meminit vmemmap_create_mapping(unsigned long start,
 }
 #endif /* CONFIG_PPC_BOOK3E */
 
-int __meminit vmemmap_populate(struct page *start_page,
-			       unsigned long nr_pages, int node)
+struct vmemmap_backing *vmemmap_list;
+
+static __meminit struct vmemmap_backing * vmemmap_list_alloc(int node)
 {
-	unsigned long start = (unsigned long)start_page;
-	unsigned long end = (unsigned long)(start_page + nr_pages);
+	static struct vmemmap_backing *next;
+	static int num_left;
+
+	/* allocate a page when required and hand out chunks */
+	if (!next || !num_left) {
+		next = vmemmap_alloc_block(PAGE_SIZE, node);
+		if (unlikely(!next)) {
+			WARN_ON(1);
+			return NULL;
+		}
+		num_left = PAGE_SIZE / sizeof(struct vmemmap_backing);
+	}
+
+	num_left--;
+
+	return next++;
+}
+
+static __meminit void vmemmap_list_populate(unsigned long phys,
+					    unsigned long start,
+					    int node)
+{
+	struct vmemmap_backing *vmem_back;
+
+	vmem_back = vmemmap_list_alloc(node);
+	if (unlikely(!vmem_back)) {
+		WARN_ON(1);
+		return;
+	}
+
+	vmem_back->phys = phys;
+	vmem_back->virt_addr = start;
+	vmem_back->list = vmemmap_list;
+
+	vmemmap_list = vmem_back;
+}
+
+int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
+{
 	unsigned long page_size = 1 << mmu_psize_defs[mmu_vmemmap_psize].shift;
 
 	/* Align to the page size of the linear mapping. */
 	start = _ALIGN_DOWN(start, page_size);
 
-	pr_debug("vmemmap_populate page %p, %ld pages, node %d\n",
-		 start_page, nr_pages, node);
-	pr_debug(" -> map %lx..%lx\n", start, end);
+	pr_debug("vmemmap_populate %lx..%lx, node %d\n", start, end, node);
 
 	for (; start < end; start += page_size) {
 		void *p;
@@ -240,6 +278,8 @@ int __meminit vmemmap_populate(struct page *start_page,
 		p = vmemmap_alloc_block(page_size, node);
 		if (!p)
 			return -ENOMEM;
+
+		vmemmap_list_populate(__pa(p), start, node);
 
 		pr_debug("      * %016lx..%016lx allocated at %p\n",
 			 start, start + page_size, p);

@@ -4,14 +4,58 @@
 #include <asm/hvcall.h>
 #include <asm/page.h>
 
+/* Get state of physical CPU from query_cpu_stopped */
+int smp_query_cpu_stopped(unsigned int pcpu);
+#define QCSS_STOPPED 0
+#define QCSS_STOPPING 1
+#define QCSS_NOT_STOPPED 2
+#define QCSS_HARDWARE_ERROR -1
+#define QCSS_HARDWARE_BUSY -2
+
+static inline long plpar_get_cpu_characteristics(struct h_cpu_char_result *p)
+{
+	unsigned long retbuf[PLPAR_HCALL_BUFSIZE];
+	long rc;
+
+	rc = plpar_hcall(H_GET_CPU_CHARACTERISTICS, retbuf);
+	if (rc == H_SUCCESS) {
+		p->character = retbuf[0];
+		p->behaviour = retbuf[1];
+	}
+
+	return rc;
+}
+
 static inline long poll_pending(void)
 {
 	return plpar_hcall_norets(H_POLL_PENDING);
 }
 
+static inline u8 get_cede_latency_hint(void)
+{
+	return get_lppaca()->gpr5_dword.fields.cede_latency_hint;
+}
+
+static inline void set_cede_latency_hint(u8 latency_hint)
+{
+	get_lppaca()->gpr5_dword.fields.cede_latency_hint = latency_hint;
+}
+
 static inline long cede_processor(void)
 {
 	return plpar_hcall_norets(H_CEDE);
+}
+
+static inline long extended_cede_processor(unsigned long latency_hint)
+{
+	long rc;
+	u8 old_latency_hint = get_cede_latency_hint();
+
+	set_cede_latency_hint(latency_hint);
+	rc = cede_processor();
+	set_cede_latency_hint(old_latency_hint);
+
+	return rc;
 }
 
 static inline long vpa_call(unsigned long flags, unsigned long cpu,
@@ -43,9 +87,9 @@ static inline long register_slb_shadow(unsigned long cpu, unsigned long vpa)
 	return vpa_call(0x3, cpu, vpa);
 }
 
-static inline long unregister_dtl(unsigned long cpu, unsigned long vpa)
+static inline long unregister_dtl(unsigned long cpu)
 {
-	return vpa_call(0x6, cpu, vpa);
+	return vpa_call(0x6, cpu, 0);
 }
 
 static inline long register_dtl(unsigned long cpu, unsigned long vpa)
@@ -248,5 +292,11 @@ static inline long plpar_xirr(unsigned long *xirr_ret)
 
 	return rc;
 }
+
+#ifdef CONFIG_SUSPEND
+int pseries_suspend_cpu(void);
+#else
+static inline int pseries_suspend_cpu(void) {return 0;}
+#endif
 
 #endif /* _PSERIES_PLPAR_WRAPPERS_H */

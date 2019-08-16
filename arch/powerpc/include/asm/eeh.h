@@ -28,17 +28,19 @@
 struct pci_dev;
 struct pci_bus;
 struct device_node;
+struct pci_dn;
 
 #ifdef CONFIG_EEH
 
 extern int eeh_subsystem_enabled;
 
 /* Values for eeh_mode bits in device_node */
-#define EEH_MODE_SUPPORTED     (1<<0)
-#define EEH_MODE_NOCHECK       (1<<1)
-#define EEH_MODE_ISOLATED      (1<<2)
-#define EEH_MODE_RECOVERING    (1<<3)
-#define EEH_MODE_IRQ_DISABLED  (1<<4)
+#define EEH_MODE_SUPPORTED		(1<<0)
+#define EEH_MODE_NOCHECK		(1<<1)
+#define EEH_MODE_ISOLATED		(1<<2)
+#define EEH_MODE_RECOVERING		(1<<3)
+#define EEH_MODE_IRQ_DISABLED		(1<<4)
+#define EEH_MODE_PCI_CFG_BLOCKED	(1<<5)
 
 /* Max number of EEH freezes allowed before we consider the device
  * to be permanently disabled. */
@@ -59,8 +61,11 @@ void __init pci_addr_cache_build(void);
  * device (including config space i/o).  Call eeh_add_device_late
  * to finish the eeh setup for this device.
  */
+void eeh_add_device_early(struct device_node *);
 void eeh_add_device_tree_early(struct device_node *);
+void eeh_add_device_late(struct pci_dev *);
 void eeh_add_device_tree_late(struct pci_bus *);
+void eeh_remove_device(struct pci_dev *);
 
 /**
  * eeh_remove_device_recursive - undo EEH for device & children.
@@ -70,6 +75,11 @@ void eeh_add_device_tree_late(struct pci_bus *);
  * pci devices as well.
  */
 void eeh_remove_bus_device(struct pci_dev *);
+
+/* eeh_toggle_dev_flag: This function toggle a flag in all functions of a
+PCI device, based on set parameter (true means to set the flag, false means
+to unset it). The function is useful for blocking PCI cfg access during EEH.*/
+void eeh_toggle_dev_flag(struct pci_dn *pdn, int flag, bool set);
 
 /**
  * EEH_POSSIBLE_ERROR() -- test for possible MMIO failure.
@@ -101,9 +111,15 @@ static inline int eeh_dn_check_failure(struct device_node *dn, struct pci_dev *d
 
 static inline void pci_addr_cache_build(void) { }
 
+static inline void eeh_add_device_early(struct device_node *dn) { }
+
 static inline void eeh_add_device_tree_early(struct device_node *dn) { }
 
+static inline void eeh_add_device_late(struct pci_dev *dev) { }
+
 static inline void eeh_add_device_tree_late(struct pci_bus *bus) { }
+
+static inline void eeh_remove_device(struct pci_dev *dev) { }
 
 static inline void eeh_remove_bus_device(struct pci_dev *dev) { }
 #define EEH_POSSIBLE_ERROR(val, type) (0)

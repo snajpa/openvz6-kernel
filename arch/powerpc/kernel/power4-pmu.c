@@ -602,6 +602,7 @@ static struct power_pmu power4_pmu = {
 	.n_generic		= ARRAY_SIZE(p4_generic_events),
 	.generic_events		= p4_generic_events,
 	.cache_events		= &power4_cache_events,
+	.flags			= PPMU_NO_SIPR | PPMU_NO_CONT_SAMPLING,
 };
 
 static int init_power4_pmu(void)
@@ -613,4 +614,4 @@ static int init_power4_pmu(void)
 	return register_power_pmu(&power4_pmu);
 }
 
-arch_initcall(init_power4_pmu);
+early_initcall(init_power4_pmu);

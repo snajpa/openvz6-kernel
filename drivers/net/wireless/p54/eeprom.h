@@ -57,6 +57,18 @@ struct pda_channel_output_limit {
 	u8 rate_set_size;
 } __packed;
 
+struct pda_channel_output_limit_point_longbow {
+	__le16 val_bpsk;
+	__le16 val_qpsk;
+	__le16 val_16qam;
+	__le16 val_64qam;
+} __packed;
+
+struct pda_channel_output_limit_longbow {
+	__le16 freq;
+	struct pda_channel_output_limit_point_longbow point[3];
+} __packed;
+
 struct pda_pa_curve_data_sample_rev0 {
 	u8 rf_power;
 	u8 pa_detector;
@@ -79,6 +91,12 @@ struct pda_pa_curve_data {
 	u8 points_per_channel;
 	u8 padding;
 	u8 data[0];
+} __packed;
+
+struct pda_rssi_cal_ext_entry {
+	__le16 freq;
+	__le16 mul;
+	__le16 add;
 } __packed;
 
 struct pda_rssi_cal_entry {
@@ -179,6 +197,7 @@ struct pda_custom_wrapper {
 
 /* used by our modificated eeprom image */
 #define PDR_RSSI_LINEAR_APPROXIMATION_CUSTOM		0xDEAD
+#define PDR_RSSI_LINEAR_APPROXIMATION_CUSTOMV2		0xCAFF
 #define PDR_PRISM_PA_CAL_OUTPUT_POWER_LIMITS_CUSTOM	0xBEEF
 #define PDR_PRISM_PA_CAL_CURVE_DATA_CUSTOM		0xB05D
 

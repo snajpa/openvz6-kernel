@@ -25,6 +25,7 @@
 #include <net/timewait_sock.h>
 #include <net/tcp_states.h>
 #include <net/xfrm.h>
+#include <net/secure_seq.h>
 
 #include "ackvec.h"
 #include "ccid.h"
@@ -46,6 +47,7 @@ int dccp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 	__be32 daddr, nexthop;
 	int tmp;
 	int err;
+	struct ip_options *inet_opt;
 
 	dp->dccps_role = DCCP_ROLE_CLIENT;
 
@@ -56,10 +58,11 @@ int dccp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 		return -EAFNOSUPPORT;
 
 	nexthop = daddr = usin->sin_addr.s_addr;
-	if (inet->opt != NULL && inet->opt->srr) {
+	inet_opt = rcu_dereference(inet->opt);
+	if (inet_opt != NULL && inet_opt->srr) {
 		if (daddr == 0)
 			return -EINVAL;
-		nexthop = inet->opt->faddr;
+		nexthop = inet_opt->faddr;
 	}
 
 	tmp = ip_route_connect(&rt, nexthop, inet->saddr,
@@ -74,7 +77,7 @@ int dccp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 		return -ENETUNREACH;
 	}
 
-	if (inet->opt == NULL || !inet->opt->srr)
+	if (inet_opt == NULL || !inet_opt->srr)
 		daddr = rt->rt_dst;
 
 	if (inet->saddr == 0)
@@ -85,8 +88,8 @@ int dccp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 	inet->daddr = daddr;
 
 	inet_csk(sk)->icsk_ext_hdr_len = 0;
-	if (inet->opt != NULL)
-		inet_csk(sk)->icsk_ext_hdr_len = inet->opt->optlen;
+	if (inet_opt != NULL)
+		inet_csk(sk)->icsk_ext_hdr_len = inet_opt->optlen;
 	/*
 	 * Socket identity is still unknown (sport may be zero).
 	 * However we set state to DCCP_REQUESTING and not releasing socket
@@ -387,7 +390,7 @@ struct sock *dccp_v4_request_recv_sock(struct sock *sk, struct sk_buff *skb,
 
 	newsk = dccp_create_openreq_child(sk, req, skb);
 	if (newsk == NULL)
-		goto exit;
+		goto exit_nonewsk;
 
 	sk_setup_caps(newsk, dst);
 
@@ -404,16 +407,20 @@ struct sock *dccp_v4_request_recv_sock(struct sock *sk, struct sk_buff *skb,
 
 	dccp_sync_mss(newsk, dst_mtu(dst));
 
-	__inet_hash_nolisten(newsk);
-	__inet_inherit_port(sk, newsk);
+	if (__inet_inherit_port(sk, newsk) < 0) {
+		sock_put(newsk);
+		goto exit;
+	}
+	__inet_hash_nolisten(newsk, NULL);
 
 	return newsk;
 
 exit_overflow:
 	NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
+exit_nonewsk:
+	dst_release(dst);
 exit:
 	NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENDROPS);
-	dst_release(dst);
 	return NULL;
 }
 
@@ -546,7 +553,7 @@ out:
 static void dccp_v4_reqsk_destructor(struct request_sock *req)
 {
 	dccp_feat_list_purge(&dccp_rsk(req)->dreq_featneg);
-	kfree(inet_rsk(req)->opt);
+	kfree_ip_options(inet_rsk(req)->opt);
 }
 
 static struct request_sock_ops dccp_request_sock_ops __read_mostly = {
@@ -987,7 +994,6 @@ static struct inet_protosw dccp_v4_protosw = {
 	.protocol	= IPPROTO_DCCP,
 	.prot		= &dccp_v4_prot,
 	.ops		= &inet_dccp_ops,
-	.capability	= -1,
 	.no_check	= 0,
 	.flags		= INET_PROTOSW_ICSK,
 };

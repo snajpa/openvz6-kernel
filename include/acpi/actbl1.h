@@ -228,7 +228,8 @@ enum acpi_einj_actions {
 	ACPI_EINJ_EXECUTE_OPERATION = 5,
 	ACPI_EINJ_CHECK_BUSY_STATUS = 6,
 	ACPI_EINJ_GET_COMMAND_STATUS = 7,
-	ACPI_EINJ_ACTION_RESERVED = 8,	/* 8 and greater are reserved */
+	ACPI_EINJ_SET_ERROR_TYPE_WITH_ADDRESS = 8,
+	ACPI_EINJ_ACTION_RESERVED = 9,	/* 9 and greater are reserved */
 	ACPI_EINJ_TRIGGER_ERROR = 0xFF	/* Except for this value */
 };
 
@@ -566,7 +567,7 @@ struct acpi_hest_generic {
 
 /* Generic Error Status block */
 
-struct acpi_hest_generic_status {
+struct acpi_generic_status {
 	u32 block_status;
 	u32 raw_data_offset;
 	u32 raw_data_length;
@@ -576,15 +577,15 @@ struct acpi_hest_generic_status {
 
 /* Values for block_status flags above */
 
-#define ACPI_HEST_UNCORRECTABLE             (1)
-#define ACPI_HEST_CORRECTABLE               (1<<1)
-#define ACPI_HEST_MULTIPLE_UNCORRECTABLE    (1<<2)
-#define ACPI_HEST_MULTIPLE_CORRECTABLE      (1<<3)
-#define ACPI_HEST_ERROR_ENTRY_COUNT         (0xFF<<4)	/* 8 bits, error count */
+#define ACPI_GEN_ERR_UC			BIT(0)
+#define ACPI_GEN_ERR_CE			BIT(1)
+#define ACPI_GEN_ERR_MULTI_UC		BIT(2)
+#define ACPI_GEN_ERR_MULTI_CE		BIT(3)
+#define ACPI_GEN_ERR_COUNT_SHIFT	(0xFF<<4) /* 8 bits, error count */
 
 /* Generic Error Data entry */
 
-struct acpi_hest_generic_data {
+struct acpi_generic_data {
 	u8 section_type[16];
 	u32 error_severity;
 	u16 revision;

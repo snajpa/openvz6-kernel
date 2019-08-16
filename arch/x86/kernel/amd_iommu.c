@@ -28,8 +28,10 @@
 #include <asm/proto.h>
 #include <asm/iommu.h>
 #include <asm/gart.h>
+#include <asm/dma.h>
 #include <asm/amd_iommu_types.h>
 #include <asm/amd_iommu.h>
+#include <asm/msidef.h>
 
 #define CMD_SET_TYPE(cmd, t) ((cmd)->data[1] |= ((t) << 28))
 
@@ -49,6 +51,8 @@ static struct protection_domain *pt_domain;
 
 static struct iommu_ops amd_iommu_ops;
 
+static struct dma_map_ops amd_iommu_dma_ops;
+
 /*
  * general struct to manage commands send to an IOMMU
  */
@@ -60,7 +64,7 @@ static int dma_ops_unity_map(struct dma_ops_domain *dma_dom,
 			     struct unity_map_entry *e);
 static struct dma_ops_domain *find_protection_domain(u16 devid);
 static u64 *alloc_pte(struct protection_domain *domain,
-		      unsigned long address, int end_lvl,
+		      unsigned long address, unsigned long page_size,
 		      u64 **pte_page, gfp_t gfp);
 static void dma_ops_reserve_addresses(struct dma_ops_domain *dom,
 				      unsigned long start_page,
@@ -268,6 +272,7 @@ static int __iommu_queue_command(struct amd_iommu *iommu, struct iommu_cmd *cmd)
 	u32 tail, head;
 	u8 *target;
 
+	WARN_ON(iommu->cmd_buf_size & CMD_BUFFER_UNINITIALIZED);
 	tail = readl(iommu->mmio_base + MMIO_CMD_TAIL_OFFSET);
 	target = iommu->cmd_buf + tail;
 	memcpy_toio(target, cmd, sizeof(*cmd));
@@ -540,11 +545,11 @@ static void flush_all_devices_for_iommu(struct amd_iommu *iommu)
 static void flush_devices_by_domain(struct protection_domain *domain)
 {
 	struct amd_iommu *iommu;
-	int i;
+	unsigned long i;
 
 	for (i = 0; i <= amd_iommu_last_bdf; ++i) {
 		if ((domain == NULL && amd_iommu_pd_table[i] == NULL) ||
-		    (amd_iommu_pd_table[i] != domain))
+		    (domain != NULL && amd_iommu_pd_table[i] != domain))
 			continue;
 
 		iommu = amd_iommu_rlookup_table[i];
@@ -595,31 +600,36 @@ static int iommu_map_page(struct protection_domain *dom,
 			  unsigned long bus_addr,
 			  unsigned long phys_addr,
 			  int prot,
-			  int map_size)
+			  unsigned long page_size)
 {
 	u64 __pte, *pte;
-
-	bus_addr  = PAGE_ALIGN(bus_addr);
-	phys_addr = PAGE_ALIGN(phys_addr);
-
-	BUG_ON(!PM_ALIGNED(map_size, bus_addr));
-	BUG_ON(!PM_ALIGNED(map_size, phys_addr));
+	int i, count;
 
 	if (!(prot & IOMMU_PROT_MASK))
 		return -EINVAL;
 
-	pte = alloc_pte(dom, bus_addr, map_size, NULL, GFP_KERNEL);
+	bus_addr  = PAGE_ALIGN(bus_addr);
+	phys_addr = PAGE_ALIGN(phys_addr);
+	count     = PAGE_SIZE_PTE_COUNT(page_size);
+	pte       = alloc_pte(dom, bus_addr, page_size, NULL, GFP_KERNEL);
 
-	if (IOMMU_PTE_PRESENT(*pte))
-		return -EBUSY;
+	for (i = 0; i < count; ++i)
+		if (IOMMU_PTE_PRESENT(pte[i]))
+			return -EBUSY;
 
-	__pte = phys_addr | IOMMU_PTE_P;
+	if (page_size > PAGE_SIZE) {
+		__pte = PAGE_SIZE_PTE(phys_addr, page_size);
+		__pte |= PM_LEVEL_ENC(7) | IOMMU_PTE_P | IOMMU_PTE_FC;
+	} else
+		__pte = phys_addr | IOMMU_PTE_P | IOMMU_PTE_FC;
+
 	if (prot & IOMMU_PROT_IR)
 		__pte |= IOMMU_PTE_IR;
 	if (prot & IOMMU_PROT_IW)
 		__pte |= IOMMU_PTE_IW;
 
-	*pte = __pte;
+	for (i = 0; i < count; ++i)
+		pte[i] = __pte;
 
 	update_domain(dom);
 
@@ -688,7 +698,7 @@ static int dma_ops_unity_map(struct dma_ops_domain *dma_dom,
 	for (addr = e->address_start; addr < e->address_end;
 	     addr += PAGE_SIZE) {
 		ret = iommu_map_page(&dma_dom->domain, addr, addr, e->prot,
-				     PM_MAP_4k);
+				     PAGE_SIZE);
 		if (ret)
 			return ret;
 		/*
@@ -780,7 +790,7 @@ static int alloc_new_range(struct amd_iommu *iommu,
 			   bool populate, gfp_t gfp)
 {
 	int index = dma_dom->aperture_size >> APERTURE_RANGE_SHIFT;
-	int i;
+	unsigned long i, old_size;
 
 #ifdef CONFIG_IOMMU_STRESS
 	populate = false;
@@ -805,7 +815,7 @@ static int alloc_new_range(struct amd_iommu *iommu,
 		u64 *pte, *pte_page;
 
 		for (i = 0; i < num_ptes; ++i) {
-			pte = alloc_pte(&dma_dom->domain, address, PM_MAP_4k,
+			pte = alloc_pte(&dma_dom->domain, address, PAGE_SIZE,
 					&pte_page, gfp);
 			if (!pte)
 				goto out_free;
@@ -816,7 +826,20 @@ static int alloc_new_range(struct amd_iommu *iommu,
 		}
 	}
 
+	old_size                = dma_dom->aperture_size;
 	dma_dom->aperture_size += APERTURE_RANGE_SIZE;
+
+	/* Reserve address range used for MSI messages */
+	if (old_size < MSI_ADDR_BASE_LO &&
+	    dma_dom->aperture_size > MSI_ADDR_BASE_LO) {
+		unsigned long spage;
+		int pages;
+
+		pages = iommu_num_pages(MSI_ADDR_BASE_LO, 0x10000, PAGE_SIZE);
+		spage = MSI_ADDR_BASE_LO >> PAGE_SHIFT;
+
+		dma_ops_reserve_addresses(dma_dom, spage, pages);
+	}
 
 	/* Intialize the exclusion range if necessary */
 	if (iommu->exclusion_start &&
@@ -842,7 +865,7 @@ static int alloc_new_range(struct amd_iommu *iommu,
 		if (!pte || !IOMMU_PTE_PRESENT(*pte))
 			continue;
 
-		dma_ops_reserve_addresses(dma_dom, i << PAGE_SHIFT, 1);
+		dma_ops_reserve_addresses(dma_dom, i >> PAGE_SHIFT, 1);
 	}
 
 	update_domain(&dma_dom->domain);
@@ -1020,34 +1043,59 @@ static void dma_ops_reserve_addresses(struct dma_ops_domain *dom,
 	}
 }
 
+#define DEFINE_FREE_PT_FN(LVL, FN)				\
+static void free_pt_##LVL (unsigned long __pt)			\
+{								\
+	unsigned long p;					\
+	u64 *pt;						\
+	int i;							\
+								\
+	pt = (u64 *)__pt;					\
+								\
+	for (i = 0; i < 512; ++i) {				\
+		if (!IOMMU_PTE_PRESENT(pt[i]))			\
+			continue;				\
+								\
+		p = (unsigned long)IOMMU_PTE_PAGE(pt[i]);	\
+		FN(p);						\
+	}							\
+	free_page((unsigned long)pt);				\
+}
+
+DEFINE_FREE_PT_FN(l2, free_page)
+DEFINE_FREE_PT_FN(l3, free_pt_l2)
+DEFINE_FREE_PT_FN(l4, free_pt_l3)
+DEFINE_FREE_PT_FN(l5, free_pt_l4)
+DEFINE_FREE_PT_FN(l6, free_pt_l5)
+
 static void free_pagetable(struct protection_domain *domain)
 {
-	int i, j;
-	u64 *p1, *p2, *p3;
+	unsigned long root = (unsigned long)domain->pt_root;
 
-	p1 = domain->pt_root;
-
-	if (!p1)
-		return;
-
-	for (i = 0; i < 512; ++i) {
-		if (!IOMMU_PTE_PRESENT(p1[i]))
-			continue;
-
-		p2 = IOMMU_PTE_PAGE(p1[i]);
-		for (j = 0; j < 512; ++j) {
-			if (!IOMMU_PTE_PRESENT(p2[j]))
-				continue;
-			p3 = IOMMU_PTE_PAGE(p2[j]);
-			free_page((unsigned long)p3);
-		}
-
-		free_page((unsigned long)p2);
+	switch (domain->mode) {
+	case PAGE_MODE_NONE:
+		break;
+	case PAGE_MODE_1_LEVEL:
+		free_page(root);
+		break;
+	case PAGE_MODE_2_LEVEL:
+		free_pt_l2(root);
+		break;
+	case PAGE_MODE_3_LEVEL:
+		free_pt_l3(root);
+		break;
+	case PAGE_MODE_4_LEVEL:
+		free_pt_l4(root);
+		break;
+	case PAGE_MODE_5_LEVEL:
+		free_pt_l5(root);
+		break;
+	case PAGE_MODE_6_LEVEL:
+		free_pt_l6(root);
+		break;
+	default:
+		BUG();
 	}
-
-	free_page((unsigned long)p1);
-
-	domain->pt_root = NULL;
 }
 
 /*
@@ -1208,6 +1256,7 @@ static void attach_device(struct amd_iommu *iommu,
  */
 static void __detach_device(struct protection_domain *domain, u16 devid)
 {
+	struct amd_iommu *iommu = amd_iommu_rlookup_table[devid];
 
 	/* lock domain */
 	spin_lock(&domain->lock);
@@ -1230,12 +1279,16 @@ static void __detach_device(struct protection_domain *domain, u16 devid)
 
 	/*
 	 * If we run in passthrough mode the device must be assigned to the
-	 * passthrough domain if it is detached from any other domain
+	 * passthrough domain if it is detached from any other domain.
+	 * Make sure we can deassign from the pt_domain itself.
 	 */
-	if (iommu_pass_through) {
-		struct amd_iommu *iommu = amd_iommu_rlookup_table[devid];
+	if (iommu_pass_through && domain != pt_domain)
 		__attach_device(iommu, pt_domain, devid);
-	}
+
+	iommu_queue_inv_dev_entry(iommu, devid);
+	if (domain->dev_cnt == 0)
+		iommu_flush_tlb_pde(iommu, domain->id);
+	iommu_completion_wait(iommu);
 }
 
 /*
@@ -1273,10 +1326,6 @@ static int device_change_notifier(struct notifier_block *nb,
 
 	domain = domain_for_device(devid);
 
-	if (domain && !dma_ops_domain(domain))
-		WARN_ONCE(1, "AMD IOMMU WARNING: device %s already bound "
-			  "to a non-dma-ops domain\n", dev_name(dev));
-
 	switch (action) {
 	case BUS_NOTIFY_UNBOUND_DRIVER:
 		if (!domain)
@@ -1286,6 +1335,12 @@ static int device_change_notifier(struct notifier_block *nb,
 		detach_device(domain, devid);
 		break;
 	case BUS_NOTIFY_ADD_DEVICE:
+
+		if (iommu_pass_through) {
+			attach_device(iommu, pt_domain, devid);
+			break;
+		}
+
 		/* allocate a protection domain if a device is added */
 		dma_domain = find_protection_domain(devid);
 		if (dma_domain)
@@ -1298,6 +1353,8 @@ static int device_change_notifier(struct notifier_block *nb,
 		spin_lock_irqsave(&iommu_pd_list_lock, flags);
 		list_add_tail(&dma_domain->list, &iommu_pd_list);
 		spin_unlock_irqrestore(&iommu_pd_list_lock, flags);
+
+		dev->archdata.dma_ops = &amd_iommu_dma_ops;
 
 		break;
 	default:
@@ -1314,6 +1371,11 @@ out:
 static struct notifier_block device_nb = {
 	.notifier_call = device_change_notifier,
 };
+
+void amd_iommu_init_notifier(void)
+{
+	bus_register_notifier(&pci_bus_type, &device_nb);
+}
 
 /*****************************************************************************
  *
@@ -1466,18 +1528,22 @@ static bool increase_address_space(struct protection_domain *domain,
 
 static u64 *alloc_pte(struct protection_domain *domain,
 		      unsigned long address,
-		      int end_lvl,
+		      unsigned long page_size,
 		      u64 **pte_page,
 		      gfp_t gfp)
 {
+	int level, end_lvl;
 	u64 *pte, *page;
-	int level;
+
+	BUG_ON(!is_power_of_2(page_size));
 
 	while (address > PM_LEVEL_SIZE(domain->mode))
 		increase_address_space(domain, gfp);
 
-	level =  domain->mode - 1;
-	pte   = &domain->pt_root[PM_LEVEL_INDEX(level, address)];
+	level   = domain->mode - 1;
+	pte     = &domain->pt_root[PM_LEVEL_INDEX(level, address)];
+	address = PAGE_SIZE_ALIGN(address, page_size);
+	end_lvl = PAGE_SIZE_LEVEL(page_size);
 
 	while (level > end_lvl) {
 		if (!IOMMU_PTE_PRESENT(*pte)) {
@@ -1486,6 +1552,10 @@ static u64 *alloc_pte(struct protection_domain *domain,
 				return NULL;
 			*pte = PM_LEVEL_PDE(level, virt_to_phys(page));
 		}
+
+		/* No level skipping support yet */
+		if (PM_PTE_LEVEL(*pte) != level)
+			return NULL;
 
 		level -= 1;
 
@@ -1515,7 +1585,7 @@ static u64* dma_ops_get_pte(struct dma_ops_domain *dom,
 
 	pte = aperture->pte_pages[APERTURE_PAGE_INDEX(address)];
 	if (!pte) {
-		pte = alloc_pte(&dom->domain, address, PM_MAP_4k, &pte_page,
+		pte = alloc_pte(&dom->domain, address, PAGE_SIZE, &pte_page,
 				GFP_ATOMIC);
 		aperture->pte_pages[APERTURE_PAGE_INDEX(address)] = pte_page;
 	} else
@@ -1687,6 +1757,7 @@ static void __unmap_single(struct amd_iommu *iommu,
 			   size_t size,
 			   int dir)
 {
+	dma_addr_t flush_addr;
 	dma_addr_t i, start;
 	unsigned int pages;
 
@@ -1694,6 +1765,7 @@ static void __unmap_single(struct amd_iommu *iommu,
 	    (dma_addr + size > dma_dom->aperture_size))
 		return;
 
+	flush_addr = dma_addr;
 	pages = iommu_num_pages(dma_addr, size, PAGE_SIZE);
 	dma_addr &= PAGE_MASK;
 	start = dma_addr;
@@ -1708,7 +1780,7 @@ static void __unmap_single(struct amd_iommu *iommu,
 	dma_ops_free_addresses(dma_dom, dma_addr, pages);
 
 	if (amd_iommu_unmap_flush || dma_dom->need_flush) {
-		iommu_flush_pages(iommu, dma_dom->domain.id, dma_addr, size);
+		iommu_flush_pages(iommu, dma_dom->domain.id, flush_addr, size);
 		dma_dom->need_flush = false;
 	}
 }
@@ -2047,10 +2119,10 @@ static void prealloc_protection_domains(void)
 	struct pci_dev *dev = NULL;
 	struct dma_ops_domain *dma_dom;
 	struct amd_iommu *iommu;
-	u16 devid;
+	u16 devid, __devid;
 
 	while ((dev = pci_get_device(PCI_ANY_ID, PCI_ANY_ID, dev)) != NULL) {
-		devid = calc_devid(dev->bus->number, dev->devfn);
+		__devid = devid = calc_devid(dev->bus->number, dev->devfn);
 		if (devid > amd_iommu_last_bdf)
 			continue;
 		devid = amd_iommu_alias_table[devid];
@@ -2064,6 +2136,10 @@ static void prealloc_protection_domains(void)
 			continue;
 		init_unity_mappings_for_device(dma_dom, devid);
 		dma_dom->target_dev = devid;
+
+		attach_device(iommu, &dma_dom->domain, devid);
+		if (__devid != devid)
+			attach_device(iommu, &dma_dom->domain, __devid);
 
 		list_add_tail(&dma_dom->list, &iommu_pd_list);
 	}
@@ -2079,13 +2155,36 @@ static struct dma_map_ops amd_iommu_dma_ops = {
 	.dma_supported = amd_iommu_dma_supported,
 };
 
+static unsigned device_dma_ops_init(void)
+{
+	struct pci_dev *pdev = NULL;
+	unsigned unhandled = 0;
+
+	for_each_pci_dev(pdev) {
+		if (!check_device(&pdev->dev)) {
+			unhandled += 1;
+			continue;
+		}
+
+		pdev->dev.archdata.dma_ops = &amd_iommu_dma_ops;
+	}
+
+	return unhandled;
+}
+
 /*
  * The function which clues the AMD IOMMU driver into dma_ops.
  */
+
+void __init amd_iommu_init_api(void)
+{
+	register_iommu(&amd_iommu_ops);
+}
+
 int __init amd_iommu_init_dma_ops(void)
 {
 	struct amd_iommu *iommu;
-	int ret;
+	int ret, unhandled;
 
 	/*
 	 * first allocate a default protection domain for every IOMMU we
@@ -2110,19 +2209,15 @@ int __init amd_iommu_init_dma_ops(void)
 		prealloc_protection_domains();
 
 	iommu_detected = 1;
-	force_iommu = 1;
 	bad_dma_address = 0;
-#ifdef CONFIG_GART_IOMMU
-	gart_iommu_aperture_disabled = 1;
-	gart_iommu_aperture = 0;
-#endif
+	swiotlb = 0;
 
 	/* Make the driver finally visible to the drivers */
-	dma_ops = &amd_iommu_dma_ops;
-
-	register_iommu(&amd_iommu_ops);
-
-	bus_register_notifier(&pci_bus_type, &device_nb);
+	unhandled = device_dma_ops_init();
+	if (unhandled && max_pfn > MAX_DMA32_PFN) {
+		/* There are unhandled devices - initialize swiotlb for them */
+		swiotlb = 1;
+	}
 
 	amd_iommu_stats_init();
 
@@ -2231,9 +2326,7 @@ static void amd_iommu_domain_destroy(struct iommu_domain *dom)
 
 	free_pagetable(domain);
 
-	domain_id_free(domain->id);
-
-	kfree(domain);
+	protection_domain_free(domain);
 
 	dom->priv = NULL;
 }
@@ -2280,7 +2373,7 @@ static int amd_iommu_attach_device(struct iommu_domain *dom,
 
 	devid = calc_devid(pdev->bus->number, pdev->devfn);
 
-	if (devid >= amd_iommu_last_bdf ||
+	if (devid > amd_iommu_last_bdf ||
 			devid != amd_iommu_alias_table[devid])
 		return -EINVAL;
 
@@ -2317,7 +2410,7 @@ static int amd_iommu_map_range(struct iommu_domain *dom,
 	paddr &= PAGE_MASK;
 
 	for (i = 0; i < npages; ++i) {
-		ret = iommu_map_page(domain, iova, paddr, prot, PM_MAP_4k);
+		ret = iommu_map_page(domain, iova, paddr, prot, PAGE_SIZE);
 		if (ret)
 			return ret;
 
@@ -2375,8 +2468,8 @@ static struct iommu_ops amd_iommu_ops = {
 	.domain_destroy = amd_iommu_domain_destroy,
 	.attach_dev = amd_iommu_attach_device,
 	.detach_dev = amd_iommu_detach_device,
-	.map = amd_iommu_map_range,
-	.unmap = amd_iommu_unmap_range,
+	.map_range = amd_iommu_map_range,
+	.unmap_range = amd_iommu_unmap_range,
 	.iova_to_phys = amd_iommu_iova_to_phys,
 	.domain_has_cap = amd_iommu_domain_has_cap,
 };

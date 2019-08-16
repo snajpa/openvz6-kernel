@@ -41,6 +41,8 @@ MODULE_AUTHOR("Remy Card and others");
 MODULE_DESCRIPTION("Second Extended Filesystem");
 MODULE_LICENSE("GPL");
 
+static int __ext2_write_inode(struct inode *inode, int do_sync);
+
 /*
  * Test whether an inode is a fast symlink.
  */
@@ -62,14 +64,16 @@ void ext2_delete_inode (struct inode * inode)
 
 	if (is_bad_inode(inode))
 		goto no_delete;
+	sb_start_intwrite(inode->i_sb);
 	EXT2_I(inode)->i_dtime	= get_seconds();
 	mark_inode_dirty(inode);
-	ext2_write_inode(inode, inode_needs_sync(inode));
+	__ext2_write_inode(inode, inode_needs_sync(inode));
 
 	inode->i_size = 0;
 	if (inode->i_blocks)
 		ext2_truncate (inode);
 	ext2_free_inode (inode);
+	sb_end_intwrite(inode->i_sb);
 
 	return;
 no_delete:
@@ -1266,6 +1270,16 @@ struct inode *ext2_iget (struct super_block *sb, unsigned long ino)
 	ei->i_frag_size = raw_inode->i_fsize;
 	ei->i_file_acl = le32_to_cpu(raw_inode->i_file_acl);
 	ei->i_dir_acl = 0;
+
+	if (ei->i_file_acl &&
+	    !ext2_data_block_valid(EXT2_SB(sb), ei->i_file_acl, 1)) {
+		ext2_error(sb, "ext2_iget", "bad extended attribute block %u",
+			   ei->i_file_acl);
+		brelse(bh);
+		ret = -EFSCORRUPTED;
+		goto bad_inode;
+	}
+
 	if (S_ISREG(inode->i_mode))
 		inode->i_size |= ((__u64)le32_to_cpu(raw_inode->i_size_high)) << 32;
 	else
@@ -1333,7 +1347,7 @@ bad_inode:
 	return ERR_PTR(ret);
 }
 
-int ext2_write_inode(struct inode *inode, int do_sync)
+static int __ext2_write_inode(struct inode *inode, int do_sync)
 {
 	struct ext2_inode_info *ei = EXT2_I(inode);
 	struct super_block *sb = inode->i_sb;
@@ -1436,6 +1450,11 @@ int ext2_write_inode(struct inode *inode, int do_sync)
 	ei->i_state &= ~EXT2_STATE_NEW;
 	brelse (bh);
 	return err;
+}
+
+int ext2_write_inode(struct inode *inode, struct writeback_control *wbc)
+{
+	return __ext2_write_inode(inode, wbc->sync_mode == WB_SYNC_ALL);
 }
 
 int ext2_sync_inode(struct inode *inode)

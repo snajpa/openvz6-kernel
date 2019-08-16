@@ -222,7 +222,7 @@ acpi_status acpi_ns_root_initialize(void)
 			default:
 
 				ACPI_ERROR((AE_INFO,
-					    "Unsupported initial type value %X",
+					    "Unsupported initial type value 0x%X",
 					    init_val->type));
 				acpi_ut_remove_reference(obj_desc);
 				obj_desc = NULL;
@@ -338,8 +338,7 @@ acpi_ns_lookup(union acpi_generic_state *scope_info,
 			 */
 			while (!acpi_ns_opens_scope(prefix_node->type) &&
 			       prefix_node->type != ACPI_TYPE_ANY) {
-				prefix_node =
-				    acpi_ns_get_parent_node(prefix_node);
+				prefix_node = prefix_node->parent;
 			}
 		}
 	}
@@ -419,7 +418,7 @@ acpi_ns_lookup(union acpi_generic_state *scope_info,
 				/* Backup to the parent node */
 
 				num_carats++;
-				this_node = acpi_ns_get_parent_node(this_node);
+				this_node = this_node->parent;
 				if (!this_node) {
 
 					/* Current scope has no parent scope */

@@ -49,6 +49,7 @@
 #include <asm/pci-direct.h>
 #include <linux/init_ohci1394_dma.h>
 #include <linux/kvm_para.h>
+#include <xen/xen.h>
 
 #include <linux/errno.h>
 #include <linux/kernel.h>
@@ -73,6 +74,7 @@
 
 #include <asm/mtrr.h>
 #include <asm/apic.h>
+#include <asm/trampoline.h>
 #include <asm/e820.h>
 #include <asm/mpspec.h>
 #include <asm/setup.h>
@@ -109,6 +111,7 @@
 #ifdef CONFIG_X86_64
 #include <asm/numa_64.h>
 #endif
+#include <asm/mce.h>
 
 /*
  * end_pfn only includes RAM, while max_pfn_mapped includes all e820 entries.
@@ -171,9 +174,17 @@ static struct resource bss_resource = {
 #ifdef CONFIG_X86_32
 /* cpu data as detected by the assembly code in head.S */
 struct cpuinfo_x86 new_cpu_data __cpuinitdata = {0, 0, 0, 0, -1, 1, 0, 0, -1};
+struct cpuinfo_x86_rh new_cpu_data_rh __cpuinitdata;
 /* common cpu data for all cpus */
 struct cpuinfo_x86 boot_cpu_data __read_mostly = {0, 0, 0, 0, -1, 1, 0, 0, -1};
+/* This symbol should not be on kabi whitelists */
+struct cpuinfo_x86_rh boot_cpu_data_rh = {
+	.x86_cache_max_rmid = -1,
+	.x86_cache_occ_scale = -1,
+};
 EXPORT_SYMBOL(boot_cpu_data);
+EXPORT_SYMBOL(boot_cpu_data_rh);
+
 static void set_mca_bus(int x)
 {
 #ifdef CONFIG_MCA
@@ -203,7 +214,13 @@ struct ist_info ist_info;
 struct cpuinfo_x86 boot_cpu_data __read_mostly = {
 	.x86_phys_bits = MAX_PHYSMEM_BITS,
 };
+/* This symbol should not be on kabi whitelists */
+struct cpuinfo_x86_rh boot_cpu_data_rh __read_mostly = {
+	.x86_cache_max_rmid = -1,
+	.x86_cache_occ_scale = -1,
+};
 EXPORT_SYMBOL(boot_cpu_data);
+EXPORT_SYMBOL(boot_cpu_data_rh);
 #endif
 
 
@@ -302,6 +319,20 @@ static void __init reserve_brk(void)
 	/* Mark brk area as locked down and no longer taking any
 	   new allocations */
 	_brk_start = 0;
+}
+
+static unsigned long __init reserve_log_buf(unsigned long len)
+{
+	unsigned long end_of_lowmem = max_low_pfn_mapped << PAGE_SHIFT;
+	unsigned long addr = end_of_lowmem - len;
+	unsigned long mem;
+
+	mem = find_e820_area(addr, end_of_lowmem, len, PAGE_SIZE);
+	if (mem == -1ULL)
+		return 0ULL;
+
+	reserve_early(mem, mem + len, "LOG BUF");
+	return mem;
 }
 
 #ifdef CONFIG_BLK_DEV_INITRD
@@ -501,9 +532,13 @@ unsigned long long __init find_and_reserve_crashkernel(unsigned long long size)
 	while (1) {
 		int ret;
 
-		start = find_e820_area(start, ULONG_MAX, size, alignment);
-		if (start == -1ULL)
-			return start;
+		start = find_e820_area(start, KEXEC_RESERVE_UPPER_LIMIT, size, alignment);
+
+		if (start == -1ULL) {
+			pr_info("crashkernel reservation failed. "
+				"No suitable area found.\n");
+			return -1ULL;
+		}
 
 		/* try to reserve it */
 		ret = reserve_bootmem_generic(start, size, BOOTMEM_EXCLUSIVE);
@@ -538,16 +573,23 @@ static void __init reserve_crashkernel(void)
 			&crash_size, &crash_base);
 	if (ret != 0 || crash_size <= 0)
 		return;
+	if (crash_size >= KEXEC_RESERVE_UPPER_LIMIT) {
+		pr_info("crashkernel reservation failed. "
+			"specified size is too big.\n");
+		return;
+	}
 
 	/* 0 means: find the address automatically */
 	if (crash_base <= 0) {
 		crash_base = find_and_reserve_crashkernel(crash_size);
-		if (crash_base == -1ULL) {
+		if (crash_base == -1ULL)
+			return;
+	} else {
+		if (crash_base + crash_size > KEXEC_RESERVE_UPPER_LIMIT) {
 			pr_info("crashkernel reservation failed. "
-				"No suitable area found.\n");
+				"specified region can not be reserved.\n");
 			return;
 		}
-	} else {
 		ret = reserve_bootmem_generic(crash_base, crash_size,
 					BOOTMEM_EXCLUSIVE);
 		if (ret < 0) {
@@ -628,6 +670,25 @@ static int __init setup_elfcorehdr(char *arg)
 early_param("elfcorehdr", setup_elfcorehdr);
 #endif
 
+static bool __read_mostly map_individual_e820;
+static int __init setup_map_individual_e820(char *str)
+{
+	map_individual_e820 = 1;
+
+	return 0;
+}
+early_param("map_individual_e820", setup_map_individual_e820);
+
+static __init void reserve_ibft_region(void)
+{
+	unsigned long addr, size = 0;
+
+	addr = find_ibft_region(&size);
+
+	if (size)
+		reserve_early_overlap_ok(addr, addr + size, "ibft");
+}
+
 #ifdef CONFIG_X86_RESERVE_LOW_64K
 static int __init dmi_low_memory_corruption(const struct dmi_system_id *d)
 {
@@ -666,22 +727,96 @@ static struct dmi_system_id __initdata bad_bios_dmi_table[] = {
 			DMI_MATCH(DMI_BIOS_VENDOR, "Phoenix/MSC"),
 		},
 	},
-	{
 	/*
-	 * AMI BIOS with low memory corruption was found on Intel DG45ID board.
-	 * It hase different DMI_BIOS_VENDOR = "Intel Corp.", for now we will
+	 * AMI BIOS with low memory corruption was found on Intel DG45ID and
+	 * DG45FC boards.
+	 * It has a different DMI_BIOS_VENDOR = "Intel Corp.", for now we will
 	 * match only DMI_BOARD_NAME and see if there is more bad products
 	 * with this vendor.
 	 */
+	{
 		.callback = dmi_low_memory_corruption,
 		.ident = "AMI BIOS",
 		.matches = {
 			DMI_MATCH(DMI_BOARD_NAME, "DG45ID"),
 		},
 	},
+	{
+		.callback = dmi_low_memory_corruption,
+		.ident = "AMI BIOS",
+		.matches = {
+			DMI_MATCH(DMI_BOARD_NAME, "DG45FC"),
+		},
+	},
 #endif
 	{}
 };
+
+static void __init trim_bios_range(void)
+{
+	/*
+	 * A special case is the first 4Kb of memory;
+	 * This is a BIOS owned area, not kernel ram, but generally
+	 * not listed as such in the E820 table.
+	 */
+	e820_update_range(0, PAGE_SIZE, E820_RAM, E820_RESERVED);
+	/*
+	 * special case: Some BIOSen report the PC BIOS
+	 * area (640->1Mb) as ram even though it is not.
+	 * take them out.
+	 */
+	e820_remove_range(BIOS_BEGIN, BIOS_END - BIOS_BEGIN, E820_RAM, 1);
+	sanitize_e820_map(e820.map, ARRAY_SIZE(e820.map), &e820.nr_map);
+}
+
+static void rh_check_supported(void)
+{
+	/* The RHEL kernel does not support this hardware.  The kernel will
+	 * attempt to boot, but no support is given for this hardware */
+
+
+	/*
+	* Check if we are running on VMware's hypervisor and bail out
+	* if we are.  They run their own hypervisor and have different
+	* support requirements than we do.
+	*/
+	if (x86_hyper == &x86_hyper_vmware)
+		return;
+
+	/* RHEL only supports Intel and AMD processors */
+	if ((boot_cpu_data.x86_vendor != X86_VENDOR_INTEL) &&
+	    (boot_cpu_data.x86_vendor != X86_VENDOR_AMD)) {
+		printk(KERN_CRIT "Detected processor %s %s\n",
+		       boot_cpu_data.x86_vendor_id,
+		       boot_cpu_data.x86_model_id);
+		mark_hardware_unsupported("Processor");
+	}
+
+	/* Intel CPU family 6, model greater than 60 */
+	if ((boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) &&
+	    ((boot_cpu_data.x86 == 6))) {
+		switch (boot_cpu_data.x86_model) {
+		case 94: /* Skylake-S */
+		case 86: /* Broadwell-DE SoC */
+		case 85: /* Purley */
+		case 79: /* Broadwell-EP and EX */
+		case 78: /* Skylake-Y */
+		case 77: /* Atom Avoton */
+		case 71: /* Broadwell-H */
+		case 70: /* Crystal Well */
+			break;
+		default:
+			if (boot_cpu_data.x86_model > 63) {
+				printk(KERN_CRIT
+				       "Detected CPU family %d model %d\n",
+				       boot_cpu_data.x86,
+				       boot_cpu_data.x86_model);
+				mark_hardware_unsupported("Intel CPU model");
+			}
+			break;
+		}
+	}
+}
 
 /*
  * Determine if we were loaded by an EFI loader.  If so, then we have also been
@@ -753,6 +888,7 @@ void __init setup_arch(char **cmdline_p)
 
 	x86_init.oem.arch_setup();
 
+	iomem_resource.end = (1ULL << boot_cpu_data.x86_phys_bits) - 1;
 	setup_memory_map();
 	parse_setup_data();
 	/* update the e820_saved too */
@@ -830,6 +966,7 @@ void __init setup_arch(char **cmdline_p)
 		efi_init();
 
 	dmi_scan_machine();
+	dmi_memdev_walk();
 
 	dmi_check_system(bad_bios_dmi_table);
 
@@ -846,7 +983,7 @@ void __init setup_arch(char **cmdline_p)
 	insert_resource(&iomem_resource, &data_resource);
 	insert_resource(&iomem_resource, &bss_resource);
 
-
+	trim_bios_range();
 #ifdef CONFIG_X86_32
 	if (ppro_with_ram_bug()) {
 		e820_update_range(0x70000000ULL, 0x40000ULL, E820_RAM,
@@ -908,10 +1045,51 @@ void __init setup_arch(char **cmdline_p)
 
 #ifdef CONFIG_X86_64
 	if (max_pfn > max_low_pfn) {
-		max_pfn_mapped = init_memory_mapping(1UL<<32,
-						     max_pfn<<PAGE_SHIFT);
-		/* can we preseve max_low_pfn ?*/
-		max_low_pfn = max_pfn;
+		if (!map_individual_e820) {
+			printk(KERN_DEBUG "Use unified mapping for non-reserved e820 regions.\n");
+			max_pfn_mapped = init_memory_mapping(1UL<<32,
+							     max_pfn<<PAGE_SHIFT);
+
+			/* can we preseve max_low_pfn ?*/
+			max_low_pfn = max_pfn;
+		} else {
+			int i;
+			__u64 map_begin = 0, map_end = 0;
+
+			printk(KERN_DEBUG "Use individual mapping for non-reserved e820 regions.\n");
+
+			/*
+			 * We are grouping contiguous E820 "usable" regions together
+			 * into one mapping (eventhough there is a small whole), 
+			 * and separated by "reserved" region.
+			 */
+			
+			for (i = 0; i < e820.nr_map; i++) {
+				struct e820entry *ei = &e820.map[i];
+
+				if (ei->addr + ei->size <= 1UL << 32)
+					continue;
+
+				if (ei->type == E820_RESERVED) {
+					if (map_begin != 0) {
+						max_pfn_mapped = init_memory_mapping(map_begin, map_end);
+						map_begin = 0;
+						map_end = 0;
+					}
+					continue;
+				}
+
+				if (map_begin == 0)
+					map_begin = (ei->addr < (1UL << 32)) ? (1UL << 32) : ei->addr;
+				map_end = ei->addr + ei->size;
+			}
+
+			if (map_begin != 0)
+				max_pfn_mapped = init_memory_mapping(map_begin, map_end);
+
+			/* can we preseve max_low_pfn ?*/
+			max_low_pfn = max_pfn;
+		}
 	}
 #endif
 
@@ -923,6 +1101,8 @@ void __init setup_arch(char **cmdline_p)
 	if (init_ohci1394_dma_early)
 		init_ohci1394_dma_on_all_controllers();
 #endif
+	/* Allocate bigger log buffer as early as possible */
+	setup_log_buf(reserve_log_buf);
 
 	reserve_initrd();
 
@@ -957,6 +1137,15 @@ void __init setup_arch(char **cmdline_p)
 	 */
 	find_smp_config();
 
+	reserve_ibft_region();
+
+	/*
+	 * The EFI specification says that boot service code won't be called
+	 * after ExitBootServices(). This is, in fact, a lie.
+	 */
+	if (efi_enabled)
+		efi_reserve_boot_services();
+
 	reserve_crashkernel();
 
 #ifdef CONFIG_X86_64
@@ -968,8 +1157,6 @@ void __init setup_arch(char **cmdline_p)
 	dma32_reserve_bootmem();
 #endif
 
-	reserve_ibft_region();
-
 #ifdef CONFIG_KVM_CLOCK
 	kvmclock_init();
 #endif
@@ -977,6 +1164,8 @@ void __init setup_arch(char **cmdline_p)
 	x86_init.paging.pagetable_setup_start(swapper_pg_dir);
 	paging_init();
 	x86_init.paging.pagetable_setup_done(swapper_pg_dir);
+
+	setup_trampoline_page_table();
 
 	tboot_probe();
 
@@ -1014,6 +1203,7 @@ void __init setup_arch(char **cmdline_p)
 	probe_nr_irqs_gsi();
 
 	kvm_guest_init();
+	xen_hvm_guest_init();
 
 	e820_reserve_resources();
 	e820_mark_nosave_regions(max_low_pfn);
@@ -1031,6 +1221,10 @@ void __init setup_arch(char **cmdline_p)
 #endif
 #endif
 	x86_init.oem.banner();
+
+	mcheck_init();
+
+	rh_check_supported();
 }
 
 #ifdef CONFIG_X86_32

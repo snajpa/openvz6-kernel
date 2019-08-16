@@ -139,6 +139,8 @@ struct hvc_iucv_private *hvc_iucv_get_private(uint32_t num)
  *
  * This function allocates a new struct iucv_tty_buffer element and, optionally,
  * allocates an internal data buffer with the specified size @size.
+ * The internal data buffer is always allocated with GFP_DMA which is
+ * required for receiving and sending data with IUCV.
  * Note: The total message size arises from the internal buffer size and the
  *	 members of the iucv_tty_msg structure.
  * The function returns NULL if memory allocation has failed.
@@ -154,7 +156,7 @@ static struct iucv_tty_buffer *alloc_tty_buffer(size_t size, gfp_t flags)
 
 	if (size > 0) {
 		bufp->msg.length = MSG_SIZE(size);
-		bufp->mbuf = kmalloc(bufp->msg.length, flags);
+		bufp->mbuf = kmalloc(bufp->msg.length, flags | GFP_DMA);
 		if (!bufp->mbuf) {
 			mempool_free(bufp, hvc_iucv_mempool);
 			return NULL;
@@ -237,7 +239,7 @@ static int hvc_iucv_write(struct hvc_iucv_private *priv,
 	if (!rb->mbuf) { /* message not yet received ... */
 		/* allocate mem to store msg data; if no memory is available
 		 * then leave the buffer on the list and re-try later */
-		rb->mbuf = kmalloc(rb->msg.length, GFP_ATOMIC);
+		rb->mbuf = kmalloc(rb->msg.length, GFP_ATOMIC | GFP_DMA);
 		if (!rb->mbuf)
 			return -ENOMEM;
 
@@ -653,21 +655,64 @@ static void hvc_iucv_notifier_hangup(struct hvc_struct *hp, int id)
 }
 
 /**
+ * hvc_iucv_dtr_rts() - HVC notifier for handling DTR/RTS
+ * @hp:		Pointer the HVC device (struct hvc_struct)
+ * @raise:	Non-zero to raise or zero to lower DTR/RTS lines
+ *
+ * This routine notifies the HVC back-end to raise or lower DTR/RTS
+ * lines.  Raising DTR/RTS is ignored.  Lowering DTR/RTS indicates to
+ * drop the IUCV connection (similar to hang up the modem).
+ */
+static void hvc_iucv_dtr_rts(struct hvc_struct *hp, int raise)
+{
+	struct hvc_iucv_private *priv;
+	struct iucv_path        *path;
+
+	/* Raising the DTR/RTS is ignored as IUCV connections can be
+	 * established at any times.
+	 */
+	if (raise)
+		return;
+
+	priv = hvc_iucv_get_private(hp->vtermno);
+	if (!priv)
+		return;
+
+	/* Lowering the DTR/RTS lines disconnects an established IUCV
+	 * connection.
+	 */
+	flush_sndbuf_sync(priv);
+
+	spin_lock_bh(&priv->lock);
+	path = priv->path;		/* save reference to IUCV path */
+	priv->path = NULL;
+	priv->iucv_state = IUCV_DISCONN;
+	spin_unlock_bh(&priv->lock);
+
+	/* Sever IUCV path outside of priv->lock due to lock ordering of:
+	 * priv->lock <--> iucv_table_lock */
+	if (path) {
+		iucv_path_sever(path, NULL);
+		iucv_path_free(path);
+	}
+}
+
+/**
  * hvc_iucv_notifier_del() - HVC notifier for closing a TTY for the last time.
  * @hp:		Pointer to the HVC device (struct hvc_struct)
  * @id:		Additional data (originally passed to hvc_alloc):
  *		the index of an struct hvc_iucv_private instance.
  *
  * This routine notifies the HVC back-end that the last tty device fd has been
- * closed.  The function calls hvc_iucv_cleanup() to clean up the struct
- * hvc_iucv_private instance.
+ * closed.  The function cleans up tty resources.  The clean-up of the IUCV
+ * connection is done in hvc_iucv_dtr_rts() and depends on the HUPCL termios
+ * control setting.
  *
  * Locking:	struct hvc_iucv_private->lock
  */
 static void hvc_iucv_notifier_del(struct hvc_struct *hp, int id)
 {
 	struct hvc_iucv_private *priv;
-	struct iucv_path	*path;
 
 	priv = hvc_iucv_get_private(id);
 	if (!priv)
@@ -676,17 +721,11 @@ static void hvc_iucv_notifier_del(struct hvc_struct *hp, int id)
 	flush_sndbuf_sync(priv);
 
 	spin_lock_bh(&priv->lock);
-	path = priv->path;		/* save reference to IUCV path */
-	priv->path = NULL;
-	hvc_iucv_cleanup(priv);
+	destroy_tty_buffer_list(&priv->tty_outqueue);
+	destroy_tty_buffer_list(&priv->tty_inqueue);
+	priv->tty_state = TTY_CLOSED;
+	priv->sndbuf_len = 0;
 	spin_unlock_bh(&priv->lock);
-
-	/* sever IUCV path outside of priv->lock due to lock ordering of:
-	 * priv->lock <--> iucv_table_lock */
-	if (path) {
-		iucv_path_sever(path, NULL);
-		iucv_path_free(path);
-	}
 }
 
 /**
@@ -922,12 +961,13 @@ static int hvc_iucv_pm_restore_thaw(struct device *dev)
 
 
 /* HVC operations */
-static struct hv_ops hvc_iucv_ops = {
+static const struct hv_ops hvc_iucv_ops = {
 	.get_chars = hvc_iucv_get_chars,
 	.put_chars = hvc_iucv_put_chars,
 	.notifier_add = hvc_iucv_notifier_add,
 	.notifier_del = hvc_iucv_notifier_del,
 	.notifier_hangup = hvc_iucv_notifier_hangup,
+	.dtr_rts = hvc_iucv_dtr_rts,
 };
 
 /* Suspend / resume device operations */
@@ -1295,13 +1335,11 @@ static int __init hvc_iucv_init(void)
 	if (rc) {
 		pr_err("Registering IUCV handlers failed with error code=%d\n",
 			rc);
-		goto out_error_iucv;
+		goto out_error_hvc;
 	}
 
 	return 0;
 
-out_error_iucv:
-	iucv_unregister(&hvc_iucv_handler, 0);
 out_error_hvc:
 	for (i = 0; i < hvc_iucv_devices; i++)
 		if (hvc_iucv_table[i])

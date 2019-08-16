@@ -149,6 +149,7 @@ EXPORT_SYMBOL(phy_scan_fixups);
 struct phy_device* phy_device_create(struct mii_bus *bus, int addr, int phy_id)
 {
 	struct phy_device *dev;
+
 	/* We allocate the device, and initialize the
 	 * default values */
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
@@ -177,6 +178,17 @@ struct phy_device* phy_device_create(struct mii_bus *bus, int addr, int phy_id)
 	dev->state = PHY_DOWN;
 
 	mutex_init(&dev->lock);
+
+	/* Request the appropriate module unconditionally; don't
+	   bother trying to do so only if it isn't already loaded,
+	   because that gets complicated. A hotplug event would have
+	   done an unconditional modprobe anyway.
+	   We don't do normal hotplug because it won't work for MDIO
+	   -- because it relies on the device staying around for long
+	   enough for the driver to get loaded. With MDIO, the NIC
+	   driver will get bored and give up as soon as it finds that
+	   there's no driver _already_ loaded. */
+	request_module(MDIO_MODULE_PREFIX MDIO_ID_FMT, MDIO_ID_ARGS(phy_id));
 
 	return dev;
 }
@@ -524,20 +536,9 @@ int genphy_config_advert(struct phy_device *phydev)
 	if (adv < 0)
 		return adv;
 
-	adv &= ~(ADVERTISE_ALL | ADVERTISE_100BASE4 | ADVERTISE_PAUSE_CAP | 
+	adv &= ~(ADVERTISE_ALL | ADVERTISE_100BASE4 | ADVERTISE_PAUSE_CAP |
 		 ADVERTISE_PAUSE_ASYM);
-	if (advertise & ADVERTISED_10baseT_Half)
-		adv |= ADVERTISE_10HALF;
-	if (advertise & ADVERTISED_10baseT_Full)
-		adv |= ADVERTISE_10FULL;
-	if (advertise & ADVERTISED_100baseT_Half)
-		adv |= ADVERTISE_100HALF;
-	if (advertise & ADVERTISED_100baseT_Full)
-		adv |= ADVERTISE_100FULL;
-	if (advertise & ADVERTISED_Pause)
-		adv |= ADVERTISE_PAUSE_CAP;
-	if (advertise & ADVERTISED_Asym_Pause)
-		adv |= ADVERTISE_PAUSE_ASYM;
+	adv |= ethtool_adv_to_mii_adv_t(advertise);
 
 	if (adv != oldadv) {
 		err = phy_write(phydev, MII_ADVERTISE, adv);
@@ -556,10 +557,7 @@ int genphy_config_advert(struct phy_device *phydev)
 			return adv;
 
 		adv &= ~(ADVERTISE_1000FULL | ADVERTISE_1000HALF);
-		if (advertise & SUPPORTED_1000baseT_Half)
-			adv |= ADVERTISE_1000HALF;
-		if (advertise & SUPPORTED_1000baseT_Full)
-			adv |= ADVERTISE_1000FULL;
+		adv |= ethtool_adv_to_mii_ctrl1000_t(advertise);
 
 		if (adv != oldadv) {
 			err = phy_write(phydev, MII_CTRL1000, adv);

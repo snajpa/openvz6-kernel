@@ -2,7 +2,7 @@
  * Driver for HP iLO/iLO2 management processor.
  *
  * Copyright (C) 2008 Hewlett-Packard Development Company, L.P.
- *	David Altobelli <david.altobelli@hp.com>
+ *	David Altobelli <david.altobelli@hpe.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -29,6 +29,7 @@
 
 static struct class *ilo_class;
 static unsigned int ilo_major;
+static unsigned int max_ccb = 16;
 static char ilo_hwdev[MAX_ILO_DEV];
 
 static inline int get_entry_id(int entry)
@@ -255,7 +256,8 @@ static void ilo_ccb_close(struct pci_dev *pdev, struct ccb_data *data)
 
 static int ilo_ccb_setup(struct ilo_hwinfo *hw, struct ccb_data *data, int slot)
 {
-	char *dma_va, *dma_pa;
+	char *dma_va;
+	dma_addr_t dma_pa;
 	struct ccb *driver_ccb, *ilo_ccb;
 
 	driver_ccb = &data->driver_ccb;
@@ -271,12 +273,12 @@ static int ilo_ccb_setup(struct ilo_hwinfo *hw, struct ccb_data *data, int slot)
 		return -ENOMEM;
 
 	dma_va = (char *)data->dma_va;
-	dma_pa = (char *)data->dma_pa;
+	dma_pa = data->dma_pa;
 
 	memset(dma_va, 0, data->dma_size);
 
 	dma_va = (char *)roundup((unsigned long)dma_va, ILO_START_ALIGN);
-	dma_pa = (char *)roundup((unsigned long)dma_pa, ILO_START_ALIGN);
+	dma_pa = roundup(dma_pa, ILO_START_ALIGN);
 
 	/*
 	 * Create two ccb's, one with virt addrs, one with phys addrs.
@@ -287,26 +289,26 @@ static int ilo_ccb_setup(struct ilo_hwinfo *hw, struct ccb_data *data, int slot)
 
 	fifo_setup(dma_va, NR_QENTRY);
 	driver_ccb->ccb_u1.send_fifobar = dma_va + FIFOHANDLESIZE;
-	ilo_ccb->ccb_u1.send_fifobar = dma_pa + FIFOHANDLESIZE;
+	ilo_ccb->ccb_u1.send_fifobar_pa = dma_pa + FIFOHANDLESIZE;
 	dma_va += fifo_sz(NR_QENTRY);
 	dma_pa += fifo_sz(NR_QENTRY);
 
 	dma_va = (char *)roundup((unsigned long)dma_va, ILO_CACHE_SZ);
-	dma_pa = (char *)roundup((unsigned long)dma_pa, ILO_CACHE_SZ);
+	dma_pa = roundup(dma_pa, ILO_CACHE_SZ);
 
 	fifo_setup(dma_va, NR_QENTRY);
 	driver_ccb->ccb_u3.recv_fifobar = dma_va + FIFOHANDLESIZE;
-	ilo_ccb->ccb_u3.recv_fifobar = dma_pa + FIFOHANDLESIZE;
+	ilo_ccb->ccb_u3.recv_fifobar_pa = dma_pa + FIFOHANDLESIZE;
 	dma_va += fifo_sz(NR_QENTRY);
 	dma_pa += fifo_sz(NR_QENTRY);
 
 	driver_ccb->ccb_u2.send_desc = dma_va;
-	ilo_ccb->ccb_u2.send_desc = dma_pa;
+	ilo_ccb->ccb_u2.send_desc_pa = dma_pa;
 	dma_pa += desc_mem_sz(NR_QENTRY);
 	dma_va += desc_mem_sz(NR_QENTRY);
 
 	driver_ccb->ccb_u4.recv_desc = dma_va;
-	ilo_ccb->ccb_u4.recv_desc = dma_pa;
+	ilo_ccb->ccb_u4.recv_desc_pa = dma_pa;
 
 	driver_ccb->channel = slot;
 	ilo_ccb->channel = slot;
@@ -422,7 +424,7 @@ static void ilo_set_reset(struct ilo_hwinfo *hw)
 	 * Mapped memory is zeroed on ilo reset, so set a per ccb flag
 	 * to indicate that this ccb needs to be closed and reopened.
 	 */
-	for (slot = 0; slot < MAX_CCB; slot++) {
+	for (slot = 0; slot < max_ccb; slot++) {
 		if (!hw->ccb_alloc[slot])
 			continue;
 		set_channel_reset(&hw->ccb_alloc[slot]->driver_ccb);
@@ -533,7 +535,7 @@ static int ilo_close(struct inode *ip, struct file *fp)
 	struct ilo_hwinfo *hw;
 	unsigned long flags;
 
-	slot = iminor(ip) % MAX_CCB;
+	slot = iminor(ip) % max_ccb;
 	hw = container_of(ip->i_cdev, struct ilo_hwinfo, cdev);
 
 	spin_lock(&hw->open_lock);
@@ -564,7 +566,7 @@ static int ilo_open(struct inode *ip, struct file *fp)
 	struct ilo_hwinfo *hw;
 	unsigned long flags;
 
-	slot = iminor(ip) % MAX_CCB;
+	slot = iminor(ip) % max_ccb;
 	hw = container_of(ip->i_cdev, struct ilo_hwinfo, cdev);
 
 	/* new ccb allocation */
@@ -660,7 +662,7 @@ static irqreturn_t ilo_isr(int irq, void *data)
 		ilo_set_reset(hw);
 	}
 
-	for (i = 0; i < MAX_CCB; i++) {
+	for (i = 0; i < max_ccb; i++) {
 		if (!hw->ccb_alloc[i])
 			continue;
 		if (pending & (1 << i))
@@ -684,7 +686,9 @@ static void ilo_unmap_device(struct pci_dev *pdev, struct ilo_hwinfo *hw)
 
 static int __devinit ilo_map_device(struct pci_dev *pdev, struct ilo_hwinfo *hw)
 {
-	int error = -ENOMEM;
+	int bar;
+	unsigned long off;
+	unsigned long sz;
 
 	/* map the memory mapped i/o registers */
 	hw->mmio_vaddr = pci_iomap(pdev, 1, 0);
@@ -694,14 +698,24 @@ static int __devinit ilo_map_device(struct pci_dev *pdev, struct ilo_hwinfo *hw)
 	}
 
 	/* map the adapter shared memory region */
-	hw->ram_vaddr = pci_iomap(pdev, 2, MAX_CCB * ILOHW_CCB_SZ);
+	if (pdev->subsystem_device == 0x00E4) {
+		bar = 5;
+		/* Last 8k is reserved for CCBs */
+		off = pci_resource_len(pdev, bar) - 0x2000;
+		sz = 0;
+	} else {
+		bar = 2;
+		off = 0;
+		sz = max_ccb * ILOHW_CCB_SZ;
+	}
+	hw->ram_vaddr = pci_iomap(pdev, bar, sz) + off;
 	if (hw->ram_vaddr == NULL) {
 		dev_err(&pdev->dev, "Error mapping shared mem\n");
 		goto mmio_free;
 	}
 
 	/* map the doorbell aperture */
-	hw->db_vaddr = pci_iomap(pdev, 3, MAX_CCB * ONE_DB_SIZE);
+	hw->db_vaddr = pci_iomap(pdev, 3, max_ccb * ONE_DB_SIZE);
 	if (hw->db_vaddr == NULL) {
 		dev_err(&pdev->dev, "Error mapping doorbell\n");
 		goto ram_free;
@@ -713,7 +727,7 @@ ram_free:
 mmio_free:
 	pci_iounmap(pdev, hw->mmio_vaddr);
 out:
-	return error;
+	return -ENOMEM;
 }
 
 static void ilo_remove(struct pci_dev *pdev)
@@ -721,10 +735,13 @@ static void ilo_remove(struct pci_dev *pdev)
 	int i, minor;
 	struct ilo_hwinfo *ilo_hw = pci_get_drvdata(pdev);
 
+	if (!ilo_hw)
+		return;
+
 	clear_device(ilo_hw);
 
 	minor = MINOR(ilo_hw->cdev.dev);
-	for (i = minor; i < minor + MAX_CCB; i++)
+	for (i = minor; i < minor + max_ccb; i++)
 		device_destroy(ilo_class, MKDEV(ilo_major, i));
 
 	cdev_del(&ilo_hw->cdev);
@@ -732,16 +749,32 @@ static void ilo_remove(struct pci_dev *pdev)
 	free_irq(pdev->irq, ilo_hw);
 	ilo_unmap_device(pdev, ilo_hw);
 	pci_release_regions(pdev);
-	pci_disable_device(pdev);
+	/*
+	 * pci_disable_device(pdev) used to be here. But this PCI device has
+	 * two functions with interrupt lines connected to a single pin. The
+	 * other one is a USB host controller. So when we disable the PIN here
+	 * e.g. by rmmod hpilo, the controller stops working. It is because
+	 * the interrupt link is disabled in ACPI since it is not refcounted
+	 * yet. See acpi_pci_link_free_irq called from acpi_pci_irq_disable.
+	 */
 	kfree(ilo_hw);
-	ilo_hwdev[(minor / MAX_CCB)] = 0;
+	ilo_hwdev[(minor / max_ccb)] = 0;
 }
 
 static int __devinit ilo_probe(struct pci_dev *pdev,
 			       const struct pci_device_id *ent)
 {
-	int devnum, minor, start, error;
+	int devnum, minor, start, error = 0;
 	struct ilo_hwinfo *ilo_hw;
+
+	/* Ignore subsystem_device = 0x1979 (set by BIOS)  */
+	if (pdev->subsystem_device == 0x1979)
+		return 0;
+
+	if (max_ccb > MAX_CCB)
+		max_ccb = MAX_CCB;
+	else if (max_ccb < MIN_CCB)
+		max_ccb = MIN_CCB;
 
 	/* find a free range for device files */
 	for (devnum = 0; devnum < MAX_ILO_DEV; devnum++) {
@@ -792,14 +825,14 @@ static int __devinit ilo_probe(struct pci_dev *pdev,
 
 	cdev_init(&ilo_hw->cdev, &ilo_fops);
 	ilo_hw->cdev.owner = THIS_MODULE;
-	start = devnum * MAX_CCB;
-	error = cdev_add(&ilo_hw->cdev, MKDEV(ilo_major, start), MAX_CCB);
+	start = devnum * max_ccb;
+	error = cdev_add(&ilo_hw->cdev, MKDEV(ilo_major, start), max_ccb);
 	if (error) {
 		dev_err(&pdev->dev, "Could not add cdev\n");
 		goto remove_isr;
 	}
 
-	for (minor = 0 ; minor < MAX_CCB; minor++) {
+	for (minor = 0 ; minor < max_ccb; minor++) {
 		struct device *dev;
 		dev = device_create(ilo_class, &pdev->dev,
 				    MKDEV(ilo_major, minor), NULL,
@@ -817,7 +850,7 @@ unmap:
 free_regions:
 	pci_release_regions(pdev);
 disable:
-	pci_disable_device(pdev);
+/*	pci_disable_device(pdev);  see comment in ilo_remove */
 free:
 	kfree(ilo_hw);
 out:
@@ -876,11 +909,14 @@ static void __exit ilo_exit(void)
 	class_destroy(ilo_class);
 }
 
-MODULE_VERSION("1.2");
+MODULE_VERSION("1.5.0");
 MODULE_ALIAS(ILO_NAME);
 MODULE_DESCRIPTION(ILO_NAME);
-MODULE_AUTHOR("David Altobelli <david.altobelli@hp.com>");
+MODULE_AUTHOR("David Altobelli <david.altobelli@hpe.com>");
 MODULE_LICENSE("GPL v2");
+
+module_param(max_ccb, uint, 0444);
+MODULE_PARM_DESC(max_ccb, "Maximum number of HP iLO channels to attach (16)");
 
 module_init(ilo_init);
 module_exit(ilo_exit);

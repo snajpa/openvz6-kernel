@@ -39,12 +39,16 @@
 #include <linux/seq_file.h>
 #include <linux/math64.h>
 #include <linux/hash.h>
+#include <linux/log2.h>
+#include <linux/vmalloc.h>
+#include <linux/bitops.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/jbd2.h>
 
 #include <asm/uaccess.h>
 #include <asm/page.h>
+#include <asm/system.h>
 
 EXPORT_SYMBOL(jbd2_journal_start);
 EXPORT_SYMBOL(jbd2_journal_restart);
@@ -78,6 +82,7 @@ EXPORT_SYMBOL(jbd2_journal_errno);
 EXPORT_SYMBOL(jbd2_journal_ack_err);
 EXPORT_SYMBOL(jbd2_journal_clear_err);
 EXPORT_SYMBOL(jbd2_log_wait_commit);
+EXPORT_SYMBOL(jbd2_log_start_commit);
 EXPORT_SYMBOL(jbd2_journal_start_commit);
 EXPORT_SYMBOL(jbd2_journal_force_commit_nested);
 EXPORT_SYMBOL(jbd2_journal_wipe);
@@ -92,6 +97,7 @@ EXPORT_SYMBOL(jbd2_journal_begin_ordered_truncate);
 
 static int journal_convert_superblock_v1(journal_t *, journal_superblock_t *);
 static void __journal_abort_soft (journal_t *journal, int errno);
+static int jbd2_journal_create_slab(size_t slab_size);
 
 /*
  * Helper function used to manage commit timeouts
@@ -293,7 +299,6 @@ int jbd2_journal_write_metadata_buffer(transaction_t *transaction,
 	struct page *new_page;
 	unsigned int new_offset;
 	struct buffer_head *bh_in = jh2bh(jh_in);
-	struct jbd2_buffer_trigger_type *triggers;
 	journal_t *journal = transaction->t_journal;
 
 	/*
@@ -324,21 +329,21 @@ repeat:
 		done_copy_out = 1;
 		new_page = virt_to_page(jh_in->b_frozen_data);
 		new_offset = offset_in_page(jh_in->b_frozen_data);
-		triggers = jh_in->b_frozen_triggers;
 	} else {
 		new_page = jh2bh(jh_in)->b_page;
 		new_offset = offset_in_page(jh2bh(jh_in)->b_data);
-		triggers = jh_in->b_triggers;
 	}
 
 	mapped_data = kmap_atomic(new_page, KM_USER0);
 	/*
-	 * Fire any commit trigger.  Do this before checking for escaping,
-	 * as the trigger may modify the magic offset.  If a copy-out
-	 * happens afterwards, it will have the correct data in the buffer.
+	 * Fire data frozen trigger if data already wasn't frozen.  Do this
+	 * before checking for escaping, as the trigger may modify the magic
+	 * offset.  If a copy-out happens afterwards, it will have the correct
+	 * data in the buffer.
 	 */
-	jbd2_buffer_commit_trigger(jh_in, mapped_data + new_offset,
-				   triggers);
+	if (!done_copy_out)
+		jbd2_buffer_frozen_trigger(jh_in, mapped_data + new_offset,
+					   jh_in->b_triggers);
 
 	/*
 	 * Check for escaping
@@ -358,6 +363,10 @@ repeat:
 
 		jbd_unlock_bh_state(bh_in);
 		tmp = jbd2_alloc(bh_in->b_size, GFP_NOFS);
+		if (!tmp) {
+			jbd2_journal_put_journal_head(new_jh);
+			return -ENOMEM;
+		}
 		jbd_lock_bh_state(bh_in);
 		if (jh_in->b_frozen_data) {
 			jbd2_free(tmp, bh_in->b_size);
@@ -457,12 +466,19 @@ int __jbd2_log_space_left(journal_t *journal)
  */
 int __jbd2_log_start_commit(journal_t *journal, tid_t target)
 {
+	/* Return if the txn has already requested to be committed */
+	if (journal->j_commit_request == target)
+		return 0;
+
 	/*
-	 * Are we already doing a recent enough commit?
+	 * The only transaction we can possibly wait upon is the
+	 * currently running transaction (if it exists).  Otherwise,
+	 * the target tid must be an old one.
 	 */
-	if (!tid_geq(journal->j_commit_request, target)) {
+	if (journal->j_running_transaction &&
+	    journal->j_running_transaction->t_tid == target) {
 		/*
-		 * We want a new commit: OK, mark the request and wakup the
+		 * We want a new commit: OK, mark the request and wakeup the
 		 * commit thread.  We do _not_ do the commit ourselves.
 		 */
 
@@ -472,7 +488,14 @@ int __jbd2_log_start_commit(journal_t *journal, tid_t target)
 			  journal->j_commit_sequence);
 		wake_up(&journal->j_wait_commit);
 		return 1;
-	}
+	} else if (!tid_geq(journal->j_commit_request, target))
+		/* This should never happen, but if it does, preserve
+		   the evidence before kjournald goes into a loop and
+		   increments j_commit_sequence beyond all recognition. */
+		WARN(1, "jbd: bad log_start_commit: %u %u %u %u\n",
+		     journal->j_commit_request, journal->j_commit_sequence,
+		     target, journal->j_running_transaction ? 
+		     journal->j_running_transaction->t_tid : 0);
 	return 0;
 }
 
@@ -552,6 +575,47 @@ int jbd2_journal_start_commit(journal_t *journal, tid_t *ptid)
 }
 
 /*
+ * Return 1 if a given transaction has not yet sent barrier request
+ * connected with a transaction commit. If 0 is returned, transaction
+ * may or may not have sent the barrier. Used to avoid sending barrier
+ * twice in common cases.
+ */
+int jbd2_trans_will_send_data_barrier(journal_t *journal, tid_t tid)
+{
+	int ret = 0;
+	transaction_t *commit_trans;
+
+	if (!(journal->j_flags & JBD2_BARRIER))
+		return 0;
+	spin_lock(&journal->j_state_lock);
+	/* Transaction already committed? */
+	if (tid_geq(journal->j_commit_sequence, tid))
+		goto out;
+	commit_trans = journal->j_committing_transaction;
+	if (!commit_trans || commit_trans->t_tid != tid) {
+		ret = 1;
+		goto out;
+	}
+	/*
+	 * Transaction is being committed and we already proceeded to
+	 * submitting a flush to fs partition?
+	 */
+	if (journal->j_fs_dev != journal->j_dev) {
+		if (!commit_trans->t_need_data_flush ||
+		    commit_trans->t_state >= T_COMMIT_DFLUSH)
+			goto out;
+	} else {
+		if (commit_trans->t_state >= T_COMMIT_JFLUSH)
+			goto out;
+	}
+	ret = 1;
+out:
+	spin_unlock(&journal->j_state_lock);
+	return ret;
+}
+EXPORT_SYMBOL(jbd2_trans_will_send_data_barrier);
+
+/*
  * Wait for a specified commit to complete.
  * The caller may not hold the journal lock.
  */
@@ -586,6 +650,37 @@ int jbd2_log_wait_commit(journal_t *journal, tid_t tid)
 	}
 	return err;
 }
+
+/*
+ * When this function returns the transaction corresponding to tid
+ * will be completed.  If the transaction has currently running, start
+ * committing that transaction before waiting for it to complete.  If
+ * the transaction id is stale, it is by definition already completed,
+ * so just return SUCCESS.
+ */
+int jbd2_complete_transaction(journal_t *journal, tid_t tid)
+{
+	int	need_to_wait = 1;
+
+	spin_lock(&journal->j_state_lock);
+	if (journal->j_running_transaction &&
+	    journal->j_running_transaction->t_tid == tid) {
+		if (journal->j_commit_request != tid) {
+			/* transaction not yet started, so request it */
+			spin_unlock(&journal->j_state_lock);
+			jbd2_log_start_commit(journal, tid);
+			goto wait_commit;
+		}
+	} else if (!(journal->j_committing_transaction &&
+		     journal->j_committing_transaction->t_tid == tid))
+		need_to_wait = 0;
+	spin_unlock(&journal->j_state_lock);
+	if (!need_to_wait)
+		return 0;
+wait_commit:
+	return jbd2_log_wait_commit(journal, tid);
+}
+EXPORT_SYMBOL(jbd2_complete_transaction);
 
 /*
  * Log buffer allocation routines:
@@ -809,7 +904,7 @@ static journal_t * journal_init_common (void)
 	journal_t *journal;
 	int err;
 
-	journal = kzalloc(sizeof(*journal), GFP_KERNEL|__GFP_NOFAIL);
+	journal = kzalloc(sizeof(*journal), GFP_KERNEL);
 	if (!journal)
 		goto fail;
 
@@ -883,6 +978,14 @@ journal_t * jbd2_journal_init_dev(struct block_device *bdev,
 
 	/* journal descriptor can store up to n blocks -bzzz */
 	journal->j_blocksize = blocksize;
+	journal->j_dev = bdev;
+	journal->j_fs_dev = fs_dev;
+	journal->j_blk_offset = start;
+	journal->j_maxlen = len;
+	bdevname(journal->j_dev, journal->j_devname);
+	p = journal->j_devname;
+	while ((p = strchr(p, '/')))
+		*p = '!';
 	jbd2_stats_proc_init(journal);
 	n = journal->j_blocksize / sizeof(journal_block_tag_t);
 	journal->j_wbufsize = n;
@@ -892,14 +995,6 @@ journal_t * jbd2_journal_init_dev(struct block_device *bdev,
 			__func__);
 		goto out_err;
 	}
-	journal->j_dev = bdev;
-	journal->j_fs_dev = fs_dev;
-	journal->j_blk_offset = start;
-	journal->j_maxlen = len;
-	bdevname(journal->j_dev, journal->j_devname);
-	p = journal->j_devname;
-	while ((p = strchr(p, '/')))
-		*p = '!';
 
 	bh = __getblk(journal->j_dev, start, journal->j_blocksize);
 	if (!bh) {
@@ -1110,7 +1205,9 @@ void jbd2_journal_update_superblock(journal_t *journal, int wait)
 			set_buffer_uptodate(bh);
 		}
 	} else
-		ll_rw_block(SWRITE, 1, &bh);
+		write_dirty_buffer(bh, WRITE);
+
+	trace_jbd2_update_superblock_end(journal, wait);
 
 out:
 	/* If we have just flushed the log (by marking s_start==0), then
@@ -1175,6 +1272,14 @@ static int journal_get_superblock(journal_t *journal)
 		journal->j_maxlen = be32_to_cpu(sb->s_maxlen);
 	else if (be32_to_cpu(sb->s_maxlen) > journal->j_maxlen) {
 		printk (KERN_WARNING "JBD: journal file too short\n");
+		goto out;
+	}
+
+	if (be32_to_cpu(sb->s_first) == 0 ||
+	    be32_to_cpu(sb->s_first) >= journal->j_maxlen) {
+		printk(KERN_WARNING
+			"JBD2: Invalid start block of journal: %u\n",
+			be32_to_cpu(sb->s_first));
 		goto out;
 	}
 
@@ -1243,10 +1348,24 @@ int jbd2_journal_load(journal_t *journal)
 		}
 	}
 
+	/*
+	 * Create a slab for this blocksize
+	 */
+	err = jbd2_journal_create_slab(be32_to_cpu(sb->s_blocksize));
+	if (err)
+		return err;
+
 	/* Let the recovery code check whether it needs to recover any
 	 * data from the journal. */
 	if (jbd2_journal_recover(journal))
 		goto recovery_error;
+
+	if (journal->j_failed_commit) {
+		printk(KERN_ERR "JBD2: journal transaction %u on %s "
+		       "is corrupt.\n", journal->j_failed_commit,
+		       journal->j_devname);
+		return -EIO;
+	}
 
 	/* OK, we've finished with the dynamic journal bits:
 	 * reinitialise the dynamic contents of the superblock in memory
@@ -1795,6 +1914,127 @@ size_t journal_tag_bytes(journal_t *journal)
 }
 
 /*
+ * JBD memory management
+ *
+ * These functions are used to allocate block-sized chunks of memory
+ * used for making copies of buffer_head data.  Very often it will be
+ * page-sized chunks of data, but sometimes it will be in
+ * sub-page-size chunks.  (For example, 16k pages on Power systems
+ * with a 4k block file system.)  For blocks smaller than a page, we
+ * use a SLAB allocator.  There are slab caches for each block size,
+ * which are allocated at mount time, if necessary, and we only free
+ * (all of) the slab caches when/if the jbd2 module is unloaded.  For
+ * this reason we don't need to a mutex to protect access to
+ * jbd2_slab[] allocating or releasing memory; only in
+ * jbd2_journal_create_slab().
+ */
+#define JBD2_MAX_SLABS 8
+static struct kmem_cache *jbd2_slab[JBD2_MAX_SLABS];
+static DECLARE_MUTEX(jbd2_slab_create_sem);
+
+static const char *jbd2_slab_names[JBD2_MAX_SLABS] = {
+	"jbd2_1k", "jbd2_2k", "jbd2_4k", "jbd2_8k",
+	"jbd2_16k", "jbd2_32k", "jbd2_64k", "jbd2_128k"
+};
+
+
+static void jbd2_journal_destroy_slabs(void)
+{
+	int i;
+
+	for (i = 0; i < JBD2_MAX_SLABS; i++) {
+		if (jbd2_slab[i])
+			kmem_cache_destroy(jbd2_slab[i]);
+		jbd2_slab[i] = NULL;
+	}
+}
+
+static int jbd2_journal_create_slab(size_t size)
+{
+	int i = order_base_2(size) - 10;
+	size_t slab_size;
+
+	if (size == PAGE_SIZE)
+		return 0;
+
+	if (i >= JBD2_MAX_SLABS)
+		return -EINVAL;
+
+	if (unlikely(i < 0))
+		i = 0;
+	down(&jbd2_slab_create_sem);
+	if (jbd2_slab[i]) {
+		up(&jbd2_slab_create_sem);
+		return 0;	/* Already created */
+	}
+
+	slab_size = 1 << (i+10);
+	jbd2_slab[i] = kmem_cache_create(jbd2_slab_names[i], slab_size,
+					 slab_size, 0, NULL);
+	up(&jbd2_slab_create_sem);
+	if (!jbd2_slab[i]) {
+		printk(KERN_EMERG "JBD2: no memory for jbd2_slab cache\n");
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+static struct kmem_cache *get_slab(size_t size)
+{
+	int i = order_base_2(size) - 10;
+
+	BUG_ON(i >= JBD2_MAX_SLABS);
+	if (unlikely(i < 0))
+		i = 0;
+	BUG_ON(jbd2_slab[i] == 0);
+	return jbd2_slab[i];
+}
+
+void *jbd2_alloc(size_t size, gfp_t flags)
+{
+	void *ptr;
+
+	BUG_ON(size & (size-1)); /* Must be a power of 2 */
+
+	flags |= __GFP_REPEAT;
+	if (size == PAGE_SIZE)
+		ptr = (void *)__get_free_pages(flags, 0);
+	else if (size > PAGE_SIZE) {
+		int order = get_order(size);
+
+		if (order < 3)
+			ptr = (void *)__get_free_pages(flags, order);
+		else
+			ptr = vmalloc(size);
+	} else
+		ptr = kmem_cache_alloc(get_slab(size), flags);
+
+	/* Check alignment; SLUB has gotten this wrong in the past,
+	 * and this can lead to user data corruption! */
+	BUG_ON(((unsigned long) ptr) & (size-1));
+
+	return ptr;
+}
+
+void jbd2_free(void *ptr, size_t size)
+{
+	if (size == PAGE_SIZE) {
+		free_pages((unsigned long)ptr, 0);
+		return;
+	}
+	if (size > PAGE_SIZE) {
+		int order = get_order(size);
+
+		if (order < 3)
+			free_pages((unsigned long)ptr, order);
+		else
+			vfree(ptr);
+		return;
+	}
+	kmem_cache_free(get_slab(size), ptr);
+};
+
+/*
  * Journal_head storage management
  */
 static struct kmem_cache *jbd2_journal_head_cache;
@@ -1878,10 +2118,9 @@ static void journal_free_journal_head(struct journal_head *jh)
  * When a buffer has its BH_JBD bit set it is immune from being released by
  * core kernel code, mainly via ->b_count.
  *
- * A journal_head may be detached from its buffer_head when the journal_head's
- * b_transaction, b_cp_transaction and b_next_transaction pointers are NULL.
- * Various places in JBD call jbd2_journal_remove_journal_head() to indicate that the
- * journal_head can be dropped if needed.
+ * A journal_head is detached from its buffer_head when the journal_head's
+ * b_jcount reaches zero. Running transaction (b_transaction) and checkpoint
+ * transaction (b_cp_transaction) hold their references to b_jcount.
  *
  * Various places in the kernel want to attach a journal_head to a buffer_head
  * _before_ attaching the journal_head to a transaction.  To protect the
@@ -1894,17 +2133,16 @@ static void journal_free_journal_head(struct journal_head *jh)
  *	(Attach a journal_head if needed.  Increments b_jcount)
  *	struct journal_head *jh = jbd2_journal_add_journal_head(bh);
  *	...
+ *      (Get another reference for transaction)
+ *	jbd2_journal_grab_journal_head(bh);
  *	jh->b_transaction = xxx;
+ *	(Put original reference)
  *	jbd2_journal_put_journal_head(jh);
- *
- * Now, the journal_head's b_jcount is zero, but it is safe from being released
- * because it has a non-zero b_transaction.
  */
 
 /*
  * Give a buffer_head a journal_head.
  *
- * Doesn't need the journal lock.
  * May sleep.
  */
 struct journal_head *jbd2_journal_add_journal_head(struct buffer_head *bh)
@@ -1968,61 +2206,29 @@ static void __journal_remove_journal_head(struct buffer_head *bh)
 	struct journal_head *jh = bh2jh(bh);
 
 	J_ASSERT_JH(jh, jh->b_jcount >= 0);
-
-	get_bh(bh);
-	if (jh->b_jcount == 0) {
-		if (jh->b_transaction == NULL &&
-				jh->b_next_transaction == NULL &&
-				jh->b_cp_transaction == NULL) {
-			J_ASSERT_JH(jh, jh->b_jlist == BJ_None);
-			J_ASSERT_BH(bh, buffer_jbd(bh));
-			J_ASSERT_BH(bh, jh2bh(jh) == bh);
-			BUFFER_TRACE(bh, "remove journal_head");
-			if (jh->b_frozen_data) {
-				printk(KERN_WARNING "%s: freeing "
-						"b_frozen_data\n",
-						__func__);
-				jbd2_free(jh->b_frozen_data, bh->b_size);
-			}
-			if (jh->b_committed_data) {
-				printk(KERN_WARNING "%s: freeing "
-						"b_committed_data\n",
-						__func__);
-				jbd2_free(jh->b_committed_data, bh->b_size);
-			}
-			bh->b_private = NULL;
-			jh->b_bh = NULL;	/* debug, really */
-			clear_buffer_jbd(bh);
-			__brelse(bh);
-			journal_free_journal_head(jh);
-		} else {
-			BUFFER_TRACE(bh, "journal_head was locked");
-		}
+	J_ASSERT_JH(jh, jh->b_transaction == NULL);
+	J_ASSERT_JH(jh, jh->b_next_transaction == NULL);
+	J_ASSERT_JH(jh, jh->b_cp_transaction == NULL);
+	J_ASSERT_JH(jh, jh->b_jlist == BJ_None);
+	J_ASSERT_BH(bh, buffer_jbd(bh));
+	J_ASSERT_BH(bh, jh2bh(jh) == bh);
+	BUFFER_TRACE(bh, "remove journal_head");
+	if (jh->b_frozen_data) {
+		printk(KERN_WARNING "%s: freeing b_frozen_data\n", __func__);
+		jbd2_free(jh->b_frozen_data, bh->b_size);
 	}
+	if (jh->b_committed_data) {
+		printk(KERN_WARNING "%s: freeing b_committed_data\n", __func__);
+		jbd2_free(jh->b_committed_data, bh->b_size);
+	}
+	bh->b_private = NULL;
+	jh->b_bh = NULL;	/* debug, really */
+	clear_buffer_jbd(bh);
+	journal_free_journal_head(jh);
 }
 
 /*
- * jbd2_journal_remove_journal_head(): if the buffer isn't attached to a transaction
- * and has a zero b_jcount then remove and release its journal_head.   If we did
- * see that the buffer is not used by any transaction we also "logically"
- * decrement ->b_count.
- *
- * We in fact take an additional increment on ->b_count as a convenience,
- * because the caller usually wants to do additional things with the bh
- * after calling here.
- * The caller of jbd2_journal_remove_journal_head() *must* run __brelse(bh) at some
- * time.  Once the caller has run __brelse(), the buffer is eligible for
- * reaping by try_to_free_buffers().
- */
-void jbd2_journal_remove_journal_head(struct buffer_head *bh)
-{
-	jbd_lock_bh_journal_head(bh);
-	__journal_remove_journal_head(bh);
-	jbd_unlock_bh_journal_head(bh);
-}
-
-/*
- * Drop a reference on the passed journal_head.  If it fell to zero then try to
+ * Drop a reference on the passed journal_head.  If it fell to zero then
  * release the journal_head from the buffer_head.
  */
 void jbd2_journal_put_journal_head(struct journal_head *jh)
@@ -2032,11 +2238,12 @@ void jbd2_journal_put_journal_head(struct journal_head *jh)
 	jbd_lock_bh_journal_head(bh);
 	J_ASSERT_JH(jh, jh->b_jcount > 0);
 	--jh->b_jcount;
-	if (!jh->b_jcount && !jh->b_transaction) {
+	if (!jh->b_jcount) {
 		__journal_remove_journal_head(bh);
+		jbd_unlock_bh_journal_head(bh);
 		__brelse(bh);
-	}
-	jbd_unlock_bh_journal_head(bh);
+	} else
+		jbd_unlock_bh_journal_head(bh);
 }
 
 /*
@@ -2066,9 +2273,10 @@ void jbd2_journal_release_jbd_inode(journal_t *journal,
 restart:
 	spin_lock(&journal->j_list_lock);
 	/* Is commit writing out inode - we have to wait */
-	if (jinode->i_flags & JI_COMMIT_RUNNING) {
+	if (test_bit(__JI_COMMIT_RUNNING, &jinode->i_flags)) {
 		wait_queue_head_t *wq;
 		DEFINE_WAIT_BIT(wait, &jinode->i_flags, __JI_COMMIT_RUNNING);
+		smp_mb();
 		wq = bit_waitqueue(&jinode->i_flags, __JI_COMMIT_RUNNING);
 		prepare_to_wait(wq, &wait.wait, TASK_UNINTERRUPTIBLE);
 		spin_unlock(&journal->j_list_lock);
@@ -2103,7 +2311,8 @@ static void __init jbd2_create_debugfs_entry(void)
 {
 	jbd2_debugfs_dir = debugfs_create_dir("jbd2", NULL);
 	if (jbd2_debugfs_dir)
-		jbd2_debug = debugfs_create_u8(JBD2_DEBUG_NAME, S_IRUGO,
+		jbd2_debug = debugfs_create_u8(JBD2_DEBUG_NAME,
+					       S_IRUGO | S_IWUSR,
 					       jbd2_debugfs_dir,
 					       &jbd2_journal_enable_debug);
 }
@@ -2191,6 +2400,7 @@ static void jbd2_journal_destroy_caches(void)
 	jbd2_journal_destroy_revoke_caches();
 	jbd2_journal_destroy_jbd2_journal_head_cache();
 	jbd2_journal_destroy_handle_cache();
+	jbd2_journal_destroy_slabs();
 }
 
 static int __init journal_init(void)

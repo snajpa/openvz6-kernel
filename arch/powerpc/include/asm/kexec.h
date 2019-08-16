@@ -31,6 +31,10 @@
 #define KEXEC_ARCH KEXEC_ARCH_PPC
 #endif
 
+#define KEXEC_STATE_NONE 0
+#define KEXEC_STATE_IRQS_OFF 1
+#define KEXEC_STATE_REAL_MODE 2
+
 #ifndef __ASSEMBLY__
 #include <linux/cpumask.h>
 #include <asm/reg.h>
@@ -38,6 +42,22 @@
 typedef void (*crash_shutdown_t)(void);
 
 #ifdef CONFIG_KEXEC
+
+#ifdef CONFIG_KEXEC_AUTO_RESERVE
+
+#if PAGE_SHIFT==12
+#ifndef KEXEC_AUTO_THRESHOLD
+#define KEXEC_AUTO_THRESHOLD (1ULL<<31) /* 2G */
+#endif
+#else
+#ifndef KEXEC_AUTO_THRESHOLD
+#define KEXEC_AUTO_THRESHOLD (1ULL<<33) /* 8G */
+#endif
+#endif /*PAGE_SHIFT == 12 */
+
+#endif
+
+#include <asm-generic/kexec.h>
 
 /*
  * This function is responsible for capturing register states if coming

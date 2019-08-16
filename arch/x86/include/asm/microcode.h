@@ -1,6 +1,21 @@
 #ifndef _ASM_X86_MICROCODE_H
 #define _ASM_X86_MICROCODE_H
 
+#define native_rdmsr(msr, val1, val2)			\
+do {							\
+	u64 __val = native_read_msr((msr));		\
+	(void)((val1) = (u32)__val);			\
+	(void)((val2) = (u32)(__val >> 32));		\
+} while (0)
+
+#define native_wrmsr(msr, low, high)			\
+	native_write_msr(msr, low, high)
+
+#define native_wrmsrl(msr, val)				\
+	native_write_msr((msr),				\
+			 (u32)((u64)(val)),		\
+			 (u32)((u64)(val) >> 32))
+
 struct cpu_signature {
 	unsigned int sig;
 	unsigned int pf;
@@ -12,6 +27,8 @@ struct device;
 enum ucode_state { UCODE_ERROR, UCODE_OK, UCODE_NFOUND };
 
 struct microcode_ops {
+	void (*init)(struct device *device);
+	void (*fini)(void);
 	enum ucode_state (*request_microcode_user) (int cpu,
 				const void __user *buf, size_t size);
 

@@ -800,10 +800,14 @@ static struct proto ax25_proto = {
 	.obj_size = sizeof(struct sock),
 };
 
-static int ax25_create(struct net *net, struct socket *sock, int protocol)
+static int ax25_create(struct net *net, struct socket *sock, int protocol,
+		       int kern)
 {
 	struct sock *sk;
 	ax25_cb *ax25;
+
+	if (protocol < 0 || protocol > SK_PROTOCOL_MAX)
+		return -EINVAL;
 
 	if (net != &init_net)
 		return -EAFNOSUPPORT;
@@ -1619,6 +1623,8 @@ static int ax25_recvmsg(struct kiocb *iocb, struct socket *sock,
 	int copied;
 	int err = 0;
 
+	msg->msg_namelen = 0;
+
 	lock_sock(sk);
 	/*
 	 * 	This works for seqpacket too. The receiver has ordered the
@@ -1648,11 +1654,11 @@ static int ax25_recvmsg(struct kiocb *iocb, struct socket *sock,
 
 	skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
 
-	if (msg->msg_namelen != 0) {
-		struct sockaddr_ax25 *sax = (struct sockaddr_ax25 *)msg->msg_name;
+	if (msg->msg_name) {
 		ax25_digi digi;
 		ax25_address src;
 		const unsigned char *mac = skb_mac_header(skb);
+		struct sockaddr_ax25 *sax = msg->msg_name;
 
 		ax25_addr_parse(mac + 1, skb->data - mac - 1, &src, NULL,
 				&digi, NULL, NULL);

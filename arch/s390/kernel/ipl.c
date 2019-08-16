@@ -15,6 +15,8 @@
 #include <linux/reboot.h>
 #include <linux/ctype.h>
 #include <linux/fs.h>
+#include <linux/kexec.h>
+#include <linux/crash_dump.h>
 #include <asm/ipl.h>
 #include <asm/smp.h>
 #include <asm/setup.h>
@@ -44,11 +46,13 @@
  * - halt
  * - power off
  * - reipl
+ * - restart
  */
 #define ON_PANIC_STR		"on_panic"
 #define ON_HALT_STR		"on_halt"
 #define ON_POFF_STR		"on_poff"
 #define ON_REIPL_STR		"on_reboot"
+#define ON_RESTART_STR		"on_restart"
 
 struct shutdown_action;
 struct shutdown_trigger {
@@ -402,8 +406,9 @@ static ssize_t sys_ipl_device_show(struct kobject *kobj,
 static struct kobj_attribute sys_ipl_device_attr =
 	__ATTR(device, S_IRUGO, sys_ipl_device_show, NULL);
 
-static ssize_t ipl_parameter_read(struct kobject *kobj, struct bin_attribute *attr,
-				  char *buf, loff_t off, size_t count)
+static ssize_t ipl_parameter_read(struct file *filp, struct kobject *kobj,
+				  struct bin_attribute *attr, char *buf,
+				  loff_t off, size_t count)
 {
 	return memory_read_from_buffer(buf, count, &off, IPL_PARMBLOCK_START,
 					IPL_PARMBLOCK_SIZE);
@@ -418,8 +423,9 @@ static struct bin_attribute ipl_parameter_attr = {
 	.read = &ipl_parameter_read,
 };
 
-static ssize_t ipl_scp_data_read(struct kobject *kobj, struct bin_attribute *attr,
-				 char *buf, loff_t off, size_t count)
+static ssize_t ipl_scp_data_read(struct file *filp, struct kobject *kobj,
+				 struct bin_attribute *attr, char *buf,
+				 loff_t off, size_t count)
 {
 	unsigned int size = IPL_PARMBLOCK_START->ipl_info.fcp.scp_data_len;
 	void *scp_data = &IPL_PARMBLOCK_START->ipl_info.fcp.scp_data;
@@ -555,6 +561,7 @@ out:
 
 static void ipl_run(struct shutdown_trigger *trigger)
 {
+	__bpon();
 	diag308(DIAG308_IPL, NULL);
 	if (MACHINE_IS_VM)
 		__cpcmd("IPL", NULL, 0, NULL);
@@ -688,7 +695,7 @@ static struct kobj_attribute sys_reipl_ccw_vmparm_attr =
 
 /* FCP reipl device attributes */
 
-static ssize_t reipl_fcp_scpdata_read(struct kobject *kobj,
+static ssize_t reipl_fcp_scpdata_read(struct file *filp, struct kobject *kobj,
 				      struct bin_attribute *attr,
 				      char *buf, loff_t off, size_t count)
 {
@@ -698,7 +705,7 @@ static ssize_t reipl_fcp_scpdata_read(struct kobject *kobj,
 	return memory_read_from_buffer(buf, count, &off, scp_data, size);
 }
 
-static ssize_t reipl_fcp_scpdata_write(struct kobject *kobj,
+static ssize_t reipl_fcp_scpdata_write(struct file *filp, struct kobject *kobj,
 				       struct bin_attribute *attr,
 				       char *buf, loff_t off, size_t count)
 {
@@ -1369,6 +1376,16 @@ static struct kobj_attribute dump_type_attr =
 
 static struct kset *dump_kset;
 
+static void diag308_dump(void *dump_block)
+{
+	diag308(DIAG308_SET, dump_block);
+	while (1) {
+		if (diag308(DIAG308_DUMP, NULL) != 0x302)
+			break;
+		udelay_simple(USEC_PER_SEC);
+	}
+}
+
 static void dump_run(struct shutdown_trigger *trigger)
 {
 	struct ccw_dev_id devid;
@@ -1389,12 +1406,10 @@ static void dump_run(struct shutdown_trigger *trigger)
 		__cpcmd(buf, NULL, 0, NULL);
 		break;
 	case DUMP_METHOD_CCW_DIAG:
-		diag308(DIAG308_SET, dump_block_ccw);
-		diag308(DIAG308_DUMP, NULL);
+		diag308_dump(dump_block_ccw);
 		break;
 	case DUMP_METHOD_FCP_DIAG:
-		diag308(DIAG308_SET, dump_block_fcp);
-		diag308(DIAG308_DUMP, NULL);
+		diag308_dump(dump_block_fcp);
 		break;
 	case DUMP_METHOD_NONE:
 		return;
@@ -1526,17 +1541,20 @@ static char vmcmd_on_reboot[128];
 static char vmcmd_on_panic[128];
 static char vmcmd_on_halt[128];
 static char vmcmd_on_poff[128];
+static char vmcmd_on_restart[128];
 
 DEFINE_IPL_ATTR_STR_RW(vmcmd, on_reboot, "%s\n", "%s\n", vmcmd_on_reboot);
 DEFINE_IPL_ATTR_STR_RW(vmcmd, on_panic, "%s\n", "%s\n", vmcmd_on_panic);
 DEFINE_IPL_ATTR_STR_RW(vmcmd, on_halt, "%s\n", "%s\n", vmcmd_on_halt);
 DEFINE_IPL_ATTR_STR_RW(vmcmd, on_poff, "%s\n", "%s\n", vmcmd_on_poff);
+DEFINE_IPL_ATTR_STR_RW(vmcmd, on_restart, "%s\n", "%s\n", vmcmd_on_restart);
 
 static struct attribute *vmcmd_attrs[] = {
 	&sys_vmcmd_on_reboot_attr.attr,
 	&sys_vmcmd_on_panic_attr.attr,
 	&sys_vmcmd_on_halt_attr.attr,
 	&sys_vmcmd_on_poff_attr.attr,
+	&sys_vmcmd_on_restart_attr.attr,
 	NULL,
 };
 
@@ -1558,6 +1576,8 @@ static void vmcmd_run(struct shutdown_trigger *trigger)
 		cmd = vmcmd_on_halt;
 	else if (strcmp(trigger->name, ON_POFF_STR) == 0)
 		cmd = vmcmd_on_poff;
+	else if (strcmp(trigger->name, ON_RESTART_STR) == 0)
+		cmd = vmcmd_on_restart;
 	else
 		return;
 
@@ -1593,7 +1613,8 @@ static struct shutdown_action vmcmd_action = {SHUTDOWN_ACTION_VMCMD_STR,
 
 static void stop_run(struct shutdown_trigger *trigger)
 {
-	if (strcmp(trigger->name, ON_PANIC_STR) == 0)
+	if (strcmp(trigger->name, ON_PANIC_STR) == 0 ||
+	    strcmp(trigger->name, ON_RESTART_STR) == 0)
 		disabled_wait((unsigned long) __builtin_return_address(0));
 	while (signal_processor(smp_processor_id(), sigp_stop) == sigp_busy)
 		cpu_relax();
@@ -1685,8 +1706,44 @@ static struct kobj_attribute on_panic_attr =
 
 static void do_panic(void)
 {
+	lgr_info_log();
 	on_panic_trigger.action->fn(&on_panic_trigger);
 	stop_run(&on_panic_trigger);
+}
+
+/* on restart */
+
+static struct shutdown_trigger on_restart_trigger = {ON_RESTART_STR,
+	&stop_action};
+
+static ssize_t on_restart_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *page)
+{
+	return sprintf(page, "%s\n", on_restart_trigger.action->name);
+}
+
+static ssize_t on_restart_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t len)
+{
+	return set_trigger(buf, &on_restart_trigger, len);
+}
+
+static struct kobj_attribute on_restart_attr =
+	__ATTR(on_restart, 0644, on_restart_show, on_restart_store);
+
+void do_restart(void)
+{
+	tracing_off();
+	debug_locks_off();
+	lgr_info_log();
+	smp_restart_with_online_cpu();
+	smp_send_stop();
+#ifdef CONFIG_CRASH_DUMP
+	crash_kexec(NULL);
+#endif
+	on_restart_trigger.action->fn(&on_restart_trigger);
+	stop_run(&on_restart_trigger);
 }
 
 /* on halt */
@@ -1765,7 +1822,9 @@ static void __init shutdown_triggers_init(void)
 	if (sysfs_create_file(&shutdown_actions_kset->kobj,
 			      &on_poff_attr.attr))
 		goto fail;
-
+	if (sysfs_create_file(&shutdown_actions_kset->kobj,
+			      &on_restart_attr.attr))
+		goto fail;
 	return;
 fail:
 	panic("shutdown_triggers_init failed\n");
@@ -1939,17 +1998,25 @@ void unregister_reset_call(struct reset_call *reset)
 }
 EXPORT_SYMBOL_GPL(unregister_reset_call);
 
+extern void do_reset_diag308(void);
+
 static void do_reset_calls(void)
 {
 	struct reset_call *reset;
 
+#ifdef CONFIG_64BIT
+	if (diag308_set_works) {
+		do_reset_diag308();
+		return;
+	}
+#endif
 	list_for_each_entry(reset, &rcall, list)
 		reset->fn();
 }
 
 u32 dump_prefix_page;
 
-void s390_reset_system(void)
+void s390_reset_system(void (*func)(void *), void *data)
 {
 	struct _lowcore *lc;
 
@@ -1977,6 +2044,10 @@ void s390_reset_system(void)
 	S390_lowcore.program_new_psw.addr =
 		PSW_ADDR_AMODE | (unsigned long) s390_base_pgm_handler;
 
-	do_reset_calls();
-}
+	/* Store status at absolute zero */
+	store_status();
 
+	do_reset_calls();
+	if (func)
+		func(data);
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright 2008 Cisco Systems, Inc.  All rights reserved.
+ * Copyright 2008-2010 Cisco Systems, Inc.  All rights reserved.
  * Copyright 2007 Nuova Systems, Inc.  All rights reserved.
  *
  * This program is free software; you may redistribute it and/or modify
@@ -60,6 +60,11 @@ struct vnic_rx_stats {
 	u64 rx_frames_1518;
 	u64 rx_frames_to_max;
 	u64 rsvd[16];
+};
+
+/* Generic statistics */
+struct vnic_gen_stats {
+	u64 dma_map_error;
 };
 
 struct vnic_stats {

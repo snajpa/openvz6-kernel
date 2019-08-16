@@ -73,8 +73,6 @@ static inline void __tlb_flush_idte(unsigned long asce)
 
 static inline void __tlb_flush_mm(struct mm_struct * mm)
 {
-	if (unlikely(cpumask_empty(mm_cpumask(mm))))
-		return;
 	/*
 	 * If the machine has IDTE we prefer to do a per mm flush
 	 * on all cpus instead of doing a local flush if the mm
@@ -83,10 +81,8 @@ static inline void __tlb_flush_mm(struct mm_struct * mm)
 	if (MACHINE_HAS_IDTE) {
 		if (mm->context.noexec)
 			__tlb_flush_idte((unsigned long)
-					 get_shadow_table(mm->pgd) |
-					 mm->context.asce_bits);
-		__tlb_flush_idte((unsigned long) mm->pgd |
-				 mm->context.asce_bits);
+				get_shadow_table((void *) mm->context.asce));
+		__tlb_flush_idte(mm->context.asce);
 		return;
 	}
 	__tlb_flush_full(mm);
@@ -94,8 +90,12 @@ static inline void __tlb_flush_mm(struct mm_struct * mm)
 
 static inline void __tlb_flush_mm_cond(struct mm_struct * mm)
 {
-	if (atomic_read(&mm->mm_users) <= 1 && mm == current->active_mm)
+	spin_lock(&mm->page_table_lock);
+	if (mm->context.flush_mm) {
 		__tlb_flush_mm(mm);
+		mm->context.flush_mm = 0;
+	}
+	spin_unlock(&mm->page_table_lock);
 }
 
 /*

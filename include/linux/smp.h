@@ -80,12 +80,15 @@ void __smp_call_function_single(int cpuid, struct call_single_data *data,
  * Generic and arch helpers
  */
 #ifdef CONFIG_USE_GENERIC_SMP_HELPERS
+void call_function_init(void);
 void generic_smp_call_function_single_interrupt(void);
 void generic_smp_call_function_interrupt(void);
 void ipi_call_lock(void);
 void ipi_call_unlock(void);
 void ipi_call_lock_irq(void);
 void ipi_call_unlock_irq(void);
+#else
+static inline void call_function_init(void) { }
 #endif
 
 /*
@@ -102,6 +105,13 @@ int on_each_cpu(void (*func) (void *info), void *info, int wait);
 					 */
 #define MSG_RESCHEDULE		0x0003	/* Reschedule request from master CPU*/
 #define MSG_CALL_FUNCTION       0x0004  /* Call function on all other CPUs */
+
+/*
+ * Call a function on processors specified by mask, which might include
+ * the local one.
+ */
+void on_each_cpu_mask(const struct cpumask *mask, void (*func) (void *info),
+		void *info, bool wait);
 
 /*
  * Mark the boot cpu "online" so that it can call console drivers in
@@ -132,14 +142,27 @@ static inline int up_smp_call_function(void (*func)(void *), void *info)
 		local_irq_enable();		\
 		0;				\
 	})
+/*
+ * Note we still need to test the mask even for UP
+ * because we actually can get an empty mask from
+ * code that on SMP might call us without the local
+ * CPU in the mask.
+ */
+#define on_each_cpu_mask(mask, func, info, wait) \
+	do {						\
+		if (cpumask_test_cpu(0, (mask))) {	\
+			local_irq_disable();		\
+			(func)(info);			\
+			local_irq_enable();		\
+		}					\
+	} while (0)
+
 static inline void smp_send_reschedule(int cpu) { }
 #define num_booting_cpus()			1
 #define smp_prepare_boot_cpu()			do {} while (0)
 #define smp_call_function_many(mask, func, info, wait) \
 			(up_smp_call_function(func, info))
-static inline void init_call_single_data(void)
-{
-}
+static inline void call_function_init(void) { }
 #endif /* !SMP */
 
 /*

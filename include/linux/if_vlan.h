@@ -16,6 +16,8 @@
 #ifdef __KERNEL__
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/rtnetlink.h>
+#include <linux/u64_stats_sync.h>
 
 #define VLAN_HLEN	4		/* The additional bytes (on top of the Ethernet header)
 					 * that VLAN requires.
@@ -63,7 +65,18 @@ static inline struct vlan_ethhdr *vlan_eth_hdr(const struct sk_buff *skb)
 	return (struct vlan_ethhdr *)skb_mac_header(skb);
 }
 
-#define VLAN_VID_MASK	0xfff
+#define VLAN_PRIO_MASK		0xe000 /* Priority Code Point */
+#define VLAN_PRIO_SHIFT		13
+#define VLAN_CFI_MASK		0x1000 /* Canonical Format Indicator */
+#define VLAN_TAG_PRESENT	VLAN_CFI_MASK
+#define VLAN_VID_MASK		0x0fff /* VLAN Identifier */
+#define VLAN_N_VID		4096
+
+/*
+ * RHEL: VLAN_GROUP_ARRAY_LEN was renamed to VLAN_N_VID in the big VLAN
+ * rework. Some 3rd party modules need the old macro to compile.
+ */
+#define VLAN_GROUP_ARRAY_LEN VLAN_N_VID
 
 /* found in socket.c */
 extern void vlan_ioctl_set(int (*hook)(struct net *, void __user *));
@@ -72,9 +85,8 @@ extern void vlan_ioctl_set(int (*hook)(struct net *, void __user *));
  * depends on completely exhausting the VLAN identifier space.  Thus
  * it gives constant time look-up, but in many cases it wastes memory.
  */
-#define VLAN_GROUP_ARRAY_LEN          4096
 #define VLAN_GROUP_ARRAY_SPLIT_PARTS  8
-#define VLAN_GROUP_ARRAY_PART_LEN     (VLAN_GROUP_ARRAY_LEN/VLAN_GROUP_ARRAY_SPLIT_PARTS)
+#define VLAN_GROUP_ARRAY_PART_LEN     (VLAN_N_VID/VLAN_GROUP_ARRAY_SPLIT_PARTS)
 
 struct vlan_group {
 	struct net_device	*real_dev; /* The ethernet(like) device
@@ -90,6 +102,10 @@ static inline struct net_device *vlan_group_get_device(struct vlan_group *vg,
 						       u16 vlan_id)
 {
 	struct net_device **array;
+
+	if (!vg)
+		return NULL;
+
 	array = vg->vlan_devices_arrays[vlan_id / VLAN_GROUP_ARRAY_PART_LEN];
 	return array ? array[vlan_id % VLAN_GROUP_ARRAY_PART_LEN] : NULL;
 }
@@ -105,20 +121,121 @@ static inline void vlan_group_set_device(struct vlan_group *vg,
 	array[vlan_id % VLAN_GROUP_ARRAY_PART_LEN] = dev;
 }
 
-#define vlan_tx_tag_present(__skb)	((__skb)->vlan_tci)
-#define vlan_tx_tag_get(__skb)		((__skb)->vlan_tci)
+static inline int is_vlan_dev(struct net_device *dev)
+{
+        return dev->priv_flags & IFF_802_1Q_VLAN;
+}
+
+#define skb_vlan_tag_present(__skb)	((__skb)->vlan_tci & VLAN_TAG_PRESENT)
+#define skb_vlan_tag_get(__skb)		((__skb)->vlan_tci & ~VLAN_TAG_PRESENT)
+#define skb_vlan_tag_get_id(__skb)	((__skb)->vlan_tci & VLAN_VID_MASK)
 
 #if defined(CONFIG_VLAN_8021Q) || defined(CONFIG_VLAN_8021Q_MODULE)
+
 extern struct net_device *vlan_dev_real_dev(const struct net_device *dev);
 extern u16 vlan_dev_vlan_id(const struct net_device *dev);
 
+/**
+ *	struct vlan_priority_tci_mapping - vlan egress priority mappings
+ *	@priority: skb priority
+ *	@vlan_qos: vlan priority: (skb->priority << 13) & 0xE000
+ *	@next: pointer to next struct
+ */
+struct vlan_priority_tci_mapping {
+	u32					priority;
+	u16					vlan_qos;
+	struct vlan_priority_tci_mapping	*next;
+};
+
+
+/**
+ *	struct vlan_pcpu_stats - VLAN percpu rx/tx stats
+ *	@rx_packets: number of received packets
+ *	@rx_bytes: number of received bytes
+ *	@rx_multicast: number of received multicast packets
+ *	@tx_packets: number of transmitted packets
+ *	@tx_bytes: number of transmitted bytes
+ *	@syncp: synchronization point for 64bit counters
+ *	@rx_errors: number of rx errors
+ *	@tx_dropped: number of tx drops
+ */
+struct vlan_pcpu_stats {
+	u64			rx_packets;
+	u64			rx_bytes;
+	u64			rx_multicast;
+	u64			tx_packets;
+	u64			tx_bytes;
+	struct u64_stats_sync	syncp;
+	u32			rx_errors;
+	u32			tx_dropped;
+};
+
+/**
+ *	struct vlan_dev_info - VLAN private device data
+ *	@nr_ingress_mappings: number of ingress priority mappings
+ *	@ingress_priority_map: ingress priority mappings
+ *	@nr_egress_mappings: number of egress priority mappings
+ *	@egress_priority_map: hash of egress priority mappings
+ *	@vlan_id: VLAN identifier
+ *	@flags: device flags
+ *	@real_dev: underlying netdevice
+ *	@real_dev_addr: address of underlying netdevice
+ *	@dent: proc dir entry
+ *	@vlan_pcpu_stats: ptr to percpu rx stats
+ */
+struct vlan_dev_info {
+	unsigned int				nr_ingress_mappings;
+	u32					ingress_priority_map[8];
+	unsigned int				nr_egress_mappings;
+	struct vlan_priority_tci_mapping	*egress_priority_map[16];
+
+	u16					vlan_id;
+	u16					flags;
+
+	struct net_device			*real_dev;
+	unsigned char				real_dev_addr[ETH_ALEN];
+
+	struct proc_dir_entry			*dent;
+	struct vlan_pcpu_stats __percpu		*vlan_pcpu_stats;
+};
+
+static inline struct vlan_dev_info *vlan_dev_info(const struct net_device *dev)
+{
+	return netdev_priv(dev);
+}
+
+static inline u16
+vlan_dev_get_egress_qos_mask(struct net_device *dev, u32 skprio)
+{
+	struct vlan_priority_tci_mapping *mp;
+
+	smp_rmb(); /* coupled with smp_wmb() in vlan_dev_set_egress_priority() */
+
+	mp = vlan_dev_info(dev)->egress_priority_map[(skprio & 0xF)];
+	while (mp) {
+		if (mp->priority == skprio) {
+			return mp->vlan_qos; /* This should already be shifted
+					      * to mask correctly with the
+					      * VLAN's TCI */
+		}
+		mp = mp->next;
+	}
+	return 0;
+}
+
 extern int __vlan_hwaccel_rx(struct sk_buff *skb, struct vlan_group *grp,
 			     u16 vlan_tci, int polling);
-extern int vlan_hwaccel_do_receive(struct sk_buff *skb);
+extern bool vlan_do_receive(struct sk_buff **skb);
 extern int vlan_gro_receive(struct napi_struct *napi, struct vlan_group *grp,
 			    unsigned int vlan_tci, struct sk_buff *skb);
+extern gro_result_t
+vlan_gro_receive_gr(struct napi_struct *napi, struct vlan_group *grp,
+		    unsigned int vlan_tci, struct sk_buff *skb);
 extern int vlan_gro_frags(struct napi_struct *napi, struct vlan_group *grp,
 			  unsigned int vlan_tci);
+extern gro_result_t
+vlan_gro_frags_gr(struct napi_struct *napi, struct vlan_group *grp,
+		  unsigned int vlan_tci);
 
 #else
 static inline struct net_device *vlan_dev_real_dev(const struct net_device *dev)
@@ -140,9 +257,15 @@ static inline int __vlan_hwaccel_rx(struct sk_buff *skb, struct vlan_group *grp,
 	return NET_XMIT_SUCCESS;
 }
 
-static inline int vlan_hwaccel_do_receive(struct sk_buff *skb)
+static inline u16 vlan_dev_get_egress_qos_mask(struct net_device *dev,
+					       u32 skprio)
 {
 	return 0;
+}
+
+static inline bool vlan_do_receive(struct sk_buff **skb)
+{
+	return false;
 }
 
 static inline int vlan_gro_receive(struct napi_struct *napi,
@@ -152,10 +275,24 @@ static inline int vlan_gro_receive(struct napi_struct *napi,
 	return NET_RX_DROP;
 }
 
+static inline gro_result_t
+vlan_gro_receive_gr(struct napi_struct *napi, struct vlan_group *grp,
+		    unsigned int vlan_tci, struct sk_buff *skb)
+{
+	return GRO_DROP;
+}
+
 static inline int vlan_gro_frags(struct napi_struct *napi,
 				 struct vlan_group *grp, unsigned int vlan_tci)
 {
 	return NET_RX_DROP;
+}
+
+static inline gro_result_t
+vlan_gro_frags_gr(struct napi_struct *napi, struct vlan_group *grp,
+		  unsigned int vlan_tci)
+{
+	return GRO_DROP;
 }
 #endif
 
@@ -186,7 +323,7 @@ static inline int vlan_hwaccel_receive_skb(struct sk_buff *skb,
 }
 
 /**
- * __vlan_put_tag - regular VLAN tag inserting
+ * vlan_insert_tag - regular VLAN tag inserting
  * @skb: skbuff to tag
  * @vlan_tci: VLAN TCI to insert
  *
@@ -195,8 +332,10 @@ static inline int vlan_hwaccel_receive_skb(struct sk_buff *skb,
  *
  * Following the skb_unshare() example, in case of error, the calling function
  * doesn't have to worry about freeing the original skb.
+ *
+ * Does not change skb->protocol so this function can be used during receive.
  */
-static inline struct sk_buff *__vlan_put_tag(struct sk_buff *skb, u16 vlan_tci)
+static inline struct sk_buff *vlan_insert_tag(struct sk_buff *skb, u16 vlan_tci)
 {
 	struct vlan_ethhdr *veth;
 
@@ -216,8 +355,25 @@ static inline struct sk_buff *__vlan_put_tag(struct sk_buff *skb, u16 vlan_tci)
 	/* now, the TCI */
 	veth->h_vlan_TCI = htons(vlan_tci);
 
-	skb->protocol = htons(ETH_P_8021Q);
+	return skb;
+}
 
+/**
+ * __vlan_put_tag - regular VLAN tag inserting
+ * @skb: skbuff to tag
+ * @vlan_tci: VLAN TCI to insert
+ *
+ * Inserts the VLAN tag into @skb as part of the payload
+ * Returns a VLAN tagged skb. If a new skb is created, @skb is freed.
+ *
+ * Following the skb_unshare() example, in case of error, the calling function
+ * doesn't have to worry about freeing the original skb.
+ */
+static inline struct sk_buff *__vlan_put_tag(struct sk_buff *skb, u16 vlan_tci)
+{
+	skb = vlan_insert_tag(skb, vlan_tci);
+	if (skb)
+		skb->protocol = htons(ETH_P_8021Q);
 	return skb;
 }
 
@@ -231,7 +387,7 @@ static inline struct sk_buff *__vlan_put_tag(struct sk_buff *skb, u16 vlan_tci)
 static inline struct sk_buff *__vlan_hwaccel_put_tag(struct sk_buff *skb,
 						     u16 vlan_tci)
 {
-	skb->vlan_tci = vlan_tci;
+	skb->vlan_tci = VLAN_TAG_PRESENT | vlan_tci;
 	return skb;
 }
 
@@ -283,8 +439,8 @@ static inline int __vlan_get_tag(const struct sk_buff *skb, u16 *vlan_tci)
 static inline int __vlan_hwaccel_get_tag(const struct sk_buff *skb,
 					 u16 *vlan_tci)
 {
-	if (vlan_tx_tag_present(skb)) {
-		*vlan_tci = skb->vlan_tci;
+	if (skb_vlan_tag_present(skb)) {
+		*vlan_tci = skb_vlan_tag_get(skb);
 		return 0;
 	} else {
 		*vlan_tci = 0;
@@ -310,6 +466,97 @@ static inline int vlan_get_tag(const struct sk_buff *skb, u16 *vlan_tci)
 	}
 }
 
+/**
+ * vlan_get_protocol - get protocol EtherType.
+ * @skb: skbuff to query
+ * @type: first vlan protocol
+ * @depth: buffer to store length of eth and vlan tags in bytes
+ *
+ * Returns the EtherType of the packet, regardless of whether it is
+ * vlan encapsulated (normal or hardware accelerated) or not.
+ */
+static inline __be16 __vlan_get_protocol(struct sk_buff *skb, __be16 type,
+					 int *depth)
+{
+	unsigned int vlan_depth = skb->mac_len;
+
+	/* if type is 802.1Q/AD then the header should already be
+	 * present at mac_len - VLAN_HLEN (if mac_len > 0), or at
+	 * ETH_HLEN otherwise
+	 */
+	if (type == htons(ETH_P_8021Q) || type == htons(ETH_P_8021AD)) {
+		if (vlan_depth) {
+			if (WARN_ON(vlan_depth < VLAN_HLEN))
+				return 0;
+			vlan_depth -= VLAN_HLEN;
+		} else {
+			vlan_depth = ETH_HLEN;
+		}
+		do {
+			struct vlan_hdr *vh;
+
+			if (unlikely(!pskb_may_pull(skb,
+						    vlan_depth + VLAN_HLEN)))
+				return 0;
+
+			vh = (struct vlan_hdr *)(skb->data + vlan_depth);
+			type = vh->h_vlan_encapsulated_proto;
+			vlan_depth += VLAN_HLEN;
+		} while (type == htons(ETH_P_8021Q) ||
+			 type == htons(ETH_P_8021AD));
+	}
+
+	if (depth)
+		*depth = vlan_depth;
+
+	return type;
+}
+
+/**
+ * vlan_get_protocol - get protocol EtherType.
+ * @skb: skbuff to query
+ *
+ * Returns the EtherType of the packet, regardless of whether it is
+ * vlan encapsulated (normal or hardware accelerated) or not.
+ */
+static inline __be16 vlan_get_protocol(struct sk_buff *skb)
+{
+	return __vlan_get_protocol(skb, skb->protocol, NULL);
+}
+
+static inline void vlan_set_encap_proto(struct sk_buff *skb,
+					struct vlan_hdr *vhdr)
+{
+	__be16 proto;
+	unsigned short *rawp;
+
+	/*
+	 * Was a VLAN packet, grab the encapsulated protocol, which the layer
+	 * three protocols care about.
+	 */
+
+	proto = vhdr->h_vlan_encapsulated_proto;
+	if (ntohs(proto) >= 1536) {
+		skb->protocol = proto;
+		return;
+	}
+
+	rawp = (unsigned short *)(vhdr + 1);
+	if (*rawp == 0xFFFF)
+		/*
+		 * This is a magic hack to spot IPX packets. Older Novell
+		 * breaks the protocol design and runs IPX over 802.3 without
+		 * an 802.2 LLC layer. We look for FFFF which isn't a used
+		 * 802.2 SSAP/DSAP. This won't work for fault tolerant netware
+		 * but does for the rest.
+		 */
+		skb->protocol = htons(ETH_P_802_3);
+	else
+		/*
+		 * Real 802.2 LLC
+		 */
+		skb->protocol = htons(ETH_P_802_2);
+}
 #endif /* __KERNEL__ */
 
 /* VLAN IOCTLs are found in sockios.h */
@@ -331,6 +578,7 @@ enum vlan_ioctl_cmds {
 enum vlan_flags {
 	VLAN_FLAG_REORDER_HDR	= 0x1,
 	VLAN_FLAG_GVRP		= 0x2,
+	VLAN_FLAG_LOOSE_BINDING	= 0x4,
 };
 
 enum vlan_name_types {

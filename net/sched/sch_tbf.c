@@ -118,14 +118,62 @@ struct tbf_sched_data
 #define L2T(q,L)   qdisc_l2t((q)->R_tab,L)
 #define L2T_P(q,L) qdisc_l2t((q)->P_tab,L)
 
+/*
+ * Return length of individual segments of a gso packet,
+ * including all headers (MAC, IP, TCP/UDP)
+ */
+static unsigned int skb_gso_mac_seglen(const struct sk_buff *skb)
+{
+	unsigned int hdr_len = skb_transport_header(skb) - skb_mac_header(skb);
+	return hdr_len + skb_gso_transport_seglen(skb);
+}
+
+/* GSO packet is too big, segment it so that tbf can transmit
+ * each segment in time
+ */
+static int tbf_segment(struct sk_buff *skb, struct Qdisc *sch)
+{
+	struct tbf_sched_data *q = qdisc_priv(sch);
+	struct sk_buff *segs, *nskb;
+	int features = netif_skb_features(skb);
+	int ret, nb;
+
+	segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
+
+	if (IS_ERR_OR_NULL(segs))
+		return qdisc_reshape_fail(skb, sch);
+
+	nb = 0;
+	while (segs) {
+		nskb = segs->next;
+		segs->next = NULL;
+		qdisc_skb_cb(segs)->pkt_len = segs->len;
+		ret = qdisc_enqueue(segs, q->qdisc);
+		if (ret != NET_XMIT_SUCCESS) {
+			if (net_xmit_drop_count(ret))
+				sch->qstats.drops++;
+		} else {
+			nb++;
+		}
+		segs = nskb;
+	}
+	sch->q.qlen += nb;
+	if (nb > 1)
+		qdisc_tree_decrease_qlen(sch, 1 - nb);
+	consume_skb(skb);
+	return nb > 0 ? NET_XMIT_SUCCESS : NET_XMIT_DROP;
+}
+
 static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
 	int ret;
 
-	if (qdisc_pkt_len(skb) > q->max_size)
+	if (qdisc_pkt_len(skb) > q->max_size) {
+		if (skb_is_gso(skb) && skb_gso_mac_seglen(skb) <= q->max_size)
+			return tbf_segment(skb, sch);
 		return qdisc_reshape_fail(skb, sch);
-
+	}
 	ret = qdisc_enqueue(skb, q->qdisc);
 	if (ret != 0) {
 		if (net_xmit_drop_count(ret))
@@ -272,6 +320,11 @@ static int tbf_change(struct Qdisc* sch, struct nlattr *opt)
 	}
 	if (max_size < 0)
 		goto done;
+
+	if (max_size < psched_mtu(qdisc_dev(sch)))
+		pr_warn_ratelimited("sch_tbf: burst %u is lower than device %s mtu (%u) !\n",
+				    max_size, qdisc_dev(sch)->name,
+				    psched_mtu(qdisc_dev(sch)));
 
 	if (qopt->limit > 0) {
 		child = fifo_create_dflt(sch, &bfifo_qdisc_ops, qopt->limit);

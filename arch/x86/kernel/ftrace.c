@@ -25,6 +25,15 @@
 #include <asm/nops.h>
 #include <asm/nmi.h>
 
+#if defined(CONFIG_FTRACE_SYSCALLS) && defined(CONFIG_IA32_EMULATION)
+#include <asm/compat.h>
+bool arch_trace_is_compat_syscall(struct pt_regs *regs)
+{
+	if (is_compat_task())
+		return true;
+	return false;
+}
+#endif /* CONFIG_FTRACE_SYSCALLS && CONFIG_IA32_EMULATION */
 
 #ifdef CONFIG_DYNAMIC_FTRACE
 
@@ -187,9 +196,26 @@ static void wait_for_nmi(void)
 	nmi_wait_count++;
 }
 
+static inline int
+within(unsigned long addr, unsigned long start, unsigned long end)
+{
+	return addr >= start && addr < end;
+}
+
 static int
 do_ftrace_mod_code(unsigned long ip, void *new_code)
 {
+	/*
+	 * On x86_64, kernel text mappings are mapped read-only with
+	 * CONFIG_DEBUG_RODATA. So we use the kernel identity mapping instead
+	 * of the kernel text mapping to modify the kernel text.
+	 *
+	 * For 32bit kernels, these mappings are same and we can use
+	 * kernel identity mapping to modify code.
+	 */
+	if (within(ip, (unsigned long)_text, (unsigned long)_etext))
+		ip = (unsigned long)__va(__pa(ip));
+
 	mod_code_ip = (void *)ip;
 	mod_code_newcode = new_code;
 
@@ -319,7 +345,7 @@ int __init ftrace_dyn_arch_init(void *data)
 		"nop\n"
 		"nop\n"  /* 2 byte jmp + 3 bytes */
 		"ftrace_test_p6nop:"
-		P6_NOP5
+		_ASM_MK_NOP(P6_NOP5)
 		"jmp 1f\n"
 		"ftrace_test_nop5:"
 		".byte 0x66,0x66,0x66,0x66,0x90\n"
@@ -468,26 +494,26 @@ void prepare_ftrace_return(unsigned long *parent, unsigned long self_addr,
 
 #ifdef CONFIG_FTRACE_SYSCALLS
 
-extern unsigned long __start_syscalls_metadata[];
-extern unsigned long __stop_syscalls_metadata[];
+extern struct syscall_metadata *__start_syscalls_metadata[];
+extern struct syscall_metadata *__stop_syscalls_metadata[];
 extern unsigned long *sys_call_table;
 
 static struct syscall_metadata **syscalls_metadata;
 
 static struct syscall_metadata *find_syscall_meta(unsigned long *syscall)
 {
-	struct syscall_metadata *start;
-	struct syscall_metadata *stop;
+	struct syscall_metadata **start;
+	struct syscall_metadata **stop;
 	char str[KSYM_SYMBOL_LEN];
 
 
-	start = (struct syscall_metadata *)__start_syscalls_metadata;
-	stop = (struct syscall_metadata *)__stop_syscalls_metadata;
+	start = __start_syscalls_metadata;
+	stop = __stop_syscalls_metadata;
 	kallsyms_lookup((unsigned long) syscall, NULL, NULL, NULL, str);
 
 	for ( ; start < stop; start++) {
-		if (start->name && !strcmp(start->name, str))
-			return start;
+		if ((*start)->name && !strcmp((*start)->name, str))
+			return *start;
 	}
 	return NULL;
 }
@@ -500,7 +526,7 @@ struct syscall_metadata *syscall_nr_to_meta(int nr)
 	return syscalls_metadata[nr];
 }
 
-int syscall_name_to_nr(char *name)
+int syscall_name_to_nr(const char *name)
 {
 	int i;
 

@@ -1,6 +1,8 @@
 #ifndef LINUX_MM_INLINE_H
 #define LINUX_MM_INLINE_H
 
+#include <linux/huge_mm.h>
+
 /**
  * page_is_file_cache - should the page be on a file LRU or anon LRU?
  * @page: the page to test
@@ -22,17 +24,19 @@ static inline int page_is_file_cache(struct page *page)
 static inline void
 add_page_to_lru_list(struct zone *zone, struct page *page, enum lru_list l)
 {
-	list_add(&page->lru, &zone->lru[l].list);
-	__inc_zone_state(zone, NR_LRU_BASE + l);
-	mem_cgroup_add_lru_list(page, l);
+	struct lruvec *lruvec;
+
+	lruvec = mem_cgroup_lru_add_list(zone, page, l);
+	list_add(&page->lru, &lruvec->lists[l]);
+	__mod_zone_page_state(zone, NR_LRU_BASE + l, hpage_nr_pages(page));
 }
 
 static inline void
 del_page_from_lru_list(struct zone *zone, struct page *page, enum lru_list l)
 {
+	mem_cgroup_lru_del_list(page, l);
 	list_del(&page->lru);
-	__dec_zone_state(zone, NR_LRU_BASE + l);
-	mem_cgroup_del_lru_list(page, l);
+	__mod_zone_page_state(zone, NR_LRU_BASE + l, -hpage_nr_pages(page));
 }
 
 /**
@@ -55,7 +59,6 @@ del_page_from_lru(struct zone *zone, struct page *page)
 {
 	enum lru_list l;
 
-	list_del(&page->lru);
 	if (PageUnevictable(page)) {
 		__ClearPageUnevictable(page);
 		l = LRU_UNEVICTABLE;
@@ -66,8 +69,9 @@ del_page_from_lru(struct zone *zone, struct page *page)
 			l += LRU_ACTIVE;
 		}
 	}
-	__dec_zone_state(zone, NR_LRU_BASE + l);
-	mem_cgroup_del_lru_list(page, l);
+	mem_cgroup_lru_del_list(page, l);
+	list_del(&page->lru);
+	__mod_zone_page_state(zone, NR_LRU_BASE + l, -hpage_nr_pages(page));
 }
 
 /**

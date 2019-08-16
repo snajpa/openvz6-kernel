@@ -28,6 +28,17 @@ menuconfig WATCHDOG
 
 if WATCHDOG
 
+config WATCHDOG_CORE
+	bool "WatchDog Timer Driver Core"
+	---help---
+	  Say Y here if you want to use the new watchdog timer driver core.
+	  This driver provides a framework for all watchdog timer drivers
+	  and gives them the /dev/watchdog interface (and later also the
+	  sysfs interface).
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called watchdog.
+
 config WATCHDOG_NOWAYOUT
 	bool "Disable watchdog shutdown on close"
 	help
@@ -396,8 +407,8 @@ config SBC_FITPC2_WATCHDOG
 	tristate "Compulab SBC-FITPC2 watchdog"
 	depends on X86
 	---help---
-	  This is the driver for the built-in watchdog timer on the fit-PC2
-	  Single-board computer made by Compulab.
+	  This is the driver for the built-in watchdog timer on the fit-PC2,
+	  fit-PC2i, CM-iAM single-board computers made by Compulab.
 
 	  It`s possible to enable watchdog timer either from BIOS (F2) or from booted Linux.
 	  When "Watchdog Timer Value" enabled one can set 31-255 s operational range.
@@ -461,7 +472,7 @@ config WAFER_WDT
 
 config I6300ESB_WDT
 	tristate "Intel 6300ESB Timer/Watchdog"
-	depends on X86 && PCI
+	depends on PCI
 	---help---
 	  Hardware driver for the watchdog timer built into the Intel
 	  6300ESB controller hub.
@@ -469,9 +480,24 @@ config I6300ESB_WDT
 	  To compile this driver as a module, choose M here: the
 	  module will be called i6300esb.
 
+config IE6XX_WDT
+	tristate "Intel Atom E6xx Watchdog"
+	depends on X86 && PCI
+	select WATCHDOG_CORE
+	select MFD_CORE
+	select LPC_SCH
+	---help---
+	  Hardware driver for the watchdog timer built into the Intel
+	  Atom E6XX (TunnelCreek) processor.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called ie6xx_wdt.
+
 config ITCO_WDT
 	tristate "Intel TCO Timer/Watchdog"
 	depends on (X86 || IA64) && PCI
+	select LPC_ICH if !EXPERT
+	select I2C_I801 if !EXPERT
 	---help---
 	  Hardware driver for the intel TCO timer based watchdog devices.
 	  These drivers are included in the Intel 82801 I/O Controller
@@ -521,16 +547,21 @@ config IT87_WDT
 	  be called it87_wdt.
 
 config HP_WATCHDOG
-	tristate "HP Proliant iLO 2 Hardware Watchdog Timer"
+	tristate "HP Proliant iLO2+ Hardware Watchdog Timer"
 	depends on X86
 	help
 	  A software monitoring watchdog and NMI sourcing driver. This driver
-	  will detect lockups and provide stack trace. Also, when an NMI
-	  occurs this driver will make the necessary BIOS calls to log
-	  the cause of the NMI. This is a driver that will only load on a
-	  HP ProLiant system with a minimum of iLO2 support.
-	  To compile this driver as a module, choose M here: the
-	  module will be called hpwdt.
+	  will detect lockups and provide a stack trace. This is a driver that
+	  will only load on a HP ProLiant system with a minimum of iLO2 support.
+	  To compile this driver as a module, choose M here: the module will be
+	  called hpwdt.
+
+config HPWDT_NMI_DECODING
+	bool "NMI decoding support for the HP ProLiant iLO2+ Hardware Watchdog Timer"
+	depends on HP_WATCHDOG
+	help
+	  When an NMI occurs this feature will make the necessary BIOS calls to
+	  log the cause of the NMI.
 
 config SC1200_WDT
 	tristate "National Semiconductor PC87307/PC97307 (ala SC1200) Watchdog"

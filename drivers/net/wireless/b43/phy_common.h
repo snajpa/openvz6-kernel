@@ -2,9 +2,16 @@
 #define LINUX_B43_PHY_COMMON_H_
 
 #include <linux/types.h>
+#include <linux/nl80211.h>
 
 struct b43_wldev;
 
+/* Complex number using 2 32-bit signed integers */
+struct b43_c32 { s32 i, q; };
+
+#define CORDIC_CONVERT(value)	(((value) >= 0) ? \
+				 ((((value) >> 15) + 1) >> 1) : \
+				 -((((-(value)) >> 15) + 1) >> 1))
 
 /* PHY register routing bits */
 #define B43_PHYROUTE			0x0C00 /* PHY register routing bits mask */
@@ -31,6 +38,9 @@ struct b43_wldev;
 #define B43_PHYVER_TYPE			0x0F00
 #define B43_PHYVER_TYPE_SHIFT		8
 #define B43_PHYVER_VERSION		0x00FF
+
+/* PHY writes need to be flushed if we reach limit */
+#define B43_MAX_WRITES_IN_ROW		24
 
 /**
  * enum b43_interference_mitigation - Interference Mitigation mode
@@ -184,6 +194,8 @@ struct b43_phy_a;
 struct b43_phy_g;
 struct b43_phy_n;
 struct b43_phy_lp;
+struct b43_phy_ht;
+struct b43_phy_lcn;
 
 struct b43_phy {
 	/* Hardware operation callbacks. */
@@ -206,14 +218,23 @@ struct b43_phy {
 		struct b43_phy_n *n;
 		/* LP-PHY specific information */
 		struct b43_phy_lp *lp;
+		/* HT-PHY specific information */
+		struct b43_phy_ht *ht;
+		/* LCN-PHY specific information */
+		struct b43_phy_lcn *lcn;
+		/* AC-PHY specific information */
+		struct b43_phy_ac *ac;
 	};
 
 	/* Band support flags. */
 	bool supports_2ghz;
 	bool supports_5ghz;
 
-	/* GMODE bit enabled? */
+	/* Is GMODE (2 GHz mode) bit enabled? */
 	bool gmode;
+
+	/* After power reset full init has to be performed */
+	bool do_full_init;
 
 	/* Analog Type */
 	u8 analog;
@@ -221,6 +242,9 @@ struct b43_phy {
 	u8 type;
 	/* PHY revision number. */
 	u8 rev;
+
+	/* Count writes since last read */
+	u8 writes_counter;
 
 	/* Radio versioning */
 	u16 radio_manuf;	/* Radio manufacturer */
@@ -241,7 +265,8 @@ struct b43_phy {
 	 * check is needed. */
 	unsigned long next_txpwr_check_time;
 
-	/* current channel */
+	/* Current channel */
+	struct cfg80211_chan_def *chandef;
 	unsigned int channel;
 
 	/* PHY TX errors counter. */
@@ -341,6 +366,12 @@ void b43_radio_set(struct b43_wldev *dev, u16 offset, u16 set);
 void b43_radio_maskset(struct b43_wldev *dev, u16 offset, u16 mask, u16 set);
 
 /**
+ * b43_radio_wait_value - Waits for a given value in masked register read
+ */
+bool b43_radio_wait_value(struct b43_wldev *dev, u16 offset, u16 mask,
+			  u16 value, int delay, int timeout);
+
+/**
  * b43_radio_lock - Lock firmware radio register access
  */
 void b43_radio_lock(struct b43_wldev *dev);
@@ -360,14 +391,13 @@ void b43_phy_lock(struct b43_wldev *dev);
  */
 void b43_phy_unlock(struct b43_wldev *dev);
 
+void b43_phy_put_into_reset(struct b43_wldev *dev);
+void b43_phy_take_out_of_reset(struct b43_wldev *dev);
+
 /**
  * b43_switch_channel - Switch to another channel
  */
 int b43_switch_channel(struct b43_wldev *dev, unsigned int new_channel);
-/**
- * B43_DEFAULT_CHANNEL - Switch to the default channel.
- */
-#define B43_DEFAULT_CHANNEL	UINT_MAX
 
 /**
  * b43_software_rfkill - Turn the radio ON or OFF in software.
@@ -418,5 +448,10 @@ int b43_phy_shm_tssi_read(struct b43_wldev *dev, u16 shm_offset);
  */
 void b43_phyop_switch_analog_generic(struct b43_wldev *dev, bool on);
 
+bool b43_is_40mhz(struct b43_wldev *dev);
+
+void b43_phy_force_clock(struct b43_wldev *dev, bool force);
+
+struct b43_c32 b43_cordic(int theta);
 
 #endif /* LINUX_B43_PHY_COMMON_H_ */

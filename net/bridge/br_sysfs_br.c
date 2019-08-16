@@ -14,6 +14,7 @@
 #include <linux/capability.h>
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
+#include <linux/etherdevice.h>
 #include <linux/if_bridge.h>
 #include <linux/rtnetlink.h>
 #include <linux/spinlock.h>
@@ -182,6 +183,39 @@ static ssize_t store_stp_state(struct device *d,
 static DEVICE_ATTR(stp_state, S_IRUGO | S_IWUSR, show_stp_state,
 		   store_stp_state);
 
+static ssize_t show_group_fwd_mask(struct device *d,
+			      struct device_attribute *attr, char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%#x\n", br->group_fwd_mask);
+}
+
+
+static ssize_t store_group_fwd_mask(struct device *d,
+			       struct device_attribute *attr, const char *buf,
+			       size_t len)
+{
+	struct net_bridge *br = to_bridge(d);
+	char *endp;
+	unsigned long val;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
+	val = simple_strtoul(buf, &endp, 0);
+	if (endp == buf)
+		return -EINVAL;
+
+	if (val & BR_GROUPFWD_RESTRICTED)
+		return -EINVAL;
+
+	br->group_fwd_mask = val;
+
+	return len;
+}
+static DEVICE_ATTR(group_fwd_mask, S_IRUGO | S_IWUSR, show_group_fwd_mask,
+		   store_group_fwd_mask);
+
 static ssize_t show_priority(struct device *d, struct device_attribute *attr,
 			     char *buf)
 {
@@ -297,23 +331,18 @@ static ssize_t store_group_addr(struct device *d,
 				const char *buf, size_t len)
 {
 	struct net_bridge *br = to_bridge(d);
-	unsigned new_addr[6];
+	u8 new_addr[6];
 	int i;
 
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
 
-	if (sscanf(buf, "%x:%x:%x:%x:%x:%x",
+	if (sscanf(buf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
 		   &new_addr[0], &new_addr[1], &new_addr[2],
 		   &new_addr[3], &new_addr[4], &new_addr[5]) != 6)
 		return -EINVAL;
 
-	/* Must be 01:80:c2:00:00:0X */
-	for (i = 0; i < 5; i++)
-		if (new_addr[i] != br_group_address[i])
-			return -EINVAL;
-
-	if (new_addr[5] & ~0xf)
+	if (!is_link_local_ether_addr(new_addr))
 		return -EINVAL;
 
 	if (new_addr[5] == 1 	/* 802.3x Pause address */
@@ -345,12 +374,297 @@ static ssize_t store_flush(struct device *d,
 }
 static DEVICE_ATTR(flush, S_IWUSR, NULL, store_flush);
 
+#ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+static ssize_t show_multicast_router(struct device *d,
+				     struct device_attribute *attr, char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%d\n", br->multicast_router);
+}
+
+static ssize_t store_multicast_router(struct device *d,
+				      struct device_attribute *attr,
+				      const char *buf, size_t len)
+{
+	return store_bridge_parm(d, buf, len, br_multicast_set_router);
+}
+static DEVICE_ATTR(multicast_router, S_IRUGO | S_IWUSR, show_multicast_router,
+		   store_multicast_router);
+
+static ssize_t show_multicast_snooping(struct device *d,
+				       struct device_attribute *attr,
+				       char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%d\n", !br->multicast_disabled);
+}
+
+static ssize_t store_multicast_snooping(struct device *d,
+					struct device_attribute *attr,
+					const char *buf, size_t len)
+{
+	return store_bridge_parm(d, buf, len, br_multicast_toggle);
+}
+static DEVICE_ATTR(multicast_snooping, S_IRUGO | S_IWUSR,
+		   show_multicast_snooping, store_multicast_snooping);
+
+static ssize_t show_multicast_querier(struct device *d,
+				      struct device_attribute *attr,
+				      char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%d\n", br->multicast_querier);
+}
+
+static ssize_t store_multicast_querier(struct device *d,
+				       struct device_attribute *attr,
+				       const char *buf, size_t len)
+{
+	return store_bridge_parm(d, buf, len, br_multicast_set_querier);
+}
+static DEVICE_ATTR(multicast_querier, S_IRUGO | S_IWUSR,
+		   show_multicast_querier, store_multicast_querier);
+
+static ssize_t show_hash_elasticity(struct device *d,
+				    struct device_attribute *attr, char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%u\n", br->hash_elasticity);
+}
+
+static int set_elasticity(struct net_bridge *br, unsigned long val)
+{
+	br->hash_elasticity = val;
+	return 0;
+}
+
+static ssize_t store_hash_elasticity(struct device *d,
+				     struct device_attribute *attr,
+				     const char *buf, size_t len)
+{
+	return store_bridge_parm(d, buf, len, set_elasticity);
+}
+static DEVICE_ATTR(hash_elasticity, S_IRUGO | S_IWUSR, show_hash_elasticity,
+		   store_hash_elasticity);
+
+static ssize_t show_hash_max(struct device *d, struct device_attribute *attr,
+			     char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%u\n", br->hash_max);
+}
+
+static ssize_t store_hash_max(struct device *d, struct device_attribute *attr,
+			      const char *buf, size_t len)
+{
+	return store_bridge_parm(d, buf, len, br_multicast_set_hash_max);
+}
+static DEVICE_ATTR(hash_max, S_IRUGO | S_IWUSR, show_hash_max,
+		   store_hash_max);
+
+static ssize_t show_multicast_last_member_count(struct device *d,
+						struct device_attribute *attr,
+						char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%u\n", br->multicast_last_member_count);
+}
+
+static int set_last_member_count(struct net_bridge *br, unsigned long val)
+{
+	br->multicast_last_member_count = val;
+	return 0;
+}
+
+static ssize_t store_multicast_last_member_count(struct device *d,
+						 struct device_attribute *attr,
+						 const char *buf, size_t len)
+{
+	return store_bridge_parm(d, buf, len, set_last_member_count);
+}
+static DEVICE_ATTR(multicast_last_member_count, S_IRUGO | S_IWUSR,
+		   show_multicast_last_member_count,
+		   store_multicast_last_member_count);
+
+static ssize_t show_multicast_startup_query_count(
+	struct device *d, struct device_attribute *attr, char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%u\n", br->multicast_startup_query_count);
+}
+
+static int set_startup_query_count(struct net_bridge *br, unsigned long val)
+{
+	br->multicast_startup_query_count = val;
+	return 0;
+}
+
+static ssize_t store_multicast_startup_query_count(
+	struct device *d, struct device_attribute *attr, const char *buf,
+	size_t len)
+{
+	return store_bridge_parm(d, buf, len, set_startup_query_count);
+}
+static DEVICE_ATTR(multicast_startup_query_count, S_IRUGO | S_IWUSR,
+		   show_multicast_startup_query_count,
+		   store_multicast_startup_query_count);
+
+static ssize_t show_multicast_last_member_interval(
+	struct device *d, struct device_attribute *attr, char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%lu\n",
+		       jiffies_to_clock_t(br->multicast_last_member_interval));
+}
+
+static int set_last_member_interval(struct net_bridge *br, unsigned long val)
+{
+	br->multicast_last_member_interval = clock_t_to_jiffies(val);
+	return 0;
+}
+
+static ssize_t store_multicast_last_member_interval(
+	struct device *d, struct device_attribute *attr, const char *buf,
+	size_t len)
+{
+	return store_bridge_parm(d, buf, len, set_last_member_interval);
+}
+static DEVICE_ATTR(multicast_last_member_interval, S_IRUGO | S_IWUSR,
+		   show_multicast_last_member_interval,
+		   store_multicast_last_member_interval);
+
+static ssize_t show_multicast_membership_interval(
+	struct device *d, struct device_attribute *attr, char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%lu\n",
+		       jiffies_to_clock_t(br->multicast_membership_interval));
+}
+
+static int set_membership_interval(struct net_bridge *br, unsigned long val)
+{
+	br->multicast_membership_interval = clock_t_to_jiffies(val);
+	return 0;
+}
+
+static ssize_t store_multicast_membership_interval(
+	struct device *d, struct device_attribute *attr, const char *buf,
+	size_t len)
+{
+	return store_bridge_parm(d, buf, len, set_membership_interval);
+}
+static DEVICE_ATTR(multicast_membership_interval, S_IRUGO | S_IWUSR,
+		   show_multicast_membership_interval,
+		   store_multicast_membership_interval);
+
+static ssize_t show_multicast_querier_interval(struct device *d,
+					       struct device_attribute *attr,
+					       char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%lu\n",
+		       jiffies_to_clock_t(br->multicast_querier_interval));
+}
+
+static int set_querier_interval(struct net_bridge *br, unsigned long val)
+{
+	br->multicast_querier_interval = clock_t_to_jiffies(val);
+	return 0;
+}
+
+static ssize_t store_multicast_querier_interval(struct device *d,
+						struct device_attribute *attr,
+						const char *buf, size_t len)
+{
+	return store_bridge_parm(d, buf, len, set_querier_interval);
+}
+static DEVICE_ATTR(multicast_querier_interval, S_IRUGO | S_IWUSR,
+		   show_multicast_querier_interval,
+		   store_multicast_querier_interval);
+
+static ssize_t show_multicast_query_interval(struct device *d,
+					     struct device_attribute *attr,
+					     char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(buf, "%lu\n",
+		       jiffies_to_clock_t(br->multicast_query_interval));
+}
+
+static int set_query_interval(struct net_bridge *br, unsigned long val)
+{
+	br->multicast_query_interval = clock_t_to_jiffies(val);
+	return 0;
+}
+
+static ssize_t store_multicast_query_interval(struct device *d,
+					      struct device_attribute *attr,
+					      const char *buf, size_t len)
+{
+	return store_bridge_parm(d, buf, len, set_query_interval);
+}
+static DEVICE_ATTR(multicast_query_interval, S_IRUGO | S_IWUSR,
+		   show_multicast_query_interval,
+		   store_multicast_query_interval);
+
+static ssize_t show_multicast_query_response_interval(
+	struct device *d, struct device_attribute *attr, char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(
+		buf, "%lu\n",
+		jiffies_to_clock_t(br->multicast_query_response_interval));
+}
+
+static int set_query_response_interval(struct net_bridge *br, unsigned long val)
+{
+	br->multicast_query_response_interval = clock_t_to_jiffies(val);
+	return 0;
+}
+
+static ssize_t store_multicast_query_response_interval(
+	struct device *d, struct device_attribute *attr, const char *buf,
+	size_t len)
+{
+	return store_bridge_parm(d, buf, len, set_query_response_interval);
+}
+static DEVICE_ATTR(multicast_query_response_interval, S_IRUGO | S_IWUSR,
+		   show_multicast_query_response_interval,
+		   store_multicast_query_response_interval);
+
+static ssize_t show_multicast_startup_query_interval(
+	struct device *d, struct device_attribute *attr, char *buf)
+{
+	struct net_bridge *br = to_bridge(d);
+	return sprintf(
+		buf, "%lu\n",
+		jiffies_to_clock_t(br->multicast_startup_query_interval));
+}
+
+static int set_startup_query_interval(struct net_bridge *br, unsigned long val)
+{
+	br->multicast_startup_query_interval = clock_t_to_jiffies(val);
+	return 0;
+}
+
+static ssize_t store_multicast_startup_query_interval(
+	struct device *d, struct device_attribute *attr, const char *buf,
+	size_t len)
+{
+	return store_bridge_parm(d, buf, len, set_startup_query_interval);
+}
+static DEVICE_ATTR(multicast_startup_query_interval, S_IRUGO | S_IWUSR,
+		   show_multicast_startup_query_interval,
+		   store_multicast_startup_query_interval);
+#endif
+
 static struct attribute *bridge_attrs[] = {
 	&dev_attr_forward_delay.attr,
 	&dev_attr_hello_time.attr,
 	&dev_attr_max_age.attr,
 	&dev_attr_ageing_time.attr,
 	&dev_attr_stp_state.attr,
+	&dev_attr_group_fwd_mask.attr,
 	&dev_attr_priority.attr,
 	&dev_attr_bridge_id.attr,
 	&dev_attr_root_id.attr,
@@ -364,6 +678,21 @@ static struct attribute *bridge_attrs[] = {
 	&dev_attr_gc_timer.attr,
 	&dev_attr_group_addr.attr,
 	&dev_attr_flush.attr,
+#ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+	&dev_attr_multicast_router.attr,
+	&dev_attr_multicast_snooping.attr,
+	&dev_attr_multicast_querier.attr,
+	&dev_attr_hash_elasticity.attr,
+	&dev_attr_hash_max.attr,
+	&dev_attr_multicast_last_member_count.attr,
+	&dev_attr_multicast_startup_query_count.attr,
+	&dev_attr_multicast_last_member_interval.attr,
+	&dev_attr_multicast_membership_interval.attr,
+	&dev_attr_multicast_querier_interval.attr,
+	&dev_attr_multicast_query_interval.attr,
+	&dev_attr_multicast_query_response_interval.attr,
+	&dev_attr_multicast_startup_query_interval.attr,
+#endif
 	NULL
 };
 
@@ -378,7 +707,7 @@ static struct attribute_group bridge_group = {
  *
  * Returns the number of bytes read.
  */
-static ssize_t brforward_read(struct kobject *kobj,
+static ssize_t brforward_read(struct file *filp, struct kobject *kobj,
 			      struct bin_attribute *bin_attr,
 			      char *buf, loff_t off, size_t count)
 {

@@ -55,8 +55,12 @@ struct serial_private {
 	unsigned int		nr;
 	void __iomem		*remapped_bar[PCI_NUM_BAR_RESOURCES];
 	struct pci_serial_quirk	*quirk;
+	const struct pciserial_board *board;
 	int			line[0];
 };
+
+static int pci_default_setup(struct serial_private*,
+	  const struct pciserial_board*, struct uart_port*, int);
 
 static void moan_device(const char *str, struct pci_dev *dev)
 {
@@ -754,6 +758,62 @@ pci_ni8430_setup(struct serial_private *priv,
 	return setup_port(priv, port, bar, offset, board->reg_shift);
 }
 
+static int pci_netmos_9900_setup(struct serial_private *priv,
+				const struct pciserial_board *board,
+				struct uart_port *port, int idx)
+{
+	unsigned int bar;
+
+	if ((priv->dev->subsystem_device & 0xff00) == 0x3000) {
+		/* netmos apparently orders BARs by datasheet layout, so serial
+		 * ports get BARs 0 and 3 (or 1 and 4 for memmapped)
+		 */
+		bar = 3 * idx;
+
+		return setup_port(priv, port, bar, 0, board->reg_shift);
+	} else {
+		return pci_default_setup(priv, board, port, idx);
+	}
+}
+
+/* the 99xx series comes with a range of device IDs and a variety
+ * of capabilities:
+ *
+ * 9900 has varying capabilities and can cascade to sub-controllers
+ *   (cascading should be purely internal)
+ * 9904 is hardwired with 4 serial ports
+ * 9912 and 9922 are hardwired with 2 serial ports
+ */
+static int pci_netmos_9900_numports(struct pci_dev *dev)
+{
+	unsigned int c = dev->class;
+	unsigned int pi;
+	unsigned short sub_serports;
+
+	pi = (c & 0xff);
+
+	if (pi == 2) {
+		return 1;
+	} else if ((pi == 0) &&
+			   (dev->device == PCI_DEVICE_ID_NETMOS_9900)) {
+		/* two possibilities: 0x30ps encodes number of parallel and
+		 * serial ports, or 0x1000 indicates *something*. This is not
+		 * immediately obvious, since the 2s1p+4s configuration seems
+		 * to offer all functionality on functions 0..2, while still
+		 * advertising the same function 3 as the 4s+2s1p config.
+		 */
+		sub_serports = dev->subsystem_device & 0xf;
+		if (sub_serports > 0) {
+			return sub_serports;
+		} else {
+			printk(KERN_NOTICE "NetMos/Mostech serial driver ignoring port on ambiguous config.\n");
+			return 0;
+		}
+	}
+
+	moan_device("unknown NetMos/Mostech program interface", dev);
+	return 0;
+}
 
 static int pci_netmos_init(struct pci_dev *dev)
 {
@@ -762,12 +822,28 @@ static int pci_netmos_init(struct pci_dev *dev)
 
 	if (dev->device == PCI_DEVICE_ID_NETMOS_9901)
 		return 0;
+
 	if (dev->subsystem_vendor == PCI_VENDOR_ID_IBM &&
 			dev->subsystem_device == 0x0299)
 		return 0;
 
+	switch (dev->device) { /* FALLTHROUGH on all */
+		case PCI_DEVICE_ID_NETMOS_9904:
+		case PCI_DEVICE_ID_NETMOS_9912:
+		case PCI_DEVICE_ID_NETMOS_9922:
+		case PCI_DEVICE_ID_NETMOS_9900:
+			num_serial = pci_netmos_9900_numports(dev);
+			break;
+
+		default:
+			if (num_serial == 0 ) {
+				moan_device("unknown NetMos/Mostech device", dev);
+			}
+	}
+
 	if (num_serial == 0)
 		return -ENODEV;
+
 	return num_serial;
 }
 
@@ -954,6 +1030,18 @@ pci_default_setup(struct serial_private *priv,
 		return 1;
 
 	return setup_port(priv, port, bar, offset, board->reg_shift);
+}
+
+static int
+pci_brcm_trumanage_setup(struct serial_private *priv,
+			 const struct pciserial_board *board,
+			 struct uart_port *port, int idx)
+{
+	int ret = pci_default_setup(priv, board, port, idx);
+
+	port->type = PORT_BRCM_TRUMANAGE;
+	port->flags = (port->flags | UPF_FIXED_PORT | UPF_FIXED_TYPE);
+	return ret;
 }
 
 static int skip_tx_en_setup(struct serial_private *priv,
@@ -1371,10 +1459,10 @@ static struct pci_serial_quirk pci_serial_quirks[] __refdata = {
 		.subvendor	= PCI_ANY_ID,
 		.subdevice	= PCI_ANY_ID,
 		.init		= pci_netmos_init,
-		.setup		= pci_default_setup,
+		.setup		= pci_netmos_9900_setup,
 	},
 	/*
-	 * For Oxford Semiconductor and Mainpine
+	 * For Oxford Semiconductor Tornado based devices
 	 */
 	{
 		.vendor		= PCI_VENDOR_ID_OXSEMI,
@@ -1392,6 +1480,25 @@ static struct pci_serial_quirk pci_serial_quirks[] __refdata = {
 		.init		= pci_oxsemi_tornado_init,
 		.setup		= pci_default_setup,
 	},
+	{
+		.vendor		= PCI_VENDOR_ID_DIGI,
+		.device		= PCIE_DEVICE_ID_NEO_2_OX_IBM,
+		.subvendor		= PCI_SUBVENDOR_ID_IBM,
+		.subdevice		= PCI_ANY_ID,
+		.init			= pci_oxsemi_tornado_init,
+		.setup		= pci_default_setup,
+	},
+	/*
+	 * Broadcom TruManage (NetXtreme)
+	 */
+	{
+		.vendor		= PCI_VENDOR_ID_BROADCOM,
+		.device		= PCI_DEVICE_ID_BROADCOM_TRUMANAGE,
+		.subvendor	= PCI_ANY_ID,
+		.subdevice	= PCI_ANY_ID,
+		.setup		= pci_brcm_trumanage_setup,
+	},
+
 	/*
 	 * Default "match everything" terminator entry
 	 */
@@ -1571,6 +1678,8 @@ enum pci_board_num_t {
 	pbn_ADDIDATA_PCIe_2_3906250,
 	pbn_ADDIDATA_PCIe_4_3906250,
 	pbn_ADDIDATA_PCIe_8_3906250,
+	pbn_NETMOS9900_2s_115200,
+	pbn_brcm_trumanage,
 };
 
 /*
@@ -2228,6 +2337,17 @@ static struct pciserial_board pci_boards[] __devinitdata = {
 		.uart_offset	= 0x200,
 		.first_offset	= 0x1000,
 	},
+	[pbn_NETMOS9900_2s_115200] = {
+		.flags		= FL_BASE0,
+		.num_ports	= 2,
+		.base_baud	= 115200,
+	},
+	[pbn_brcm_trumanage] = {
+		.flags		= FL_BASE0,
+		.num_ports	= 1,
+		.reg_shift	= 2,
+		.base_baud	= 115200,
+	},
 };
 
 static const struct pci_device_id softmodem_blacklist[] = {
@@ -2394,6 +2514,7 @@ pciserial_init_ports(struct pci_dev *dev, const struct pciserial_board *board)
 		}
 	}
 	priv->nr = i;
+	priv->board = board;
 	return priv;
 
 err_deinit:
@@ -2404,7 +2525,7 @@ err_out:
 }
 EXPORT_SYMBOL_GPL(pciserial_init_ports);
 
-void pciserial_remove_ports(struct serial_private *priv)
+void pciserial_detach_ports(struct serial_private *priv)
 {
 	struct pci_serial_quirk *quirk;
 	int i;
@@ -2424,7 +2545,11 @@ void pciserial_remove_ports(struct serial_private *priv)
 	quirk = find_quirk(priv->dev);
 	if (quirk->exit)
 		quirk->exit(priv->dev);
+}
 
+void pciserial_remove_ports(struct serial_private *priv)
+{
+	pciserial_detach_ports(priv);
 	kfree(priv);
 }
 EXPORT_SYMBOL_GPL(pciserial_remove_ports);
@@ -2476,6 +2601,7 @@ pciserial_init_one(struct pci_dev *dev, const struct pci_device_id *ent)
 	board = &pci_boards[ent->driver_data];
 
 	rc = pci_enable_device(dev);
+	pci_save_state(dev);
 	if (rc)
 		return rc;
 
@@ -2983,6 +3109,14 @@ static struct pci_device_id serial_pci_tbl[] = {
 	{	PCI_VENDOR_ID_MAINPINE, 0x4000,	/* IQ Express 8 Port V.34 Super-G3 Fax */
 		PCI_VENDOR_ID_MAINPINE, 0x4008, 0, 0,
 		pbn_oxsemi_8_4000000 },
+
+	/*
+	 * Digi/IBM PCIe 2-port Async EIA-232 Adapter utilizing OxSemi Tornado
+	 */
+	{	PCI_VENDOR_ID_DIGI, PCIE_DEVICE_ID_NEO_2_OX_IBM,
+		PCI_SUBVENDOR_ID_IBM, PCI_ANY_ID, 0, 0,
+		pbn_oxsemi_2_4000000 },
+
 	/*
 	 * SBS Technologies, Inc. P-Octal and PMC-OCTPRO cards,
 	 * from skokodyn@yahoo.com
@@ -3648,6 +3782,34 @@ static struct pci_device_id serial_pci_tbl[] = {
 		0xA000, 0x1000,
 		0, 0, pbn_b0_1_115200 },
 
+	/* the 9901 is a rebranded 9912 */
+	{	PCI_VENDOR_ID_NETMOS, PCI_DEVICE_ID_NETMOS_9912,
+		0xA000, 0x1000,
+		0, 0, pbn_b0_1_115200 },
+
+	{	PCI_VENDOR_ID_NETMOS, PCI_DEVICE_ID_NETMOS_9922,
+		0xA000, 0x1000,
+		0, 0, pbn_b0_1_115200 },
+
+	{	PCI_VENDOR_ID_NETMOS, PCI_DEVICE_ID_NETMOS_9904,
+		0xA000, 0x1000,
+		0, 0, pbn_b0_1_115200 },
+
+	{	PCI_VENDOR_ID_NETMOS, PCI_DEVICE_ID_NETMOS_9900,
+		0xA000, 0x1000,
+		0, 0, pbn_b0_1_115200 },
+
+	{	PCI_VENDOR_ID_NETMOS, PCI_DEVICE_ID_NETMOS_9900,
+		0xA000, 0x3002,
+		0, 0, pbn_NETMOS9900_2s_115200 },
+
+	/*
+	 * Broadcom TruManage
+	 */
+	{	PCI_VENDOR_ID_BROADCOM, PCI_DEVICE_ID_BROADCOM_TRUMANAGE,
+		PCI_ANY_ID, PCI_ANY_ID, 0, 0,
+		pbn_brcm_trumanage },
+
 	/*
 	 * These entries match devices with class COMMUNICATION_SERIAL,
 	 * COMMUNICATION_MODEM or COMMUNICATION_MULTISERIAL
@@ -3667,6 +3829,60 @@ static struct pci_device_id serial_pci_tbl[] = {
 	{ 0, }
 };
 
+static pci_ers_result_t serial8250_io_error_detected(struct pci_dev *dev,
+						pci_channel_state_t state)
+{
+	struct serial_private *priv = pci_get_drvdata(dev);
+
+	if (state == pci_channel_io_perm_failure)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	if (priv)
+		pciserial_detach_ports(priv);
+
+	pci_disable_device(dev);
+
+	return PCI_ERS_RESULT_NEED_RESET;
+}
+
+static pci_ers_result_t serial8250_io_slot_reset(struct pci_dev *dev)
+{
+	int rc;
+
+	rc = pci_enable_device(dev);
+
+	if (rc)
+		return PCI_ERS_RESULT_DISCONNECT;
+
+	pci_restore_state(dev);
+	pci_save_state(dev);
+
+	return PCI_ERS_RESULT_RECOVERED;
+}
+
+static void serial8250_io_resume(struct pci_dev *dev)
+{
+	struct serial_private *priv = pci_get_drvdata(dev);
+	const struct pciserial_board *board;
+
+	if (!priv)
+		return;
+
+	board = priv->board;
+	kfree(priv);
+	priv = pciserial_init_ports(dev, board);
+
+	if (!IS_ERR(priv)) {
+		pci_set_drvdata(dev, priv);
+	}
+}
+
+static struct pci_error_handlers serial8250_err_handler = {
+	.error_detected = serial8250_io_error_detected,
+	.slot_reset = serial8250_io_slot_reset,
+	.resume = serial8250_io_resume,
+};
+
 static struct pci_driver serial_pci_driver = {
 	.name		= "serial",
 	.probe		= pciserial_init_one,
@@ -3676,6 +3892,7 @@ static struct pci_driver serial_pci_driver = {
 	.resume		= pciserial_resume_one,
 #endif
 	.id_table	= serial_pci_tbl,
+	.err_handler	= &serial8250_err_handler,
 };
 
 static int __init serial8250_pci_init(void)

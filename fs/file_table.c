@@ -13,7 +13,6 @@
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/security.h>
-#include <linux/ima.h>
 #include <linux/eventpoll.h>
 #include <linux/rcupdate.h>
 #include <linux/mount.h>
@@ -22,8 +21,11 @@
 #include <linux/fsnotify.h>
 #include <linux/sysctl.h>
 #include <linux/percpu_counter.h>
+#include <linux/ima.h>
 
 #include <asm/atomic.h>
+
+#include "internal.h"
 
 /* sysctl tunables... */
 struct files_stat_struct files_stat = {
@@ -56,7 +58,7 @@ static inline void file_free(struct file *f)
 /*
  * Return the total number of open files in the system
  */
-static int get_nr_files(void)
+static long get_nr_files(void)
 {
 	return percpu_counter_read_positive(&nr_files);
 }
@@ -64,7 +66,7 @@ static int get_nr_files(void)
 /*
  * Return the maximum number of open files in the system
  */
-int get_max_files(void)
+unsigned long get_max_files(void)
 {
 	return files_stat.max_files;
 }
@@ -78,7 +80,7 @@ int proc_nr_files(ctl_table *table, int write,
                      void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	files_stat.nr_files = get_nr_files();
-	return proc_dointvec(table, write, buffer, lenp, ppos);
+	return proc_doulongvec_minmax(table, write, buffer, lenp, ppos);
 }
 #else
 int proc_nr_files(ctl_table *table, int write,
@@ -101,7 +103,7 @@ int proc_nr_files(ctl_table *table, int write,
 struct file *get_empty_filp(void)
 {
 	const struct cred *cred = current_cred();
-	static int old_max;
+	static long old_max;
 	struct file * f;
 
 	/*
@@ -129,6 +131,7 @@ struct file *get_empty_filp(void)
 	rwlock_init(&f->f_owner.lock);
 	f->f_cred = get_cred(cred);
 	spin_lock_init(&f->f_lock);
+	mutex_init(&f->f_pos_lock);
 	eventpoll_init_file(f);
 	/* f->f_version: 0 */
 	return f;
@@ -136,8 +139,7 @@ struct file *get_empty_filp(void)
 over:
 	/* Ran out of filps - report that */
 	if (get_nr_files() > old_max) {
-		printk(KERN_INFO "VFS: file-max limit %d reached\n",
-					get_max_files());
+		pr_info("VFS: file-max limit %lu reached\n", get_max_files());
 		old_max = get_nr_files();
 	}
 	goto fail;
@@ -147,8 +149,6 @@ fail_sec:
 fail:
 	return NULL;
 }
-
-EXPORT_SYMBOL(get_empty_filp);
 
 /**
  * alloc_file - allocate and initialize a 'struct file'
@@ -165,8 +165,8 @@ EXPORT_SYMBOL(get_empty_filp);
  * If all the callers of init_file() are eliminated, its
  * code should be moved into this function.
  */
-struct file *alloc_file(struct vfsmount *mnt, struct dentry *dentry,
-		fmode_t mode, const struct file_operations *fop)
+struct file *alloc_file(struct path *path, fmode_t mode,
+		const struct file_operations *fop)
 {
 	struct file *file;
 
@@ -174,35 +174,8 @@ struct file *alloc_file(struct vfsmount *mnt, struct dentry *dentry,
 	if (!file)
 		return NULL;
 
-	init_file(file, mnt, dentry, mode, fop);
-	return file;
-}
-EXPORT_SYMBOL(alloc_file);
-
-/**
- * init_file - initialize a 'struct file'
- * @file: the already allocated 'struct file' to initialized
- * @mnt: the vfsmount on which the file resides
- * @dentry: the dentry representing this file
- * @mode: the mode the file is opened with
- * @fop: the 'struct file_operations' for this file
- *
- * Use this instead of setting the members directly.  Doing so
- * avoids making mistakes like forgetting the mntget() or
- * forgetting to take a write on the mnt.
- *
- * Note: This is a crappy interface.  It is here to make
- * merging with the existing users of get_empty_filp()
- * who have complex failure logic easier.  All users
- * of this should be moving to alloc_file().
- */
-int init_file(struct file *file, struct vfsmount *mnt, struct dentry *dentry,
-	   fmode_t mode, const struct file_operations *fop)
-{
-	int error = 0;
-	file->f_path.dentry = dentry;
-	file->f_path.mnt = mntget(mnt);
-	file->f_mapping = dentry->d_inode->i_mapping;
+	file->f_path = *path;
+	file->f_mapping = path->dentry->d_inode->i_mapping;
 	file->f_mode = mode;
 	file->f_op = fop;
 
@@ -212,14 +185,14 @@ int init_file(struct file *file, struct vfsmount *mnt, struct dentry *dentry,
 	 * visible.  We do this for consistency, and so
 	 * that we can do debugging checks at __fput()
 	 */
-	if ((mode & FMODE_WRITE) && !special_file(dentry->d_inode->i_mode)) {
+	if ((mode & FMODE_WRITE) && !special_file(path->dentry->d_inode->i_mode)) {
 		file_take_write(file);
-		error = mnt_clone_write(mnt);
-		WARN_ON(error);
+		WARN_ON(mnt_clone_write(path->mnt));
 	}
-	return error;
+	ima_counts_get(file);
+	return file;
 }
-EXPORT_SYMBOL(init_file);
+EXPORT_SYMBOL(alloc_file);
 
 void fput(struct file *file)
 {
@@ -249,7 +222,7 @@ void drop_file_write_access(struct file *file)
 		return;
 	if (file_check_writeable(file) != 0)
 		return;
-	mnt_drop_write(mnt);
+	__mnt_drop_write(mnt);
 	file_release_write(file);
 }
 EXPORT_SYMBOL_GPL(drop_file_write_access);
@@ -347,6 +320,29 @@ struct file *fget_light(unsigned int fd, int *fput_needed)
 	return file;
 }
 
+/*
+ * We only lock f_pos if we have threads or if the file might be
+ * shared with another process. In both cases we'll have an elevated
+ * file count (done either by fdget() or by fork()).
+ */
+struct file *fget_light_pos(unsigned int fd, int *fput_needed)
+{
+	struct file *file = fget_light(fd, fput_needed);
+
+	if (file && (file->f_mode & FMODE_ATOMIC_POS)) {
+		if (file_count(file) > 1) {
+			*fput_needed |= FDPUT_POS_UNLOCK;
+			mutex_lock(&file->f_pos_lock);
+		}
+	}
+	return file;
+}
+
+/* only to avoid giving file.h struct file */
+void fput_pos_unlock(struct file *file)
+{
+	mutex_unlock(&file->f_pos_lock);
+}
 
 void put_filp(struct file *file)
 {
@@ -420,7 +416,9 @@ retry:
 			continue;
 		if (!(f->f_mode & FMODE_WRITE))
 			continue;
+		spin_lock(&f->f_lock);
 		f->f_mode &= ~FMODE_WRITE;
+		spin_unlock(&f->f_lock);
 		if (file_check_writeable(f) != 0)
 			continue;
 		file_release_write(f);
@@ -439,7 +437,7 @@ retry:
 
 void __init files_init(unsigned long mempages)
 { 
-	int n; 
+	unsigned long n;
 
 	filp_cachep = kmem_cache_create("filp", sizeof(struct file), 0,
 			SLAB_HWCACHE_ALIGN | SLAB_PANIC, NULL);
@@ -450,9 +448,7 @@ void __init files_init(unsigned long mempages)
 	 */ 
 
 	n = (mempages * (PAGE_SIZE / 1024)) / 10;
-	files_stat.max_files = n; 
-	if (files_stat.max_files < NR_FILE)
-		files_stat.max_files = NR_FILE;
+	files_stat.max_files = max_t(unsigned long, n, NR_FILE);
 	files_defer_init();
 	percpu_counter_init(&nr_files, 0);
 } 

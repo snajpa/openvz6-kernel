@@ -14,40 +14,70 @@
 #include <net/inet_timewait_sock.h>
 #include <net/ip.h>
 
+
+/*
+ * unhash a timewait socket from established hash
+ * lock must be hold by caller
+ */
+int inet_twsk_unhash(struct inet_timewait_sock *tw)
+{
+	if (hlist_nulls_unhashed(&tw->tw_node))
+		return 0;
+
+	hlist_nulls_del_rcu(&tw->tw_node);
+	sk_nulls_node_init(&tw->tw_node);
+	return 1;
+}
+
+/*
+ * unhash a timewait socket from bind hash
+ * lock must be hold by caller
+ */
+int inet_twsk_bind_unhash(struct inet_timewait_sock *tw,
+			  struct inet_hashinfo *hashinfo)
+{
+	struct inet_bind_bucket *tb = tw->tw_tb;
+
+	if (!tb)
+		return 0;
+
+	__hlist_del(&tw->tw_bind_node);
+	tw->tw_tb = NULL;
+	inet_bind_bucket_destroy(hashinfo->bind_bucket_cachep, tb);
+	return 1;
+}
+
 /* Must be called with locally disabled BHs. */
 static void __inet_twsk_kill(struct inet_timewait_sock *tw,
 			     struct inet_hashinfo *hashinfo)
 {
 	struct inet_bind_hashbucket *bhead;
-	struct inet_bind_bucket *tb;
+	int refcnt;
 	/* Unlink from established hashes. */
 	spinlock_t *lock = inet_ehash_lockp(hashinfo, tw->tw_hash);
 
 	spin_lock(lock);
-	if (hlist_nulls_unhashed(&tw->tw_node)) {
-		spin_unlock(lock);
-		return;
-	}
-	hlist_nulls_del_rcu(&tw->tw_node);
-	sk_nulls_node_init(&tw->tw_node);
+	refcnt = inet_twsk_unhash(tw);
 	spin_unlock(lock);
 
 	/* Disassociate with bind bucket. */
 	bhead = &hashinfo->bhash[inet_bhashfn(twsk_net(tw), tw->tw_num,
 			hashinfo->bhash_size)];
+
 	spin_lock(&bhead->lock);
-	tb = tw->tw_tb;
-	__hlist_del(&tw->tw_bind_node);
-	tw->tw_tb = NULL;
-	inet_bind_bucket_destroy(hashinfo->bind_bucket_cachep, tb);
+	refcnt += inet_twsk_bind_unhash(tw, hashinfo);
 	spin_unlock(&bhead->lock);
+
 #ifdef SOCK_REFCNT_DEBUG
 	if (atomic_read(&tw->tw_refcnt) != 1) {
 		printk(KERN_DEBUG "%s timewait_sock %p refcnt=%d\n",
 		       tw->tw_prot->name, tw, atomic_read(&tw->tw_refcnt));
 	}
 #endif
-	inet_twsk_put(tw);
+	while (refcnt) {
+		inet_twsk_put(tw);
+		refcnt--;
+	}
 }
 
 static noinline void inet_twsk_free(struct inet_timewait_sock *tw)
@@ -101,12 +131,21 @@ void __inet_twsk_hashdance(struct inet_timewait_sock *tw, struct sock *sk,
 	 * Should be done before removing sk from established chain
 	 * because readers are lockless and search established first.
 	 */
-	atomic_inc(&tw->tw_refcnt);
 	inet_twsk_add_node_rcu(tw, &ehead->twchain);
 
 	/* Step 3: Remove SK from established hash. */
 	if (__sk_nulls_del_node_init_rcu(sk))
 		sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
+
+	/*
+	 * Notes :
+ 	 * - We initially set tw_refcnt to 0 in inet_twsk_alloc()
+	 * - We add one reference for the bhash link
+	 * - We add one reference for the ehash link
+	 * - We want this refcnt update done before allowing other
+	 *   threads to find this tw in ehash chain.
+	 */
+	atomic_add(1 + 1 + 1, &tw->tw_refcnt);
 
 	spin_unlock(lock);
 }
@@ -139,7 +178,12 @@ struct inet_timewait_sock *inet_twsk_alloc(const struct sock *sk, const int stat
 		tw->tw_transparent  = inet->transparent;
 		tw->tw_prot	    = sk->sk_prot_creator;
 		twsk_net_set(tw, hold_net(sock_net(sk)));
-		atomic_set(&tw->tw_refcnt, 1);
+		/*
+		 * Because we use RCU lookups, we should not set tw_refcnt
+		 * to a non null value before everything is setup for this
+		 * timewait socket.
+		 */
+		atomic_set(&tw->tw_refcnt, 0);
 		inet_twsk_dead_node_init(tw);
 		__module_get(tw->tw_prot->owner);
 	}
@@ -284,7 +328,7 @@ void inet_twsk_schedule(struct inet_timewait_sock *tw,
 		       const int timeo, const int timewait_len)
 {
 	struct hlist_head *list;
-	int slot;
+	unsigned int slot;
 
 	/* timeout := RTO * 3.5
 	 *

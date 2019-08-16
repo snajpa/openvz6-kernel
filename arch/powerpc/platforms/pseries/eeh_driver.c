@@ -295,12 +295,20 @@ static int eeh_reset_device (struct pci_dn *pe_dn, struct pci_bus *bus)
 	if (bus)
 		pcibios_remove_pci_devices(bus);
 
+	/* Set this flag in all pci_dn's of the device in which EEH error
+	 * is happening. This is necessary to avoid access in PCI cfg space
+	 * during EEH, otherwise unexpected erros can occur.
+	 * We need to unset the flag below on appropriate places. */
+	eeh_toggle_dev_flag(pe_dn, EEH_MODE_PCI_CFG_BLOCKED, true);
+
 	/* Reset the pci controller. (Asserts RST#; resets config space).
 	 * Reconfigure bridges and devices. Don't try to bring the system
 	 * up if the reset failed for some reason. */
 	rc = rtas_set_slot_reset(pe_dn);
-	if (rc)
+	if (rc) {
+		eeh_toggle_dev_flag(pe_dn, EEH_MODE_PCI_CFG_BLOCKED, false);
 		return rc;
+	}
 
 	/* Walk over all functions on this device.  */
 	dn = pe_dn->node;
@@ -316,6 +324,8 @@ static int eeh_reset_device (struct pci_dn *pe_dn, struct pci_bus *bus)
  		}
 		dn = dn->sibling;
 	}
+
+	eeh_toggle_dev_flag(pe_dn, EEH_MODE_PCI_CFG_BLOCKED, false);
 
 	/* Give the system 5 seconds to finish running the user-space
 	 * hotplug shutdown scripts, e.g. ifdown for ethernet.  Yes, 
@@ -344,7 +354,7 @@ struct pci_dn * handle_eeh_events (struct eeh_event *event)
 	struct pci_bus *frozen_bus;
 	int rc = 0;
 	enum pci_ers_result result = PCI_ERS_RESULT_NONE;
-	const char *location, *pci_str, *drv_str;
+	const char *location, *pci_str, *drv_str, *bus_pci_str, *bus_drv_str;
 
 	frozen_dn = find_device_pe(event->dn);
 	if (!frozen_dn) {
@@ -353,7 +363,7 @@ struct pci_dn * handle_eeh_events (struct eeh_event *event)
 		location = location ? location : "unknown";
 		printk(KERN_ERR "EEH: Error: Cannot find partition endpoint "
 		                "for location=%s pci addr=%s\n",
-		        location, pci_name(event->dev));
+		        location, eeh_pci_name(event->dev));
 		return NULL;
 	}
 
@@ -380,22 +390,26 @@ struct pci_dn * handle_eeh_events (struct eeh_event *event)
 	frozen_pdn = PCI_DN(frozen_dn);
 	frozen_pdn->eeh_freeze_count++;
 
-	if (frozen_pdn->pcidev) {
-		pci_str = pci_name (frozen_pdn->pcidev);
-		drv_str = pcid_name (frozen_pdn->pcidev);
-	} else {
-		pci_str = pci_name (event->dev);
-		drv_str = pcid_name (event->dev);
-	}
-	
+	pci_str = eeh_pci_name(event->dev);
+	drv_str = pcid_name(event->dev);
+
 	if (frozen_pdn->eeh_freeze_count > EEH_MAX_ALLOWED_FREEZES)
 		goto excess_failures;
 
 	printk(KERN_WARNING
 	   "EEH: This PCI device has failed %d times in the last hour:\n",
 		frozen_pdn->eeh_freeze_count);
+
+	if (frozen_pdn->pcidev) {
+		bus_pci_str = pci_name(frozen_pdn->pcidev);
+		bus_drv_str = pcid_name(frozen_pdn->pcidev);
+		printk(KERN_WARNING
+			"EEH: Bus location=%s driver=%s pci addr=%s\n",
+			location, bus_drv_str, bus_pci_str);
+	}
+
 	printk(KERN_WARNING
-		"EEH: location=%s driver=%s pci addr=%s\n",
+		"EEH: Device location=%s driver=%s pci addr=%s\n",
 		location, drv_str, pci_str);
 
 	/* Walk the various device drivers attached to this slot through

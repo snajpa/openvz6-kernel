@@ -613,15 +613,20 @@ static irqreturn_t cp_interrupt (int irq, void *dev_instance)
 {
 	struct net_device *dev = dev_instance;
 	struct cp_private *cp;
+	int handled = 0;
 	u16 status;
 
 	if (unlikely(dev == NULL))
 		return IRQ_NONE;
 	cp = netdev_priv(dev);
 
+	spin_lock(&cp->lock);
+
 	status = cpr16(IntrStatus);
 	if (!status || (status == 0xFFFF))
-		return IRQ_NONE;
+		goto out_unlock;
+
+	handled = 1;
 
 	if (netif_msg_intr(cp))
 		pr_debug("%s: intr, status %04x cmd %02x cpcmd %04x\n",
@@ -629,13 +634,10 @@ static irqreturn_t cp_interrupt (int irq, void *dev_instance)
 
 	cpw16(IntrStatus, status & ~cp_rx_intr_mask);
 
-	spin_lock(&cp->lock);
-
 	/* close possible race's with dev_close */
 	if (unlikely(!netif_running(dev))) {
 		cpw16(IntrMask, 0);
-		spin_unlock(&cp->lock);
-		return IRQ_HANDLED;
+		goto out_unlock;
 	}
 
 	if (status & (RxOK | RxErr | RxEmpty | RxFIFOOvr))
@@ -649,7 +651,6 @@ static irqreturn_t cp_interrupt (int irq, void *dev_instance)
 	if (status & LinkChg)
 		mii_check_media(&cp->mii_if, netif_msg_link(cp), false);
 
-	spin_unlock(&cp->lock);
 
 	if (status & PciErr) {
 		u16 pci_status;
@@ -662,7 +663,10 @@ static irqreturn_t cp_interrupt (int irq, void *dev_instance)
 		/* TODO: reset hardware */
 	}
 
-	return IRQ_HANDLED;
+out_unlock:
+	spin_unlock(&cp->lock);
+
+	return IRQ_RETVAL(handled);
 }
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
@@ -760,8 +764,8 @@ static netdev_tx_t cp_start_xmit (struct sk_buff *skb,
 	}
 
 #if CP_VLAN_TAG_USED
-	if (cp->vlgrp && vlan_tx_tag_present(skb))
-		vlan_tag = TxVlanTag | swab16(vlan_tx_tag_get(skb));
+	if (cp->vlgrp && skb_vlan_tag_present(skb))
+		vlan_tag = TxVlanTag | swab16(skb_vlan_tag_get(skb));
 #endif
 
 	entry = cp->tx_head;
@@ -902,7 +906,6 @@ static void __cp_set_rx_mode (struct net_device *dev)
 	struct cp_private *cp = netdev_priv(dev);
 	u32 mc_filter[2];	/* Multicast hash filter */
 	int i, rx_mode;
-	u32 tmp;
 
 	/* Note: do not reorder, GCC is clever about common statements. */
 	if (dev->flags & IFF_PROMISC) {
@@ -930,11 +933,9 @@ static void __cp_set_rx_mode (struct net_device *dev)
 	}
 
 	/* We can safely update without stopping the chip. */
-	tmp = cp_rx_config | rx_mode;
-	if (cp->rx_config != tmp) {
-		cpw32_f (RxConfig, tmp);
-		cp->rx_config = tmp;
-	}
+	cp->rx_config = cp_rx_config | rx_mode;
+	cpw32_f (RxConfig, cp->rx_config);
+
 	cpw32_f (MAR0 + 0, mc_filter[0]);
 	cpw32_f (MAR0 + 4, mc_filter[1]);
 }
@@ -1004,6 +1005,11 @@ static inline void cp_start_hw (struct cp_private *cp)
 	cpw8(Cmd, RxOn | TxOn);
 }
 
+static void cp_enable_irq(struct cp_private *cp)
+{
+	cpw16_f(IntrMask, cp_intr_mask);
+}
+
 static void cp_init_hw (struct cp_private *cp)
 {
 	struct net_device *dev = cp->dev;
@@ -1042,8 +1048,6 @@ static void cp_init_hw (struct cp_private *cp)
 	cpw32_f(TxRingAddr + 4, (ring_dma >> 16) >> 16);
 
 	cpw16(MultiIntr, 0);
-
-	cpw16_f(IntrMask, cp_intr_mask);
 
 	cpw8_f(Cfg9346, Cfg9346_Lock);
 }
@@ -1179,6 +1183,8 @@ static int cp_open (struct net_device *dev)
 	if (rc)
 		goto err_out_hw;
 
+	cp_enable_irq(cp);
+
 	netif_carrier_off(dev);
 	mii_check_media(&cp->mii_if, netif_msg_link(cp), true);
 	netif_start_queue(dev);
@@ -1241,12 +1247,9 @@ static void cp_tx_timeout(struct net_device *dev)
 	return;
 }
 
-#ifdef BROKEN
 static int cp_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct cp_private *cp = netdev_priv(dev);
-	int rc;
-	unsigned long flags;
 
 	/* check for invalid MTU, according to hardware limits */
 	if (new_mtu < CP_MIN_MTU || new_mtu > CP_MAX_MTU)
@@ -1259,22 +1262,12 @@ static int cp_change_mtu(struct net_device *dev, int new_mtu)
 		return 0;
 	}
 
-	spin_lock_irqsave(&cp->lock, flags);
-
-	cp_stop_hw(cp);			/* stop h/w and free rings */
-	cp_clean_rings(cp);
-
+	/* network IS up, close it, reset MTU, and come up again. */
+	cp_close(dev);
 	dev->mtu = new_mtu;
-	cp_set_rxbufsize(cp);		/* set new rx buf size */
-
-	rc = cp_init_rings(cp);		/* realloc and restart h/w */
-	cp_start_hw(cp);
-
-	spin_unlock_irqrestore(&cp->lock, flags);
-
-	return rc;
+	cp_set_rxbufsize(cp);
+	return cp_open(dev);
 }
-#endif /* BROKEN */
 
 static const char mii_2_8139_map[8] = {
 	BasicModeCtrl,
@@ -1851,9 +1844,7 @@ static const struct net_device_ops cp_netdev_ops = {
 #if CP_VLAN_TAG_USED
 	.ndo_vlan_rx_register	= cp_vlan_rx_register,
 #endif
-#ifdef BROKEN
 	.ndo_change_mtu		= cp_change_mtu,
-#endif
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= cp_poll_controller,
@@ -1970,7 +1961,6 @@ static int cp_init_one (struct pci_dev *pdev, const struct pci_device_id *ent)
 	for (i = 0; i < 3; i++)
 		((__le16 *) (dev->dev_addr))[i] =
 		    cpu_to_le16(read_eeprom (regs, i + 7, addr_len));
-	memcpy(dev->perm_addr, dev->dev_addr, dev->addr_len);
 
 	dev->netdev_ops = &cp_netdev_ops;
 	netif_napi_add(dev, &cp->napi, cp_rx_poll, 16);
@@ -2085,6 +2075,7 @@ static int cp_resume (struct pci_dev *pdev)
 	/* FIXME: sh*t may happen if the Rx ring buffer is depleted */
 	cp_init_rings_index (cp);
 	cp_init_hw (cp);
+	cp_enable_irq(cp);
 	netif_start_queue (dev);
 
 	spin_lock_irqsave (&cp->lock, flags);

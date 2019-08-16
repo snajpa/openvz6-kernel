@@ -1144,17 +1144,11 @@ static long snd_cs4281_BA0_read(struct snd_info_entry *entry,
 				struct file *file, char __user *buf,
 				unsigned long count, unsigned long pos)
 {
-	long size;
 	struct cs4281 *chip = entry->private_data;
 	
-	size = count;
-	if (pos + size > CS4281_BA0_SIZE)
-		size = (long)CS4281_BA0_SIZE - pos;
-	if (size > 0) {
-		if (copy_to_user_fromio(buf, chip->ba0 + pos, size))
-			return -EFAULT;
-	}
-	return size;
+	if (copy_to_user_fromio(buf, chip->ba0 + pos, count))
+		return -EFAULT;
+	return count;
 }
 
 static long snd_cs4281_BA1_read(struct snd_info_entry *entry,
@@ -1162,17 +1156,11 @@ static long snd_cs4281_BA1_read(struct snd_info_entry *entry,
 				struct file *file, char __user *buf,
 				unsigned long count, unsigned long pos)
 {
-	long size;
 	struct cs4281 *chip = entry->private_data;
 	
-	size = count;
-	if (pos + size > CS4281_BA1_SIZE)
-		size = (long)CS4281_BA1_SIZE - pos;
-	if (size > 0) {
-		if (copy_to_user_fromio(buf, chip->ba1 + pos, size))
-			return -EFAULT;
-	}
-	return size;
+	if (copy_to_user_fromio(buf, chip->ba1 + pos, count))
+		return -EFAULT;
+	return count;
 }
 
 static struct snd_info_entry_ops snd_cs4281_proc_ops_BA0 = {
@@ -1413,8 +1401,6 @@ static int __devinit snd_cs4281_create(struct snd_card *card,
 	}
 
 	snd_cs4281_proc_init(chip);
-
-	snd_card_set_dev(card, &pci->dev);
 
 	*rchip = chip;
 	return 0;
@@ -1929,7 +1915,8 @@ static int __devinit snd_cs4281_probe(struct pci_dev *pci,
 		return -ENOENT;
 	}
 
-	err = snd_card_create(index[dev], id[dev], THIS_MODULE, 0, &card);
+	err = snd_card_new(&pci->dev, index[dev], id[dev], THIS_MODULE,
+			   0, &card);
 	if (err < 0)
 		return err;
 

@@ -11,10 +11,24 @@
 extern int pci_uevent(struct device *dev, struct kobj_uevent_env *env);
 extern int pci_create_sysfs_dev_files(struct pci_dev *pdev);
 extern void pci_remove_sysfs_dev_files(struct pci_dev *pdev);
+#if !defined(CONFIG_DMI) && !defined(CONFIG_ACPI)
+static inline void pci_create_firmware_label_files(struct pci_dev *pdev)
+{ return; }
+static inline void pci_remove_firmware_label_files(struct pci_dev *pdev)
+{ return; }
+#else
+extern void pci_create_firmware_label_files(struct pci_dev *pdev);
+extern void pci_remove_firmware_label_files(struct pci_dev *pdev);
+#endif
 extern void pci_cleanup_rom(struct pci_dev *dev);
 #ifdef HAVE_PCI_MMAP
+enum pci_mmap_api {
+	PCI_MMAP_SYSFS,	/* mmap on /sys/bus/pci/devices/<BDF>/resource<N> */
+	PCI_MMAP_PROCFS	/* mmap on /proc/bus/pci/<BDF> */
+};
 extern int pci_mmap_fits(struct pci_dev *pdev, int resno,
-			 struct vm_area_struct *vma);
+			 struct vm_area_struct *vmai,
+			 enum pci_mmap_api mmap_api);
 #endif
 int pci_probe_reset_function(struct pci_dev *dev);
 
@@ -44,6 +58,7 @@ struct pci_platform_pm_ops {
 	pci_power_t (*choose_state)(struct pci_dev *dev);
 	bool (*can_wakeup)(struct pci_dev *dev);
 	int (*sleep_wake)(struct pci_dev *dev, bool enable);
+	int (*run_wake)(struct pci_dev *dev, bool enable);
 };
 
 extern int pci_set_platform_pm(struct pci_platform_pm_ops *ops);
@@ -68,21 +83,27 @@ extern int pci_user_write_config_dword(struct pci_dev *dev, int where, u32 val);
 struct pci_vpd_ops {
 	ssize_t (*read)(struct pci_dev *dev, loff_t pos, size_t count, void *buf);
 	ssize_t (*write)(struct pci_dev *dev, loff_t pos, size_t count, const void *buf);
-	void (*release)(struct pci_dev *dev);
+	void (*release)(struct pci_dev *dev);   /* Deprecated, DO NOT USE */
+#ifndef __GENKSYMS__
+	int (*set_size)(struct pci_dev *dev, size_t len);
+#endif
 };
 
 struct pci_vpd {
-	unsigned int len;
+	unsigned int	len;
 	const struct pci_vpd_ops *ops;
 	struct bin_attribute *attr; /* descriptor for sysfs VPD entry */
+#ifndef __GENKSYMS__
+	struct mutex	lock;
+	u16		flag;
+	u8		cap;
+	u8		busy:1;
+	u8		valid:1;
+#endif
 };
 
-extern int pci_vpd_pci22_init(struct pci_dev *dev);
-static inline void pci_vpd_release(struct pci_dev *dev)
-{
-	if (dev->vpd)
-		dev->vpd->ops->release(dev);
-}
+int pci_vpd_init(struct pci_dev *dev);
+void pci_vpd_release(struct pci_dev *dev);
 
 /* PCI /proc functions */
 #ifdef CONFIG_PROC_FS
@@ -109,21 +130,21 @@ static inline void pci_remove_legacy_files(struct pci_bus *bus) { return; }
 /* Lock for read/write access to pci device and bus lists */
 extern struct rw_semaphore pci_bus_sem;
 
+extern spinlock_t pci_lock;
+
 extern unsigned int pci_pm_d3_delay;
 
 #ifdef CONFIG_PCI_MSI
 void pci_no_msi(void);
+void pci_yes_msi(void);
 extern void pci_msi_init_pci_dev(struct pci_dev *dev);
 #else
 static inline void pci_no_msi(void) { }
+static inline void pci_yes_msi(void) { }
 static inline void pci_msi_init_pci_dev(struct pci_dev *dev) { }
 #endif
 
-#ifdef CONFIG_PCIEAER
-void pci_no_aer(void);
-#else
-static inline void pci_no_aer(void) { }
-#endif
+void pci_realloc_get_opt(char *);
 
 static inline int pci_no_d1d2(struct pci_dev *dev)
 {
@@ -135,8 +156,8 @@ static inline int pci_no_d1d2(struct pci_dev *dev)
 
 }
 extern struct device_attribute pci_dev_attrs[];
-extern struct device_attribute dev_attr_cpuaffinity;
-extern struct device_attribute dev_attr_cpulistaffinity;
+extern struct device_attribute pcibus_dev_attrs[];
+extern struct device_type pci_dev_type;
 #ifdef CONFIG_HOTPLUG
 extern struct bus_attribute pci_bus_attrs[];
 #else
@@ -185,6 +206,8 @@ enum pci_bar_type {
 	pci_bar_mem64,		/* A 64-bit memory BAR */
 };
 
+bool pci_bus_read_dev_vendor_id(struct pci_bus *bus, int devfn, u32 *pl,
+				int crs_timeout);
 extern int pci_setup_device(struct pci_dev *dev);
 extern int __pci_read_base(struct pci_dev *dev, enum pci_bar_type type,
 				struct resource *res, unsigned int reg);
@@ -192,22 +215,12 @@ extern int pci_resource_bar(struct pci_dev *dev, int resno,
 			    enum pci_bar_type *type);
 extern int pci_bus_add_child(struct pci_bus *bus);
 extern void pci_enable_ari(struct pci_dev *dev);
-/**
- * pci_ari_enabled - query ARI forwarding status
- * @bus: the PCI bus
- *
- * Returns 1 if ARI forwarding is enabled, or 0 if not enabled;
- */
-static inline int pci_ari_enabled(struct pci_bus *bus)
-{
-	return bus->self && bus->self->ari_enabled;
-}
 
-#ifdef CONFIG_PCI_QUIRKS
-extern int pci_is_reassigndev(struct pci_dev *dev);
-resource_size_t pci_specified_resource_alignment(struct pci_dev *dev);
+void pci_reassigndev_resource_alignment(struct pci_dev *dev);
 extern void pci_disable_bridge_window(struct pci_dev *dev);
-#endif
+
+/* Use "pci=[nosriov|sriov]" to disable or enable SRIOV */
+extern unsigned int pci_sriov_enabled;
 
 /* Single Root I/O Virtualization */
 struct pci_sriov {
@@ -227,6 +240,17 @@ struct pci_sriov {
 	struct mutex lock;	/* lock for VF bus */
 	struct work_struct mtask; /* VF Migration task */
 	u8 __iomem *mstate;	/* VF Migration State Array */
+/*
+ * kabi check will complain this struct has changed,
+ * even though it's reference is a ptr in pci-dev struct,
+ * and it's only used by kernel PCI core code.
+ * So, put this new entry at the end of the structure,
+ * just in case some 3rd party driver poking in this structure,
+ *  and wrap with GENKSYM so kabi check doesn't complain/fail.
+ */
+#ifndef __GENKSYMS__
+	u16 drvttl;		/* max num VFs driver supports */
+#endif
 };
 
 /* Address Translation Service */
@@ -234,16 +258,25 @@ struct pci_ats {
 	int pos;	/* capability position */
 	int stu;	/* Smallest Translation Unit */
 	int qdep;	/* Invalidate Queue Depth */
-	int ref_cnt;	/* Physical Function reference count */
+	int ref_cnt;	/* number of VFs with ATS enabled */
 	int is_enabled:1;	/* Enable bit is set */
 };
+
+#ifdef CONFIG_PCI_IOV
+extern void pci_restore_ats_state(struct pci_dev *dev);
+#else
+static inline void pci_restore_ats_state(struct pci_dev *dev)
+{
+}
+#endif /* CONFIG_PCI_IOV */
 
 #ifdef CONFIG_PCI_IOV
 extern int pci_iov_init(struct pci_dev *dev);
 extern void pci_iov_release(struct pci_dev *dev);
 extern int pci_iov_resource_bar(struct pci_dev *dev, int resno,
 				enum pci_bar_type *type);
-extern int pci_sriov_resource_alignment(struct pci_dev *dev, int resno);
+extern resource_size_t pci_sriov_resource_alignment(struct pci_dev *dev,
+						    int resno);
 extern void pci_restore_iov_state(struct pci_dev *dev);
 extern int pci_iov_bus_range(struct pci_bus *bus);
 
@@ -299,7 +332,9 @@ static inline int pci_ats_enabled(struct pci_dev *dev)
 }
 #endif /* CONFIG_PCI_IOV */
 
-static inline int pci_resource_alignment(struct pci_dev *dev,
+extern unsigned long pci_cardbus_resource_alignment(struct resource *);
+
+static inline resource_size_t pci_resource_alignment(struct pci_dev *dev,
 					 struct resource *res)
 {
 #ifdef CONFIG_PCI_IOV
@@ -308,7 +343,19 @@ static inline int pci_resource_alignment(struct pci_dev *dev,
 	if (resno >= PCI_IOV_RESOURCES && resno <= PCI_IOV_RESOURCE_END)
 		return pci_sriov_resource_alignment(dev, resno);
 #endif
+	if (dev->class >> 8  == PCI_CLASS_BRIDGE_CARDBUS)
+		return pci_cardbus_resource_alignment(res);
 	return resource_alignment(res);
 }
+
+extern void pci_enable_acs(struct pci_dev *dev);
+
+struct pci_dev_reset_methods {
+	u16 vendor;
+	u16 device;
+	int (*reset)(struct pci_dev *dev, int probe);
+};
+
+extern int pci_dev_specific_reset(struct pci_dev *dev, int probe);
 
 #endif /* DRIVERS_PCI_H */

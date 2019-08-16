@@ -6,6 +6,7 @@
  *	      Martin Schwidefsky <schwidefsky@de.ibm.com>
  *	      Ralph Wuerthner <rwuerthn@de.ibm.com>
  *	      Felix Beck <felix.beck@de.ibm.com>
+ *	      Holger Dengler <hd@linux.vnet.ibm.com>
  *
  * Adjunct processor bus header file.
  *
@@ -32,11 +33,13 @@
 #include <linux/types.h>
 
 #define AP_DEVICES 64		/* Number of AP devices. */
-#define AP_DOMAINS 16		/* Number of AP domains. */
-#define AP_MAX_RESET 90		/* Maximum number of resets. */
-#define AP_RESET_TIMEOUT (HZ/2)	/* Time in ticks for reset timeouts. */
+#define AP_DOMAINS 256		/* Number of AP domains. */
+#define AP_RESET_TIMEOUT (HZ*0.7)	/* Time in ticks for reset timeouts. */
 #define AP_CONFIG_TIME 30	/* Time in seconds between AP bus rescans. */
 #define AP_POLL_TIME 1		/* Time in ticks between receive polls. */
+
+#define AP_POLL_IMMEDIATELY	1 /* continue running poll tasklet */
+#define AP_POLL_AFTER_TIMEOUT	2 /* run poll tasklet again after timout */
 
 extern int ap_domain_index;
 
@@ -46,9 +49,9 @@ extern int ap_domain_index;
  */
 typedef unsigned int ap_qid_t;
 
-#define AP_MKQID(_device,_queue) (((_device) & 63) << 8 | ((_queue) & 15))
+#define AP_MKQID(_device, _queue) (((_device) & 63) << 8 | ((_queue) & 255))
 #define AP_QID_DEVICE(_qid) (((_qid) >> 8) & 63)
-#define AP_QID_QUEUE(_qid) ((_qid) & 15)
+#define AP_QID_QUEUE(_qid) ((_qid) & 255)
 
 /**
  * structy ap_queue_status - Holds the AP queue status.
@@ -72,7 +75,25 @@ struct ap_queue_status {
 	unsigned int int_enabled	: 1;
 	unsigned int response_code	: 8;
 	unsigned int pad2		: 16;
-};
+} __packed;
+
+#define AP_QUEUE_STATUS_INVALID \
+		{ 1, 1, 1, 0xF, 1, 0xFF, 0xFFFF }
+
+static inline
+int ap_queue_status_invalid_test(struct ap_queue_status *status)
+{
+	struct ap_queue_status invalid = AP_QUEUE_STATUS_INVALID;
+	return !(memcmp(status, &invalid, sizeof(struct ap_queue_status)));
+}
+
+#define AP_MAX_BITS 31
+static inline int ap_test_bit(unsigned int *ptr, unsigned int nr)
+{
+	if (nr > AP_MAX_BITS)
+		return 0;
+	return (*ptr & (0x80000000u >> nr)) != 0;
+}
 
 #define AP_RESPONSE_NORMAL		0x00
 #define AP_RESPONSE_Q_NOT_AVAIL		0x01
@@ -87,6 +108,7 @@ struct ap_queue_status {
 #define AP_RESPONSE_INDEX_TOO_BIG	0x11
 #define AP_RESPONSE_NO_FIRST_PART	0x13
 #define AP_RESPONSE_MESSAGE_TOO_BIG	0x15
+#define AP_RESPONSE_REQ_FAC_NOT_INST	0x16
 
 /*
  * Known device types
@@ -96,8 +118,19 @@ struct ap_queue_status {
 #define AP_DEVICE_TYPE_PCIXCC	5
 #define AP_DEVICE_TYPE_CEX2A	6
 #define AP_DEVICE_TYPE_CEX2C	7
-#define AP_DEVICE_TYPE_CEX2A2	8
-#define AP_DEVICE_TYPE_CEX2C2	9
+#define AP_DEVICE_TYPE_CEX3A	8
+#define AP_DEVICE_TYPE_CEX3C	9
+#define AP_DEVICE_TYPE_CEX4	10
+
+/*
+ * Known function facilities
+ */
+#define AP_FUNC_MEX4K 1
+#define AP_FUNC_CRT4K 2
+#define AP_FUNC_COPRO 3
+#define AP_FUNC_ACCEL 4
+#define AP_FUNC_EP11  5
+#define AP_FUNC_APXA  6
 
 /*
  * AP reset flag states
@@ -105,6 +138,14 @@ struct ap_queue_status {
 #define AP_RESET_IGNORE	0	/* request timeout will be ignored */
 #define AP_RESET_ARMED	1	/* request timeout timer is active */
 #define AP_RESET_DO	2	/* AP reset required */
+#define AP_RESET_IN_PROGRESS	3	/* AP reset in progress */
+
+/*
+ * AP interrupt states
+ */
+#define AP_INTR_DISABLED	0	/* AP interrupt disabled */
+#define AP_INTR_ENABLED		1	/* AP interrupt enabled */
+#define AP_INTR_IN_PROGRESS	3	/* AP interrupt in progress */
 
 struct ap_device;
 struct ap_message;
@@ -115,9 +156,6 @@ struct ap_driver {
 
 	int (*probe)(struct ap_device *);
 	void (*remove)(struct ap_device *);
-	/* receive is called from tasklet context */
-	void (*receive)(struct ap_device *, struct ap_message *,
-			struct ap_message *);
 	int request_timeout;		/* request timeout in jiffies */
 };
 
@@ -135,10 +173,13 @@ struct ap_device {
 	ap_qid_t qid;			/* AP queue id. */
 	int queue_depth;		/* AP queue depth.*/
 	int device_type;		/* AP device type. */
+	int raw_hwtype;			/* AP raw hardware type. */
+	unsigned int functions;		/* AP device function bitfield. */
 	int unregistered;		/* marks AP device as unregistered */
 	struct timer_list timeout;	/* Timer for request timeouts. */
 	int reset;			/* Reset required after req. timeout. */
 
+	int interrupt;			/* indicate if interrupts are enabled */
 	int queue_count;		/* # messages currently on AP queue. */
 
 	struct list_head pendingq;	/* List of message sent to AP queue. */
@@ -161,11 +202,39 @@ struct ap_message {
 	size_t length;			/* Message length. */
 
 	void *private;			/* ap driver private pointer. */
+	unsigned int special:1;		/* Used for special commands. */
+	/* receive is called from tasklet context */
+	void (*receive)(struct ap_device *, struct ap_message *,
+			struct ap_message *);
 };
+
+struct ap_config_info {
+	unsigned int special_command:1;
+	unsigned int ap_extended:1;
+	unsigned char reserved1:6;
+	unsigned char reserved2[15];
+	unsigned int apm[8];		/* AP ID mask */
+	unsigned int aqm[8];		/* AP queue mask */
+	unsigned int adm[8];		/* AP domain mask */
+	unsigned char reserved4[16];
+} __packed;
 
 #define AP_DEVICE(dt)					\
 	.dev_type=(dt),					\
 	.match_flags=AP_DEVICE_ID_MATCH_DEVICE_TYPE,
+
+/**
+ * ap_init_message() - Initialize ap_message.
+ * Initialize a message before using. Otherwise this might result in
+ * unexpected behaviour.
+ */
+static inline void ap_init_message(struct ap_message *ap_msg)
+{
+	ap_msg->psmid = 0;
+	ap_msg->length = 0;
+	ap_msg->special = 0;
+	ap_msg->receive = NULL;
+}
 
 /*
  * Note: don't use ap_send/ap_recv after using ap_queue_message
@@ -178,6 +247,7 @@ int ap_recv(ap_qid_t, unsigned long long *, void *, size_t);
 void ap_queue_message(struct ap_device *ap_dev, struct ap_message *ap_msg);
 void ap_cancel_message(struct ap_device *ap_dev, struct ap_message *ap_msg);
 void ap_flush_queue(struct ap_device *ap_dev);
+void ap_bus_force_rescan(void);
 
 int ap_module_init(void);
 void ap_module_exit(void);

@@ -152,6 +152,7 @@ static struct alias_lcu *_allocate_lcu(struct dasd_uid *uid)
 	INIT_WORK(&lcu->suc_data.worker, summary_unit_check_handling_work);
 	INIT_DELAYED_WORK(&lcu->ruac_data.dwork, lcu_update_work);
 	spin_lock_init(&lcu->lock);
+	init_completion(&lcu->lcu_setup);
 	return lcu;
 
 out_err4:
@@ -187,48 +188,44 @@ int dasd_alias_make_device_known_to_lcu(struct dasd_device *device)
 	unsigned long flags;
 	struct alias_server *server, *newserver;
 	struct alias_lcu *lcu, *newlcu;
-	int is_lcu_known;
-	struct dasd_uid *uid;
+	struct dasd_uid uid;
 
 	private = (struct dasd_eckd_private *) device->private;
-	uid = &private->uid;
+
+	device->discipline->get_uid(device, &uid);
 	spin_lock_irqsave(&aliastree.lock, flags);
-	is_lcu_known = 1;
-	server = _find_server(uid);
+	server = _find_server(&uid);
 	if (!server) {
 		spin_unlock_irqrestore(&aliastree.lock, flags);
-		newserver = _allocate_server(uid);
+		newserver = _allocate_server(&uid);
 		if (IS_ERR(newserver))
 			return PTR_ERR(newserver);
 		spin_lock_irqsave(&aliastree.lock, flags);
-		server = _find_server(uid);
+		server = _find_server(&uid);
 		if (!server) {
 			list_add(&newserver->server, &aliastree.serverlist);
 			server = newserver;
-			is_lcu_known = 0;
 		} else {
 			/* someone was faster */
 			_free_server(newserver);
 		}
 	}
 
-	lcu = _find_lcu(server, uid);
+	lcu = _find_lcu(server, &uid);
 	if (!lcu) {
 		spin_unlock_irqrestore(&aliastree.lock, flags);
-		newlcu = _allocate_lcu(uid);
+		newlcu = _allocate_lcu(&uid);
 		if (IS_ERR(newlcu))
 			return PTR_ERR(lcu);
 		spin_lock_irqsave(&aliastree.lock, flags);
-		lcu = _find_lcu(server, uid);
+		lcu = _find_lcu(server, &uid);
 		if (!lcu) {
 			list_add(&newlcu->lcu, &server->lculist);
 			lcu = newlcu;
-			is_lcu_known = 0;
 		} else {
 			/* someone was faster */
 			_free_lcu(newlcu);
 		}
-		is_lcu_known = 0;
 	}
 	spin_lock(&lcu->lock);
 	list_add(&device->alias_list, &lcu->inactive_devices);
@@ -236,7 +233,7 @@ int dasd_alias_make_device_known_to_lcu(struct dasd_device *device)
 	spin_unlock(&lcu->lock);
 	spin_unlock_irqrestore(&aliastree.lock, flags);
 
-	return is_lcu_known;
+	return 0;
 }
 
 /*
@@ -251,9 +248,14 @@ void dasd_alias_disconnect_device_from_lcu(struct dasd_device *device)
 	struct alias_lcu *lcu;
 	struct alias_server *server;
 	int was_pending;
+	struct dasd_uid uid;
 
 	private = (struct dasd_eckd_private *) device->private;
 	lcu = private->lcu;
+	/* nothing to do if already disconnected */
+	if (!lcu)
+		return;
+	device->discipline->get_uid(device, &uid);
 	spin_lock_irqsave(&lcu->lock, flags);
 	list_del_init(&device->alias_list);
 	/* make sure that the workers don't use this device */
@@ -290,7 +292,7 @@ void dasd_alias_disconnect_device_from_lcu(struct dasd_device *device)
 			_schedule_lcu_update(lcu, NULL);
 		spin_unlock(&lcu->lock);
 	}
-	server = _find_server(&private->uid);
+	server = _find_server(&uid);
 	if (server && list_empty(&server->lculist)) {
 		list_del(&server->server);
 		_free_server(server);
@@ -303,19 +305,22 @@ void dasd_alias_disconnect_device_from_lcu(struct dasd_device *device)
  * in the lcu is up to date and will update the device uid before
  * adding it to a pav group.
  */
+
 static int _add_device_to_lcu(struct alias_lcu *lcu,
-			      struct dasd_device *device)
+			      struct dasd_device *device,
+			      struct dasd_device *pos)
 {
 
 	struct dasd_eckd_private *private;
 	struct alias_pav_group *group;
-	struct dasd_uid *uid;
+	struct dasd_uid uid;
 
 	private = (struct dasd_eckd_private *) device->private;
-	uid = &private->uid;
-	uid->type = lcu->uac->unit[uid->real_unit_addr].ua_type;
-	uid->base_unit_addr = lcu->uac->unit[uid->real_unit_addr].base_ua;
-	dasd_set_uid(device->cdev, &private->uid);
+
+	private->uid.type = lcu->uac->unit[private->uid.real_unit_addr].ua_type;
+	private->uid.base_unit_addr =
+		lcu->uac->unit[private->uid.real_unit_addr].base_ua;
+	uid = private->uid;
 
 	/* if we have no PAV anyway, we don't need to bother with PAV groups */
 	if (lcu->pav == NO_PAV) {
@@ -323,25 +328,25 @@ static int _add_device_to_lcu(struct alias_lcu *lcu,
 		return 0;
 	}
 
-	group = _find_group(lcu, uid);
+	group = _find_group(lcu, &uid);
 	if (!group) {
 		group = kzalloc(sizeof(*group), GFP_ATOMIC);
 		if (!group)
 			return -ENOMEM;
-		memcpy(group->uid.vendor, uid->vendor, sizeof(uid->vendor));
-		memcpy(group->uid.serial, uid->serial, sizeof(uid->serial));
-		group->uid.ssid = uid->ssid;
-		if (uid->type == UA_BASE_DEVICE)
-			group->uid.base_unit_addr = uid->real_unit_addr;
+		memcpy(group->uid.vendor, uid.vendor, sizeof(uid.vendor));
+		memcpy(group->uid.serial, uid.serial, sizeof(uid.serial));
+		group->uid.ssid = uid.ssid;
+		if (uid.type == UA_BASE_DEVICE)
+			group->uid.base_unit_addr = uid.real_unit_addr;
 		else
-			group->uid.base_unit_addr = uid->base_unit_addr;
-		memcpy(group->uid.vduit, uid->vduit, sizeof(uid->vduit));
+			group->uid.base_unit_addr = uid.base_unit_addr;
+		memcpy(group->uid.vduit, uid.vduit, sizeof(uid.vduit));
 		INIT_LIST_HEAD(&group->group);
 		INIT_LIST_HEAD(&group->baselist);
 		INIT_LIST_HEAD(&group->aliaslist);
 		list_add(&group->group, &lcu->grouplist);
 	}
-	if (uid->type == UA_BASE_DEVICE)
+	if (uid.type == UA_BASE_DEVICE)
 		list_move(&device->alias_list, &group->baselist);
 	else
 		list_move(&device->alias_list, &group->aliaslist);
@@ -369,6 +374,130 @@ static void _remove_device_from_lcu(struct alias_lcu *lcu,
 	if (group->next == device)
 		group->next = NULL;
 };
+
+/*
+ * This function tries to lock all devices on an lcu via trylock
+ * return NULL on success otherwise return first failed device
+ */
+static struct dasd_device *_trylock_all_devices_on_lcu(struct alias_lcu *lcu,
+						      struct dasd_device *pos)
+
+{
+	struct alias_pav_group *pavgroup;
+	struct dasd_device *device;
+
+	list_for_each_entry(device, &lcu->active_devices, alias_list) {
+		if (device == pos)
+			continue;
+		if (!spin_trylock(get_ccwdev_lock(device->cdev)))
+			return device;
+	}
+	list_for_each_entry(device, &lcu->inactive_devices, alias_list) {
+		if (device == pos)
+			continue;
+		if (!spin_trylock(get_ccwdev_lock(device->cdev)))
+			return device;
+	}
+	list_for_each_entry(pavgroup, &lcu->grouplist, group) {
+		list_for_each_entry(device, &pavgroup->baselist, alias_list) {
+			if (device == pos)
+				continue;
+			if (!spin_trylock(get_ccwdev_lock(device->cdev)))
+				return device;
+		}
+		list_for_each_entry(device, &pavgroup->aliaslist, alias_list) {
+			if (device == pos)
+				continue;
+			if (!spin_trylock(get_ccwdev_lock(device->cdev)))
+				return device;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * unlock all devices except the one that is specified as pos
+ * stop if enddev is specified and reached
+ */
+static void _unlock_all_devices_on_lcu(struct alias_lcu *lcu,
+				       struct dasd_device *pos,
+				       struct dasd_device *enddev)
+
+{
+	struct alias_pav_group *pavgroup;
+	struct dasd_device *device;
+
+	list_for_each_entry(device, &lcu->active_devices, alias_list) {
+		if (device == pos)
+			continue;
+		if (device == enddev)
+			return;
+		spin_unlock(get_ccwdev_lock(device->cdev));
+	}
+	list_for_each_entry(device, &lcu->inactive_devices, alias_list) {
+		if (device == pos)
+			continue;
+		if (device == enddev)
+			return;
+		spin_unlock(get_ccwdev_lock(device->cdev));
+	}
+	list_for_each_entry(pavgroup, &lcu->grouplist, group) {
+		list_for_each_entry(device, &pavgroup->baselist, alias_list) {
+			if (device == pos)
+				continue;
+			if (device == enddev)
+				return;
+			spin_unlock(get_ccwdev_lock(device->cdev));
+		}
+		list_for_each_entry(device, &pavgroup->aliaslist, alias_list) {
+			if (device == pos)
+				continue;
+			if (device == enddev)
+				return;
+			spin_unlock(get_ccwdev_lock(device->cdev));
+		}
+	}
+}
+
+/*
+ *  this function is needed because the locking order
+ *  device lock -> lcu lock
+ *  needs to be assured when iterating over devices in an LCU
+ *
+ *  if a device is specified in pos then the device lock is already hold
+ */
+static void _trylock_and_lock_lcu_irqsave(struct alias_lcu *lcu,
+					  struct dasd_device *pos,
+					  unsigned long *flags)
+{
+	struct dasd_device *failed;
+
+	do {
+		spin_lock_irqsave(&lcu->lock, *flags);
+		failed = _trylock_all_devices_on_lcu(lcu, pos);
+		if (failed) {
+			_unlock_all_devices_on_lcu(lcu, pos, failed);
+			spin_unlock_irqrestore(&lcu->lock, *flags);
+			cpu_relax();
+		}
+	} while (failed);
+}
+
+static void _trylock_and_lock_lcu(struct alias_lcu *lcu,
+				  struct dasd_device *pos)
+{
+	struct dasd_device *failed;
+
+	do {
+		spin_lock(&lcu->lock);
+		failed = _trylock_all_devices_on_lcu(lcu, pos);
+		if (failed) {
+			_unlock_all_devices_on_lcu(lcu, pos, failed);
+			spin_unlock(&lcu->lock);
+			cpu_relax();
+		}
+	} while (failed);
+}
 
 static int read_unit_address_configuration(struct dasd_device *device,
 					   struct alias_lcu *lcu)
@@ -462,7 +591,7 @@ static int _lcu_update(struct dasd_device *refdev, struct alias_lcu *lcu)
 	if (rc)
 		return rc;
 
-	spin_lock_irqsave(&lcu->lock, flags);
+	_trylock_and_lock_lcu_irqsave(lcu, NULL, &flags);
 	lcu->pav = NO_PAV;
 	for (i = 0; i < MAX_DEVICES_PER_LCU; ++i) {
 		switch (lcu->uac->unit[i].ua_type) {
@@ -479,8 +608,9 @@ static int _lcu_update(struct dasd_device *refdev, struct alias_lcu *lcu)
 
 	list_for_each_entry_safe(device, tempdev, &lcu->active_devices,
 				 alias_list) {
-		_add_device_to_lcu(lcu, device);
+		_add_device_to_lcu(lcu, device, refdev);
 	}
+	_unlock_all_devices_on_lcu(lcu, NULL, NULL);
 	spin_unlock_irqrestore(&lcu->lock, flags);
 	return 0;
 }
@@ -506,7 +636,8 @@ static void lcu_update_work(struct work_struct *work)
 	if (rc || (lcu->flags & NEED_UAC_UPDATE)) {
 		DBF_DEV_EVENT(DBF_WARNING, device, "could not update"
 			    " alias data in lcu (rc = %d), retry later", rc);
-		schedule_delayed_work(&lcu->ruac_data.dwork, 30*HZ);
+		queue_delayed_work(dasd_blocking_queue,
+				   &lcu->ruac_data.dwork, 30*HZ);
 	} else {
 		lcu->ruac_data.device = NULL;
 		lcu->flags &= ~UPDATE_PENDING;
@@ -551,7 +682,7 @@ static int _schedule_lcu_update(struct alias_lcu *lcu,
 	if (!usedev)
 		return -EINVAL;
 	lcu->ruac_data.device = usedev;
-	schedule_delayed_work(&lcu->ruac_data.dwork, 0);
+	queue_delayed_work(dasd_blocking_queue, &lcu->ruac_data.dwork, 0);
 	return 0;
 }
 
@@ -565,9 +696,10 @@ int dasd_alias_add_device(struct dasd_device *device)
 	private = (struct dasd_eckd_private *) device->private;
 	lcu = private->lcu;
 	rc = 0;
-	spin_lock_irqsave(&lcu->lock, flags);
+	spin_lock_irqsave(get_ccwdev_lock(device->cdev), flags);
+	spin_lock(&lcu->lock);
 	if (!(lcu->flags & UPDATE_PENDING)) {
-		rc = _add_device_to_lcu(lcu, device);
+		rc = _add_device_to_lcu(lcu, device, device);
 		if (rc)
 			lcu->flags |= UPDATE_PENDING;
 	}
@@ -575,8 +707,17 @@ int dasd_alias_add_device(struct dasd_device *device)
 		list_move(&device->alias_list, &lcu->active_devices);
 		_schedule_lcu_update(lcu, device);
 	}
-	spin_unlock_irqrestore(&lcu->lock, flags);
+	spin_unlock(&lcu->lock);
+	spin_unlock_irqrestore(get_ccwdev_lock(device->cdev), flags);
 	return rc;
+}
+
+int dasd_alias_update_add_device(struct dasd_device *device)
+{
+	struct dasd_eckd_private *private;
+	private = (struct dasd_eckd_private *) device->private;
+	private->lcu->flags |= UPDATE_PENDING;
+	return dasd_alias_add_device(device);
 }
 
 int dasd_alias_remove_device(struct dasd_device *device)
@@ -587,6 +728,9 @@ int dasd_alias_remove_device(struct dasd_device *device)
 
 	private = (struct dasd_eckd_private *) device->private;
 	lcu = private->lcu;
+	/* nothing to do if already removed */
+	if (!lcu)
+		return 0;
 	spin_lock_irqsave(&lcu->lock, flags);
 	_remove_device_from_lcu(lcu, device);
 	spin_unlock_irqrestore(&lcu->lock, flags);
@@ -610,6 +754,16 @@ struct dasd_device *dasd_alias_get_start_dev(struct dasd_device *base_device)
 	if (lcu->pav == NO_PAV ||
 	    lcu->flags & (NEED_UAC_UPDATE | UPDATE_PENDING))
 		return NULL;
+	if (unlikely(!(private->features.feature[8] & 0x01))) {
+		/*
+		 * PAV enabled but prefix not, very unlikely
+		 * seems to be a lost pathgroup
+		 * use base device to do IO
+		 */
+		DBF_DEV_EVENT(DBF_ERR, base_device, "%s",
+			      "Prefix not enabled with PAV enabled\n");
+		return NULL;
+	}
 
 	spin_lock_irqsave(&lcu->lock, flags);
 	alias_device = group->next;
@@ -631,7 +785,8 @@ struct dasd_device *dasd_alias_get_start_dev(struct dasd_device *base_device)
 					       struct dasd_device, alias_list);
 	spin_unlock_irqrestore(&lcu->lock, flags);
 	alias_priv = (struct dasd_eckd_private *) alias_device->private;
-	if ((alias_priv->count < private->count) && !alias_device->stopped)
+	if ((alias_priv->count < private->count) && !alias_device->stopped &&
+	    !test_bit(DASD_FLAG_OFFLINE, &alias_device->flags))
 		return alias_device;
 	else
 		return NULL;
@@ -654,7 +809,7 @@ static int reset_summary_unit_check(struct alias_lcu *lcu,
 	ASCEBC((char *) &cqr->magic, 4);
 	ccw = cqr->cpaddr;
 	ccw->cmd_code = DASD_ECKD_CCW_RSCK;
-	ccw->flags = 0 ;
+	ccw->flags = CCW_FLAG_SLI;
 	ccw->count = 16;
 	ccw->cda = (__u32)(addr_t) cqr->data;
 	((char *)cqr->data)[0] = reason;
@@ -744,44 +899,29 @@ static void flush_all_alias_devices_on_lcu(struct alias_lcu *lcu)
 		 * were waiting for the flush
 		 */
 		if (device == list_first_entry(&active,
-					       struct dasd_device, alias_list))
+					       struct dasd_device, alias_list)) {
 			list_move(&device->alias_list, &lcu->active_devices);
+			private = (struct dasd_eckd_private *) device->private;
+			private->pavgroup = NULL;
+		}
 	}
 	spin_unlock_irqrestore(&lcu->lock, flags);
 }
 
-static void __stop_device_on_lcu(struct dasd_device *device,
-				 struct dasd_device *pos)
-{
-	/* If pos == device then device is already locked! */
-	if (pos == device) {
-		pos->stopped |= DASD_STOPPED_SU;
-		return;
-	}
-	spin_lock(get_ccwdev_lock(pos->cdev));
-	pos->stopped |= DASD_STOPPED_SU;
-	spin_unlock(get_ccwdev_lock(pos->cdev));
-}
-
-/*
- * This function is called in interrupt context, so the
- * cdev lock for device is already locked!
- */
-static void _stop_all_devices_on_lcu(struct alias_lcu *lcu,
-				     struct dasd_device *device)
+static void _stop_all_devices_on_lcu(struct alias_lcu *lcu)
 {
 	struct alias_pav_group *pavgroup;
-	struct dasd_device *pos;
+	struct dasd_device *device;
 
-	list_for_each_entry(pos, &lcu->active_devices, alias_list)
-		__stop_device_on_lcu(device, pos);
-	list_for_each_entry(pos, &lcu->inactive_devices, alias_list)
-		__stop_device_on_lcu(device, pos);
+	list_for_each_entry(device, &lcu->active_devices, alias_list)
+		dasd_device_set_stop_bits(device, DASD_STOPPED_SU);
+	list_for_each_entry(device, &lcu->inactive_devices, alias_list)
+		dasd_device_set_stop_bits(device, DASD_STOPPED_SU);
 	list_for_each_entry(pavgroup, &lcu->grouplist, group) {
-		list_for_each_entry(pos, &pavgroup->baselist, alias_list)
-			__stop_device_on_lcu(device, pos);
-		list_for_each_entry(pos, &pavgroup->aliaslist, alias_list)
-			__stop_device_on_lcu(device, pos);
+		list_for_each_entry(device, &pavgroup->baselist, alias_list)
+			dasd_device_set_stop_bits(device, DASD_STOPPED_SU);
+		list_for_each_entry(device, &pavgroup->aliaslist, alias_list)
+			dasd_device_set_stop_bits(device, DASD_STOPPED_SU);
 	}
 }
 
@@ -789,33 +929,16 @@ static void _unstop_all_devices_on_lcu(struct alias_lcu *lcu)
 {
 	struct alias_pav_group *pavgroup;
 	struct dasd_device *device;
-	unsigned long flags;
 
-	list_for_each_entry(device, &lcu->active_devices, alias_list) {
-		spin_lock_irqsave(get_ccwdev_lock(device->cdev), flags);
-		device->stopped &= ~DASD_STOPPED_SU;
-		spin_unlock_irqrestore(get_ccwdev_lock(device->cdev), flags);
-	}
-
-	list_for_each_entry(device, &lcu->inactive_devices, alias_list) {
-		spin_lock_irqsave(get_ccwdev_lock(device->cdev), flags);
-		device->stopped &= ~DASD_STOPPED_SU;
-		spin_unlock_irqrestore(get_ccwdev_lock(device->cdev), flags);
-	}
-
+	list_for_each_entry(device, &lcu->active_devices, alias_list)
+		dasd_device_remove_stop_bits(device, DASD_STOPPED_SU);
+	list_for_each_entry(device, &lcu->inactive_devices, alias_list)
+		dasd_device_remove_stop_bits(device, DASD_STOPPED_SU);
 	list_for_each_entry(pavgroup, &lcu->grouplist, group) {
-		list_for_each_entry(device, &pavgroup->baselist, alias_list) {
-			spin_lock_irqsave(get_ccwdev_lock(device->cdev), flags);
-			device->stopped &= ~DASD_STOPPED_SU;
-			spin_unlock_irqrestore(get_ccwdev_lock(device->cdev),
-					       flags);
-		}
-		list_for_each_entry(device, &pavgroup->aliaslist, alias_list) {
-			spin_lock_irqsave(get_ccwdev_lock(device->cdev), flags);
-			device->stopped &= ~DASD_STOPPED_SU;
-			spin_unlock_irqrestore(get_ccwdev_lock(device->cdev),
-					       flags);
-		}
+		list_for_each_entry(device, &pavgroup->baselist, alias_list)
+			dasd_device_remove_stop_bits(device, DASD_STOPPED_SU);
+		list_for_each_entry(device, &pavgroup->aliaslist, alias_list)
+			dasd_device_remove_stop_bits(device, DASD_STOPPED_SU);
 	}
 }
 
@@ -836,16 +959,18 @@ static void summary_unit_check_handling_work(struct work_struct *work)
 
 	/* 2. reset summary unit check */
 	spin_lock_irqsave(get_ccwdev_lock(device->cdev), flags);
-	device->stopped &= ~(DASD_STOPPED_SU | DASD_STOPPED_PENDING);
+	dasd_device_remove_stop_bits(device,
+				     (DASD_STOPPED_SU | DASD_STOPPED_PENDING));
 	spin_unlock_irqrestore(get_ccwdev_lock(device->cdev), flags);
 	reset_summary_unit_check(lcu, device, suc_data->reason);
 
-	spin_lock_irqsave(&lcu->lock, flags);
+	_trylock_and_lock_lcu_irqsave(lcu, NULL, &flags);
 	_unstop_all_devices_on_lcu(lcu);
 	_restart_all_base_devices_on_lcu(lcu);
 	/* 3. read new alias configuration */
 	_schedule_lcu_update(lcu, device);
 	lcu->suc_data.device = NULL;
+	_unlock_all_devices_on_lcu(lcu, NULL, NULL);
 	spin_unlock_irqrestore(&lcu->lock, flags);
 }
 
@@ -881,10 +1006,7 @@ void dasd_alias_handle_summary_unit_check(struct dasd_device *device,
 			    " unit check (no lcu structure)");
 		return;
 	}
-	spin_lock(&lcu->lock);
-	_stop_all_devices_on_lcu(lcu, device);
-	/* prepare for lcu_update */
-	private->lcu->flags |= NEED_UAC_UPDATE | UPDATE_PENDING;
+	_trylock_and_lock_lcu(lcu, device);
 	/* If this device is about to be removed just return and wait for
 	 * the next interrupt on a different device
 	 */
@@ -892,6 +1014,7 @@ void dasd_alias_handle_summary_unit_check(struct dasd_device *device,
 		DBF_DEV_EVENT(DBF_WARNING, device, "%s",
 			    "device is in offline processing,"
 			    " don't do summary unit check handling");
+		_unlock_all_devices_on_lcu(lcu, device, NULL);
 		spin_unlock(&lcu->lock);
 		return;
 	}
@@ -900,11 +1023,16 @@ void dasd_alias_handle_summary_unit_check(struct dasd_device *device,
 		DBF_DEV_EVENT(DBF_WARNING, device, "%s",
 			    "previous instance of summary unit check worker"
 			    " still pending");
+		_unlock_all_devices_on_lcu(lcu, device, NULL);
 		spin_unlock(&lcu->lock);
 		return ;
 	}
+	_stop_all_devices_on_lcu(lcu);
+	/* prepare for lcu_update */
+	private->lcu->flags |= NEED_UAC_UPDATE | UPDATE_PENDING;
 	lcu->suc_data.reason = reason;
 	lcu->suc_data.device = device;
+	_unlock_all_devices_on_lcu(lcu, device, NULL);
 	spin_unlock(&lcu->lock);
 	schedule_work(&lcu->suc_data.worker);
 };

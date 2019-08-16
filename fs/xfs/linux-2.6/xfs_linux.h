@@ -37,11 +37,8 @@
 
 #include <kmem.h>
 #include <mrlock.h>
-#include <sv.h>
 #include <time.h>
 
-#include <support/ktrace.h>
-#include <support/debug.h>
 #include <support/uuid.h>
 
 #include <linux/semaphore.h>
@@ -72,6 +69,8 @@
 #include <linux/random.h>
 #include <linux/ctype.h>
 #include <linux/writeback.h>
+#include <linux/capability.h>
+#include <linux/list_sort.h>
 
 #include <asm/page.h>
 #include <asm/div64.h>
@@ -80,17 +79,14 @@
 #include <asm/byteorder.h>
 #include <asm/unaligned.h>
 
-#include <xfs_cred.h>
 #include <xfs_vnode.h>
 #include <xfs_stats.h>
 #include <xfs_sysctl.h>
 #include <xfs_iops.h>
 #include <xfs_aops.h>
 #include <xfs_super.h>
-#include <xfs_globals.h>
-#include <xfs_fs_subr.h>
-#include <xfs_lrw.h>
 #include <xfs_buf.h>
+#include <xfs_message.h>
 
 /*
  * Feature macros (disable/enable)
@@ -116,6 +112,7 @@
 #define xfs_rotorstep		xfs_params.rotorstep.val
 #define xfs_inherit_nodefrag	xfs_params.inherit_nodfrg.val
 #define xfs_fstrm_centisecs	xfs_params.fstrm_timer.val
+#define xfs_eofb_secs		xfs_params.eofb_timer.val
 
 #define current_cpu()		(raw_smp_processor_id())
 #define current_pid()		(current->pid)
@@ -147,7 +144,7 @@
 #define SYNCHRONIZE()	barrier()
 #define __return_address __builtin_return_address(0)
 
-#define dfltprid	0
+#define XFS_PROJID_DEFAULT	0
 #define MAXPATHLEN	1024
 
 #define MIN(a,b)	(min(a,b))
@@ -155,12 +152,28 @@
 #define howmany(x, y)	(((x)+((y)-1))/(y))
 
 /*
+ * XFS wrapper structure for sysfs support. It depends on external data
+ * structures and is embedded in various internal data structures to implement
+ * the XFS sysfs object heirarchy. Define it here for broad access throughout
+ * the codebase.
+ */
+struct xfs_kobj {
+	struct kobject		kobject;
+	struct completion	complete;
+};
+
+struct xstats {
+	struct xfsstats __percpu	*xs_stats;
+	struct xfs_kobj			xs_kobj;
+};
+
+extern struct xstats xfsstats;
+
+/*
  * Various platform dependent calls that don't fit anywhere else
  */
 #define xfs_sort(a,n,s,fn)	sort(a,n,s,fn,NULL)
 #define xfs_stack_trace()	dump_stack()
-#define xfs_itruncate_data(ip, off)	\
-	(-vmtruncate(VFS_I(ip), (off)))
 
 
 /* Move the kernel do_div definition off to one side */
@@ -286,5 +299,26 @@ static inline __uint64_t howmany_64(__uint64_t x, __uint32_t y)
 #else
 #define __arch_pack
 #endif
+
+#define ASSERT_ALWAYS(expr)	\
+	(unlikely(expr) ? (void)0 : assfail(#expr, __FILE__, __LINE__))
+
+#ifndef DEBUG
+#define ASSERT(expr)	((void)0)
+
+#ifndef STATIC
+# define STATIC static noinline
+#endif
+
+#else /* DEBUG */
+
+#define ASSERT(expr)	\
+	(unlikely(expr) ? (void)0 : assfail(#expr, __FILE__, __LINE__))
+
+#ifndef STATIC
+# define STATIC noinline
+#endif
+
+#endif /* DEBUG */
 
 #endif /* __XFS_LINUX__ */

@@ -64,6 +64,25 @@ static __inline__ int tcp_in_window(u32 seq, u32 end_seq, u32 s_win, u32 e_win)
 	return (seq == e_win && seq == end_seq);
 }
 
+static enum tcp_tw_status
+tcp_timewait_check_oow_rate_limit(struct inet_timewait_sock *tw,
+				  const struct sk_buff *skb, int mib_idx)
+{
+	struct tcp_timewait_sock *tcptw = tcp_twsk((struct sock *)tw);
+
+	if (!tcp_oow_rate_limited(twsk_net(tw), skb, mib_idx,
+				  &tcptw->tw_last_oow_ack_time)) {
+		/* Send ACK. Note, we do not put the bucket,
+		 * it will be released by caller.
+		 */
+		return TCP_TW_ACK;
+	}
+
+	/* We are rate-limiting, so just release the tw sock and drop skb. */
+	inet_twsk_put(tw);
+	return TCP_TW_SUCCESS;
+}
+
 /*
  * * Main purpose of TIME-WAIT state is to close connection gracefully,
  *   when one of ends sits in LAST-ACK or CLOSING retransmitting FIN
@@ -119,13 +138,14 @@ tcp_timewait_state_process(struct inet_timewait_sock *tw, struct sk_buff *skb,
 		    !tcp_in_window(TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq,
 				   tcptw->tw_rcv_nxt,
 				   tcptw->tw_rcv_nxt + tcptw->tw_rcv_wnd))
-			return TCP_TW_ACK;
+			return tcp_timewait_check_oow_rate_limit(
+				tw, skb, LINUX_MIB_TCPACKSKIPPEDFINWAIT2);
 
 		if (th->rst)
 			goto kill;
 
 		if (th->syn && !before(TCP_SKB_CB(skb)->seq, tcptw->tw_rcv_nxt))
-			goto kill_with_rst;
+			return TCP_TW_RST;
 
 		/* Dup ACK? */
 		if (!th->ack ||
@@ -139,12 +159,8 @@ tcp_timewait_state_process(struct inet_timewait_sock *tw, struct sk_buff *skb,
 		 * reset.
 		 */
 		if (!th->fin ||
-		    TCP_SKB_CB(skb)->end_seq != tcptw->tw_rcv_nxt + 1) {
-kill_with_rst:
-			inet_twsk_deschedule(tw, &tcp_death_row);
-			inet_twsk_put(tw);
+		    TCP_SKB_CB(skb)->end_seq != tcptw->tw_rcv_nxt + 1)
 			return TCP_TW_RST;
-		}
 
 		/* FIN arrived, enter true time-wait state. */
 		tw->tw_substate	  = TCP_TIME_WAIT;
@@ -258,10 +274,8 @@ kill:
 			inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
 					   TCP_TIMEWAIT_LEN);
 
-		/* Send ACK. Note, we do not put the bucket,
-		 * it will be released by caller.
-		 */
-		return TCP_TW_ACK;
+		return tcp_timewait_check_oow_rate_limit(
+			tw, skb, LINUX_MIB_TCPACKSKIPPEDTIMEWAIT);
 	}
 	inet_twsk_put(tw);
 	return TCP_TW_SUCCESS;
@@ -293,6 +307,7 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
 		tcptw->tw_rcv_wnd	= tcp_receive_window(tp);
 		tcptw->tw_ts_recent	= tp->rx_opt.ts_recent;
 		tcptw->tw_ts_recent_stamp = tp->rx_opt.ts_recent_stamp;
+		tcptw->tw_last_oow_ack_time = 0;
 
 #if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
 		if (tw->tw_family == PF_INET6) {
@@ -328,9 +343,6 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
 		} while (0);
 #endif
 
-		/* Linkage updates. */
-		__inet_twsk_hashdance(tw, sk, &tcp_hashinfo);
-
 		/* Get the TIME_WAIT timeout firing. */
 		if (timeo < rto)
 			timeo = rto;
@@ -342,6 +354,9 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
 			if (state == TCP_TIME_WAIT)
 				timeo = TCP_TIMEWAIT_LEN;
 		}
+
+		/* Linkage updates. */
+		__inet_twsk_hashdance(tw, sk, &tcp_hashinfo);
 
 		inet_twsk_schedule(tw, &tcp_death_row, timeo,
 				   TCP_TIMEWAIT_LEN);
@@ -397,8 +412,10 @@ struct sock *tcp_create_openreq_child(struct sock *sk, struct request_sock *req,
 		newtp->rcv_wup = newtp->copied_seq = newtp->rcv_nxt = treq->rcv_isn + 1;
 		newtp->snd_sml = newtp->snd_una = newtp->snd_nxt = treq->snt_isn + 1;
 		newtp->snd_up = treq->snt_isn + 1;
+		newtp->segs_in = 0;
 
 		tcp_prequeue_init(newtp);
+		INIT_LIST_HEAD(&newtp->tsq_node);
 
 		tcp_init_wl(newtp, treq->rcv_isn);
 
@@ -411,13 +428,14 @@ struct sock *tcp_create_openreq_child(struct sock *sk, struct request_sock *req,
 		newtp->sacked_out = 0;
 		newtp->fackets_out = 0;
 		newtp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
+		newtp->last_oow_ack_time = 0;
 
 		/* So many TCP implementations out there (incorrectly) count the
 		 * initial SYN frame in their delayed-ACK and congestion control
 		 * algorithms that we must have the following bandaid to talk
 		 * efficiently to them.  -DaveM
 		 */
-		newtp->snd_cwnd = 2;
+		newtp->snd_cwnd = TCP_INIT_CWND;
 		newtp->snd_cwnd_cnt = 0;
 		newtp->bytes_acked = 0;
 
@@ -537,7 +555,10 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 		 * Enforce "SYN-ACK" according to figure 8, figure 6
 		 * of RFC793, fixed by RFC1122.
 		 */
-		req->rsk_ops->rtx_syn_ack(sk, req);
+		if (!tcp_oow_rate_limited(sock_net(sk), skb,
+					  LINUX_MIB_TCPACKSKIPPEDSYNRECV,
+					  &tcp_rsk(req)->last_oow_ack_time))
+			req->rsk_ops->rtx_syn_ack(sk, req);
 		return NULL;
 	}
 
@@ -647,6 +668,10 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 		inet_rsk(req)->acked = 1;
 		return NULL;
 	}
+	if (tmp_opt.saw_tstamp && tmp_opt.rcv_tsecr)
+		tcp_rsk(req)->snt_synack = tmp_opt.rcv_tsecr;
+	else if (req->retrans) /* don't take RTT sample if retrans && ~TS */
+		tcp_rsk(req)->snt_synack = 0;
 
 	/* OK, ACK is valid, create big socket and
 	 * feed this segment to it. It will repeat all
@@ -702,7 +727,7 @@ int tcp_child_process(struct sock *parent, struct sock *child,
 		 * in main socket hash table and lock on listening
 		 * socket does not protect us more.
 		 */
-		sk_add_backlog(child, skb);
+		__sk_add_backlog(child, skb);
 	}
 
 	bh_unlock_sock(child);

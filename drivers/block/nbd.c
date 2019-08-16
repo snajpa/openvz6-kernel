@@ -447,7 +447,7 @@ static void nbd_clear_que(struct nbd_device *lo)
 
 static void nbd_handle_req(struct nbd_device *lo, struct request *req)
 {
-	if (!blk_fs_request(req))
+	if (req->cmd_type != REQ_TYPE_FS)
 		goto error_out;
 
 	nbd_cmd(req) = NBD_CMD_READ;
@@ -607,8 +607,10 @@ static int __nbd_ioctl(struct block_device *bdev, struct nbd_device *lo,
 			if (S_ISSOCK(inode->i_mode)) {
 				lo->file = file;
 				lo->sock = SOCKET_I(inode);
+				mutex_lock(&bdev->bd_mutex);
 				if (max_part > 0)
-					bdev->bd_invalidated = 1;
+					bdev->bd_disk->flags |= GENHD_FL_INVALIDATED;
+				mutex_unlock(&bdev->bd_mutex);
 				return 0;
 			} else {
 				fput(file);
@@ -655,7 +657,8 @@ static int __nbd_ioctl(struct block_device *bdev, struct nbd_device *lo,
 
 		mutex_unlock(&lo->tx_lock);
 
-		thread = kthread_create(nbd_thread, lo, lo->disk->disk_name);
+		thread = kthread_create(nbd_thread, lo,
+					"%s", lo->disk->disk_name);
 		if (IS_ERR(thread)) {
 			mutex_lock(&lo->tx_lock);
 			return PTR_ERR(thread);

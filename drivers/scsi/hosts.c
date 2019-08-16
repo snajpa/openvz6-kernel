@@ -180,14 +180,20 @@ void scsi_remove_host(struct Scsi_Host *shost)
 EXPORT_SYMBOL(scsi_remove_host);
 
 /**
- * scsi_add_host - add a scsi host
+ * scsi_add_host_with_dma - add a scsi host with dma device
  * @shost:	scsi host pointer to add
  * @dev:	a struct device of type scsi class
+ * @dma_dev:	dma device for the host
+ *
+ * Note: You rarely need to worry about this unless you're in a
+ * virtualised host environments, so use the simpler scsi_add_host()
+ * function instead.
  *
  * Return value: 
  * 	0 on success / != 0 for error
  **/
-int scsi_add_host(struct Scsi_Host *shost, struct device *dev)
+int scsi_add_host_with_dma(struct Scsi_Host *shost, struct device *dev,
+			   struct device *dma_dev)
 {
 	struct scsi_host_template *sht = shost->hostt;
 	int error = -EINVAL;
@@ -207,6 +213,7 @@ int scsi_add_host(struct Scsi_Host *shost, struct device *dev)
 
 	if (!shost->shost_gendev.parent)
 		shost->shost_gendev.parent = dev ? dev : &platform_bus;
+	shost->dma_dev = dma_dev;
 
 	error = device_add(&shost->shost_gendev);
 	if (error)
@@ -262,12 +269,14 @@ int scsi_add_host(struct Scsi_Host *shost, struct device *dev)
  fail:
 	return error;
 }
-EXPORT_SYMBOL(scsi_add_host);
+EXPORT_SYMBOL(scsi_add_host_with_dma);
 
 static void scsi_host_dev_release(struct device *dev)
 {
 	struct Scsi_Host *shost = dev_to_shost(dev);
 	struct device *parent = dev->parent;
+	struct request_queue *q;
+	void *queuedata;
 
 	scsi_proc_hostdir_rm(shost->hostt);
 
@@ -275,9 +284,11 @@ static void scsi_host_dev_release(struct device *dev)
 		kthread_stop(shost->ehandler);
 	if (shost->work_q)
 		destroy_workqueue(shost->work_q);
-	if (shost->uspace_req_q) {
-		kfree(shost->uspace_req_q->queuedata);
-		scsi_free_queue(shost->uspace_req_q);
+	q = shost->uspace_req_q;
+	if (q) {
+		queuedata = q->queuedata;
+		blk_cleanup_queue(q);
+		kfree(queuedata);
 	}
 
 	scsi_destroy_command_freelist(shost);
@@ -290,6 +301,12 @@ static void scsi_host_dev_release(struct device *dev)
 		put_device(parent);
 	kfree(shost);
 }
+
+static int shost_eh_deadline = -1;
+
+module_param_named(eh_deadline, shost_eh_deadline, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(eh_deadline,
+		 "SCSI EH timeout in seconds (should be between 0 and 2^31-1)");
 
 static struct device_type scsi_host_type = {
 	.name =		"scsi_host",
@@ -363,6 +380,15 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
 	shost->unchecked_isa_dma = sht->unchecked_isa_dma;
 	shost->use_clustering = sht->use_clustering;
 	shost->ordered_tag = sht->ordered_tag;
+	if (shost_eh_deadline == -1)
+		shost->eh_deadline = -1;
+	else if ((ulong) shost_eh_deadline * HZ > INT_MAX) {
+		shost_printk(KERN_WARNING, shost,
+			     "eh_deadline %u too large, setting to %u\n",
+			     shost_eh_deadline, INT_MAX / HZ);
+		shost->eh_deadline = INT_MAX;
+	} else
+		shost->eh_deadline = shost_eh_deadline * HZ;
 
 	if (sht->supported_mode == MODE_UNKNOWN)
 		/* means we didn't set it ... default to INITIATOR */

@@ -76,8 +76,24 @@ extern unsigned long mktime(const unsigned int year, const unsigned int mon,
 			    const unsigned int min, const unsigned int sec);
 
 extern void set_normalized_timespec(struct timespec *ts, time_t sec, s64 nsec);
+
+/*
+ * timespec_add_safe assumes both values are positive and checks
+ * for overflow. It will return TIME_T_MAX if the reutrn would be
+ * smaller then either of the arguments.
+ */
 extern struct timespec timespec_add_safe(const struct timespec lhs,
 					 const struct timespec rhs);
+
+
+static inline struct timespec timespec_add(struct timespec lhs,
+						struct timespec rhs)
+{
+	struct timespec ts_delta;
+	set_normalized_timespec(&ts_delta, lhs.tv_sec + rhs.tv_sec,
+				lhs.tv_nsec + rhs.tv_nsec);
+	return ts_delta;
+}
 
 /*
  * sub = lhs - rhs, in normalized form
@@ -91,18 +107,43 @@ static inline struct timespec timespec_sub(struct timespec lhs,
 	return ts_delta;
 }
 
+#define TIME64_MAX			((s64)~((u64)1 << 63))
+#define KTIME_MAX			((s64)~((u64)1 << 63))
+#if (BITS_PER_LONG == 64)
+# define KTIME_SEC_MAX			(KTIME_MAX / NSEC_PER_SEC)
+#else
+# define KTIME_SEC_MAX			LONG_MAX
+#endif
+
 /*
  * Returns true if the timespec is norm, false if denorm:
  */
-#define timespec_valid(ts) \
-	(((ts)->tv_sec >= 0) && (((unsigned long) (ts)->tv_nsec) < NSEC_PER_SEC))
+static inline bool timespec_valid(const struct timespec *ts)
+{
+	/* Dates before 1970 are bogus */
+	if (ts->tv_sec < 0)
+		return false;
+	/* Can't have more nanoseconds then a second */
+	if ((unsigned long)ts->tv_nsec >= NSEC_PER_SEC)
+		return false;
+	return true;
+}
 
-extern struct timespec xtime;
-extern struct timespec wall_to_monotonic;
+static inline bool timespec_valid_strict(const struct timespec *ts)
+{
+	if (!timespec_valid(ts))
+		return false;
+	/* Disallow values that could overflow ktime_t */
+	if ((unsigned long long)ts->tv_sec >= KTIME_SEC_MAX)
+		return false;
+	return true;
+}
+
 extern seqlock_t xtime_lock;
 
 extern void read_persistent_clock(struct timespec *ts);
 extern void read_boot_clock(struct timespec *ts);
+extern int persistent_clock_is_local;
 extern int update_persistent_clock(struct timespec now);
 extern int no_sync_cmos_clock __read_mostly;
 void timekeeping_init(void);
@@ -110,8 +151,11 @@ extern int timekeeping_suspended;
 
 unsigned long get_seconds(void);
 struct timespec current_kernel_time(void);
-struct timespec __current_kernel_time(void); /* does not hold xtime_lock */
+struct timespec __current_kernel_time(void); /* does not take xtime_lock */
 struct timespec get_monotonic_coarse(void);
+void get_xtime_and_monotonic_and_sleep_offset(struct timespec *xtim,
+				struct timespec *wtom, struct timespec *sleep);
+void timekeeping_inject_sleeptime(struct timespec *delta);
 
 #define CURRENT_TIME		(current_kernel_time())
 #define CURRENT_TIME_SEC	((struct timespec) { get_seconds(), 0 })
@@ -132,8 +176,9 @@ static inline u32 arch_gettimeoffset(void) { return 0; }
 #endif
 
 extern void do_gettimeofday(struct timeval *tv);
-extern int do_settimeofday(struct timespec *tv);
-extern int do_sys_settimeofday(struct timespec *tv, struct timezone *tz);
+extern int do_settimeofday(const struct timespec *tv);
+extern int do_sys_settimeofday(const struct timespec *tv,
+			       const struct timezone *tz);
 #define do_posix_clock_monotonic_gettime(ts) ktime_get_ts(ts)
 extern long do_utimes(int dfd, char __user *filename, struct timespec *times, int flags);
 struct itimerval;
@@ -145,12 +190,13 @@ extern void getnstimeofday(struct timespec *tv);
 extern void getrawmonotonic(struct timespec *ts);
 extern void getboottime(struct timespec *ts);
 extern void monotonic_to_bootbased(struct timespec *ts);
+extern void get_monotonic_boottime(struct timespec *ts);
 
 extern struct timespec timespec_trunc(struct timespec t, unsigned gran);
 extern int timekeeping_valid_for_hres(void);
-extern void update_wall_time(void);
-extern void update_xtime_cache(u64 nsec);
+extern u64 timekeeping_max_deferment(void);
 extern void timekeeping_leap_insert(int leapsecond);
+extern int timekeeping_inject_offset(struct timespec *ts);
 
 struct tms;
 extern void do_sys_times(struct tms *);
@@ -288,5 +334,179 @@ struct itimerval {
  * The various flags for setting POSIX.1b interval timers:
  */
 #define TIMER_ABSTIME			0x01
+
+#ifdef __KERNEL__
+
+typedef __s64 time64_t;
+
+/*
+ * This wants to go into uapi/linux/time.h once we agreed about the
+ * userspace interfaces.
+ */
+#if __BITS_PER_LONG == 64
+# define timespec64 timespec
+#else
+struct timespec64 {
+	time64_t	tv_sec;			/* seconds */
+	long		tv_nsec;		/* nanoseconds */
+};
+#endif
+
+#if __BITS_PER_LONG == 64
+
+static inline struct timespec timespec64_to_timespec(const struct timespec64 ts64)
+{
+	return ts64;
+}
+
+static inline struct timespec64 timespec_to_timespec64(const struct timespec ts)
+{
+	return ts;
+}
+
+# define timespec64_equal		timespec_equal
+# define timespec64_compare		timespec_compare
+# define set_normalized_timespec64	set_normalized_timespec
+# define timespec64_add_safe		timespec_add_safe
+# define timespec64_add			timespec_add
+# define timespec64_sub			timespec_sub
+# define timespec64_valid		timespec_valid
+# define timespec64_valid_strict	timespec_valid_strict
+# define timespec64_to_ns		timespec_to_ns
+# define ns_to_timespec64		ns_to_timespec
+# define timespec64_add_ns		timespec_add_ns
+
+#else
+
+static inline struct timespec timespec64_to_timespec(const struct timespec64 ts64)
+{
+	struct timespec ret;
+
+	ret.tv_sec = (time_t)ts64.tv_sec;
+	ret.tv_nsec = ts64.tv_nsec;
+	return ret;
+}
+
+static inline struct timespec64 timespec_to_timespec64(const struct timespec ts)
+{
+	struct timespec64 ret;
+
+	ret.tv_sec = ts.tv_sec;
+	ret.tv_nsec = ts.tv_nsec;
+	return ret;
+}
+
+static inline int timespec64_equal(const struct timespec64 *a,
+				   const struct timespec64 *b)
+{
+	return (a->tv_sec == b->tv_sec) && (a->tv_nsec == b->tv_nsec);
+}
+
+/*
+ * lhs < rhs:  return <0
+ * lhs == rhs: return 0
+ * lhs > rhs:  return >0
+ */
+static inline int timespec64_compare(const struct timespec64 *lhs, const struct timespec64 *rhs)
+{
+	if (lhs->tv_sec < rhs->tv_sec)
+		return -1;
+	if (lhs->tv_sec > rhs->tv_sec)
+		return 1;
+	return lhs->tv_nsec - rhs->tv_nsec;
+}
+
+extern void set_normalized_timespec64(struct timespec64 *ts, time64_t sec, s64 nsec);
+
+/*
+ * timespec64_add_safe assumes both values are positive and checks for
+ * overflow. It will return TIME_T_MAX if the returned value would be
+ * smaller then either of the arguments.
+ */
+extern struct timespec64 timespec64_add_safe(const struct timespec64 lhs,
+					 const struct timespec64 rhs);
+
+
+static inline struct timespec64 timespec64_add(struct timespec64 lhs,
+						struct timespec64 rhs)
+{
+	struct timespec64 ts_delta;
+	set_normalized_timespec64(&ts_delta, lhs.tv_sec + rhs.tv_sec,
+				lhs.tv_nsec + rhs.tv_nsec);
+	return ts_delta;
+}
+
+/*
+ * sub = lhs - rhs, in normalized form
+ */
+static inline struct timespec64 timespec64_sub(struct timespec64 lhs,
+						struct timespec64 rhs)
+{
+	struct timespec64 ts_delta;
+	set_normalized_timespec64(&ts_delta, lhs.tv_sec - rhs.tv_sec,
+				lhs.tv_nsec - rhs.tv_nsec);
+	return ts_delta;
+}
+
+/*
+ * Returns true if the timespec64 is norm, false if denorm:
+ */
+static inline bool timespec64_valid(const struct timespec64 *ts)
+{
+	/* Dates before 1970 are bogus */
+	if (ts->tv_sec < 0)
+		return false;
+	/* Can't have more nanoseconds then a second */
+	if ((unsigned long)ts->tv_nsec >= NSEC_PER_SEC)
+		return false;
+	return true;
+}
+
+static inline bool timespec64_valid_strict(const struct timespec64 *ts)
+{
+	if (!timespec64_valid(ts))
+		return false;
+	/* Disallow values that could overflow ktime_t */
+	if ((unsigned long long)ts->tv_sec >= KTIME_SEC_MAX)
+		return false;
+	return true;
+}
+
+/**
+ * timespec64_to_ns - Convert timespec64 to nanoseconds
+ * @ts:		pointer to the timespec64 variable to be converted
+ *
+ * Returns the scalar nanosecond representation of the timespec64
+ * parameter.
+ */
+static inline s64 timespec64_to_ns(const struct timespec64 *ts)
+{
+	return ((s64) ts->tv_sec * NSEC_PER_SEC) + ts->tv_nsec;
+}
+
+/**
+ * ns_to_timespec64 - Convert nanoseconds to timespec64
+ * @nsec:	the nanoseconds value to be converted
+ *
+ * Returns the timespec64 representation of the nsec parameter.
+ */
+extern struct timespec64 ns_to_timespec64(const s64 nsec);
+
+/**
+ * timespec64_add_ns - Adds nanoseconds to a timespec64
+ * @a:		pointer to timespec64 to be incremented
+ * @ns:		unsigned nanoseconds value to be added
+ *
+ * This must always be inlined because its used from the x86-64 vdso,
+ * which cannot call other kernel functions.
+ */
+static __always_inline void timespec64_add_ns(struct timespec64 *a, u64 ns)
+{
+	a->tv_sec += __iter_div_u64_rem(a->tv_nsec + ns, NSEC_PER_SEC, &ns);
+	a->tv_nsec = ns;
+}
+#endif
+
+#endif /* __KERNEL__ */
 
 #endif

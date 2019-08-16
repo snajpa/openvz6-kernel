@@ -40,7 +40,10 @@
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/smp_lock.h>
+#include <linux/cpu.h>
 #include <asm/pgtable.h>
+
+#include <rdma/ib.h>
 
 #include "ipath_kernel.h"
 #include "ipath_common.h"
@@ -1529,7 +1532,7 @@ static int init_subports(struct ipath_devdata *dd,
 	}
 
 	num_subports = uinfo->spu_subport_cnt;
-	pd->subport_uregbase = vmalloc(PAGE_SIZE * num_subports);
+	pd->subport_uregbase = vzalloc(PAGE_SIZE * num_subports);
 	if (!pd->subport_uregbase) {
 		ret = -ENOMEM;
 		goto bail;
@@ -1537,13 +1540,13 @@ static int init_subports(struct ipath_devdata *dd,
 	/* Note: pd->port_rcvhdrq_size isn't initialized yet. */
 	size = ALIGN(dd->ipath_rcvhdrcnt * dd->ipath_rcvhdrentsize *
 		     sizeof(u32), PAGE_SIZE) * num_subports;
-	pd->subport_rcvhdr_base = vmalloc(size);
+	pd->subport_rcvhdr_base = vzalloc(size);
 	if (!pd->subport_rcvhdr_base) {
 		ret = -ENOMEM;
 		goto bail_ureg;
 	}
 
-	pd->subport_rcvegrbuf = vmalloc(pd->port_rcvegrbuf_chunks *
+	pd->subport_rcvegrbuf = vzalloc(pd->port_rcvegrbuf_chunks *
 					pd->port_rcvegrbuf_size *
 					num_subports);
 	if (!pd->subport_rcvegrbuf) {
@@ -1555,11 +1558,6 @@ static int init_subports(struct ipath_devdata *dd,
 	pd->port_subport_id = uinfo->spu_subport_id;
 	pd->active_slaves = 1;
 	set_bit(IPATH_PORT_MASTER_UNINIT, &pd->port_flag);
-	memset(pd->subport_uregbase, 0, PAGE_SIZE * num_subports);
-	memset(pd->subport_rcvhdr_base, 0, size);
-	memset(pd->subport_rcvegrbuf, 0, pd->port_rcvegrbuf_chunks *
-				         pd->port_rcvegrbuf_size *
-				         num_subports);
 	goto bail;
 
 bail_rhdr:
@@ -1688,17 +1686,19 @@ static int find_best_unit(struct file *fp,
 	 * information.  There may be some issues with dual core numbering
 	 * as well.  This needs more work prior to release.
 	 */
-	if (!cpumask_empty(&current->cpus_allowed) &&
-	    !cpumask_full(&current->cpus_allowed)) {
+	if (!cpumask_empty(tsk_cpus_allowed(current)) &&
+	    !cpumask_full(tsk_cpus_allowed(current))) {
 		int ncpus = num_online_cpus(), curcpu = -1, nset = 0;
-		for (i = 0; i < ncpus; i++)
-			if (cpumask_test_cpu(i, &current->cpus_allowed)) {
+		get_online_cpus();
+		for_each_online_cpu(i)
+			if (cpumask_test_cpu(i, tsk_cpus_allowed(current))) {
 				ipath_cdbg(PROC, "%s[%u] affinity set for "
 					   "cpu %d/%d\n", current->comm,
 					   current->pid, i, ncpus);
 				curcpu = i;
 				nset++;
 			}
+		put_online_cpus();
 		if (curcpu != -1 && nset != ncpus) {
 			if (npresent) {
 				prefunit = curcpu / (ncpus / npresent);
@@ -1821,7 +1821,6 @@ done:
 static int ipath_open(struct inode *in, struct file *fp)
 {
 	/* The real work is performed later in ipath_assign_port() */
-	cycle_kernel_lock();
 	fp->private_data = kzalloc(sizeof(struct ipath_filedata), GFP_KERNEL);
 	return fp->private_data ? 0 : -ENOMEM;
 }
@@ -1977,7 +1976,7 @@ static int ipath_do_user_init(struct file *fp,
 	 * 0 to 1.  So for those chips, we turn it off and then back on.
 	 * This will (very briefly) affect any other open ports, but the
 	 * duration is very short, and therefore isn't an issue.  We
-	 * explictly set the in-memory tail copy to 0 beforehand, so we
+	 * explicitly set the in-memory tail copy to 0 beforehand, so we
 	 * don't have to wait to be sure the DMA update has happened
 	 * (chip resets head/tail to 0 on transition to enable).
 	 */
@@ -2055,7 +2054,7 @@ static int ipath_close(struct inode *in, struct file *fp)
 
 	mutex_lock(&ipath_mutex);
 
-	fd = (struct ipath_filedata *) fp->private_data;
+	fd = fp->private_data;
 	fp->private_data = NULL;
 	pd = fd->pd;
 	if (!pd) {
@@ -2239,6 +2238,9 @@ static ssize_t ipath_write(struct file *fp, const char __user *data,
 	struct ipath_cmd cmd;
 	ssize_t ret = 0;
 	void *dest;
+
+	if (WARN_ON_ONCE(!ib_safe_file_access(fp)))
+		return -EACCES;
 
 	if (count < sizeof(cmd.type)) {
 		ret = -EINVAL;

@@ -59,6 +59,9 @@ extern void tcp_time_wait(struct sock *sk, int state, int timeo);
  */
 #define MAX_TCP_WINDOW		32767U
 
+/* Offer an initial receive window of 10 mss. */
+#define TCP_DEFAULT_INIT_RCVWND	10
+
 /* Minimal accepted MSS. It is (60+60+8) - (20+20). */
 #define TCP_MIN_MSS		88U
 
@@ -127,7 +130,13 @@ extern void tcp_time_wait(struct sock *sk, int state, int timeo);
 #endif
 #define TCP_RTO_MAX	((unsigned)(120*HZ))
 #define TCP_RTO_MIN	((unsigned)(HZ/5))
-#define TCP_TIMEOUT_INIT ((unsigned)(3*HZ))	/* RFC 1122 initial RTO value	*/
+#define TCP_TIMEOUT_INIT ((unsigned)(1*HZ))	/* RFC2988bis initial RTO value	*/
+#define TCP_TIMEOUT_FALLBACK ((unsigned)(3*HZ))	/* RFC 1122 initial RTO value, now
+						 * used as a fallback RTO for the
+						 * initial data transmission if no
+						 * valid RTT sample has been acquired,
+						 * most likely due to retrans in 3WHS.
+						 */
 
 #define TCP_RESOURCE_PROBE_INTERVAL ((unsigned)(HZ/2U)) /* Maximal interval between probes
 					                 * for local resources.
@@ -193,6 +202,12 @@ extern void tcp_time_wait(struct sock *sk, int state, int timeo);
 #define TCP_NAGLE_CORK		2	/* Socket is corked	    */
 #define TCP_NAGLE_PUSH		4	/* Cork is overridden for already queued data */
 
+/* TCP thin-stream limits */
+#define TCP_THIN_LINEAR_RETRIES 6       /* After 6 linear retries, do exp. backoff */
+
+/* TCP initial congestion window */
+#define TCP_INIT_CWND		10
+
 extern struct inet_timewait_death_row tcp_death_row;
 
 /* sysctl variables for tcp */
@@ -237,6 +252,12 @@ extern int sysctl_tcp_base_mss;
 extern int sysctl_tcp_workaround_signed_windows;
 extern int sysctl_tcp_slow_start_after_idle;
 extern int sysctl_tcp_max_ssthresh;
+extern int sysctl_tcp_thin_linear_timeouts;
+extern int sysctl_tcp_thin_dupack;
+extern int sysctl_tcp_limit_output_bytes;
+extern int sysctl_tcp_challenge_ack_limit;
+extern int sysctl_tcp_min_tso_segs;
+extern int sysctl_tcp_invalid_ratelimit;
 
 extern atomic_t tcp_memory_allocated;
 extern struct percpu_counter tcp_sockets_allocated;
@@ -276,7 +297,7 @@ static inline void tcp_synq_overflow(struct sock *sk)
 static inline int tcp_synq_no_recent_overflow(const struct sock *sk)
 {
 	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
-	return time_after(jiffies, last_overflow + TCP_TIMEOUT_INIT);
+	return time_after(jiffies, last_overflow + TCP_TIMEOUT_FALLBACK);
 }
 
 extern struct proto tcp_prot;
@@ -285,6 +306,8 @@ extern struct proto tcp_prot;
 #define TCP_INC_STATS_BH(net, field)	SNMP_INC_STATS_BH((net)->mib.tcp_statistics, field)
 #define TCP_DEC_STATS(net, field)	SNMP_DEC_STATS((net)->mib.tcp_statistics, field)
 #define TCP_ADD_STATS_USER(net, field, val) SNMP_ADD_STATS_USER((net)->mib.tcp_statistics, field, val)
+
+extern void			tcp_tasklet_init(void);
 
 extern void			tcp_v4_err(struct sk_buff *skb, u32);
 
@@ -299,6 +322,8 @@ extern int		    	tcp_v4_tw_remember_stamp(struct inet_timewait_sock *tw);
 extern int			tcp_sendmsg(struct kiocb *iocb, struct socket *sock,
 					    struct msghdr *msg, size_t size);
 extern ssize_t			tcp_sendpage(struct socket *sock, struct page *page, int offset, size_t size, int flags);
+
+extern void			tcp_release_cb(struct sock *sk);
 
 extern int			tcp_ioctl(struct sock *sk, 
 					  int cmd, 
@@ -351,6 +376,7 @@ static inline void tcp_clear_options(struct tcp_options_received *rx_opt)
 #define	TCP_ECN_OK		1
 #define	TCP_ECN_QUEUE_CWR	2
 #define	TCP_ECN_DEMAND_CWR	4
+#define	TCP_ECN_SEEN		8
 
 static __inline__ void
 TCP_ECN_create_request(struct request_sock *req, struct tcphdr *th)
@@ -452,8 +478,36 @@ extern int			tcp_disconnect(struct sock *sk, int flags);
 extern __u32 syncookie_secret[2][16-4+SHA_DIGEST_WORDS];
 extern struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb, 
 				    struct ip_options *opt);
+#ifdef CONFIG_SYN_COOKIES
+#include <linux/ktime.h>
+
+/* Syncookies use a monotonic timer which increments every 60 seconds.
+ * This counter is used both as a hash input and partially encoded into
+ * the cookie value.  A cookie is only validated further if the delta
+ * between the current counter value and the encoded one is less than this,
+ * i.e. a sent cookie is valid only at most for 2*60 seconds (or less if
+ * the counter advances immediately after a cookie is generated).
+ */
+#define MAX_SYNCOOKIE_AGE 2
+
+static inline u32 tcp_cookie_time(void)
+{
+	u64 val = get_jiffies_64();
+
+	do_div(val, 60 * HZ);
+	return val;
+}
+
 extern __u32 cookie_v4_init_sequence(struct sock *sk, struct sk_buff *skb, 
 				     __u16 *mss);
+#else
+static inline __u32 cookie_v4_init_sequence(struct sock *sk,
+					    struct sk_buff *skb,
+					    __u16 *mss)
+{
+	return 0;
+}
+#endif
 
 extern __u32 cookie_init_timestamp(struct request_sock *req);
 extern void cookie_check_timestamp(struct tcp_options_received *tcp_opt);
@@ -501,8 +555,22 @@ extern unsigned int tcp_current_mss(struct sock *sk);
 /* Bound MSS / TSO packet size with the half of the window */
 static inline int tcp_bound_to_half_wnd(struct tcp_sock *tp, int pktsize)
 {
-	if (tp->max_window && pktsize > (tp->max_window >> 1))
-		return max(tp->max_window >> 1, 68U - tp->tcp_header_len);
+	int cutoff;
+
+	/* When peer uses tiny windows, there is no use in packetizing
+	 * to sub-MSS pieces for the sake of SWS or making sure there
+	 * are enough packets in the pipe for fast recovery.
+	 *
+	 * On the other hand, for extremely large MSS devices, handling
+	 * smaller than MSS windows in this way does make sense.
+	 */
+	if (tp->max_window > TCP_MIN_RCVMSS)
+		cutoff = (tp->max_window >> 1);
+	else
+		cutoff = tp->max_window;
+
+	if (cutoff && pktsize > cutoff)
+		return max_t(int, cutoff, 68U - tp->tcp_header_len);
 	else
 		return pktsize;
 }
@@ -521,6 +589,7 @@ extern void tcp_initialize_rcv_mss(struct sock *sk);
 extern int tcp_mtu_to_mss(struct sock *sk, int pmtu);
 extern int tcp_mss_to_mtu(struct sock *sk, int mss);
 extern void tcp_mtup_init(struct sock *sk);
+extern void tcp_valid_rtt_meas(struct sock *sk, u32 seq_rtt);
 
 static inline void tcp_bound_rto(const struct sock *sk)
 {
@@ -594,6 +663,17 @@ extern u32	__tcp_select_window(struct sock *sk);
  */
 #define tcp_time_stamp		((__u32)(jiffies))
 
+#define tcp_flag_byte(th) (((u_int8_t *)th)[13])
+
+#define TCPHDR_FIN 0x01
+#define TCPHDR_SYN 0x02
+#define TCPHDR_RST 0x04
+#define TCPHDR_PSH 0x08
+#define TCPHDR_ACK 0x10
+#define TCPHDR_URG 0x20
+#define TCPHDR_ECE 0x40
+#define TCPHDR_CWR 0x80
+
 /* This is what the send packet queuing engine uses to pass
  * TCP per-packet control information to the transmission
  * code.  We also store the host-order sequence numbers in
@@ -611,26 +691,14 @@ struct tcp_skb_cb {
 	__u32		seq;		/* Starting sequence number	*/
 	__u32		end_seq;	/* SEQ + FIN + SYN + datalen	*/
 	__u32		when;		/* used to compute rtt's	*/
-	__u8		flags;		/* TCP header flags.		*/
-
-	/* NOTE: These must match up to the flags byte in a
-	 *       real TCP header.
-	 */
-#define TCPCB_FLAG_FIN		0x01
-#define TCPCB_FLAG_SYN		0x02
-#define TCPCB_FLAG_RST		0x04
-#define TCPCB_FLAG_PSH		0x08
-#define TCPCB_FLAG_ACK		0x10
-#define TCPCB_FLAG_URG		0x20
-#define TCPCB_FLAG_ECE		0x40
-#define TCPCB_FLAG_CWR		0x80
-
+	__u8		tcp_flags;	/* TCP header flags. (tcp[13])	*/
 	__u8		sacked;		/* State flags for SACK/FACK.	*/
 #define TCPCB_SACKED_ACKED	0x01	/* SKB ACK'd by a SACK block	*/
 #define TCPCB_SACKED_RETRANS	0x02	/* SKB retransmitted		*/
 #define TCPCB_LOST		0x04	/* SKB is lost			*/
 #define TCPCB_TAGBITS		0x07	/* All tag bits			*/
-
+	__u8		ip_dsfield;	/* IPv4 tos or IPv6 dsfield	*/
+	/* 1 byte hole */
 #define TCPCB_EVER_RETRANS	0x80	/* Ever retransmitted frame	*/
 #define TCPCB_RETRANS		(TCPCB_SACKED_RETRANS|TCPCB_EVER_RETRANS)
 
@@ -972,7 +1040,8 @@ static inline void tcp_sack_reset(struct tcp_options_received *rx_opt)
 /* Determine a window scaling and initial window to offer. */
 extern void tcp_select_initial_window(int __space, __u32 mss,
 				      __u32 *rcv_wnd, __u32 *window_clamp,
-				      int wscale_ok, __u8 *rcv_wscale);
+				      int wscale_ok, __u8 *rcv_wscale,
+				      __u32 init_rcv_wnd);
 
 static inline int tcp_win_from_space(int space)
 {
@@ -1002,6 +1071,7 @@ static inline void tcp_openreq_init(struct request_sock *req,
 	req->rcv_wnd = 0;		/* So that tcp_send_synack() knows! */
 	req->cookie_ts = 0;
 	tcp_rsk(req)->rcv_isn = TCP_SKB_CB(skb)->seq;
+	tcp_rsk(req)->last_oow_ack_time = 0;
 	req->mss = rx_opt->mss_clamp;
 	req->ts_recent = rx_opt->saw_tstamp ? rx_opt->rcv_tsval : 0;
 	ireq->tstamp_ok = rx_opt->tstamp_ok;
@@ -1031,6 +1101,14 @@ static inline int keepalive_probes(const struct tcp_sock *tp)
 	return tp->keepalive_probes ? : sysctl_tcp_keepalive_probes;
 }
 
+static inline u32 keepalive_time_elapsed(const struct tcp_sock *tp)
+{
+	const struct inet_connection_sock *icsk = &tp->inet_conn;
+
+	return min_t(u32, tcp_time_stamp - icsk->icsk_ack.lrcvtime,
+			  tcp_time_stamp - tp->rcv_tstamp);
+}
+
 static inline int tcp_fin_time(const struct sock *sk)
 {
 	int fin_timeout = tcp_sk(sk)->linger2 ? : sysctl_tcp_fin_timeout;
@@ -1049,7 +1127,13 @@ static inline int tcp_paws_check(const struct tcp_options_received *rx_opt,
 		return 1;
 	if (unlikely(get_seconds() >= rx_opt->ts_recent_stamp + TCP_PAWS_24DAYS))
 		return 1;
-
+	/*
+	 * Some OSes send SYN and SYNACK messages with tsval=0 tsecr=0,
+	 * then following tcp messages have valid values. Ignore 0 value,
+	 * or else 'negative' tsval might forbid us to accept their packets.
+	 */
+	if (!rx_opt->ts_recent)
+		return 1;
 	return 0;
 }
 
@@ -1077,6 +1161,9 @@ static inline int tcp_paws_reject(const struct tcp_options_received *rx_opt,
 }
 
 #define TCP_CHECK_TIMER(sk) do { } while (0)
+
+bool tcp_oow_rate_limited(struct net *net, const struct sk_buff *skb,
+			  int mib_idx, u32 *last_oow_ack_time);
 
 static inline void tcp_mib_init(struct net *net)
 {
@@ -1228,6 +1315,7 @@ static inline void tcp_write_queue_purge(struct sock *sk)
 	while ((skb = __skb_dequeue(&sk->sk_write_queue)) != NULL)
 		sk_wmem_free_skb(sk, skb);
 	sk_mem_reclaim(sk);
+	tcp_clear_all_retrans_hints(tcp_sk(sk));
 }
 
 static inline struct sk_buff *tcp_write_queue_head(struct sock *sk)
@@ -1261,25 +1349,35 @@ static inline struct sk_buff *tcp_write_queue_prev(struct sock *sk, struct sk_bu
 
 /* This function calculates a "timeout" which is equivalent to the timeout of a
  * TCP connection after "boundary" unsucessful, exponentially backed-off
- * retransmissions with an initial RTO of TCP_RTO_MIN.
+ * retransmissions with an initial RTO of TCP_RTO_MIN or TCP_TIMEOUT_INIT if
+ * syn_set flag is set.
  */
-static inline bool retransmits_timed_out(const struct sock *sk,
-					 unsigned int boundary)
+static inline bool retransmits_timed_out(struct sock *sk,
+					 unsigned int boundary,
+					 unsigned int timeout,
+					 bool syn_set)
 {
-	unsigned int timeout, linear_backoff_thresh;
+	unsigned int linear_backoff_thresh, start_ts;
+	unsigned int rto_base = syn_set ? TCP_TIMEOUT_INIT : TCP_RTO_MIN;
 
 	if (!inet_csk(sk)->icsk_retransmits)
 		return false;
 
-	linear_backoff_thresh = ilog2(TCP_RTO_MAX/TCP_RTO_MIN);
-
-	if (boundary <= linear_backoff_thresh)
-		timeout = ((2 << boundary) - 1) * TCP_RTO_MIN;
+	if (unlikely(!tcp_sk(sk)->retrans_stamp))
+		start_ts = TCP_SKB_CB(tcp_write_queue_head(sk))->when;
 	else
-		timeout = ((2 << linear_backoff_thresh) - 1) * TCP_RTO_MIN +
-			  (boundary - linear_backoff_thresh) * TCP_RTO_MAX;
+		start_ts = tcp_sk(sk)->retrans_stamp;
 
-	return (tcp_time_stamp - tcp_sk(sk)->retrans_stamp) >= timeout;
+	if (likely(timeout == 0)) {
+		linear_backoff_thresh = ilog2(TCP_RTO_MAX/rto_base);
+
+		if (boundary <= linear_backoff_thresh)
+			timeout = ((2 << boundary) - 1) * rto_base;
+		else
+			timeout = ((2 << linear_backoff_thresh) - 1) * rto_base +
+				  (boundary - linear_backoff_thresh) * TCP_RTO_MAX;
+	}
+	return (tcp_time_stamp - start_ts) >= timeout;
 }
 
 static inline struct sk_buff *tcp_send_head(struct sock *sk)
@@ -1305,6 +1403,8 @@ static inline void tcp_check_send_head(struct sock *sk, struct sk_buff *skb_unli
 {
 	if (sk->sk_send_head == skb_unlinked)
 		sk->sk_send_head = NULL;
+	if (tcp_sk(sk)->highest_sack == skb_unlinked)
+		tcp_sk(sk)->highest_sack = NULL;
 }
 
 static inline void tcp_init_send_head(struct sock *sk)
@@ -1401,6 +1501,24 @@ static inline void tcp_highest_sack_combine(struct sock *sk,
 {
 	if (tcp_sk(sk)->sacked_out && (old == tcp_sk(sk)->highest_sack))
 		tcp_sk(sk)->highest_sack = new;
+}
+
+/* This helper checks if socket has IP_TRANSPARENT set */
+static inline bool inet_sk_transparent(const struct sock *sk)
+{
+	switch (sk->sk_state) {
+	case TCP_TIME_WAIT:
+		return inet_twsk(sk)->tw_transparent;
+	}
+	return inet_sk(sk)->transparent;
+}
+
+/* Determines whether this is a thin stream (which may suffer from
+ * increased latency). Used to trigger latency-reducing mechanisms.
+ */
+static inline unsigned int tcp_stream_is_thin(struct tcp_sock *tp)
+{
+	return tp->packets_out < 4 && !tcp_in_initial_slowstart(tp);
 }
 
 /* /proc */

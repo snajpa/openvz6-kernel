@@ -234,6 +234,8 @@ static int do_video_set_spu_palette(unsigned int fd, unsigned int cmd, unsigned 
 	up = (struct compat_video_spu_palette __user *) arg;
 	err  = get_user(palp, &up->palette);
 	err |= get_user(length, &up->length);
+	if (err)
+		return -EFAULT;
 
 	up_native = compat_alloc_user_space(sizeof(struct video_spu_palette));
 	err  = put_user(compat_ptr(palp), &up_native->palette);
@@ -524,6 +526,7 @@ static int dev_ifsioc(unsigned int fd, unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 		break;
 	case SIOCSHWTSTAMP:
+	case SIOCGHWTSTAMP:
 		if (copy_from_user(&ifr, uifr32, sizeof(*uifr32)))
 			return -EFAULT;
 		ifr.ifr_data = compat_ptr(uifr32->ifr_ifru.ifru_data);
@@ -729,8 +732,15 @@ static int sg_ioctl_trans(unsigned int fd, unsigned int cmd, unsigned long arg)
 	u32 data;
 	void __user *dxferp;
 	int err;
+	int interface_id;
 
 	sgio32 = compat_ptr(arg);
+
+	if (get_user(interface_id, &sgio32->interface_id))
+		return -EFAULT;
+	if (interface_id != 'S')
+		return sys_ioctl(fd, cmd, (unsigned long)sgio32);
+
 	if (get_user(iovec_count, &sgio32->iovec_count))
 		return -EFAULT;
 
@@ -1497,7 +1507,6 @@ struct serial_struct32 {
 
 static int serial_struct_ioctl(unsigned fd, unsigned cmd, unsigned long arg)
 {
-        typedef struct serial_struct SS;
         typedef struct serial_struct32 SS32;
         struct serial_struct32 __user *ss32 = compat_ptr(arg);
         int err;
@@ -1912,28 +1921,6 @@ COMPATIBLE_IOCTL(FIGETBSZ)
 /* 'X' - originally XFS but some now in the VFS */
 COMPATIBLE_IOCTL(FIFREEZE)
 COMPATIBLE_IOCTL(FITHAW)
-/* RAID */
-COMPATIBLE_IOCTL(RAID_VERSION)
-COMPATIBLE_IOCTL(GET_ARRAY_INFO)
-COMPATIBLE_IOCTL(GET_DISK_INFO)
-COMPATIBLE_IOCTL(PRINT_RAID_DEBUG)
-COMPATIBLE_IOCTL(RAID_AUTORUN)
-COMPATIBLE_IOCTL(CLEAR_ARRAY)
-COMPATIBLE_IOCTL(ADD_NEW_DISK)
-ULONG_IOCTL(HOT_REMOVE_DISK)
-COMPATIBLE_IOCTL(SET_ARRAY_INFO)
-COMPATIBLE_IOCTL(SET_DISK_INFO)
-COMPATIBLE_IOCTL(WRITE_RAID_INFO)
-COMPATIBLE_IOCTL(UNPROTECT_ARRAY)
-COMPATIBLE_IOCTL(PROTECT_ARRAY)
-ULONG_IOCTL(HOT_ADD_DISK)
-ULONG_IOCTL(SET_DISK_FAULTY)
-COMPATIBLE_IOCTL(RUN_ARRAY)
-COMPATIBLE_IOCTL(STOP_ARRAY)
-COMPATIBLE_IOCTL(STOP_ARRAY_RO)
-COMPATIBLE_IOCTL(RESTART_ARRAY_RW)
-COMPATIBLE_IOCTL(GET_BITMAP_FILE)
-ULONG_IOCTL(SET_BITMAP_FILE)
 /* Big K */
 COMPATIBLE_IOCTL(PIO_FONT)
 COMPATIBLE_IOCTL(GIO_FONT)
@@ -2554,6 +2541,7 @@ HANDLE_IOCTL(SIOCGIFADDR, dev_ifsioc)
 HANDLE_IOCTL(SIOCSIFADDR, dev_ifsioc)
 HANDLE_IOCTL(SIOCSIFHWBROADCAST, dev_ifsioc)
 HANDLE_IOCTL(SIOCSHWTSTAMP, dev_ifsioc)
+HANDLE_IOCTL(SIOCGHWTSTAMP, dev_ifsioc)
 
 /* ioctls used by appletalk ddp.c */
 HANDLE_IOCTL(SIOCATALKDIFADDR, dev_ifsioc)

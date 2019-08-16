@@ -102,6 +102,8 @@ static const int multicast_filter_limit = 32;
 #include <linux/ethtool.h>
 #include <linux/crc32.h>
 #include <linux/bitops.h>
+#include <linux/workqueue.h>
+#include <linux/u64_stats_sync.h>
 #include <asm/processor.h>	/* Processor type for cache alignment. */
 #include <asm/io.h>
 #include <asm/irq.h>
@@ -364,6 +366,12 @@ enum chip_cmd_bits {
 	Cmd1NoTxPoll=0x08, Cmd1Reset=0x80,
 };
 
+struct rhine_stats {
+	u64		packets;
+	u64		bytes;
+	struct u64_stats_sync syncp;
+};
+
 struct rhine_private {
 	/* Descriptor rings */
 	struct rx_desc *rx_ring;
@@ -389,6 +397,7 @@ struct rhine_private {
 	struct net_device *dev;
 	struct napi_struct napi;
 	spinlock_t lock;
+	struct work_struct reset_task;
 
 	/* Frequently used values: keep some adjacent for cache effect. */
 	u32 quirks;
@@ -396,6 +405,8 @@ struct rhine_private {
 	unsigned int cur_rx, dirty_rx;	/* Producer/consumer ring indices */
 	unsigned int cur_tx, dirty_tx;
 	unsigned int rx_buf_sz;		/* Based on MTU+slack. */
+	struct rhine_stats rx_stats;
+	struct rhine_stats tx_stats;
 	u8 wolopts;
 
 	u8 tx_thresh, rx_thresh;
@@ -407,6 +418,7 @@ struct rhine_private {
 static int  mdio_read(struct net_device *dev, int phy_id, int location);
 static void mdio_write(struct net_device *dev, int phy_id, int location, int value);
 static int  rhine_open(struct net_device *dev);
+static void rhine_reset_task(struct work_struct *work);
 static void rhine_tx_timeout(struct net_device *dev);
 static netdev_tx_t rhine_start_tx(struct sk_buff *skb,
 				  struct net_device *dev);
@@ -415,7 +427,8 @@ static void rhine_tx(struct net_device *dev);
 static int rhine_rx(struct net_device *dev, int limit);
 static void rhine_error(struct net_device *dev, int intr_status);
 static void rhine_set_rx_mode(struct net_device *dev);
-static struct net_device_stats *rhine_get_stats(struct net_device *dev);
+static struct rtnl_link_stats64 *rhine_get_stats64(struct net_device *dev,
+	       struct rtnl_link_stats64 *stats);
 static int netdev_ioctl(struct net_device *dev, struct ifreq *rq, int cmd);
 static const struct ethtool_ops netdev_ethtool_ops;
 static int  rhine_close(struct net_device *dev);
@@ -620,7 +633,6 @@ static const struct net_device_ops rhine_netdev_ops = {
 	.ndo_open		 = rhine_open,
 	.ndo_stop		 = rhine_close,
 	.ndo_start_xmit		 = rhine_start_tx,
-	.ndo_get_stats		 = rhine_get_stats,
 	.ndo_set_multicast_list	 = rhine_set_rx_mode,
 	.ndo_change_mtu		 = eth_change_mtu,
 	.ndo_validate_addr	 = eth_validate_addr,
@@ -630,6 +642,11 @@ static const struct net_device_ops rhine_netdev_ops = {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	 = rhine_poll,
 #endif
+};
+
+static const struct net_device_ops_ext rhine_netdev_ops_ext = {
+	.size			= sizeof(struct net_device_ops_ext),
+	.ndo_get_stats64	= rhine_get_stats64,
 };
 
 static int __devinit rhine_init_one(struct pci_dev *pdev,
@@ -775,6 +792,8 @@ static int __devinit rhine_init_one(struct pci_dev *pdev,
 	dev->irq = pdev->irq;
 
 	spin_lock_init(&rp->lock);
+	INIT_WORK(&rp->reset_task, rhine_reset_task);
+
 	rp->mii_if.dev = dev;
 	rp->mii_if.mdio_read = mdio_read;
 	rp->mii_if.mdio_write = mdio_write;
@@ -783,6 +802,7 @@ static int __devinit rhine_init_one(struct pci_dev *pdev,
 
 	/* The chip-specific entries in the device structure. */
 	dev->netdev_ops = &rhine_netdev_ops;
+	set_netdev_ops_ext(dev, &rhine_netdev_ops_ext);
 	dev->ethtool_ops = &netdev_ethtool_ops,
 	dev->watchdog_timeo = TX_TIMEOUT;
 
@@ -1179,22 +1199,18 @@ static int rhine_open(struct net_device *dev)
 	return 0;
 }
 
-static void rhine_tx_timeout(struct net_device *dev)
+static void rhine_reset_task(struct work_struct *work)
 {
-	struct rhine_private *rp = netdev_priv(dev);
-	void __iomem *ioaddr = rp->base;
-
-	printk(KERN_WARNING "%s: Transmit timed out, status %4.4x, PHY status "
-	       "%4.4x, resetting...\n",
-	       dev->name, ioread16(ioaddr + IntrStatus),
-	       mdio_read(dev, rp->mii_if.phy_id, MII_BMSR));
+	struct rhine_private *rp = container_of(work, struct rhine_private,
+						reset_task);
+	struct net_device *dev = rp->dev;
 
 	/* protect against concurrent rx interrupts */
 	disable_irq(rp->pdev->irq);
 
 	napi_disable(&rp->napi);
 
-	spin_lock(&rp->lock);
+	spin_lock_bh(&rp->lock);
 
 	/* clear all descriptors */
 	free_tbufs(dev);
@@ -1206,12 +1222,25 @@ static void rhine_tx_timeout(struct net_device *dev)
 	rhine_chip_reset(dev);
 	init_registers(dev);
 
-	spin_unlock(&rp->lock);
+	spin_unlock_bh(&rp->lock);
 	enable_irq(rp->pdev->irq);
 
 	dev->trans_start = jiffies;
 	dev->stats.tx_errors++;
 	netif_wake_queue(dev);
+}
+
+static void rhine_tx_timeout(struct net_device *dev)
+{
+	struct rhine_private *rp = netdev_priv(dev);
+	void __iomem *ioaddr = rp->base;
+
+	printk(KERN_WARNING "%s: Transmit timed out, status %4.4x, PHY status "
+	       "%4.4x, resetting...\n",
+	       dev->name, ioread16(ioaddr + IntrStatus),
+	       mdio_read(dev, rp->mii_if.phy_id, MII_BMSR));
+
+	schedule_work(&rp->reset_task);
 }
 
 static netdev_tx_t rhine_start_tx(struct sk_buff *skb,
@@ -1406,8 +1435,11 @@ static void rhine_tx(struct net_device *dev)
 				printk(KERN_DEBUG "collisions: %1.1x:%1.1x\n",
 				       (txstatus >> 3) & 0xF,
 				       txstatus & 0xF);
-			dev->stats.tx_bytes += rp->tx_skbuff[entry]->len;
-			dev->stats.tx_packets++;
+
+			u64_stats_update_begin(&rp->tx_stats.syncp);
+			rp->tx_stats.bytes += rp->tx_skbuff[entry]->len;
+			rp->tx_stats.packets++;
+			u64_stats_update_end(&rp->tx_stats.syncp);
 		}
 		/* Free the original skb. */
 		if (rp->tx_skbuff_dma[entry]) {
@@ -1523,8 +1555,11 @@ static int rhine_rx(struct net_device *dev, int limit)
 			}
 			skb->protocol = eth_type_trans(skb, dev);
 			netif_receive_skb(skb);
-			dev->stats.rx_bytes += pkt_len;
-			dev->stats.rx_packets++;
+
+			u64_stats_update_begin(&rp->rx_stats.syncp);
+			rp->rx_stats.bytes += pkt_len;
+			rp->rx_stats.packets++;
+			u64_stats_update_end(&rp->rx_stats.syncp);
 		}
 		entry = (++rp->cur_rx) % RX_RING_SIZE;
 		rp->rx_head_desc = &rp->rx_ring[entry];
@@ -1657,11 +1692,13 @@ static void rhine_error(struct net_device *dev, int intr_status)
 	spin_unlock(&rp->lock);
 }
 
-static struct net_device_stats *rhine_get_stats(struct net_device *dev)
+static struct rtnl_link_stats64 *
+rhine_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	struct rhine_private *rp = netdev_priv(dev);
 	void __iomem *ioaddr = rp->base;
 	unsigned long flags;
+	unsigned int start;
 
 	spin_lock_irqsave(&rp->lock, flags);
 	dev->stats.rx_crc_errors += ioread16(ioaddr + RxCRCErrs);
@@ -1669,7 +1706,21 @@ static struct net_device_stats *rhine_get_stats(struct net_device *dev)
 	clear_tally_counters(ioaddr);
 	spin_unlock_irqrestore(&rp->lock, flags);
 
-	return &dev->stats;
+	netdev_stats_to_stats64(stats, &dev->stats);
+
+	do {
+		start = u64_stats_fetch_begin_irq(&rp->rx_stats.syncp);
+		stats->rx_packets = rp->rx_stats.packets;
+		stats->rx_bytes = rp->rx_stats.bytes;
+	} while (u64_stats_fetch_retry_irq(&rp->rx_stats.syncp, start));
+
+	do {
+		start = u64_stats_fetch_begin_irq(&rp->tx_stats.syncp);
+		stats->tx_packets = rp->tx_stats.packets;
+		stats->tx_bytes = rp->tx_stats.bytes;
+	} while (u64_stats_fetch_retry_irq(&rp->tx_stats.syncp, start));
+
+	return stats;
 }
 
 static void rhine_set_rx_mode(struct net_device *dev)
@@ -1830,10 +1881,11 @@ static int rhine_close(struct net_device *dev)
 	struct rhine_private *rp = netdev_priv(dev);
 	void __iomem *ioaddr = rp->base;
 
-	spin_lock_irq(&rp->lock);
-
-	netif_stop_queue(dev);
 	napi_disable(&rp->napi);
+	cancel_work_sync(&rp->reset_task);
+	netif_stop_queue(dev);
+
+	spin_lock_irq(&rp->lock);
 
 	if (debug > 1)
 		printk(KERN_DEBUG "%s: Shutting down ethercard, "

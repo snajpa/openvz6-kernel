@@ -2,6 +2,7 @@
 #define _SCSI_PRIV_H
 
 #include <linux/device.h>
+#include <linux/async.h>
 
 struct request_queue;
 struct request;
@@ -77,12 +78,11 @@ int scsi_noretry_cmd(struct scsi_cmnd *scmd);
 /* scsi_lib.c */
 extern int scsi_maybe_unblock_host(struct scsi_device *sdev);
 extern void scsi_device_unbusy(struct scsi_device *sdev);
-extern int scsi_queue_insert(struct scsi_cmnd *cmd, int reason);
+extern void scsi_queue_insert(struct scsi_cmnd *cmd, int reason);
 extern void scsi_next_command(struct scsi_cmnd *cmd);
 extern void scsi_io_completion(struct scsi_cmnd *, unsigned int);
 extern void scsi_run_host_queues(struct Scsi_Host *shost);
 extern struct request_queue *scsi_alloc_queue(struct scsi_device *sdev);
-extern void scsi_free_queue(struct request_queue *q);
 extern int scsi_init_queue(void);
 extern void scsi_exit_queue(void);
 struct request_queue;
@@ -143,6 +143,8 @@ extern struct sock *scsi_nl_sock;
 static inline void scsi_netlink_init(void) {}
 static inline void scsi_netlink_exit(void) {}
 #endif
+
+extern struct async_domain scsi_sd_probe_domain;
 
 /* 
  * internal scsi timeout functions: for use by mid-layer and transport

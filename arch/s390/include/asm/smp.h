@@ -35,6 +35,7 @@ typedef struct
 extern void machine_restart_smp(char *);
 extern void machine_halt_smp(void);
 extern void machine_power_off_smp(void);
+extern void smp_restart_with_online_cpu(void);
 
 #define NO_PROC_ID		0xFF		/* No processor magic marker */
 
@@ -51,7 +52,6 @@ extern void machine_power_off_smp(void);
 #define PROC_CHANGE_PENALTY	20		/* Schedule penalty */
 
 #define raw_smp_processor_id()	(S390_lowcore.cpu_nr)
-#define cpu_logical_map(cpu)	(cpu)
 
 extern int __cpu_disable (void);
 extern void __cpu_die (unsigned int cpu);
@@ -63,6 +63,32 @@ extern int smp_cpu_polarization[];
 
 extern void arch_send_call_function_single_ipi(int cpu);
 extern void arch_send_call_function_ipi_mask(const struct cpumask *mask);
+
+/*
+ * returns 1 if (virtual) cpu is scheduled
+ * returns 0 otherwise
+ */
+static inline int smp_vcpu_scheduled(int cpu)
+{
+	u32 status;
+
+	switch (signal_processor_ps(&status, 0, cpu, sigp_sense_running)) {
+	case sigp_status_stored:
+		/* Check for running status */
+		if (status & 0x400)
+			return 0;
+		break;
+	case sigp_not_operational:
+		return 0;
+	default:
+		break;
+	}
+	return 1;
+}
+
+#else
+
+#define smp_vcpu_scheduler (1)
 
 #endif
 

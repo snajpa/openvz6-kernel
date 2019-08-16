@@ -44,6 +44,9 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/completion.h>
+#include <linux/slab.h>
+#include <linux/module.h>
+#include <linux/sysctl.h>
 
 #include <rdma/iw_cm.h>
 #include <rdma/ib_addr.h>
@@ -62,6 +65,27 @@ struct iwcm_work {
 	struct iw_cm_event event;
 	struct list_head free_list;
 };
+
+static unsigned int default_backlog = 256;
+
+static struct ctl_table_header *iwcm_ctl_table_hdr;
+static struct ctl_table iwcm_ctl_table[] = {
+	{
+		.procname	= "default_backlog",
+		.data		= &default_backlog,
+		.maxlen		= sizeof(default_backlog),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{ }
+};
+
+static struct ctl_path iwcm_ctl_path[] = {
+	{ .procname = "net", .ctl_name = CTL_NET },
+	{ .procname = "rdma_iwcm", .ctl_name = CTL_UNNUMBERED },
+	{ }
+};
+
 
 /*
  * The following services provide a mechanism for pre-allocating iwcm_work
@@ -179,9 +203,16 @@ static void add_ref(struct iw_cm_id *cm_id)
 static void rem_ref(struct iw_cm_id *cm_id)
 {
 	struct iwcm_id_private *cm_id_priv;
+	int cb_destroy;
+
 	cm_id_priv = container_of(cm_id, struct iwcm_id_private, id);
-	if (iwcm_deref_id(cm_id_priv) &&
-	    test_bit(IWCM_F_CALLBACK_DESTROY, &cm_id_priv->flags)) {
+
+	/*
+	 * Test bit before deref in case the cm_id gets freed on another
+	 * thread.
+	 */
+	cb_destroy = test_bit(IWCM_F_CALLBACK_DESTROY, &cm_id_priv->flags);
+	if (iwcm_deref_id(cm_id_priv) && cb_destroy) {
 		BUG_ON(!list_empty(&cm_id_priv->work_list));
 		free_cm_id(cm_id_priv);
 	}
@@ -325,7 +356,6 @@ static void destroy_cm_id(struct iw_cm_id *cm_id)
 {
 	struct iwcm_id_private *cm_id_priv;
 	unsigned long flags;
-	int ret;
 
 	cm_id_priv = container_of(cm_id, struct iwcm_id_private, id);
 	/*
@@ -341,7 +371,7 @@ static void destroy_cm_id(struct iw_cm_id *cm_id)
 		cm_id_priv->state = IW_CM_STATE_DESTROYING;
 		spin_unlock_irqrestore(&cm_id_priv->lock, flags);
 		/* destroy the listening endpoint */
-		ret = cm_id->device->iwcm->destroy_listen(cm_id);
+		cm_id->device->iwcm->destroy_listen(cm_id);
 		spin_lock_irqsave(&cm_id_priv->lock, flags);
 		break;
 	case IW_CM_STATE_ESTABLISHED:
@@ -416,6 +446,9 @@ int iw_cm_listen(struct iw_cm_id *cm_id, int backlog)
 	int ret;
 
 	cm_id_priv = container_of(cm_id, struct iwcm_id_private, id);
+
+	if (!backlog)
+		backlog = default_backlog;
 
 	ret = alloc_work_entries(cm_id_priv, backlog);
 	if (ret)
@@ -505,6 +538,8 @@ int iw_cm_accept(struct iw_cm_id *cm_id,
 	qp = cm_id->device->iwcm->get_qp(cm_id->device, iw_param->qpn);
 	if (!qp) {
 		spin_unlock_irqrestore(&cm_id_priv->lock, flags);
+		clear_bit(IWCM_F_CONNECT_WAIT, &cm_id_priv->flags);
+		wake_up_all(&cm_id_priv->connect_wait);
 		return -EINVAL;
 	}
 	cm_id->device->iwcm->add_ref(qp);
@@ -564,6 +599,8 @@ int iw_cm_connect(struct iw_cm_id *cm_id, struct iw_cm_conn_param *iw_param)
 	qp = cm_id->device->iwcm->get_qp(cm_id->device, iw_param->qpn);
 	if (!qp) {
 		spin_unlock_irqrestore(&cm_id_priv->lock, flags);
+		clear_bit(IWCM_F_CONNECT_WAIT, &cm_id_priv->flags);
+		wake_up_all(&cm_id_priv->connect_wait);
 		return -EINVAL;
 	}
 	cm_id->device->iwcm->add_ref(qp);
@@ -618,17 +655,6 @@ static void cm_conn_req_handler(struct iwcm_id_private *listen_id_priv,
 	 */
 	BUG_ON(iw_event->status);
 
-	/*
-	 * We could be destroying the listening id. If so, ignore this
-	 * upcall.
-	 */
-	spin_lock_irqsave(&listen_id_priv->lock, flags);
-	if (listen_id_priv->state != IW_CM_STATE_LISTEN) {
-		spin_unlock_irqrestore(&listen_id_priv->lock, flags);
-		goto out;
-	}
-	spin_unlock_irqrestore(&listen_id_priv->lock, flags);
-
 	cm_id = iw_create_cm_id(listen_id_priv->id.device,
 				listen_id_priv->id.cm_handler,
 				listen_id_priv->id.context);
@@ -642,6 +668,19 @@ static void cm_conn_req_handler(struct iwcm_id_private *listen_id_priv,
 
 	cm_id_priv = container_of(cm_id, struct iwcm_id_private, id);
 	cm_id_priv->state = IW_CM_STATE_CONN_RECV;
+
+	/*
+	 * We could be destroying the listening id. If so, ignore this
+	 * upcall.
+	 */
+	spin_lock_irqsave(&listen_id_priv->lock, flags);
+	if (listen_id_priv->state != IW_CM_STATE_LISTEN) {
+		spin_unlock_irqrestore(&listen_id_priv->lock, flags);
+		iw_cm_reject(cm_id, NULL, 0);
+		iw_destroy_cm_id(cm_id);
+		goto out;
+	}
+	spin_unlock_irqrestore(&listen_id_priv->lock, flags);
 
 	ret = alloc_work_entries(cm_id_priv, 3);
 	if (ret) {
@@ -720,7 +759,7 @@ static int cm_conn_rep_handler(struct iwcm_id_private *cm_id_priv,
 	 */
 	clear_bit(IWCM_F_CONNECT_WAIT, &cm_id_priv->flags);
 	BUG_ON(cm_id_priv->state != IW_CM_STATE_CONN_SENT);
-	if (iw_event->status == IW_CM_EVENT_STATUS_ACCEPTED) {
+	if (iw_event->status == 0) {
 		cm_id_priv->id.local_addr = iw_event->local_addr;
 		cm_id_priv->id.remote_addr = iw_event->remote_addr;
 		cm_id_priv->state = IW_CM_STATE_ESTABLISHED;
@@ -870,6 +909,8 @@ static void cm_work_handler(struct work_struct *_work)
 			}
 			return;
 		}
+		if (empty)
+			return;
 		spin_lock_irqsave(&cm_id_priv->lock, flags);
 	}
 	spin_unlock_irqrestore(&cm_id_priv->lock, flags);
@@ -1014,11 +1055,21 @@ static int __init iw_cm_init(void)
 	if (!iwcm_wq)
 		return -ENOMEM;
 
+	iwcm_ctl_table_hdr = register_net_sysctl_table(&init_net,
+						       iwcm_ctl_path,
+						       iwcm_ctl_table);
+	if (!iwcm_ctl_table_hdr) {
+		pr_err("iw_cm: couldn't register sysctl paths\n");
+		destroy_workqueue(iwcm_wq);
+		return -ENOMEM;
+	}
+
 	return 0;
 }
 
 static void __exit iw_cm_cleanup(void)
 {
+	unregister_net_sysctl_table(iwcm_ctl_table_hdr);
 	destroy_workqueue(iwcm_wq);
 }
 

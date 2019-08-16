@@ -195,6 +195,7 @@ static const struct sierra_iface_info direct_ip_interface_blacklist = {
 static struct usb_device_id id_table [] = {
 	{ USB_DEVICE(0x0F3D, 0x0112) }, /* Airprime/Sierra PC 5220 */
 	{ USB_DEVICE(0x03F0, 0x1B1D) },	/* HP ev2200 a.k.a MC5720 */
+	{ USB_DEVICE(0x03F0, 0x211D) }, /* HP ev2210 a.k.a MC5725 */
 	{ USB_DEVICE(0x03F0, 0x1E1D) },	/* HP hs2300 a.k.a MC8775 */
 
 	{ USB_DEVICE(0x1199, 0x0017) },	/* Sierra Wireless EM5625 */
@@ -264,6 +265,14 @@ static struct usb_device_id id_table [] = {
 	{ USB_DEVICE(0x1199, 0x68A3), 	/* Sierra Wireless Direct IP modems */
 	  .driver_info = (kernel_ulong_t)&direct_ip_interface_blacklist
 	},
+	/* AT&T Direct IP LTE modems */
+	{ USB_DEVICE_AND_INTERFACE_INFO(0x0F3D, 0x68AA, 0xFF, 0xFF, 0xFF),
+	  .driver_info = (kernel_ulong_t)&direct_ip_interface_blacklist
+	},
+	{ USB_DEVICE(0x0f3d, 0x68A3), 	/* Airprime/Sierra Wireless Direct IP modems */
+	  .driver_info = (kernel_ulong_t)&direct_ip_interface_blacklist
+	},
+       { USB_DEVICE(0x413C, 0x08133) }, /* Dell Computer Corp. Wireless 5720 VZW Mobile Broadband (EVDO Rev-A) Minicard GPS Port */
 
 	{ }
 };
@@ -567,14 +576,17 @@ static void sierra_indat_callback(struct urb *urb)
 	} else {
 		if (urb->actual_length) {
 			tty = tty_port_tty_get(&port->port);
+			if (tty) {
+				tty_buffer_request_room(tty,
+					urb->actual_length);
+				tty_insert_flip_string(tty, data,
+					urb->actual_length);
+				tty_flip_buffer_push(tty);
 
-			tty_buffer_request_room(tty, urb->actual_length);
-			tty_insert_flip_string(tty, data, urb->actual_length);
-			tty_flip_buffer_push(tty);
-
-			tty_kref_put(tty);
-			usb_serial_debug_data(debug, &port->dev, __func__,
-				urb->actual_length, data);
+				tty_kref_put(tty);
+				usb_serial_debug_data(debug, &port->dev,
+					__func__, urb->actual_length, data);
+			}
 		} else {
 			dev_dbg(&port->dev, "%s: empty read urb"
 				" received\n", __func__);

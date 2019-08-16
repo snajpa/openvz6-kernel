@@ -3,6 +3,7 @@
 
 #include <linux/types.h>
 #include <linux/device.h>
+#include <asm/css_chars.h>
 #include <asm/chpid.h>
 #include <asm/chsc.h>
 #include <asm/schid.h>
@@ -24,15 +25,22 @@ struct cmg_entry {
 	u32 values[NR_MEASUREMENT_ENTRIES];
 } __attribute__ ((packed));
 
-struct channel_path_desc {
+struct channel_path_desc_fmt1 {
 	u8 flags;
 	u8 lsn;
 	u8 desc;
 	u8 chpid;
-	u8 swla;
-	u8 zeroes;
-	u8 chla;
+	u32:24;
 	u8 chpp;
+	u32 unused[2];
+	u16 chid;
+	u32:16;
+	u16 mdc;
+	u16:13;
+	u8 r:1;
+	u8 s:1;
+	u8 f:1;
+	u32 zeros[2];
 } __attribute__ ((packed));
 
 struct channel_path;
@@ -74,10 +82,58 @@ int chsc_determine_channel_path_desc(struct chp_id chpid, int fmt, int rfmt,
 				     struct chsc_response_struct *resp);
 int chsc_determine_base_channel_path_desc(struct chp_id chpid,
 					  struct channel_path_desc *desc);
+int chsc_determine_fmt1_channel_path_desc(struct chp_id chpid,
+					  struct channel_path_desc_fmt1 *desc);
 void chsc_chp_online(struct chp_id chpid);
 void chsc_chp_offline(struct chp_id chpid);
 int chsc_get_channel_measurement_chars(struct channel_path *chp);
 
 int chsc_error_from_response(int response);
+
+int chsc_siosl(struct subchannel_id schid);
+
+/* Functions and definitions to query storage-class memory. */
+struct sale {
+	u64 sa;
+	u32 p:4;
+	u32 op_state:4;
+	u32 data_state:4;
+	u32 rank:4;
+	u32 r:1;
+	u32:7;
+	u32 rid:8;
+	u32:32;
+} __packed;
+
+struct chsc_scm_info {
+	struct chsc_header request;
+	u32:32;
+	u64 reqtok;
+	u32 reserved1[4];
+	struct chsc_header response;
+	u64:56;
+	u8 rq;
+	u32 mbc;
+	u64 msa;
+	u16 is;
+	u16 mmc;
+	u32 mci;
+	u64 nr_scm_ini;
+	u64 nr_scm_unini;
+	u32 reserved2[10];
+	u64 restok;
+	struct sale scmal[248];
+} __packed;
+
+int chsc_scm_info(struct chsc_scm_info *scm_area, u64 token);
+
+#ifdef CONFIG_SCM_BUS
+int scm_update_information(void);
+int scm_process_availability_information(void);
+#else /* CONFIG_SCM_BUS */
+static inline int scm_update_information(void) { return 0; }
+static inline int scm_process_availability_information(void) { return 0; }
+#endif /* CONFIG_SCM_BUS */
+
 
 #endif

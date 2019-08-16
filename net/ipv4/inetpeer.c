@@ -19,6 +19,7 @@
 #include <linux/net.h>
 #include <net/ip.h>
 #include <net/inetpeer.h>
+#include <net/secure_seq.h>
 
 /*
  *  Theory of operations.
@@ -154,10 +155,13 @@ static void unlink_from_unused(struct inet_peer *p)
 	for (u = peer_root; u != peer_avl_empty; ) {		\
 		if (_daddr == u->v4daddr)			\
 			break;					\
-		if ((__force __u32)_daddr < (__force __u32)u->v4daddr)	\
+		if ((__force __u32)_daddr < (__force __u32)u->v4daddr) { \
+			gmb();					\
 			v = &u->avl_left;			\
-		else						\
+		} else {					\
+			gmb();					\
 			v = &u->avl_right;			\
+		}						\
 		if (_stack != NULL)				\
 			*stackptr++ = v;			\
 		u = *v;						\
@@ -285,6 +289,7 @@ static void unlink_from_pool(struct inet_peer *p)
 		struct inet_peer ***stackptr, ***delp;
 		if (lookup(p->v4daddr, stack) != p)
 			BUG();
+		gmb();
 		delp = stackptr - 1; /* *delp[0] == p */
 		if (p->avl_left == peer_avl_empty) {
 			*delp[0] = p->avl_right;
@@ -369,8 +374,10 @@ struct inet_peer *inet_getpeer(__be32 daddr, int create)
 	/* Look up for the address quickly. */
 	read_lock_bh(&peer_pool_lock);
 	p = lookup(daddr, NULL);
-	if (p != peer_avl_empty)
+	if (p != peer_avl_empty) {
+		gmb();
 		atomic_inc(&p->refcnt);
+	}
 	read_unlock_bh(&peer_pool_lock);
 
 	if (p != peer_avl_empty) {

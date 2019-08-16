@@ -31,6 +31,7 @@
 #define ASYNC_SIZE  (PAGE_SIZE << ASYNC_ORDER)
 
 #ifndef __ASSEMBLY__
+#include <linux/types.h>
 #include <asm/lowcore.h>
 #include <asm/page.h>
 #include <asm/processor.h>
@@ -50,6 +51,10 @@ struct thread_info {
 	struct restart_block	restart_block;
 	__u64			user_timer;
 	__u64			system_timer;
+#ifndef __GENKSYMS__
+	unsigned long		last_break;	/* last breaking-event-address. */
+	struct list_head	list;		/* pfault task list */
+#endif
 };
 
 /*
@@ -93,6 +98,8 @@ static inline struct thread_info *current_thread_info(void)
 #define TIF_SYSCALL_AUDIT	9	/* syscall auditing active */
 #define TIF_SECCOMP		10	/* secure computing */
 #define TIF_SYSCALL_TRACEPOINT	11	/* syscall tracepoint instrumentation */
+#define TIF_ISOLATE_BP		12	/* Run process with isolated BP */
+#define TIF_ISOLATE_BP_GUEST	13	/* Run KVM guests with isolated BP */
 #define TIF_USEDFPU		16	/* FPU was used by this task this quantum (SMP) */
 #define TIF_POLLING_NRFLAG	17	/* true if poll_idle() is polling 
 					   TIF_NEED_RESCHED */
@@ -112,10 +119,18 @@ static inline struct thread_info *current_thread_info(void)
 #define _TIF_SYSCALL_AUDIT	(1<<TIF_SYSCALL_AUDIT)
 #define _TIF_SECCOMP		(1<<TIF_SECCOMP)
 #define _TIF_SYSCALL_TRACEPOINT	(1<<TIF_SYSCALL_TRACEPOINT)
+#define _TIF_ISOLATE_BP		(1<<TIF_ISOLATE_BP)
+#define _TIF_ISOLATE_BP_GUEST	(1<<TIF_ISOLATE_BP_GUEST)
 #define _TIF_USEDFPU		(1<<TIF_USEDFPU)
 #define _TIF_POLLING_NRFLAG	(1<<TIF_POLLING_NRFLAG)
 #define _TIF_31BIT		(1<<TIF_31BIT)
 #define _TIF_FREEZE		(1<<TIF_FREEZE)
+
+#ifdef CONFIG_64BIT
+#define is_32bit_task()		(test_thread_flag(TIF_31BIT))
+#else
+#define is_32bit_task()		(1)
+#endif
 
 #endif /* __KERNEL__ */
 

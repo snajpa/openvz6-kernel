@@ -2,7 +2,7 @@
  * This file is part of the zfcp device driver for
  * FCP adapters for IBM System z9 and zSeries.
  *
- * Copyright IBM Corp. 2008, 2009
+ * Copyright IBM Corp. 2008, 2016
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -22,6 +22,7 @@
 #ifndef ZFCP_DBF_H
 #define ZFCP_DBF_H
 
+#include <scsi/fc/fc_fcp.h>
 #include "zfcp_ext.h"
 #include "zfcp_fsf.h"
 #include "zfcp_def.h"
@@ -50,6 +51,11 @@ struct zfcp_dbf_rec_record_target {
 	u64 wwpn;
 	u64 fcp_lun;
 	u32 erp_count;
+};
+
+enum zfcp_dbf_pseudo_erp_act_type {
+	ZFCP_PSEUDO_ERP_ACTION_RPORT_ADD = 0xff,
+	ZFCP_PSEUDO_ERP_ACTION_RPORT_DEL = 0xfe,
 };
 
 struct zfcp_dbf_rec_record_trigger {
@@ -108,6 +114,7 @@ struct zfcp_dbf_hba_record_response {
 		struct {
 			u64 cmnd;
 			u64 serial;
+			u32 data_dir;
 		} fcp;
 		struct {
 			u64 wwpn;
@@ -145,6 +152,8 @@ struct zfcp_dbf_hba_record_qdio {
 	u32 qdio_error;
 	u8 sbal_index;
 	u8 sbal_count;
+	u64 fsf_reqid;
+	u8 scount;
 } __attribute__ ((packed));
 
 struct zfcp_dbf_hba_record {
@@ -240,6 +249,30 @@ struct zfcp_dbf {
 	struct zfcp_adapter		*adapter;
 };
 
+/**
+ * zfcp_dbf_hba_fsf_resp_suppress - true if we should not trace by default
+ * @req: request that has been completed
+ *
+ * Returns true if FCP response with only benign residual under count.
+ */
+static inline
+bool zfcp_dbf_hba_fsf_resp_suppress(struct zfcp_fsf_req *req)
+{
+	struct fsf_qtcb *qtcb = req->qtcb;
+	u32 fsf_stat = qtcb->header.fsf_status;
+	struct fcp_resp *fcp_rsp;
+	u8 rsp_flags, fr_status;
+
+	if (qtcb->prefix.qtcb_type != FSF_IO_COMMAND)
+		return false; /* not an FCP response */
+	fcp_rsp = (struct fcp_resp *)&qtcb->bottom.io.fcp_rsp;
+	rsp_flags = fcp_rsp->fr_flags;
+	fr_status = fcp_rsp->fr_status;
+	return (fsf_stat == FSF_FCP_RSP_AVAILABLE) &&
+		(rsp_flags == FCP_RESID_UNDER) &&
+		(fr_status == SAM_STAT_GOOD);
+}
+
 static inline
 void zfcp_dbf_hba_fsf_resp(const char *tag2, int level,
 			   struct zfcp_fsf_req *req, struct zfcp_dbf *dbf)
@@ -262,7 +295,9 @@ static inline void zfcp_dbf_hba_fsf_response(struct zfcp_fsf_req *req)
 		zfcp_dbf_hba_fsf_resp("perr", 1, req, dbf);
 
 	} else if (qtcb->header.fsf_status != FSF_GOOD) {
-		zfcp_dbf_hba_fsf_resp("ferr", 1, req, dbf);
+		zfcp_dbf_hba_fsf_resp("ferr",
+				      zfcp_dbf_hba_fsf_resp_suppress(req)
+				      ? 5 : 1, req, dbf);
 
 	} else if ((req->fsf_command == FSF_QTCB_OPEN_PORT_WITH_DID) ||
 		   (req->fsf_command == FSF_QTCB_OPEN_LUN)) {
@@ -343,8 +378,21 @@ static inline
 void zfcp_dbf_scsi_devreset(const char *tag, u8 flag, struct zfcp_unit *unit,
 			    struct scsi_cmnd *scsi_cmnd)
 {
-	zfcp_dbf_scsi(flag == FCP_TARGET_RESET ? "trst" : "lrst", tag, 1,
+	zfcp_dbf_scsi(flag == FCP_TMF_TGT_RESET ? "trst" : "lrst", tag, 1,
 			    unit->port->adapter->dbf, scsi_cmnd, NULL, 0);
+}
+
+/**
+ * zfcp_dbf_scsi_nullcmnd() - trace NULLify of SCSI command in dev/tgt-reset.
+ * @scmnd: SCSI command that was NULLified.
+ * @fsf_req: request that owned @scmnd.
+ */
+static inline void zfcp_dbf_scsi_nullcmnd(const char *tag, u8 flag,
+					  struct scsi_cmnd *scmd,
+					  struct zfcp_fsf_req *fsf_req)
+{
+	zfcp_dbf_scsi(flag == FCP_TMF_TGT_RESET ? "trst" : "lrst", tag, 3,
+			fsf_req->adapter->dbf, scmd, fsf_req, 0);
 }
 
 #endif /* ZFCP_DBF_H */

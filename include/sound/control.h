@@ -31,10 +31,15 @@ typedef int (snd_kcontrol_info_t) (struct snd_kcontrol * kcontrol, struct snd_ct
 typedef int (snd_kcontrol_get_t) (struct snd_kcontrol * kcontrol, struct snd_ctl_elem_value * ucontrol);
 typedef int (snd_kcontrol_put_t) (struct snd_kcontrol * kcontrol, struct snd_ctl_elem_value * ucontrol);
 typedef int (snd_kcontrol_tlv_rw_t)(struct snd_kcontrol *kcontrol,
-				    int op_flag, /* 0=read,1=write,-1=command */
+				    int op_flag, /* SNDRV_CTL_TLV_OP_XXX */
 				    unsigned int size,
 				    unsigned int __user *tlv);
 
+enum {
+	SNDRV_CTL_TLV_OP_READ = 0,
+	SNDRV_CTL_TLV_OP_WRITE = 1,
+	SNDRV_CTL_TLV_OP_CMD = -1,
+};
 
 struct snd_kcontrol_new {
 	snd_ctl_elem_iface_t iface;	/* interface identifier */
@@ -159,12 +164,14 @@ static inline struct snd_ctl_elem_id *snd_ctl_build_ioff(struct snd_ctl_elem_id 
 }
 
 /*
- * Frequently used control callbacks
+ * Frequently used control callbacks/helpers
  */
 int snd_ctl_boolean_mono_info(struct snd_kcontrol *kcontrol,
 			      struct snd_ctl_elem_info *uinfo);
 int snd_ctl_boolean_stereo_info(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_info *uinfo);
+int snd_ctl_enum_info(struct snd_ctl_elem_info *info, unsigned int channels,
+		      unsigned int items, const char *const names[]);
 
 /*
  * virtual master control
@@ -186,7 +193,7 @@ int _snd_ctl_add_slave(struct snd_kcontrol *master, struct snd_kcontrol *slave,
  * Returns zero if successful or a negative error code.
  *
  * All slaves must be the same type (returning the same information
- * via info callback).  The fucntion doesn't check it, so it's your
+ * via info callback).  The function doesn't check it, so it's your
  * responsibility.
  *
  * Also, some additional limitations:
@@ -220,5 +227,19 @@ snd_ctl_add_slave_uncached(struct snd_kcontrol *master,
 {
 	return _snd_ctl_add_slave(master, slave, SND_CTL_SLAVE_NEED_UPDATE);
 }
+
+int snd_ctl_add_vmaster_hook(struct snd_kcontrol *kctl,
+			     void (*hook)(void *private_data, int),
+			     void *private_data);
+void snd_ctl_sync_vmaster(struct snd_kcontrol *kctl, bool hook_only);
+void snd_ctl_sync_vmaster_hook(struct snd_kcontrol *kctl);
+
+/*
+ * Helper functions for jack-detection controls
+ */
+struct snd_kcontrol *
+snd_kctl_jack_new(const char *name, int idx, void *private_data);
+void snd_kctl_jack_report(struct snd_card *card,
+			  struct snd_kcontrol *kctl, bool status);
 
 #endif	/* __SOUND_CONTROL_H */

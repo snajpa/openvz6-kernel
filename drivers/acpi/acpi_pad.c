@@ -29,19 +29,19 @@
 #include <linux/clockchips.h>
 #include <acpi/acpi_bus.h>
 #include <acpi/acpi_drivers.h>
+#include <asm/mwait.h>
 
-#define ACPI_PROCESSOR_AGGREGATOR_CLASS	"processor_aggregator"
+#define ACPI_PROCESSOR_AGGREGATOR_CLASS	"acpi_pad"
 #define ACPI_PROCESSOR_AGGREGATOR_DEVICE_NAME "Processor Aggregator"
 #define ACPI_PROCESSOR_AGGREGATOR_NOTIFY 0x80
 static DEFINE_MUTEX(isolated_cpus_lock);
+static DEFINE_MUTEX(round_robin_lock);
 
-#define MWAIT_SUBSTATE_MASK	(0xf)
-#define MWAIT_CSTATE_MASK	(0xf)
-#define MWAIT_SUBSTATE_SIZE	(4)
-#define CPUID_MWAIT_LEAF (5)
-#define CPUID5_ECX_EXTENSIONS_SUPPORTED (0x1)
-#define CPUID5_ECX_INTERRUPT_BREAK	(0x2)
 static unsigned long power_saving_mwait_eax;
+
+static unsigned char tsc_detected_unstable;
+static unsigned char tsc_marked_unstable;
+
 static void power_saving_mwait_init(void)
 {
 	unsigned int eax, ebx, ecx, edx;
@@ -73,7 +73,7 @@ static void power_saving_mwait_init(void)
 	for_each_online_cpu(i)
 		clockevents_notify(CLOCK_EVT_NOTIFY_BROADCAST_ON, &i);
 
-#if defined(CONFIG_GENERIC_TIME) && defined(CONFIG_X86)
+#if defined(CONFIG_X86)
 	switch (boot_cpu_data.x86_vendor) {
 	case X86_VENDOR_AMD:
 	case X86_VENDOR_INTEL:
@@ -86,8 +86,8 @@ static void power_saving_mwait_init(void)
 
 		/*FALL THROUGH*/
 	default:
-		/* TSC could halt in idle, so notify users */
-		mark_tsc_unstable("TSC halts in idle");
+		/* TSC could halt in idle */
+		tsc_detected_unstable = 1;
 	}
 #endif
 }
@@ -100,12 +100,13 @@ static void round_robin_cpu(unsigned int tsk_index)
 	struct cpumask *pad_busy_cpus = to_cpumask(pad_busy_cpus_bits);
 	cpumask_var_t tmp;
 	int cpu;
-	unsigned long min_weight = -1, preferred_cpu;
+	unsigned long min_weight = -1;
+	unsigned long uninitialized_var(preferred_cpu);
 
 	if (!alloc_cpumask_var(&tmp, GFP_KERNEL))
 		return;
 
-	mutex_lock(&isolated_cpus_lock);
+	mutex_lock(&round_robin_lock);
 	cpumask_clear(tmp);
 	for_each_cpu(cpu, pad_busy_cpus)
 		cpumask_or(tmp, tmp, topology_thread_cpumask(cpu));
@@ -114,7 +115,7 @@ static void round_robin_cpu(unsigned int tsk_index)
 	if (cpumask_empty(tmp))
 		cpumask_andnot(tmp, cpu_online_mask, pad_busy_cpus);
 	if (cpumask_empty(tmp)) {
-		mutex_unlock(&isolated_cpus_lock);
+		mutex_unlock(&round_robin_lock);
 		return;
 	}
 	for_each_cpu(cpu, tmp) {
@@ -129,7 +130,7 @@ static void round_robin_cpu(unsigned int tsk_index)
 	tsk_in_cpu[tsk_index] = preferred_cpu;
 	cpumask_set_cpu(preferred_cpu, pad_busy_cpus);
 	cpu_weight[preferred_cpu]++;
-	mutex_unlock(&isolated_cpus_lock);
+	mutex_unlock(&round_robin_lock);
 
 	set_cpus_allowed_ptr(current, cpumask_of(preferred_cpu));
 }
@@ -176,6 +177,11 @@ static int power_saving_thread(void *data)
 		expire_time = jiffies + HZ * (100 - idle_pct) / 100;
 
 		while (!need_resched()) {
+			if (tsc_detected_unstable && !tsc_marked_unstable) {
+				/* TSC could halt in idle, so notify users */
+				mark_tsc_unstable("TSC halts in idle");
+				tsc_marked_unstable = 1;
+			}
 			local_irq_disable();
 			cpu = smp_processor_id();
 			clockevents_notify(CLOCK_EVT_NOTIFY_BROADCAST_ENTER,
@@ -209,8 +215,15 @@ static int power_saving_thread(void *data)
 		 * borrow CPU time from this CPU and cause RT task use > 95%
 		 * CPU time. To make 'avoid staration' work, takes a nap here.
 		 */
-		if (do_sleep)
+		if (unlikely(do_sleep))
 			schedule_timeout_killable(HZ * idle_pct / 100);
+
+		/* If an external event has set the need_resched flag, then
+		 * we need to deal with it, or this loop will continue to
+		 * spin without calling __mwait().
+		 */
+		if (unlikely(need_resched()))
+			schedule();
 	}
 
 	exit_round_robin(tsk_index);
@@ -409,7 +422,8 @@ static void acpi_pad_ost(acpi_handle handle, int stat,
 
 static void acpi_pad_handle_notify(acpi_handle handle)
 {
-	int num_cpus, ret;
+	int num_cpus = 0;
+	int ret;
 	uint32_t idle_cpus;
 
 	mutex_lock(&isolated_cpus_lock);

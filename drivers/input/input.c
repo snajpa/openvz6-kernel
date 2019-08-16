@@ -12,7 +12,7 @@
 
 #include <linux/init.h>
 #include <linux/types.h>
-#include <linux/input.h>
+#include <linux/input/mt.h>
 #include <linux/module.h>
 #include <linux/random.h>
 #include <linux/major.h>
@@ -30,24 +30,6 @@ MODULE_DESCRIPTION("Input core");
 MODULE_LICENSE("GPL");
 
 #define INPUT_DEVICES	256
-
-/*
- * EV_ABS events which should not be cached are listed here.
- */
-static unsigned int input_abs_bypass_init_data[] __initdata = {
-	ABS_MT_TOUCH_MAJOR,
-	ABS_MT_TOUCH_MINOR,
-	ABS_MT_WIDTH_MAJOR,
-	ABS_MT_WIDTH_MINOR,
-	ABS_MT_ORIENTATION,
-	ABS_MT_POSITION_X,
-	ABS_MT_POSITION_Y,
-	ABS_MT_TOOL_TYPE,
-	ABS_MT_BLOB_ID,
-	ABS_MT_TRACKING_ID,
-	0
-};
-static unsigned long input_abs_bypass[BITS_TO_LONGS(ABS_CNT)];
 
 static LIST_HEAD(input_dev_list);
 static LIST_HEAD(input_handler_list);
@@ -162,6 +144,56 @@ static void input_stop_autorepeat(struct input_dev *dev)
 #define INPUT_PASS_TO_DEVICE	2
 #define INPUT_PASS_TO_ALL	(INPUT_PASS_TO_HANDLERS | INPUT_PASS_TO_DEVICE)
 
+static int input_handle_abs_event(struct input_dev *dev,
+				  unsigned int code, int *pval)
+{
+	struct input_mt *mt = dev->mt;
+	bool is_mt_event;
+	int *pold;
+
+	if (code == ABS_MT_SLOT) {
+		/*
+		 * "Stage" the event; we'll flush it later, when we
+		 * get actiual touch data.
+		 */
+		if (mt && *pval >= 0 && *pval < mt->num_slots)
+			mt->slot = *pval;
+
+		return INPUT_IGNORE_EVENT;
+	}
+
+	is_mt_event = input_is_mt_value(code);
+
+	if (!is_mt_event) {
+		pold = &dev->abs[code];
+	} else if (mt) {
+		pold = &mt->slots[mt->slot].abs[code - ABS_MT_FIRST];
+	} else {
+		/*
+		 * Bypass filtering for multitouch events when
+		 * not employing slots.
+		 */
+		pold = NULL;
+	}
+
+	if (pold) {
+		*pval = input_defuzz_abs_event(*pval, *pold,
+						dev->absfuzz[code]);
+		if (*pold == *pval)
+			return INPUT_IGNORE_EVENT;
+
+		*pold = *pval;
+	}
+
+	/* Flush pending "slot" event */
+	if (is_mt_event && mt && mt->slot != dev->abs[ABS_MT_SLOT]) {
+		dev->abs[ABS_MT_SLOT] = mt->slot;
+		input_pass_event(dev, EV_ABS, ABS_MT_SLOT, mt->slot);
+	}
+
+	return INPUT_PASS_TO_HANDLERS;
+}
+
 static void input_handle_event(struct input_dev *dev,
 			       unsigned int type, unsigned int code, int value)
 {
@@ -214,21 +246,9 @@ static void input_handle_event(struct input_dev *dev,
 		break;
 
 	case EV_ABS:
-		if (is_event_supported(code, dev->absbit, ABS_MAX)) {
+		if (is_event_supported(code, dev->absbit, ABS_MAX))
+			disposition = input_handle_abs_event(dev, code, &value);
 
-			if (test_bit(code, input_abs_bypass)) {
-				disposition = INPUT_PASS_TO_HANDLERS;
-				break;
-			}
-
-			value = input_defuzz_abs_event(value,
-					dev->abs[code], dev->absfuzz[code]);
-
-			if (dev->abs[code] != value) {
-				dev->abs[code] = value;
-				disposition = INPUT_PASS_TO_HANDLERS;
-			}
-		}
 		break;
 
 	case EV_REL:
@@ -856,6 +876,8 @@ static int input_devices_seq_show(struct seq_file *seq, void *v)
 		seq_printf(seq, "%s ", handle->name);
 	seq_putc(seq, '\n');
 
+	input_seq_print_bitmap(seq, "PROP", dev->propbit, INPUT_PROP_MAX);
+
 	input_seq_print_bitmap(seq, "EV", dev->evbit, EV_MAX);
 	if (test_bit(EV_KEY, dev->evbit))
 		input_seq_print_bitmap(seq, "KEY", dev->keybit, KEY_MAX);
@@ -1077,11 +1099,26 @@ static ssize_t input_dev_show_modalias(struct device *dev,
 }
 static DEVICE_ATTR(modalias, S_IRUGO, input_dev_show_modalias, NULL);
 
+static int input_print_bitmap(char *buf, int buf_size, unsigned long *bitmap,
+			      int max, int add_cr);
+
+static ssize_t input_dev_show_properties(struct device *dev,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	struct input_dev *input_dev = to_input_dev(dev);
+	int len = input_print_bitmap(buf, PAGE_SIZE, input_dev->propbit,
+				     INPUT_PROP_MAX, true);
+	return min_t(int, len, PAGE_SIZE);
+}
+static DEVICE_ATTR(properties, S_IRUGO, input_dev_show_properties, NULL);
+
 static struct attribute *input_dev_attrs[] = {
 	&dev_attr_name.attr,
 	&dev_attr_phys.attr,
 	&dev_attr_uniq.attr,
 	&dev_attr_modalias.attr,
+	&dev_attr_properties.attr,
 	NULL
 };
 
@@ -1189,6 +1226,7 @@ static void input_dev_release(struct device *device)
 	struct input_dev *dev = to_input_dev(device);
 
 	input_ff_destroy(dev);
+	input_mt_destroy_slots(dev);
 	kfree(dev);
 
 	module_put(THIS_MODULE);
@@ -1268,6 +1306,8 @@ static int input_dev_uevent(struct device *device, struct kobj_uevent_env *env)
 		INPUT_ADD_HOTPLUG_VAR("PHYS=\"%s\"", dev->phys);
 	if (dev->uniq)
 		INPUT_ADD_HOTPLUG_VAR("UNIQ=\"%s\"", dev->uniq);
+
+	INPUT_ADD_HOTPLUG_BM_VAR("PROP=", dev->propbit, INPUT_PROP_MAX);
 
 	INPUT_ADD_HOTPLUG_BM_VAR("EV=", dev->evbit, EV_MAX);
 	if (test_bit(EV_KEY, dev->evbit))
@@ -1488,6 +1528,45 @@ void input_set_capability(struct input_dev *dev, unsigned int type, unsigned int
 }
 EXPORT_SYMBOL(input_set_capability);
 
+static unsigned int input_estimate_events_per_packet(struct input_dev *dev)
+{
+	int mt_slots;
+	int i;
+	unsigned int events;
+
+	if (dev->mt) {
+		mt_slots = dev->mt->num_slots;
+	} else if (test_bit(ABS_MT_TRACKING_ID, dev->absbit)) {
+		mt_slots = dev->absmax[ABS_MT_TRACKING_ID] -
+			   dev->absmin[ABS_MT_TRACKING_ID] + 1,
+		mt_slots = clamp(mt_slots, 2, 32);
+	} else if (test_bit(ABS_MT_POSITION_X, dev->absbit)) {
+		mt_slots = 2;
+	} else {
+		mt_slots = 0;
+	}
+
+	events = mt_slots + 1; /* count SYN_MT_REPORT and SYN_REPORT */
+
+	for (i = 0; i < ABS_CNT; i++) {
+		if (test_bit(i, dev->absbit)) {
+			if (input_is_mt_axis(i))
+				events += mt_slots;
+			else
+				events++;
+		}
+	}
+
+	for (i = 0; i < REL_CNT; i++)
+		if (test_bit(i, dev->relbit))
+			events++;
+
+	/* Make room for KEY and MSC events */
+	events += 7;
+
+	return events;
+}
+
 /**
  * input_register_device - register device with input core
  * @dev: device to be registered
@@ -1504,10 +1583,15 @@ int input_register_device(struct input_dev *dev)
 {
 	static atomic_t input_no = ATOMIC_INIT(0);
 	struct input_handler *handler;
+	unsigned int packet_size;
 	const char *path;
 	int error;
 
 	__set_bit(EV_SYN, dev->evbit);
+
+	packet_size = input_estimate_events_per_packet(dev);
+	if (dev->hint_events_per_packet < packet_size)
+		dev->hint_events_per_packet = packet_size;
 
 	/*
 	 * If delay and period are pre-set by the driver, then autorepeating
@@ -1768,19 +1852,9 @@ static const struct file_operations input_fops = {
 	.open = input_open_file,
 };
 
-static void __init input_init_abs_bypass(void)
-{
-	const unsigned int *p;
-
-	for (p = input_abs_bypass_init_data; *p; p++)
-		input_abs_bypass[BIT_WORD(*p)] |= BIT_MASK(*p);
-}
-
 static int __init input_init(void)
 {
 	int err;
-
-	input_init_abs_bypass();
 
 	err = class_register(&input_class);
 	if (err) {

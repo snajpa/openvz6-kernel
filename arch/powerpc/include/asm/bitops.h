@@ -46,6 +46,11 @@
 #include <asm/asm-compat.h>
 #include <asm/synch.h>
 
+/* PPC bit number conversion */
+#define PPC_BITLSHIFT(be)	(BITS_PER_LONG - 1 - (be))
+#define PPC_BIT(bit)		(1UL << PPC_BITLSHIFT(bit))
+#define PPC_BITMASK(bs, be)	((PPC_BIT(bs) - PPC_BIT(be)) | PPC_BIT(bs))
+
 /*
  * clear_bit doesn't imply a memory barrier
  */
@@ -65,7 +70,7 @@ static __inline__ void fn(unsigned long mask,	\
 	unsigned long *p = (unsigned long *)_p;	\
 	__asm__ __volatile__ (			\
 	prefix					\
-"1:"	PPC_LLARX "%0,0,%3\n"			\
+"1:"	PPC_LLARX(%0,0,%3,0) "\n"		\
 	stringify_in_c(op) "%0,%0,%2\n"		\
 	PPC405_ERR77(0,%3)			\
 	PPC_STLCX "%0,0,%3\n"			\
@@ -103,31 +108,31 @@ static __inline__ void change_bit(int nr, volatile unsigned long *addr)
 
 /* Like DEFINE_BITOP(), with changes to the arguments to 'op' and the output
  * operands. */
-#define DEFINE_TESTOP(fn, op, prefix, postfix)	\
-static __inline__ unsigned long fn(		\
-		unsigned long mask,		\
-		volatile unsigned long *_p)	\
-{						\
-	unsigned long old, t;			\
-	unsigned long *p = (unsigned long *)_p;	\
-	__asm__ __volatile__ (			\
-	prefix					\
-"1:"	PPC_LLARX "%0,0,%3\n"			\
-	stringify_in_c(op) "%1,%0,%2\n"		\
-	PPC405_ERR77(0,%3)			\
-	PPC_STLCX "%1,0,%3\n"			\
-	"bne- 1b\n"				\
-	postfix					\
-	: "=&r" (old), "=&r" (t)		\
-	: "r" (mask), "r" (p)			\
-	: "cc", "memory");			\
-	return (old & mask);			\
+#define DEFINE_TESTOP(fn, op, prefix, postfix, eh)	\
+static __inline__ unsigned long fn(			\
+		unsigned long mask,			\
+		volatile unsigned long *_p)		\
+{							\
+	unsigned long old, t;				\
+	unsigned long *p = (unsigned long *)_p;		\
+	__asm__ __volatile__ (				\
+	prefix						\
+"1:"	PPC_LLARX(%0,0,%3,eh) "\n"			\
+	stringify_in_c(op) "%1,%0,%2\n"			\
+	PPC405_ERR77(0,%3)				\
+	PPC_STLCX "%1,0,%3\n"				\
+	"bne- 1b\n"					\
+	postfix						\
+	: "=&r" (old), "=&r" (t)			\
+	: "r" (mask), "r" (p)				\
+	: "cc", "memory");				\
+	return (old & mask);				\
 }
 
-DEFINE_TESTOP(test_and_set_bits, or, LWSYNC_ON_SMP, ISYNC_ON_SMP)
-DEFINE_TESTOP(test_and_set_bits_lock, or, "", ISYNC_ON_SMP)
-DEFINE_TESTOP(test_and_clear_bits, andc, LWSYNC_ON_SMP, ISYNC_ON_SMP)
-DEFINE_TESTOP(test_and_change_bits, xor, LWSYNC_ON_SMP, ISYNC_ON_SMP)
+DEFINE_TESTOP(test_and_set_bits, or, LWSYNC_ON_SMP, ISYNC_ON_SMP, 0)
+DEFINE_TESTOP(test_and_set_bits_lock, or, "", ISYNC_ON_SMP, 1)
+DEFINE_TESTOP(test_and_clear_bits, andc, LWSYNC_ON_SMP, ISYNC_ON_SMP, 0)
+DEFINE_TESTOP(test_and_change_bits, xor, LWSYNC_ON_SMP, ISYNC_ON_SMP, 0)
 
 static __inline__ int test_and_set_bit(unsigned long nr,
 				       volatile unsigned long *addr)
@@ -332,6 +337,33 @@ unsigned long generic_find_next_le_bit(const unsigned long *addr,
 	find_first_zero_le_bit((unsigned long *)addr, size)
 
 #include <asm-generic/bitops/sched.h>
+
+/* Compat macros for RHEL6 */
+#define find_next_zero_bit_le(addr, size, offset) \
+			generic_find_next_zero_le_bit(addr, size, offset)
+#define find_next_bit_le(addr, size, offset) \
+			generic_find_next_le_bit(addr, size, offset)
+#define __set_bit_le(nr,addr) \
+	__set_le_bit(nr, addr)
+#define __clear_bit_le(nr, addr) \
+	__clear_bit((nr) ^ BITOP_LE_SWIZZLE, (addr))
+
+#define test_bit_le(nr, addr) \
+	test_le_bit((nr), (addr))
+#define set_bit_le(nr, addr) \
+	set_bit((nr) ^ BITOP_LE_SWIZZLE, (addr))
+#define clear_bit_le(nr, addr) \
+	clear_bit((nr) ^ BITOP_LE_SWIZZLE, (addr))
+
+#define test_and_set_bit_le(nr, addr) \
+	test_and_set_bit((nr) ^ BITOP_LE_SWIZZLE, (addr))
+#define test_and_clear_bit_le(nr, addr) \
+	test_and_clear_bit((nr) ^ BITOP_LE_SWIZZLE, (addr))
+
+#define __test_and_set_bit_le(nr, addr) \
+	__test_and_set_bit((nr) ^ BITOP_LE_SWIZZLE, (addr))
+#define __test_and_clear_bit_le(nr, addr) \
+	__test_and_clear_bit((nr) ^ BITOP_LE_SWIZZLE, (addr))
 
 #endif /* __KERNEL__ */
 

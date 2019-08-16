@@ -105,6 +105,7 @@ irqsoff_tracer_call(unsigned long ip, unsigned long parent_ip)
 static struct ftrace_ops trace_ops __read_mostly =
 {
 	.func = irqsoff_tracer_call,
+	.flags = FTRACE_OPS_FL_GLOBAL,
 };
 #endif /* CONFIG_FUNCTION_TRACER */
 
@@ -410,6 +411,7 @@ static struct tracer irqsoff_tracer __read_mostly =
 #ifdef CONFIG_FTRACE_SELFTEST
 	.selftest    = trace_selftest_startup_irqsoff,
 #endif
+	.use_max_tr	= 1,
 };
 # define register_irqsoff(trace) register_tracer(&trace)
 #else
@@ -436,6 +438,7 @@ static struct tracer preemptoff_tracer __read_mostly =
 #ifdef CONFIG_FTRACE_SELFTEST
 	.selftest    = trace_selftest_startup_preemptoff,
 #endif
+	.use_max_tr	= 1,
 };
 # define register_preemptoff(trace) register_tracer(&trace)
 #else
@@ -464,6 +467,7 @@ static struct tracer preemptirqsoff_tracer __read_mostly =
 #ifdef CONFIG_FTRACE_SELFTEST
 	.selftest    = trace_selftest_startup_preemptirqsoff,
 #endif
+	.use_max_tr	= 1,
 };
 
 # define register_preemptirqsoff(trace) register_tracer(&trace)

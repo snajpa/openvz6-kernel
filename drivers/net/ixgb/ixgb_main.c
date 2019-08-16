@@ -453,9 +453,8 @@ ixgb_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	}
 
 	ixgb_get_ee_mac_addr(&adapter->hw, netdev->dev_addr);
-	memcpy(netdev->perm_addr, netdev->dev_addr, netdev->addr_len);
 
-	if (!is_valid_ether_addr(netdev->perm_addr)) {
+	if (!is_valid_ether_addr(netdev->dev_addr)) {
 		DPRINTK(PROBE, ERR, "Invalid MAC Address\n");
 		err = -EIO;
 		goto err_eeprom;
@@ -892,10 +891,18 @@ static void
 ixgb_unmap_and_free_tx_resource(struct ixgb_adapter *adapter,
                                 struct ixgb_buffer *buffer_info)
 {
-	buffer_info->dma = 0;
+	if (buffer_info->dma) {
+		if (buffer_info->mapped_as_page)
+			pci_unmap_page(adapter->pdev, buffer_info->dma,
+				       buffer_info->length, PCI_DMA_TODEVICE);
+		else
+			pci_unmap_single(adapter->pdev, buffer_info->dma,
+					 buffer_info->length,
+					 PCI_DMA_TODEVICE);
+		buffer_info->dma = 0;
+	}
+
 	if (buffer_info->skb) {
-		skb_dma_unmap(&adapter->pdev->dev, buffer_info->skb,
-		              DMA_TO_DEVICE);
 		dev_kfree_skb_any(buffer_info->skb);
 		buffer_info->skb = NULL;
 	}
@@ -1272,23 +1279,15 @@ ixgb_tx_map(struct ixgb_adapter *adapter, struct sk_buff *skb,
 	    unsigned int first)
 {
 	struct ixgb_desc_ring *tx_ring = &adapter->tx_ring;
+	struct pci_dev *pdev = adapter->pdev;
 	struct ixgb_buffer *buffer_info;
 	int len = skb_headlen(skb);
 	unsigned int offset = 0, size, count = 0, i;
 	unsigned int mss = skb_shinfo(skb)->gso_size;
-
 	unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
 	unsigned int f;
-	dma_addr_t *map;
 
 	i = tx_ring->next_to_use;
-
-	if (skb_dma_map(&adapter->pdev->dev, skb, DMA_TO_DEVICE)) {
-		dev_err(&adapter->pdev->dev, "TX DMA map failed\n");
-		return 0;
-	}
-
-	map = skb_shinfo(skb)->dma_maps;
 
 	while (len) {
 		buffer_info = &tx_ring->buffer_info[i];
@@ -1301,11 +1300,11 @@ ixgb_tx_map(struct ixgb_adapter *adapter, struct sk_buff *skb,
 		buffer_info->length = size;
 		WARN_ON(buffer_info->dma != 0);
 		buffer_info->time_stamp = jiffies;
-		buffer_info->dma = skb_shinfo(skb)->dma_head + offset;
-			pci_map_single(adapter->pdev,
-				skb->data + offset,
-				size,
-				PCI_DMA_TODEVICE);
+		buffer_info->mapped_as_page = false;
+		buffer_info->dma = pci_map_single(pdev, skb->data + offset,
+						  size, PCI_DMA_TODEVICE);
+		if (pci_dma_mapping_error(pdev, buffer_info->dma))
+			goto dma_error;
 		buffer_info->next_to_watch = 0;
 
 		len -= size;
@@ -1323,7 +1322,7 @@ ixgb_tx_map(struct ixgb_adapter *adapter, struct sk_buff *skb,
 
 		frag = &skb_shinfo(skb)->frags[f];
 		len = frag->size;
-		offset = 0;
+		offset = frag->page_offset;
 
 		while (len) {
 			i++;
@@ -1341,7 +1340,13 @@ ixgb_tx_map(struct ixgb_adapter *adapter, struct sk_buff *skb,
 
 			buffer_info->length = size;
 			buffer_info->time_stamp = jiffies;
-			buffer_info->dma = map[f] + offset;
+			buffer_info->mapped_as_page = true;
+			buffer_info->dma =
+				pci_map_page(pdev, frag->page,
+					     offset, size,
+					     PCI_DMA_TODEVICE);
+			if (pci_dma_mapping_error(pdev, buffer_info->dma))
+				goto dma_error;
 			buffer_info->next_to_watch = 0;
 
 			len -= size;
@@ -1353,6 +1358,22 @@ ixgb_tx_map(struct ixgb_adapter *adapter, struct sk_buff *skb,
 	tx_ring->buffer_info[first].next_to_watch = i;
 
 	return count;
+
+dma_error:
+	dev_err(&pdev->dev, "TX DMA map failed\n");
+	buffer_info->dma = 0;
+	count--;
+
+	while (count >= 0) {
+		count--;
+		i--;
+		if (i < 0)
+			i += tx_ring->count;
+		buffer_info = &tx_ring->buffer_info[i];
+		ixgb_unmap_and_free_tx_resource(adapter, buffer_info);
+	}
+
+	return 0;
 }
 
 static void
@@ -1467,9 +1488,9 @@ ixgb_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
                      DESC_NEEDED)))
 		return NETDEV_TX_BUSY;
 
-	if (adapter->vlgrp && vlan_tx_tag_present(skb)) {
+	if (adapter->vlgrp && skb_vlan_tag_present(skb)) {
 		tx_flags |= IXGB_TX_FLAGS_VLAN;
-		vlan_id = vlan_tx_tag_get(skb);
+		vlan_id = skb_vlan_tag_get(skb);
 	}
 
 	first = adapter->tx_ring.next_to_use;
@@ -1789,6 +1810,7 @@ ixgb_clean_tx_irq(struct ixgb_adapter *adapter)
 
 	while (eop_desc->status & IXGB_TX_DESC_STATUS_DD) {
 
+		rmb(); /* read buffer_info after eop_desc */
 		for (cleaned = false; !cleaned; ) {
 			tx_desc = IXGB_TX_DESC(*tx_ring, i);
 			buffer_info = &tx_ring->buffer_info[i];
@@ -2189,7 +2211,7 @@ ixgb_restore_vlan(struct ixgb_adapter *adapter)
 
 	if (adapter->vlgrp) {
 		u16 vid;
-		for (vid = 0; vid < VLAN_GROUP_ARRAY_LEN; vid++) {
+		for (vid = 0; vid < VLAN_N_VID; vid++) {
 			if (!vlan_group_get_device(adapter->vlgrp, vid))
 				continue;
 			ixgb_vlan_rx_add_vid(adapter->netdev, vid);

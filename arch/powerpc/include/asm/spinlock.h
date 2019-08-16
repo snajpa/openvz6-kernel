@@ -27,8 +27,7 @@
 #endif
 #include <asm/asm-compat.h>
 #include <asm/synch.h>
-
-#define __raw_spin_is_locked(x)		((x)->slock != 0)
+#include <asm/ppc-opcode.h>
 
 #ifdef CONFIG_PPC64
 /* use 0x800000yy when locked, where yy == CPU number */
@@ -50,6 +49,12 @@
 #define SYNC_IO
 #endif
 
+static inline int __raw_spin_is_locked(raw_spinlock_t *lock)
+{
+	smp_mb();
+	return lock->slock != 0;
+}
+
 /*
  * This returns the old value in the lock, so we succeeded
  * in getting the lock if the return value is 0.
@@ -60,7 +65,7 @@ static inline unsigned long arch_spin_trylock(raw_spinlock_t *lock)
 
 	token = LOCK_TOKEN;
 	__asm__ __volatile__(
-"1:	lwarx		%0,0,%2\n\
+"1:	" PPC_LWARX(%0,0,%2,1) "\n\
 	cmpwi		0,%0,0\n\
 	bne-		2f\n\
 	stwcx.		%1,0,%2\n\
@@ -186,7 +191,7 @@ static inline long arch_read_trylock(raw_rwlock_t *rw)
 	long tmp;
 
 	__asm__ __volatile__(
-"1:	lwarx		%0,0,%1\n"
+"1:	" PPC_LWARX(%0,0,%1,1) "\n"
 	__DO_SIGN_EXTEND
 "	addic.		%0,%0,1\n\
 	ble-		2f\n"
@@ -211,7 +216,7 @@ static inline long arch_write_trylock(raw_rwlock_t *rw)
 
 	token = WRLOCK_TOKEN;
 	__asm__ __volatile__(
-"1:	lwarx		%0,0,%2\n\
+"1:	" PPC_LWARX(%0,0,%2,1) "\n\
 	cmpwi		0,%0,0\n\
 	bne-		2f\n"
 	PPC405_ERR77(0,%1)

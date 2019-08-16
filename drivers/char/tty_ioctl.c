@@ -108,6 +108,7 @@ void tty_throttle(struct tty_struct *tty)
 	if (!test_and_set_bit(TTY_THROTTLED, &tty->flags) &&
 	    tty->ops->throttle)
 		tty->ops->throttle(tty);
+	tty->flow_change = 0;
 	mutex_unlock(&tty->termios_mutex);
 }
 EXPORT_SYMBOL(tty_throttle);
@@ -131,9 +132,72 @@ void tty_unthrottle(struct tty_struct *tty)
 	if (test_and_clear_bit(TTY_THROTTLED, &tty->flags) &&
 	    tty->ops->unthrottle)
 		tty->ops->unthrottle(tty);
+	tty->flow_change = 0;
 	mutex_unlock(&tty->termios_mutex);
 }
 EXPORT_SYMBOL(tty_unthrottle);
+
+/**
+ *	tty_throttle_safe	-	flow control
+ *	@tty: terminal
+ *
+ *	Similar to tty_throttle() but will only attempt throttle
+ *	if tty->flow_change is TTY_THROTTLE_SAFE. Prevents an accidental
+ *	throttle due to race conditions when throttling is conditional
+ *	on factors evaluated prior to throttling.
+ *
+ *	Returns 0 if tty is throttled (or was already throttled)
+ */
+
+int tty_throttle_safe(struct tty_struct *tty)
+{
+	int ret = 0;
+
+	mutex_lock(&tty->termios_mutex);
+	if (!test_bit(TTY_THROTTLED, &tty->flags)) {
+		if (tty->flow_change != TTY_THROTTLE_SAFE)
+			ret = 1;
+		else {
+			set_bit(TTY_THROTTLED, &tty->flags);
+			if (tty->ops->throttle)
+				tty->ops->throttle(tty);
+		}
+	}
+	mutex_unlock(&tty->termios_mutex);
+
+	return ret;
+}
+
+/**
+ *	tty_unthrottle_safe	-	flow control
+ *	@tty: terminal
+ *
+ *	Similar to tty_unthrottle() but will only attempt unthrottle
+ *	if tty->flow_change is TTY_UNTHROTTLE_SAFE. Prevents an accidental
+ *	unthrottle due to race conditions when unthrottling is conditional
+ *	on factors evaluated prior to unthrottling.
+ *
+ *	Returns 0 if tty is unthrottled (or was already unthrottled)
+ */
+
+int tty_unthrottle_safe(struct tty_struct *tty)
+{
+	int ret = 0;
+
+	mutex_lock(&tty->termios_mutex);
+	if (test_bit(TTY_THROTTLED, &tty->flags)) {
+		if (tty->flow_change != TTY_UNTHROTTLE_SAFE)
+			ret = 1;
+		else {
+			clear_bit(TTY_THROTTLED, &tty->flags);
+			if (tty->ops->unthrottle)
+				tty->ops->unthrottle(tty);
+		}
+	}
+	mutex_unlock(&tty->termios_mutex);
+
+	return ret;
+}
 
 /**
  *	tty_wait_until_sent	-	wait for I/O to finish
@@ -611,7 +675,7 @@ static int set_termios(struct tty_struct *tty, void __user *arg, int opt)
 	if (opt & TERMIOS_WAIT) {
 		tty_wait_until_sent(tty, 0);
 		if (signal_pending(current))
-			return -EINTR;
+			return -ERESTARTSYS;
 	}
 
 	change_termios(tty, &tmp_termios);
@@ -678,7 +742,7 @@ static int set_termiox(struct tty_struct *tty, void __user *arg, int opt)
 	if (opt & TERMIOS_WAIT) {
 		tty_wait_until_sent(tty, 0);
 		if (signal_pending(current))
-			return -EINTR;
+			return -ERESTARTSYS;
 	}
 
 	mutex_lock(&tty->termios_mutex);
@@ -1078,14 +1142,11 @@ int tty_mode_ioctl(struct tty_struct *tty, struct file *file,
 }
 EXPORT_SYMBOL_GPL(tty_mode_ioctl);
 
-int tty_perform_flush(struct tty_struct *tty, unsigned long arg)
+/* Caller guarantees ldisc reference is held */
+static int __tty_perform_flush(struct tty_struct *tty, unsigned long arg)
 {
-	struct tty_ldisc *ld;
-	int retval = tty_check_change(tty);
-	if (retval)
-		return retval;
+	struct tty_ldisc *ld = tty->ldisc;
 
-	ld = tty_ldisc_ref_wait(tty);
 	switch (arg) {
 	case TCIFLUSH:
 		if (ld && ld->ops->flush_buffer)
@@ -1099,11 +1160,23 @@ int tty_perform_flush(struct tty_struct *tty, unsigned long arg)
 		tty_driver_flush_buffer(tty);
 		break;
 	default:
-		tty_ldisc_deref(ld);
 		return -EINVAL;
 	}
-	tty_ldisc_deref(ld);
 	return 0;
+}
+
+int tty_perform_flush(struct tty_struct *tty, unsigned long arg)
+{
+	struct tty_ldisc *ld;
+	int retval = tty_check_change(tty);
+	if (retval)
+		return retval;
+
+	ld = tty_ldisc_ref_wait(tty);
+	retval = __tty_perform_flush(tty, arg);
+	if (ld)
+		tty_ldisc_deref(ld);
+	return retval;
 }
 EXPORT_SYMBOL_GPL(tty_perform_flush);
 
@@ -1144,7 +1217,10 @@ int n_tty_ioctl_helper(struct tty_struct *tty, struct file *file,
 		}
 		return 0;
 	case TCFLSH:
-		return tty_perform_flush(tty, arg);
+		retval = tty_check_change(tty);
+		if (retval)
+			return retval;
+		return __tty_perform_flush(tty, arg);
 	case TIOCPKT:
 	{
 		int pktmode;

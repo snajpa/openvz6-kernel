@@ -4522,6 +4522,9 @@ static int niu_alloc_channels(struct niu *np)
 {
 	struct niu_parent *parent = np->parent;
 	int first_rx_channel, first_tx_channel;
+	int num_rx_rings, num_tx_rings;
+	struct rx_ring_info *rx_rings;
+	struct tx_ring_info *tx_rings;
 	int i, port, err;
 
 	port = np->port;
@@ -4531,16 +4534,20 @@ static int niu_alloc_channels(struct niu *np)
 		first_tx_channel += parent->txchan_per_port[i];
 	}
 
-	np->num_rx_rings = parent->rxchan_per_port[port];
-	np->num_tx_rings = parent->txchan_per_port[port];
+	num_rx_rings = parent->rxchan_per_port[port];
+	num_tx_rings = parent->txchan_per_port[port];
 
-	np->dev->real_num_tx_queues = np->num_tx_rings;
+	netif_set_real_num_tx_queues(np->dev, num_tx_rings);
 
-	np->rx_rings = kzalloc(np->num_rx_rings * sizeof(struct rx_ring_info),
-			       GFP_KERNEL);
+	rx_rings = kcalloc(num_rx_rings, sizeof(struct rx_ring_info),
+			   GFP_KERNEL);
 	err = -ENOMEM;
-	if (!np->rx_rings)
+	if (!rx_rings)
 		goto out_err;
+
+	np->num_rx_rings = num_rx_rings;
+	smp_wmb();
+	np->rx_rings = rx_rings;
 
 	for (i = 0; i < np->num_rx_rings; i++) {
 		struct rx_ring_info *rp = &np->rx_rings[i];
@@ -4570,11 +4577,15 @@ static int niu_alloc_channels(struct niu *np)
 			return err;
 	}
 
-	np->tx_rings = kzalloc(np->num_tx_rings * sizeof(struct tx_ring_info),
-			       GFP_KERNEL);
+	tx_rings = kcalloc(num_tx_rings, sizeof(struct tx_ring_info),
+			   GFP_KERNEL);
 	err = -ENOMEM;
-	if (!np->tx_rings)
+	if (!tx_rings)
 		goto out_err;
+
+	np->num_tx_rings = num_tx_rings;
+	smp_wmb();
+	np->tx_rings = tx_rings;
 
 	for (i = 0; i < np->num_tx_rings; i++) {
 		struct tx_ring_info *rp = &np->tx_rings[i];
@@ -6284,14 +6295,21 @@ static void niu_sync_mac_stats(struct niu *np)
 		niu_sync_bmac_stats(np);
 }
 
-static void niu_get_rx_stats(struct niu *np)
+static void niu_get_rx_stats(struct niu *np,
+			     struct rtnl_link_stats64 *stats)
 {
-	unsigned long pkts, dropped, errors, bytes;
+	u64 pkts, dropped, errors, bytes;
+	struct rx_ring_info *rx_rings;
 	int i;
 
 	pkts = dropped = errors = bytes = 0;
+
+	rx_rings = ACCESS_ONCE(np->rx_rings);
+	if (!rx_rings)
+		goto no_rings;
+
 	for (i = 0; i < np->num_rx_rings; i++) {
-		struct rx_ring_info *rp = &np->rx_rings[i];
+		struct rx_ring_info *rp = &rx_rings[i];
 
 		niu_sync_rx_discard_stats(np, rp, 0);
 
@@ -6300,38 +6318,52 @@ static void niu_get_rx_stats(struct niu *np)
 		dropped += rp->rx_dropped;
 		errors += rp->rx_errors;
 	}
-	np->dev->stats.rx_packets = pkts;
-	np->dev->stats.rx_bytes = bytes;
-	np->dev->stats.rx_dropped = dropped;
-	np->dev->stats.rx_errors = errors;
+
+no_rings:
+	stats->rx_packets = pkts;
+	stats->rx_bytes = bytes;
+	stats->rx_dropped = dropped;
+	stats->rx_errors = errors;
 }
 
-static void niu_get_tx_stats(struct niu *np)
+static void niu_get_tx_stats(struct niu *np,
+			     struct rtnl_link_stats64 *stats)
 {
-	unsigned long pkts, errors, bytes;
+	u64 pkts, errors, bytes;
+	struct tx_ring_info *tx_rings;
 	int i;
 
 	pkts = errors = bytes = 0;
+
+	tx_rings = ACCESS_ONCE(np->tx_rings);
+	if (!tx_rings)
+		goto no_rings;
+
 	for (i = 0; i < np->num_tx_rings; i++) {
-		struct tx_ring_info *rp = &np->tx_rings[i];
+		struct tx_ring_info *rp = &tx_rings[i];
 
 		pkts += rp->tx_packets;
 		bytes += rp->tx_bytes;
 		errors += rp->tx_errors;
 	}
-	np->dev->stats.tx_packets = pkts;
-	np->dev->stats.tx_bytes = bytes;
-	np->dev->stats.tx_errors = errors;
+
+no_rings:
+	stats->tx_packets = pkts;
+	stats->tx_bytes = bytes;
+	stats->tx_errors = errors;
 }
 
-static struct net_device_stats *niu_get_stats(struct net_device *dev)
+static struct rtnl_link_stats64 *niu_get_stats(struct net_device *dev,
+					       struct rtnl_link_stats64 *stats)
 {
 	struct niu *np = netdev_priv(dev);
 
-	niu_get_rx_stats(np);
-	niu_get_tx_stats(np);
+	if (netif_running(dev)) {
+		niu_get_rx_stats(np, stats);
+		niu_get_tx_stats(np, stats);
+	}
 
-	return &dev->stats;
+	return stats;
 }
 
 static void niu_load_hash_xmac(struct niu *np, u16 *hash)
@@ -6376,7 +6408,7 @@ static void niu_set_rx_mode(struct net_device *dev)
 	if ((dev->flags & IFF_ALLMULTI) || (dev->mc_count > 0))
 		np->flags |= NIU_FLAGS_MCAST;
 
-	alt_cnt = dev->uc.count;
+	alt_cnt = netdev_uc_count(dev);
 	if (alt_cnt > niu_num_alt_addr(np)) {
 		alt_cnt = 0;
 		np->flags |= NIU_FLAGS_PROMISC;
@@ -6385,7 +6417,7 @@ static void niu_set_rx_mode(struct net_device *dev)
 	if (alt_cnt) {
 		int index = 0;
 
-		list_for_each_entry(ha, &dev->uc.list, list) {
+		netdev_for_each_uc_addr(ha, dev) {
 			err = niu_set_alt_mac(np, index, ha->addr);
 			if (err)
 				printk(KERN_WARNING PFX "%s: Error %d "
@@ -7315,33 +7347,28 @@ static int niu_get_ethtool_tcam_all(struct niu *np,
 	struct niu_parent *parent = np->parent;
 	struct niu_tcam_entry *tp;
 	int i, idx, cnt;
-	u16 n_entries;
 	unsigned long flags;
-
+	int ret = 0;
 
 	/* put the tcam size here */
 	nfc->data = tcam_get_size(np);
 
 	niu_lock_parent(np, flags);
-	n_entries = nfc->rule_cnt;
 	for (cnt = 0, i = 0; i < nfc->data; i++) {
 		idx = tcam_get_index(np, i);
 		tp = &parent->tcam[idx];
 		if (!tp->valid)
 			continue;
+		if (cnt == nfc->rule_cnt) {
+			ret = -EMSGSIZE;
+			break;
+		}
 		rule_locs[cnt] = i;
 		cnt++;
 	}
 	niu_unlock_parent(np, flags);
 
-	if (n_entries != cnt) {
-		/* print warning, this should not happen */
-		pr_info(PFX "niu%d: %s In niu_get_ethtool_tcam_all, "
-			"n_entries[%d] != cnt[%d]!!!\n\n",
-			np->parent->index, np->dev->name, n_entries, cnt);
-	}
-
-	return 0;
+	return ret;
 }
 
 static int niu_get_nfc(struct net_device *dev, struct ethtool_rxnfc *cmd,
@@ -7513,9 +7540,11 @@ static int niu_add_ethtool_tcam_entry(struct niu *np,
 	if (fsp->flow_type == IP_USER_FLOW) {
 		int i;
 		int add_usr_cls = 0;
-		int ipv6 = 0;
 		struct ethtool_usrip4_spec *uspec = &fsp->h_u.usr_ip4_spec;
 		struct ethtool_usrip4_spec *umask = &fsp->m_u.usr_ip4_spec;
+
+		if (uspec->ip_ver != ETH_RX_NFC_IP4)
+			return -EINVAL;
 
 		niu_lock_parent(np, flags);
 
@@ -7545,9 +7574,7 @@ static int niu_add_ethtool_tcam_entry(struct niu *np,
 				default:
 					break;
 				}
-				if (uspec->ip_ver == ETH_RX_NFC_IP6)
-					ipv6 = 1;
-				ret = tcam_user_ip_class_set(np, class, ipv6,
+				ret = tcam_user_ip_class_set(np, class, 0,
 							     uspec->proto,
 							     uspec->tos,
 							     umask->tos);
@@ -7606,17 +7633,7 @@ static int niu_add_ethtool_tcam_entry(struct niu *np,
 		ret = -EINVAL;
 		goto out;
 	case IP_USER_FLOW:
-		if (fsp->h_u.usr_ip4_spec.ip_ver == ETH_RX_NFC_IP4) {
-			niu_get_tcamkey_from_ip4fs(fsp, tp, l2_rdc_table,
-						   class);
-		} else {
-			/* Not yet implemented */
-			pr_info(PFX "niu%d: %s In niu_add_ethtool_tcam_entry: "
-			"usr flow for IPv6 not implemented\n\n",
-			parent->index, np->dev->name);
-			ret = -EINVAL;
-			goto out;
-		}
+		niu_get_tcamkey_from_ip4fs(fsp, tp, l2_rdc_table, class);
 		break;
 	default:
 		pr_info(PFX "niu%d: %s In niu_add_ethtool_tcam_entry: "
@@ -7941,28 +7958,31 @@ static void niu_force_led(struct niu *np, int on)
 	nw64_mac(reg, val);
 }
 
-static int niu_phys_id(struct net_device *dev, u32 data)
+static int niu_set_phys_id(struct net_device *dev,
+			   enum ethtool_phys_id_state state)
+
 {
 	struct niu *np = netdev_priv(dev);
-	u64 orig_led_state;
-	int i;
 
 	if (!netif_running(dev))
 		return -EAGAIN;
 
-	if (data == 0)
-		data = 2;
+	switch (state) {
+	case ETHTOOL_ID_ACTIVE:
+		np->orig_led_state = niu_led_state_save(np);
+		return 1;	/* cycle on/off once per second */
 
-	orig_led_state = niu_led_state_save(np);
-	for (i = 0; i < (data * 2); i++) {
-		int on = ((i % 2) == 0);
+	case ETHTOOL_ID_ON:
+		niu_force_led(np, 1);
+		break;
 
-		niu_force_led(np, on);
+	case ETHTOOL_ID_OFF:
+		niu_force_led(np, 0);
+		break;
 
-		if (msleep_interruptible(500))
-			break;
+	case ETHTOOL_ID_INACTIVE:
+		niu_led_state_restore(np, np->orig_led_state);
 	}
-	niu_led_state_restore(np, orig_led_state);
 
 	return 0;
 }
@@ -7980,9 +8000,13 @@ static const struct ethtool_ops niu_ethtool_ops = {
 	.get_strings		= niu_get_strings,
 	.get_stats_count	= niu_get_stats_count,
 	.get_ethtool_stats	= niu_get_ethtool_stats,
-	.phys_id		= niu_phys_id,
 	.get_rxnfc		= niu_get_nfc,
 	.set_rxnfc		= niu_set_nfc,
+};
+
+static const struct ethtool_ops_ext niu_ethtool_ops_ext = {
+	.size			= sizeof(struct ethtool_ops_ext),
+	.set_phys_id		= niu_set_phys_id,
 };
 
 static int niu_ldg_assign_ldn(struct niu *np, struct niu_parent *parent,
@@ -8433,14 +8457,12 @@ static void __devinit niu_pci_vpd_validate(struct niu *np)
 		return;
 	}
 
-	memcpy(dev->perm_addr, vpd->local_mac, ETH_ALEN);
+	memcpy(dev->dev_addr, vpd->local_mac, ETH_ALEN);
 
-	val8 = dev->perm_addr[5];
-	dev->perm_addr[5] += np->port;
-	if (dev->perm_addr[5] < val8)
-		dev->perm_addr[4]++;
-
-	memcpy(dev->dev_addr, dev->perm_addr, dev->addr_len);
+	val8 = dev->dev_addr[5];
+	dev->dev_addr[5] += np->port;
+	if (dev->dev_addr[5] < val8)
+		dev->dev_addr[4]++;
 }
 
 static int __devinit niu_pci_probe_sprom(struct niu *np)
@@ -8535,32 +8557,30 @@ static int __devinit niu_pci_probe_sprom(struct niu *np)
 	val = nr64(ESPC_MAC_ADDR0);
 	niudbg(PROBE, "SPROM: MAC_ADDR0[%08llx]\n",
 	       (unsigned long long) val);
-	dev->perm_addr[0] = (val >>  0) & 0xff;
-	dev->perm_addr[1] = (val >>  8) & 0xff;
-	dev->perm_addr[2] = (val >> 16) & 0xff;
-	dev->perm_addr[3] = (val >> 24) & 0xff;
+	dev->dev_addr[0] = (val >>  0) & 0xff;
+	dev->dev_addr[1] = (val >>  8) & 0xff;
+	dev->dev_addr[2] = (val >> 16) & 0xff;
+	dev->dev_addr[3] = (val >> 24) & 0xff;
 
 	val = nr64(ESPC_MAC_ADDR1);
 	niudbg(PROBE, "SPROM: MAC_ADDR1[%08llx]\n",
 	       (unsigned long long) val);
-	dev->perm_addr[4] = (val >>  0) & 0xff;
-	dev->perm_addr[5] = (val >>  8) & 0xff;
+	dev->dev_addr[4] = (val >>  0) & 0xff;
+	dev->dev_addr[5] = (val >>  8) & 0xff;
 
-	if (!is_valid_ether_addr(&dev->perm_addr[0])) {
+	if (!is_valid_ether_addr(&dev->dev_addr[0])) {
 		dev_err(np->device, PFX "SPROM MAC address invalid\n");
 		dev_err(np->device, PFX "[ \n");
 		for (i = 0; i < 6; i++)
-			printk("%02x ", dev->perm_addr[i]);
+			printk("%02x ", dev->dev_addr[i]);
 		printk("]\n");
 		return -EINVAL;
 	}
 
-	val8 = dev->perm_addr[5];
-	dev->perm_addr[5] += np->port;
-	if (dev->perm_addr[5] < val8)
-		dev->perm_addr[4]++;
-
-	memcpy(dev->dev_addr, dev->perm_addr, dev->addr_len);
+	val8 = dev->dev_addr[5];
+	dev->dev_addr[5] += np->port;
+	if (dev->dev_addr[5] < val8)
+		dev->dev_addr[4]++;
 
 	val = nr64(ESPC_MOD_STR_LEN);
 	niudbg(PROBE, "SPROM: MOD_STR_LEN[%llu]\n",
@@ -9357,8 +9377,8 @@ static int __devinit niu_get_of_props(struct niu *np)
 			"is wrong.\n",
 			dp->full_name, prop_len);
 	}
-	memcpy(dev->perm_addr, mac_addr, dev->addr_len);
-	if (!is_valid_ether_addr(&dev->perm_addr[0])) {
+	memcpy(dev->dev_addr, mac_addr, dev->addr_len);
+	if (!is_valid_ether_addr(&dev->dev_addr[0])) {
 		int i;
 
 		dev_err(np->device, PFX "%s: OF MAC address is invalid\n",
@@ -9366,12 +9386,10 @@ static int __devinit niu_get_of_props(struct niu *np)
 		dev_err(np->device, PFX "%s: [ \n",
 			dp->full_name);
 		for (i = 0; i < 6; i++)
-			printk("%02x ", dev->perm_addr[i]);
+			printk("%02x ", dev->dev_addr[i]);
 		printk("]\n");
 		return -EINVAL;
 	}
-
-	memcpy(dev->dev_addr, dev->perm_addr, dev->addr_len);
 
 	model = of_get_property(dp, "model", &prop_len);
 
@@ -9800,7 +9818,6 @@ static const struct net_device_ops niu_netdev_ops = {
 	.ndo_open		= niu_open,
 	.ndo_stop		= niu_close,
 	.ndo_start_xmit		= niu_start_xmit,
-	.ndo_get_stats		= niu_get_stats,
 	.ndo_set_multicast_list	= niu_set_rx_mode,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_set_mac_address	= niu_set_mac_addr,
@@ -9809,11 +9826,18 @@ static const struct net_device_ops niu_netdev_ops = {
 	.ndo_change_mtu		= niu_change_mtu,
 };
 
+static const struct net_device_ops_ext niu_netdev_ops_ext = {
+	.size			= sizeof(struct net_device_ops_ext),
+	.ndo_get_stats64	= niu_get_stats,
+};
+
 static void __devinit niu_assign_netdev_ops(struct net_device *dev)
 {
 	dev->netdev_ops = &niu_netdev_ops;
+	set_netdev_ops_ext(dev, &niu_netdev_ops_ext);
 	dev->ethtool_ops = &niu_ethtool_ops;
 	dev->watchdog_timeo = NIU_TX_TIMEOUT;
+	set_ethtool_ops_ext(dev, &niu_ethtool_ops_ext);
 }
 
 static void __devinit niu_device_announce(struct niu *np)
@@ -9851,9 +9875,8 @@ static int __devinit niu_pci_init_one(struct pci_dev *pdev,
 	union niu_parent_id parent_id;
 	struct net_device *dev;
 	struct niu *np;
-	int err, pos;
+	int err;
 	u64 dma_mask;
-	u16 val16;
 
 	niu_driver_version();
 
@@ -9879,8 +9902,7 @@ static int __devinit niu_pci_init_one(struct pci_dev *pdev,
 		goto err_out_disable_pdev;
 	}
 
-	pos = pci_find_capability(pdev, PCI_CAP_ID_EXP);
-	if (pos <= 0) {
+	if (!pci_is_pcie(pdev)) {
 		dev_err(&pdev->dev, PFX "Cannot find PCI Express capability, "
 			"aborting.\n");
 		goto err_out_free_res;
@@ -9906,14 +9928,11 @@ static int __devinit niu_pci_init_one(struct pci_dev *pdev,
 		goto err_out_free_dev;
 	}
 
-	pci_read_config_word(pdev, pos + PCI_EXP_DEVCTL, &val16);
-	val16 &= ~PCI_EXP_DEVCTL_NOSNOOP_EN;
-	val16 |= (PCI_EXP_DEVCTL_CERE |
-		  PCI_EXP_DEVCTL_NFERE |
-		  PCI_EXP_DEVCTL_FERE |
-		  PCI_EXP_DEVCTL_URRE |
-		  PCI_EXP_DEVCTL_RELAX_EN);
-	pci_write_config_word(pdev, pos + PCI_EXP_DEVCTL, val16);
+	pcie_capability_clear_and_set_word(pdev, PCI_EXP_DEVCTL,
+		PCI_EXP_DEVCTL_NOSNOOP_EN,
+		PCI_EXP_DEVCTL_CERE | PCI_EXP_DEVCTL_NFERE |
+		PCI_EXP_DEVCTL_FERE | PCI_EXP_DEVCTL_URRE |
+		PCI_EXP_DEVCTL_RELAX_EN);
 
 	dma_mask = DMA_44BIT_MASK;
 	err = pci_set_dma_mask(pdev, dma_mask);

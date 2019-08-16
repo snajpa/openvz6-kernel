@@ -19,12 +19,19 @@ static int set_x2apic_phys_mode(char *arg)
 }
 early_param("x2apic_phys", set_x2apic_phys_mode);
 
+static bool x2apic_fadt_phys(void)
+{
+	if ((acpi_gbl_FADT.header.revision >= FADT2_REVISION_ID) &&
+		(acpi_gbl_FADT.flags & ACPI_FADT_APIC_PHYSICAL)) {
+		printk(KERN_DEBUG "System requires x2apic physical mode\n");
+		return true;
+	}
+	return false;
+}
+
 static int x2apic_acpi_madt_oem_check(char *oem_id, char *oem_table_id)
 {
-	if (x2apic_phys)
-		return x2apic_enabled();
-	else
-		return 0;
+	return x2apic_enabled() && (x2apic_phys || x2apic_fadt_phys());
 }
 
 /*
@@ -146,10 +153,7 @@ x2apic_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
 			break;
 	}
 
-	if (cpu < nr_cpu_ids)
-		return per_cpu(x86_cpu_to_apicid, cpu);
-
-	return BAD_APICID;
+	return per_cpu(x86_cpu_to_apicid, cpu);
 }
 
 static unsigned int x2apic_phys_get_apic_id(unsigned long x)
@@ -176,10 +180,18 @@ static void init_x2apic_ldr(void)
 {
 }
 
+static int x2apic_phys_probe(void)
+{
+	if (x2apic_mode && (x2apic_phys || x2apic_fadt_phys()))
+		return 1;
+
+	return apic == &apic_x2apic_phys;
+}
+
 struct apic apic_x2apic_phys = {
 
 	.name				= "physical x2apic",
-	.probe				= NULL,
+	.probe				= x2apic_phys_probe,
 	.acpi_madt_oem_check		= x2apic_acpi_madt_oem_check,
 	.apic_id_registered		= x2apic_apic_id_registered,
 
@@ -229,6 +241,7 @@ struct apic apic_x2apic_phys = {
 
 	.read				= native_apic_msr_read,
 	.write				= native_apic_msr_write,
+	.eoi_write			= native_apic_msr_eoi_write,
 	.icr_read			= native_x2apic_icr_read,
 	.icr_write			= native_x2apic_icr_write,
 	.wait_icr_idle			= native_x2apic_wait_icr_idle,

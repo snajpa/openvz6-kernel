@@ -7,6 +7,25 @@
 #define TRACE_SYSTEM kvm
 #define TRACE_INCLUDE_FILE kvm
 
+TRACE_EVENT(kvm_vcpu_wakeup,
+	    TP_PROTO(__u64 ns, bool waited),
+	    TP_ARGS(ns, waited),
+
+	TP_STRUCT__entry(
+		__field(	__u64,		ns		)
+		__field(	bool,		waited		)
+	),
+
+	TP_fast_assign(
+		__entry->ns		= ns;
+		__entry->waited		= waited;
+	),
+
+	TP_printk("%s time %lld ns",
+		  __entry->waited ? "wait" : "poll",
+		  __entry->ns)
+);
+
 #if defined(__KVM_HAVE_IOAPIC)
 TRACE_EVENT(kvm_set_irq,
 	TP_PROTO(unsigned int gsi, int level, int irq_source_id),
@@ -61,6 +80,26 @@ TRACE_EVENT(kvm_ioapic_set_irq,
 		  (__entry->e & (1<<15)) ? "level" : "edge",
 		  (__entry->e & (1<<16)) ? "|masked" : "",
 		  __entry->coalesced ? " (coalesced)" : "")
+);
+
+TRACE_EVENT(kvm_ioapic_delayed_eoi_inj,
+	    TP_PROTO(__u64 e),
+	    TP_ARGS(e),
+
+	TP_STRUCT__entry(
+		__field(	__u64,		e		)
+	),
+
+	TP_fast_assign(
+		__entry->e		= e;
+	),
+
+	TP_printk("dst %x vec=%u (%s|%s|%s%s)",
+		  (u8)(__entry->e >> 56), (u8)__entry->e,
+		  __print_symbolic((__entry->e >> 8 & 0x7), kvm_deliver_mode),
+		  (__entry->e & (1<<11)) ? "logical" : "physical",
+		  (__entry->e & (1<<15)) ? "level" : "edge",
+		  (__entry->e & (1<<16)) ? "|masked" : "")
 );
 
 TRACE_EVENT(kvm_msi_set_irq,

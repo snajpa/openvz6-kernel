@@ -55,7 +55,11 @@ struct fib_rules_ops
 					   struct nlattr **);
 	int			(*fill)(struct fib_rule *, struct sk_buff *,
 					struct fib_rule_hdr *);
+#ifdef __GENKSYMS__
 	u32			(*default_pref)(struct fib_rules_ops *ops);
+#else
+	void			*rh_unused;
+#endif
 	size_t			(*nlmsg_payload)(struct fib_rule *);
 
 	/* Called after modifications to the rules set, must flush

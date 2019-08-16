@@ -38,6 +38,9 @@
 #include <rdma/ib_mad.h>
 #include <rdma/ib_sa.h>
 
+/* ib_cm and ib_user_cm modules share /sys/class/infiniband_cm */
+extern struct class cm_class;
+
 enum ib_cm_state {
 	IB_CM_IDLE,
 	IB_CM_LISTEN,
@@ -102,7 +105,8 @@ enum ib_cm_data_size {
 	IB_CM_SIDR_REQ_PRIVATE_DATA_SIZE = 216,
 	IB_CM_SIDR_REP_PRIVATE_DATA_SIZE = 136,
 	IB_CM_SIDR_REP_INFO_LENGTH	 = 72,
-	IB_CM_COMPARE_SIZE		 = 64
+	/* compare done u32 at a time */
+	IB_CM_COMPARE_SIZE		 = (64 / sizeof(u32))
 };
 
 struct ib_cm_id;
@@ -259,6 +263,18 @@ struct ib_cm_event {
 	void			*private_data;
 };
 
+#define CM_REQ_ATTR_ID		cpu_to_be16(0x0010)
+#define CM_MRA_ATTR_ID		cpu_to_be16(0x0011)
+#define CM_REJ_ATTR_ID		cpu_to_be16(0x0012)
+#define CM_REP_ATTR_ID		cpu_to_be16(0x0013)
+#define CM_RTU_ATTR_ID		cpu_to_be16(0x0014)
+#define CM_DREQ_ATTR_ID		cpu_to_be16(0x0015)
+#define CM_DREP_ATTR_ID		cpu_to_be16(0x0016)
+#define CM_SIDR_REQ_ATTR_ID	cpu_to_be16(0x0017)
+#define CM_SIDR_REP_ATTR_ID	cpu_to_be16(0x0018)
+#define CM_LAP_ATTR_ID		cpu_to_be16(0x0019)
+#define CM_APR_ATTR_ID		cpu_to_be16(0x001A)
+
 /**
  * ib_cm_handler - User-defined callback to process communication events.
  * @cm_id: Communication identifier associated with the reported event.
@@ -322,8 +338,8 @@ void ib_destroy_cm_id(struct ib_cm_id *cm_id);
 #define IB_SDP_SERVICE_ID_MASK	cpu_to_be64(0xFFFFFFFFFFFF0000ULL)
 
 struct ib_cm_compare_data {
-	u8  data[IB_CM_COMPARE_SIZE];
-	u8  mask[IB_CM_COMPARE_SIZE];
+	u32  data[IB_CM_COMPARE_SIZE];
+	u32  mask[IB_CM_COMPARE_SIZE];
 };
 
 /**

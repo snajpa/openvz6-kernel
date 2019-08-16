@@ -14,6 +14,7 @@
 
 struct netpoll {
 	struct net_device *dev;
+	struct net_device *real_dev;
 	char dev_name[IFNAMSIZ];
 	const char *name;
 	void (*rx_hook)(struct netpoll *, int, char *, int);
@@ -31,17 +32,32 @@ struct netpoll_info {
 	struct sk_buff_head arp_tx; /* list of arp requests to reply to */
 	struct sk_buff_head txq;
 	struct delayed_work tx_work;
+
+	struct netpoll *netpoll;
 };
 
+void netpoll_poll_dev(struct net_device *dev);
 void netpoll_poll(struct netpoll *np);
 void netpoll_send_udp(struct netpoll *np, const char *msg, int len);
 void netpoll_print_options(struct netpoll *np);
 int netpoll_parse_options(struct netpoll *np, char *opt);
+int __netpoll_setup(struct netpoll *np, struct net_device *ndev, gfp_t gfp);
 int netpoll_setup(struct netpoll *np);
 int netpoll_trap(void);
 void netpoll_set_trap(int trap);
+void __netpoll_cleanup(struct netpoll *np);
 void netpoll_cleanup(struct netpoll *np);
 int __netpoll_rx(struct sk_buff *skb);
+void netpoll_send_skb_on_dev(struct netpoll *np, struct sk_buff *skb,
+			     struct net_device *dev);
+static inline void netpoll_send_skb(struct netpoll *np, struct sk_buff *skb)
+{
+	unsigned long flags;
+	local_irq_save(flags);
+	netpoll_send_skb_on_dev(np, skb, np->dev);
+	local_irq_restore(flags);
+}
+
 
 
 #ifdef CONFIG_NETPOLL
@@ -101,6 +117,11 @@ static inline void netpoll_poll_unlock(void *have)
 	rcu_read_unlock();
 }
 
+static inline int netpoll_tx_running(struct net_device *dev)
+{
+	return irqs_disabled();
+}
+
 #else
 static inline int netpoll_rx(struct sk_buff *skb)
 {
@@ -123,6 +144,10 @@ static inline void netpoll_poll_unlock(void *have)
 }
 static inline void netpoll_netdev_init(struct net_device *dev)
 {
+}
+static inline int netpoll_tx_running(struct net_device *dev)
+{
+	return 0;
 }
 #endif
 

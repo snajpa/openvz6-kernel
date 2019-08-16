@@ -33,6 +33,8 @@ MODULE_LICENSE("GPL v2");
 #define UCODE_EQUIV_CPU_TABLE_TYPE 0x00000000
 #define UCODE_UCODE_TYPE           0x00000001
 
+const struct firmware *firmware;
+
 struct equiv_cpu_entry {
 	u32	installed_cpu;
 	u32	fixed_errata_mask;
@@ -63,7 +65,6 @@ struct microcode_amd {
 	unsigned int			mpb[0];
 };
 
-#define UCODE_MAX_SIZE			2048
 #define UCODE_CONTAINER_SECTION_HDR	8
 #define UCODE_CONTAINER_HEADER_SIZE	12
 
@@ -103,18 +104,11 @@ static int get_matching_microcode(int cpu, void *mc, int rev)
 		i++;
 	}
 
-	if (!equiv_cpu_id) {
-		printk(KERN_WARNING "microcode: CPU%d: cpu revision "
-		       "not listed in equivalent cpu table\n", cpu);
+	if (!equiv_cpu_id)
 		return 0;
-	}
 
-	if (mc_header->processor_rev_id != equiv_cpu_id) {
-		printk(KERN_ERR	"microcode: CPU%d: patch mismatch "
-		       "(processor_rev_id: %x, equiv_cpu_id: %x)\n",
-		       cpu, mc_header->processor_rev_id, equiv_cpu_id);
+	if (mc_header->processor_rev_id != equiv_cpu_id)
 		return 0;
-	}
 
 	/* ucode might be chipset specific -- currently we don't support this */
 	if (mc_header->nb_dev_id || mc_header->sb_dev_id) {
@@ -127,6 +121,37 @@ static int get_matching_microcode(int cpu, void *mc, int rev)
 		return 0;
 
 	return 1;
+}
+
+static unsigned int verify_ucode_size(int cpu, const u8 *buf, unsigned int size)
+{
+	struct cpuinfo_x86 *c = &cpu_data(cpu);
+	unsigned int max_size, actual_size;
+
+#define F1XH_MPB_MAX_SIZE 2048
+#define F14H_MPB_MAX_SIZE 1824
+#define F15H_MPB_MAX_SIZE 4096
+
+	switch (c->x86) {
+	case 0x14:
+		max_size = F14H_MPB_MAX_SIZE;
+		break;
+	case 0x15:
+		max_size = F15H_MPB_MAX_SIZE;
+		break;
+	default:
+		max_size = F1XH_MPB_MAX_SIZE;
+		break;
+	}
+
+	actual_size = buf[4] + (buf[5] << 8);
+
+	if (actual_size > size || actual_size > max_size) {
+		pr_err("section size mismatch\n");
+		return 0;
+	}
+
+	return actual_size;
 }
 
 static int apply_microcode_amd(int cpu)
@@ -150,6 +175,7 @@ static int apply_microcode_amd(int cpu)
 	if (rev != mc_amd->hdr.patch_id) {
 		printk(KERN_ERR "microcode: CPU%d: update failed "
 		       "(for patch_level=0x%x)\n", cpu, mc_amd->hdr.patch_id);
+		uci->cpu_sig.rev = rev;
 		return -1;
 	}
 
@@ -168,11 +194,11 @@ static int get_ucode_data(void *to, const u8 *from, size_t n)
 }
 
 static void *
-get_next_ucode(const u8 *buf, unsigned int size, unsigned int *mc_size)
+get_next_ucode(int cpu, const u8 *buf, unsigned int size, unsigned int *mc_size)
 {
-	unsigned int total_size;
+	unsigned int actual_size = 0;
 	u8 section_hdr[UCODE_CONTAINER_SECTION_HDR];
-	void *mc;
+	void *mc = NULL;
 
 	if (get_ucode_data(section_hdr, buf, UCODE_CONTAINER_SECTION_HDR))
 		return NULL;
@@ -183,26 +209,18 @@ get_next_ucode(const u8 *buf, unsigned int size, unsigned int *mc_size)
 		return NULL;
 	}
 
-	total_size = (unsigned long) (section_hdr[4] + (section_hdr[5] << 8));
-
-	printk(KERN_DEBUG "microcode: size %u, total_size %u\n",
-	       size, total_size);
-
-	if (total_size > size || total_size > UCODE_MAX_SIZE) {
-		printk(KERN_ERR "microcode: error: size mismatch\n");
+	actual_size = verify_ucode_size(cpu, buf, size);
+	if (!actual_size)
 		return NULL;
-	}
 
-	mc = vmalloc(UCODE_MAX_SIZE);
-	if (mc) {
-		memset(mc, 0, UCODE_MAX_SIZE);
-		if (get_ucode_data(mc, buf + UCODE_CONTAINER_SECTION_HDR,
-				   total_size)) {
-			vfree(mc);
-			mc = NULL;
-		} else
-			*mc_size = total_size + UCODE_CONTAINER_SECTION_HDR;
-	}
+	mc = vmalloc(actual_size);
+	if (!mc)
+		return NULL;
+
+	memset(mc, 0, actual_size);
+	get_ucode_data(mc, buf + UCODE_CONTAINER_SECTION_HDR, actual_size);
+	*mc_size = actual_size + UCODE_CONTAINER_SECTION_HDR;
+
 	return mc;
 }
 
@@ -271,7 +289,7 @@ generic_load_microcode(int cpu, const u8 *data, size_t size)
 		unsigned int uninitialized_var(mc_size);
 		struct microcode_header_amd *mc_header;
 
-		mc = get_next_ucode(ucode_ptr, leftover, &mc_size);
+		mc = get_next_ucode(cpu, ucode_ptr, leftover, &mc_size);
 		if (!mc)
 			break;
 
@@ -308,14 +326,10 @@ generic_load_microcode(int cpu, const u8 *data, size_t size)
 
 static enum ucode_state request_microcode_fw(int cpu, struct device *device)
 {
-	const char *fw_name = "amd-ucode/microcode_amd.bin";
-	const struct firmware *firmware;
 	enum ucode_state ret;
 
-	if (request_firmware(&firmware, fw_name, device)) {
-		printk(KERN_ERR "microcode: failed to load file %s\n", fw_name);
+	if (firmware == NULL)
 		return UCODE_NFOUND;
-	}
 
 	if (*(u32 *)firmware->data != UCODE_MAGIC) {
 		printk(KERN_ERR "microcode: invalid UCODE_MAGIC (0x%08x)\n",
@@ -325,16 +339,12 @@ static enum ucode_state request_microcode_fw(int cpu, struct device *device)
 
 	ret = generic_load_microcode(cpu, firmware->data, firmware->size);
 
-	release_firmware(firmware);
-
 	return ret;
 }
 
 static enum ucode_state
 request_microcode_user(int cpu, const void __user *buf, size_t size)
 {
-	printk(KERN_INFO "microcode: AMD microcode update via "
-	       "/dev/cpu/microcode not supported\n");
 	return UCODE_ERROR;
 }
 
@@ -346,7 +356,43 @@ static void microcode_fini_cpu_amd(int cpu)
 	uci->mc = NULL;
 }
 
+/*
+ * AMD microcode firmware naming convention, up to family 15h they are in
+ * the legacy file:
+ *
+ *    amd-ucode/microcode_amd.bin
+ *
+ * This legacy file is always smaller than 2K in size.
+ *
+ * Starting at family 15h they are in family specific firmware files:
+ *
+ *    amd-ucode/microcode_amd_fam15h.bin
+ *    amd-ucode/microcode_amd_fam16h.bin
+ *    ...
+ *
+ * These might be larger than 2K.
+ */
+void init_microcode_amd(struct device *device)
+{
+	char fw_name[36] = "amd-ucode/microcode_amd.bin";
+
+	if (boot_cpu_data.x86 >= 0x15)
+		snprintf(fw_name, sizeof(fw_name),
+			 "amd-ucode/microcode_amd_fam%.2xh.bin",
+			 boot_cpu_data.x86);
+
+	if (request_firmware(&firmware, (const char *)fw_name, device))
+		printk(KERN_ERR "microcode: failed to load file %s\n", fw_name);
+}
+
+void fini_microcode_amd(void)
+{
+	release_firmware(firmware);
+}
+
 static struct microcode_ops microcode_amd_ops = {
+	.init				  = init_microcode_amd,
+	.fini				  = fini_microcode_amd,
 	.request_microcode_user           = request_microcode_user,
 	.request_microcode_fw             = request_microcode_fw,
 	.collect_cpu_info                 = collect_cpu_info_amd,

@@ -73,7 +73,27 @@
 #define H_MR_CONDITION  -43
 #define H_NOT_ENOUGH_RESOURCES -44
 #define H_R_STATE       -45
-#define H_RESCINDEND    -46
+#define H_RESCINDED     -46
+#define H_P2		-55
+#define H_P3		-56
+#define H_P4		-57
+#define H_P5		-58
+#define H_P6		-59
+#define H_P7		-60
+#define H_P8		-61
+#define H_P9		-62
+#define H_TOO_BIG	-64
+#define H_OVERLAP	-68
+#define H_INTERRUPT	-69
+#define H_BAD_DATA	-70
+#define H_NOT_ACTIVE	-71
+#define H_SG_LIST	-72
+#define H_OP_MODE	-73
+#define H_COP_HW	-74
+#define H_UNSUPPORTED_FLAG_START	-256
+#define H_UNSUPPORTED_FLAG_END		-511
+#define H_MULTI_THREADS_ACTIVE	-9005
+#define H_OUTSTANDING_COP_OPS	-9006
 
 
 /* Long Busy is a condition that can be returned by the firmware
@@ -101,6 +121,7 @@
 #define H_ANDCOND		(1UL<<(63-33))
 #define H_ICACHE_INVALIDATE	(1UL<<(63-40))	/* icbi, etc.  (ignored for IO pages) */
 #define H_ICACHE_SYNCHRONIZE	(1UL<<(63-41))	/* dcbst, icbi, etc (ignored for IO pages */
+#define H_COALESCE_CAND	(1UL<<(63-42))	/* page is a good candidate for coalescing */
 #define H_ZERO_PAGE		(1UL<<(63-48))	/* zero the page before mapping (ignored for IO pages) */
 #define H_COPY_PAGE		(1UL<<(63-49))
 #define H_N			(1UL<<(63-61))
@@ -208,6 +229,7 @@
 #define H_GET_HCA_INFO          0x1B8
 #define H_GET_PERF_COUNT        0x1BC
 #define H_MANAGE_TRACE          0x1C0
+#define H_GET_CPU_CHARACTERISTICS 0x1C8
 #define H_FREE_LOGICAL_LAN_BUFFER 0x1D4
 #define H_QUERY_INT_STATE       0x1E4
 #define H_POLL_PENDING		0x1D8
@@ -215,9 +237,28 @@
 #define H_JOIN			0x298
 #define H_VASI_STATE            0x2A4
 #define H_ENABLE_CRQ		0x2B0
+#define H_GET_EM_PARMS		0x2B8
 #define H_SET_MPP		0x2D0
 #define H_GET_MPP		0x2D4
-#define MAX_HCALL_OPCODE	H_GET_MPP
+#define H_HOME_NODE_ASSOCIATIVITY 0x2EC
+#define H_RANDOM		0x300
+#define H_COP			0x304
+#define H_GET_MPP_X		0x314
+#define MAX_HCALL_OPCODE	H_GET_MPP_X
+
+/* H_GET_CPU_CHARACTERISTICS return values */
+#define H_CPU_CHAR_SPEC_BAR_ORI31	(1ull << 63) // IBM bit 0
+#define H_CPU_CHAR_BCCTRL_SERIALISED	(1ull << 62) // IBM bit 1
+#define H_CPU_CHAR_L1D_FLUSH_ORI30	(1ull << 61) // IBM bit 2
+#define H_CPU_CHAR_L1D_FLUSH_TRIG2	(1ull << 60) // IBM bit 3
+#define H_CPU_CHAR_L1D_THREAD_PRIV	(1ull << 59) // IBM bit 4
+#define H_CPU_CHAR_BRANCH_HINTS_HONORED	(1ull << 58) // IBM bit 5
+#define H_CPU_CHAR_THREAD_RECONFIG_CTRL	(1ull << 57) // IBM bit 6
+#define H_CPU_CHAR_COUNT_CACHE_DISABLED	(1ull << 56) // IBM bit 7
+
+#define H_CPU_BEHAV_FAVOUR_SECURITY	(1ull << 63) // IBM bit 0
+#define H_CPU_BEHAV_L1D_FLUSH_PR	(1ull << 62) // IBM bit 1
+#define H_CPU_BEHAV_BNDS_CHK_SPEC_BAR	(1ull << 61) // IBM bit 2
 
 #ifndef __ASSEMBLY__
 
@@ -292,6 +333,16 @@ struct hvcall_mpp_data {
 
 int h_get_mpp(struct hvcall_mpp_data *);
 
+struct hvcall_mpp_x_data {
+	unsigned long coalesced_bytes;
+	unsigned long pool_coalesced_bytes;
+	unsigned long pool_purr_cycles;
+	unsigned long pool_spurr_cycles;
+	unsigned long reserved[3];
+};
+
+int h_get_mpp_x(struct hvcall_mpp_x_data *mpp_x_data);
+
 #ifdef CONFIG_PPC_PSERIES
 extern int CMO_PrPSP;
 extern int CMO_SecPSP;
@@ -312,6 +363,13 @@ static inline unsigned long cmo_get_page_size(void)
 	return CMO_PageSize;
 }
 #endif /* CONFIG_PPC_PSERIES */
+
+#include <asm/types.h>
+
+struct h_cpu_char_result {
+	u64 character;
+	u64 behaviour;
+};
 
 #endif /* __ASSEMBLY__ */
 #endif /* __KERNEL__ */

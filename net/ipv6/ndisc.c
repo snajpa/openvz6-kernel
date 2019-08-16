@@ -449,7 +449,6 @@ struct sk_buff *ndisc_build_skb(struct net_device *dev,
 	struct sk_buff *skb;
 	struct icmp6hdr *hdr;
 	int len;
-	int err;
 	u8 *opt;
 
 	if (!dev->addr_len)
@@ -459,16 +458,18 @@ struct sk_buff *ndisc_build_skb(struct net_device *dev,
 	if (llinfo)
 		len += ndisc_opt_addr_space(dev);
 
-	skb = sock_alloc_send_skb(sk,
-				  (MAX_HEADER + sizeof(struct ipv6hdr) +
-				   len + LL_ALLOCATED_SPACE(dev)),
-				  1, &err);
+	skb = alloc_skb(MAX_HEADER + sizeof(struct ipv6hdr) + len +
+			LL_ALLOCATED_SPACE(dev), GFP_ATOMIC);
 	if (!skb) {
 		ND_PRINTK0(KERN_ERR
-			   "ICMPv6 ND: %s() failed to allocate an skb, err=%d.\n",
-			   __func__, err);
+			   "ICMPv6 ND: %s() failed to allocate an skb.\n", __func__);
 		return NULL;
 	}
+
+	/* Manually assign socket ownership as we avoid calling
+	 * sock_alloc_send_pskb() to bypass wmem buffer limits
+	 */
+	skb_set_owner_w(skb, sk);
 
 	skb_reserve(skb, LL_RESERVED_SPACE(dev));
 	ip6_nd_hdr(sk, skb, dev, saddr, daddr, IPPROTO_ICMPV6, len);
@@ -601,6 +602,27 @@ static void ndisc_send_na(struct net_device *dev, struct neighbour *neigh,
 	__ndisc_send(dev, neigh, daddr, src_addr,
 		     &icmp6h, solicited_addr,
 		     inc_opt ? ND_OPT_TARGET_LL_ADDR : 0);
+}
+
+static void ndisc_send_unsol_na(struct net_device *dev)
+{
+	struct inet6_dev *idev;
+	struct inet6_ifaddr *ifa;
+
+	idev = in6_dev_get(dev);
+	if (!idev)
+		return;
+
+	read_lock_bh(&idev->lock);
+	for (ifa = idev->addr_list; ifa; ifa = ifa->if_next) {
+		ndisc_send_na(dev, NULL, &in6addr_linklocal_allnodes, &ifa->addr,
+			      /*router=*/ !!idev->cnf.forwarding,
+			      /*solicited=*/ false, /*override=*/ true,
+			      /*inc_opt=*/ true);
+	}
+	read_unlock_bh(&idev->lock);
+
+	in6_dev_put(idev);
 }
 
 void ndisc_send_ns(struct net_device *dev, struct neighbour *neigh,
@@ -991,10 +1013,7 @@ static void ndisc_recv_na(struct sk_buff *skb)
 			/*
 			 * Change: router to host
 			 */
-			struct rt6_info *rt;
-			rt = rt6_get_dflt_router(saddr, dev);
-			if (rt)
-				ip6_del_rt(rt);
+			rt6_clean_tohost(dev_net(dev),  saddr);
 		}
 
 out:
@@ -1158,8 +1177,7 @@ static void ndisc_router_discovery(struct sk_buff *skb)
 		return;
 	}
 
-	/* skip route and link configuration on routers */
-	if (in6_dev->cnf.forwarding || !in6_dev->cnf.accept_ra)
+	if (!ipv6_accept_ra(in6_dev))
 		goto skip_linkparms;
 
 #ifdef CONFIG_IPV6_NDISC_NODETYPE
@@ -1242,7 +1260,14 @@ static void ndisc_router_discovery(struct sk_buff *skb)
 		rt->rt6i_expires = jiffies + (HZ * lifetime);
 
 	if (ra_msg->icmph.icmp6_hop_limit) {
-		in6_dev->cnf.hop_limit = ra_msg->icmph.icmp6_hop_limit;
+		/* Only set hop_limit on the interface if it is higher than
+		 * the current hop_limit.
+		 */
+		if (in6_dev->cnf.hop_limit < ra_msg->icmph.icmp6_hop_limit) {
+			in6_dev->cnf.hop_limit = ra_msg->icmph.icmp6_hop_limit;
+		} else {
+			ND_PRINTK2(KERN_WARNING "RA: Got route advertisement with lower hop_limit than current\n");
+		}
 		if (rt)
 			rt->u.dst.metrics[RTAX_HOPLIMIT-1] = ra_msg->icmph.icmp6_hop_limit;
 	}
@@ -1260,7 +1285,7 @@ skip_defrtr:
 			rtime = (rtime*HZ)/1000;
 			if (rtime < HZ/10)
 				rtime = HZ/10;
-			in6_dev->nd_parms->retrans_time = rtime;
+			NEIGH_VAR_SET(in6_dev->nd_parms, RETRANS_TIME, rtime);
 			in6_dev->tstamp = jiffies;
 			inet6_ifinfo_notify(RTM_NEWLINK, in6_dev);
 		}
@@ -1273,8 +1298,10 @@ skip_defrtr:
 				rtime = HZ/10;
 
 			if (rtime != in6_dev->nd_parms->base_reachable_time) {
-				in6_dev->nd_parms->base_reachable_time = rtime;
-				in6_dev->nd_parms->gc_staletime = 3 * rtime;
+				NEIGH_VAR_SET(in6_dev->nd_parms,
+					      BASE_REACHABLE_TIME, rtime);
+				NEIGH_VAR_SET(in6_dev->nd_parms,
+					      GC_STALETIME, 3 * rtime);
 				in6_dev->nd_parms->reachable_time = neigh_rand_reach_time(rtime);
 				in6_dev->tstamp = jiffies;
 				inet6_ifinfo_notify(RTM_NEWLINK, in6_dev);
@@ -1309,8 +1336,7 @@ skip_linkparms:
 			     NEIGH_UPDATE_F_ISROUTER);
 	}
 
-	/* skip route and link configuration on routers */
-	if (in6_dev->cnf.forwarding || !in6_dev->cnf.accept_ra)
+	if (!ipv6_accept_ra(in6_dev))
 		goto out;
 
 #ifdef CONFIG_IPV6_ROUTE_INFO
@@ -1697,11 +1723,14 @@ static int ndisc_netdev_event(struct notifier_block *this, unsigned long event, 
 	switch (event) {
 	case NETDEV_CHANGEADDR:
 		neigh_changeaddr(&nd_tbl, dev);
-		fib6_run_gc(~0UL, net);
+		fib6_run_gc(0, net, false);
 		break;
 	case NETDEV_DOWN:
 		neigh_ifdown(&nd_tbl, dev);
-		fib6_run_gc(~0UL, net);
+		fib6_run_gc(0, net, false);
+		break;
+	case NETDEV_NOTIFY_PEERS:
+		ndisc_send_unsol_na(dev);
 		break;
 	default:
 		break;
@@ -1745,16 +1774,16 @@ int ndisc_ifinfo_sysctl_change(struct ctl_table *ctl, int write, void __user *bu
 		ndisc_warn_deprecated_sysctl(ctl, "syscall", dev ? dev->name : "default");
 
 	if (strcmp(ctl->procname, "retrans_time") == 0)
-		ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+		ret = neigh_proc_dointvec(ctl, write, buffer, lenp, ppos);
 
 	else if (strcmp(ctl->procname, "base_reachable_time") == 0)
-		ret = proc_dointvec_jiffies(ctl, write,
-					    buffer, lenp, ppos);
+		ret = neigh_proc_dointvec_jiffies(ctl, write,
+						  buffer, lenp, ppos);
 
 	else if ((strcmp(ctl->procname, "retrans_time_ms") == 0) ||
 		 (strcmp(ctl->procname, "base_reachable_time_ms") == 0))
-		ret = proc_dointvec_ms_jiffies(ctl, write,
-					       buffer, lenp, ppos);
+		ret = neigh_proc_dointvec_ms_jiffies(ctl, write,
+						     buffer, lenp, ppos);
 	else
 		ret = -1;
 
@@ -1862,24 +1891,28 @@ int __init ndisc_init(void)
 	if (err)
 		goto out_unregister_pernet;
 #endif
-	err = register_netdevice_notifier(&ndisc_netdev_notifier);
-	if (err)
-		goto out_unregister_sysctl;
 out:
 	return err;
 
-out_unregister_sysctl:
 #ifdef CONFIG_SYSCTL
-	neigh_sysctl_unregister(&nd_tbl.parms);
 out_unregister_pernet:
-#endif
 	unregister_pernet_subsys(&ndisc_net_ops);
 	goto out;
+#endif
+}
+
+int __init ndisc_late_init(void)
+{
+	return register_netdevice_notifier(&ndisc_netdev_notifier);
+}
+
+void ndisc_late_cleanup(void)
+{
+	unregister_netdevice_notifier(&ndisc_netdev_notifier);
 }
 
 void ndisc_cleanup(void)
 {
-	unregister_netdevice_notifier(&ndisc_netdev_notifier);
 #ifdef CONFIG_SYSCTL
 	neigh_sysctl_unregister(&nd_tbl.parms);
 #endif

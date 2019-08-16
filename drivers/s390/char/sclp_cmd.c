@@ -19,8 +19,9 @@
 #include <linux/memory.h>
 #include <linux/platform_device.h>
 #include <asm/chpid.h>
-#include <asm/sclp.h>
 #include <asm/setup.h>
+#include <asm/page.h>
+#include <asm/sclp.h>
 
 #include "sclp.h"
 
@@ -53,7 +54,7 @@ static u8 sclp_fac84;
 static unsigned long long rzm;
 static unsigned long long rnmax;
 
-static int __init sclp_cmd_sync_early(sclp_cmdw_t cmd, void *sccb)
+int __init sclp_cmd_sync_early(sclp_cmdw_t cmd, void *sccb)
 {
 	int rc;
 
@@ -84,6 +85,7 @@ static void __init sclp_read_info_early(void)
 		do {
 			memset(sccb, 0, sizeof(*sccb));
 			sccb->header.length = sizeof(*sccb);
+			sccb->header.function_code = 0x80;
 			sccb->header.control_mask[2] = 0x80;
 			rc = sclp_cmd_sync_early(commands[i], sccb);
 		} while (rc == -EBUSY);
@@ -307,6 +309,13 @@ struct assign_storage_sccb {
 	u16 rn;
 } __packed;
 
+int arch_get_memory_phys_device(unsigned long start_pfn)
+{
+	if (!rzm)
+		return 0;
+	return PFN_PHYS(start_pfn) >> ilog2(rzm);
+}
+
 static unsigned long long rn2addr(u16 rn)
 {
 	return (unsigned long long) (rn - 1) * rzm;
@@ -343,7 +352,15 @@ out:
 
 static int sclp_assign_storage(u16 rn)
 {
-	return do_assign_storage(0x000d0001, rn);
+	unsigned long long start;
+	int rc;
+
+	rc = do_assign_storage(0x000d0001, rn);
+	if (rc)
+		return rc;
+	start = rn2addr(rn);
+	storage_key_init_range(start, start + rzm);
+	return 0;
 }
 
 static int sclp_unassign_storage(u16 rn)
@@ -563,6 +580,8 @@ static int __init sclp_detect_standby_memory(void)
 	struct read_storage_sccb *sccb;
 	int i, id, assigned, rc;
 
+	if (OLDMEM_BASE) /* No standby memory in kdump mode */
+		return 0;
 	if (!early_read_info_sccb_valid)
 		return 0;
 	if ((sclp_facilities & 0xe00000000000ULL) != 0xe00000000000ULL)

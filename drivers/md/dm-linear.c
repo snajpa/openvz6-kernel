@@ -29,6 +29,8 @@ static int linear_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct linear_c *lc;
 	unsigned long long tmp;
+	char dummy;
+	int ret;
 
 	if (argc != 2) {
 		ti->error = "Invalid argument count";
@@ -37,29 +39,31 @@ static int linear_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	lc = kmalloc(sizeof(*lc), GFP_KERNEL);
 	if (lc == NULL) {
-		ti->error = "dm-linear: Cannot allocate linear context";
+		ti->error = "Cannot allocate linear context";
 		return -ENOMEM;
 	}
 
-	if (sscanf(argv[1], "%llu", &tmp) != 1) {
-		ti->error = "dm-linear: Invalid device sector";
+	ret = -EINVAL;
+	if (sscanf(argv[1], "%llu%c", &tmp, &dummy) != 1) {
+		ti->error = "Invalid device sector";
 		goto bad;
 	}
 	lc->start = tmp;
 
-	if (dm_get_device(ti, argv[0], lc->start, ti->len,
-			  dm_table_get_mode(ti->table), &lc->dev)) {
-		ti->error = "dm-linear: Device lookup failed";
+	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &lc->dev);
+	if (ret) {
+		ti->error = "Device lookup failed";
 		goto bad;
 	}
 
 	ti->num_flush_requests = 1;
+	ti->num_discard_requests = 1;
 	ti->private = lc;
 	return 0;
 
       bad:
 	kfree(lc);
-	return -EINVAL;
+	return ret;
 }
 
 static void linear_dtr(struct dm_target *ti)
@@ -74,7 +78,7 @@ static sector_t linear_map_sector(struct dm_target *ti, sector_t bi_sector)
 {
 	struct linear_c *lc = ti->private;
 
-	return lc->start + (bi_sector - ti->begin);
+	return lc->start + dm_target_offset(ti, bi_sector);
 }
 
 static void linear_map_bio(struct dm_target *ti, struct bio *bio)
@@ -116,7 +120,17 @@ static int linear_ioctl(struct dm_target *ti, unsigned int cmd,
 			unsigned long arg)
 {
 	struct linear_c *lc = (struct linear_c *) ti->private;
-	return __blkdev_driver_ioctl(lc->dev->bdev, lc->dev->mode, cmd, arg);
+	struct dm_dev *dev = lc->dev;
+	int r = 0;
+
+	/*
+	 * Only pass ioctls through if the device sizes match exactly.
+	 */
+	if (lc->start ||
+	    ti->len != i_size_read(dev->bdev->bd_inode) >> SECTOR_SHIFT)
+		r = scsi_verify_blk_ioctl(NULL, cmd);
+
+	return r ? : __blkdev_driver_ioctl(dev->bdev, dev->mode, cmd, arg);
 }
 
 static int linear_merge(struct dm_target *ti, struct bvec_merge_data *bvm,

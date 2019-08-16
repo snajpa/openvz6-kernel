@@ -93,16 +93,8 @@ static int c2_query_port(struct ib_device *ibdev,
 	props->pkey_tbl_len = 1;
 	props->qkey_viol_cntr = 0;
 	props->active_width = 1;
-	props->active_speed = 1;
+	props->active_speed = IB_SPEED_SDR;
 
-	return 0;
-}
-
-static int c2_modify_port(struct ib_device *ibdev,
-			  u8 port, int port_modify_mask,
-			  struct ib_port_modify *props)
-{
-	pr_debug("%s:%u\n", __func__, __LINE__);
 	return 0;
 }
 
@@ -438,9 +430,9 @@ static struct ib_mr *c2_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	u64 *pages;
 	u64 kva = 0;
 	int shift, n, len;
-	int i, j, k;
+	int i, k, entry;
 	int err = 0;
-	struct ib_umem_chunk *chunk;
+	struct scatterlist *sg;
 	struct c2_pd *c2pd = to_c2pd(pd);
 	struct c2_mr *c2mr;
 
@@ -459,10 +451,7 @@ static struct ib_mr *c2_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	}
 
 	shift = ffs(c2mr->umem->page_size) - 1;
-
-	n = 0;
-	list_for_each_entry(chunk, &c2mr->umem->chunk_list, list)
-		n += chunk->nents;
+	n = c2mr->umem->nmap;
 
 	pages = kmalloc(n * sizeof(u64), GFP_KERNEL);
 	if (!pages) {
@@ -471,14 +460,12 @@ static struct ib_mr *c2_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	}
 
 	i = 0;
-	list_for_each_entry(chunk, &c2mr->umem->chunk_list, list) {
-		for (j = 0; j < chunk->nmap; ++j) {
-			len = sg_dma_len(&chunk->page_list[j]) >> shift;
-			for (k = 0; k < len; ++k) {
-				pages[i++] =
-					sg_dma_address(&chunk->page_list[j]) +
-					(c2mr->umem->page_size * k);
-			}
+	for_each_sg(c2mr->umem->sg_head.sgl, sg, c2mr->umem->nmap, entry) {
+		len = sg_dma_len(sg) >> shift;
+		for (k = 0; k < len; ++k) {
+			pages[i++] =
+				sg_dma_address(sg) +
+				(c2mr->umem->page_size * k);
 		}
 	}
 
@@ -488,7 +475,7 @@ static struct ib_mr *c2_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 					 c2mr->umem->page_size,
 					 i,
 					 length,
-					 c2mr->umem->offset,
+					 ib_umem_offset(c2mr->umem),
 					 &kva,
 					 c2_convert_access(acc),
 					 c2mr);
@@ -760,10 +747,7 @@ static struct net_device *c2_pseudo_netdev_init(struct c2_dev *c2dev)
 	memcpy_fromio(netdev->dev_addr, c2dev->kva + C2_REGS_RDMA_ENADDR, 6);
 
 	/* Print out the MAC address */
-	pr_debug("%s: MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
-		netdev->name,
-		netdev->dev_addr[0], netdev->dev_addr[1], netdev->dev_addr[2],
-		netdev->dev_addr[3], netdev->dev_addr[4], netdev->dev_addr[5]);
+	pr_debug("%s: MAC %pM\n", netdev->name, netdev->dev_addr);
 
 #if 0
 	/* Disable network packets */
@@ -816,7 +800,6 @@ int c2_register_device(struct c2_dev *dev)
 	dev->ibdev.dma_device = &dev->pcidev->dev;
 	dev->ibdev.query_device = c2_query_device;
 	dev->ibdev.query_port = c2_query_port;
-	dev->ibdev.modify_port = c2_modify_port;
 	dev->ibdev.query_pkey = c2_query_pkey;
 	dev->ibdev.query_gid = c2_query_gid;
 	dev->ibdev.alloc_ucontext = c2_alloc_ucontext;
@@ -864,7 +847,7 @@ int c2_register_device(struct c2_dev *dev)
 	dev->ibdev.iwcm->create_listen = c2_service_create;
 	dev->ibdev.iwcm->destroy_listen = c2_service_destroy;
 
-	ret = ib_register_device(&dev->ibdev);
+	ret = ib_register_device(&dev->ibdev, NULL);
 	if (ret)
 		goto out_free_iwcm;
 

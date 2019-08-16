@@ -1,7 +1,7 @@
 #/*******************************************************************
 # * This file is part of the Emulex Linux Device Driver for         *
 # * Fibre Channel Host Bus Adapters.                                *
-# * Copyright (C) 2004-2006 Emulex.  All rights reserved.           *
+# * Copyright (C) 2004-2011 Emulex.  All rights reserved.           *
 # * EMULEX and SLI are trademarks of Emulex.                        *
 # * www.emulex.com                                                  *
 # *                                                                 *
@@ -18,6 +18,8 @@
 # * included with this package.                                     *
 # *******************************************************************/
 ######################################################################
+
+ccflags-y += -Werror
 
 ifneq ($(GCOV),)
   EXTRA_CFLAGS += -fprofile-arcs -ftest-coverage

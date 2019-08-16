@@ -20,6 +20,7 @@
 #include <linux/pnp.h>
 #include <linux/io.h>
 #include <linux/kallsyms.h>
+#include <linux/dmi.h>
 #include "base.h"
 
 static void quirk_awe32_add_ports(struct pnp_dev *dev,
@@ -285,20 +286,89 @@ static void quirk_system_pci_resources(struct pnp_dev *dev)
 				 * the PCI region, and that might prevent a PCI
 				 * driver from requesting its resources.
 				 */
-				dev_warn(&dev->dev, "%s resource "
-					"(0x%llx-0x%llx) overlaps %s BAR %d "
-					"(0x%llx-0x%llx), disabling\n",
-					pnp_resource_type_name(res),
-					(unsigned long long) pnp_start,
-					(unsigned long long) pnp_end,
-					pci_name(pdev), i,
-					(unsigned long long) pci_start,
-					(unsigned long long) pci_end);
+				dev_warn(&dev->dev,
+					 "disabling %pR because it overlaps "
+					 "%s BAR %d %pR\n", res,
+					 pci_name(pdev), i, &pdev->resource[i]);
 				res->flags |= IORESOURCE_DISABLED;
 			}
 		}
 	}
 }
+
+#ifdef CONFIG_AMD_NB
+
+#include <asm/amd_nb.h>
+
+static void quirk_amd_mmconfig_area(struct pnp_dev *dev)
+{
+	resource_size_t start, end;
+	struct pnp_resource *pnp_res;
+	struct resource *res;
+	struct resource mmconfig_res, *mmconfig;
+
+	mmconfig = amd_get_mmconfig_range(&mmconfig_res);
+	if (!mmconfig)
+		return;
+
+	list_for_each_entry(pnp_res, &dev->resources, list) {
+		res = &pnp_res->res;
+		if (res->end < mmconfig->start || res->start > mmconfig->end ||
+		    (res->start == mmconfig->start && res->end == mmconfig->end))
+			continue;
+
+		dev_info(&dev->dev, FW_BUG
+			 "%pR covers only part of AMD MMCONFIG area %pR; adding more reservations\n",
+			 res, mmconfig);
+		if (mmconfig->start < res->start) {
+			gmb();
+			start = mmconfig->start;
+			end = res->start - 1;
+			pnp_add_mem_resource(dev, start, end, 0);
+		}
+		if (mmconfig->end > res->end) {
+			start = res->end + 1;
+			end = mmconfig->end;
+			pnp_add_mem_resource(dev, start, end, 0);
+		}
+		break;
+	}
+}
+#endif
+
+#if defined(CONFIG_IPMI_SI) || defined(CONFIG_IPMI_SI_MODULE)
+static void quirk_dell_ipmi(struct pnp_dev *dev)
+{
+	const char *dmi_sys_vendor;
+	struct pnp_id **pos;
+
+	/*
+	 * Some Dell servers have a _CID of PNP0C01 as well as a _HID of IPI0001
+	 * on the IPMI device in the DSDT.  If the PNP0C01 isn't removed, the
+	 * "system" PNP driver will attach to the device instead of the IPMI
+	 * driver.
+	 */
+
+	dmi_sys_vendor = dmi_get_system_info(DMI_SYS_VENDOR);
+	if (!dmi_sys_vendor)
+		return;
+	if (strncasecmp(dmi_sys_vendor, "Dell", 4))
+		return;
+	pos = &(dev->id);
+	while (*pos) {
+		if ((memcmp((*pos)->id, "PNP0c01", 7) == 0) ||
+		    (memcmp((*pos)->id, "PNP0C01", 7) == 0)) {
+			/*
+			 * Remove this id (without calling kfree since
+			 * there is no lock protecting the list).
+			 */
+			*pos = (*pos)->next;
+			return;
+		}
+		pos = &((*pos)->next);
+	}
+}
+#endif
 
 /*
  *  PnP Quirks
@@ -327,6 +397,12 @@ static struct pnp_fixup pnp_fixups[] = {
 	/* PnP resources that might overlap PCI BARs */
 	{"PNP0c01", quirk_system_pci_resources},
 	{"PNP0c02", quirk_system_pci_resources},
+#ifdef CONFIG_AMD_NB
+	{"PNP0c01", quirk_amd_mmconfig_area},
+#endif
+#if defined(CONFIG_IPMI_SI) || defined(CONFIG_IPMI_SI_MODULE)
+	{"IPI0001", quirk_dell_ipmi},
+#endif
 	{""}
 };
 

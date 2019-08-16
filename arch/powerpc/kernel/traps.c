@@ -58,6 +58,7 @@
 #ifdef CONFIG_FSL_BOOKE
 #include <asm/dbell.h>
 #endif
+#include <asm/fadump.h>
 
 #if defined(CONFIG_DEBUGGER) || defined(CONFIG_KEXEC)
 int (*__debugger)(struct pt_regs *regs);
@@ -157,6 +158,8 @@ int die(const char *str, struct pt_regs *regs, long err)
 	add_taint(TAINT_DIE);
 	spin_unlock_irqrestore(&die.lock, flags);
 
+	crash_fadump(regs, str);
+
 	if (kexec_should_crash(current) ||
 		kexec_sr_activated(smp_processor_id()))
 		crash_kexec(regs);
@@ -172,6 +175,15 @@ int die(const char *str, struct pt_regs *regs, long err)
 	do_exit(err);
 
 	return 0;
+}
+
+void user_single_step_siginfo(struct task_struct *tsk,
+				struct pt_regs *regs, siginfo_t *info)
+{
+	memset(info, 0, sizeof(*info));
+	info->si_signo = SIGTRAP;
+	info->si_code = TRAP_TRACE;
+	info->si_addr = (void __user *)regs->nip;
 }
 
 void _exception(int signr, struct pt_regs *regs, int code, unsigned long addr)

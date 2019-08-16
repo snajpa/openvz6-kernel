@@ -164,7 +164,10 @@ extern int __srcu_notifier_call_chain(struct srcu_notifier_head *nh,
 /* Encapsulate (negative) errno value (in particular, NOTIFY_BAD <=> EPERM). */
 static inline int notifier_from_errno(int err)
 {
-	return NOTIFY_STOP_MASK | (NOTIFY_OK - err);
+	if (err)
+		return NOTIFY_STOP_MASK | (NOTIFY_OK - err);
+
+	return NOTIFY_OK;
 }
 
 /* Restore (negative) errno value from notify return value. */
@@ -199,8 +202,15 @@ static inline int notifier_to_errno(int ret)
 #define NETDEV_FEAT_CHANGE	0x000B
 #define NETDEV_BONDING_FAILOVER 0x000C
 #define NETDEV_PRE_UP		0x000D
-#define NETDEV_BONDING_OLDTYPE  0x000E
-#define NETDEV_BONDING_NEWTYPE  0x000F
+#define NETDEV_PRE_TYPE_CHANGE	0x000E
+#define NETDEV_POST_TYPE_CHANGE	0x000F
+#define NETDEV_RELEASE		0x0010
+#define NETDEV_NOTIFY_PEERS	0x0013
+#define NETDEV_JOIN		0x0014
+#define NETDEV_POST_INIT	0x0015
+#define NETDEV_UNREGISTER_BATCH 0x0016
+#define NETDEV_RESEND_IGMP	0x0017
+#define NETDEV_CHANGEINFODATA	0x0018
 
 #define SYS_DOWN	0x0001	/* Notify of system down */
 #define SYS_RESTART	SYS_DOWN
@@ -239,6 +249,7 @@ static inline int notifier_to_errno(int ret)
 #define CPU_DOWN_FAILED_FROZEN	(CPU_DOWN_FAILED | CPU_TASKS_FROZEN)
 #define CPU_DEAD_FROZEN		(CPU_DEAD | CPU_TASKS_FROZEN)
 #define CPU_DYING_FROZEN	(CPU_DYING | CPU_TASKS_FROZEN)
+#define CPU_POST_DEAD_FROZEN	(CPU_POST_DEAD | CPU_TASKS_FROZEN)
 #define CPU_STARTING_FROZEN	(CPU_STARTING | CPU_TASKS_FROZEN)
 
 /* Hibernation and suspend events */

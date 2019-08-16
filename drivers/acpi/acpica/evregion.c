@@ -226,6 +226,21 @@ acpi_ev_execute_reg_method(union acpi_operand_object *region_obj, u32 function)
 	info->flags = ACPI_IGNORE_RETURN_VALUE;
 
 	/*
+	 * In most cases, the ACPI interpreter has not been entered by this
+	 * thread at this point. In those cases, routine acpi_ns_evaluate
+	 * can enter the interpreter without encountering a mutex deadlock.
+	 * However, _REG methods can be invoked for a region defined within
+	 * module-level AML code. In such a case, the interpreter has
+	 * already been entered by this thread.
+	 *
+	 * RHEL6-ONLY: If the interpreter is already active in this thread,
+	 * set flag to indicate this to acpi_ns_evaluate.
+	 */
+	if (acpi_ex_is_interpreter_entered()) {
+		info->flags |= ACPI_INTERPRETER_ENTERED;
+	}
+
+	/*
 	 * The _REG method has two arguments:
 	 *
 	 * Arg0 - Integer:
@@ -311,14 +326,26 @@ acpi_ev_address_space_dispatch(union acpi_operand_object *region_obj,
 
 	handler_desc = region_obj->region.handler;
 	if (!handler_desc) {
-		ACPI_ERROR((AE_INFO,
-			    "No handler for Region [%4.4s] (%p) [%s]",
-			    acpi_ut_get_node_name(region_obj->region.node),
-			    region_obj,
-			    acpi_ut_get_region_name(region_obj->region.
-						    space_id)));
+		char *fmtstr = "No handler for Region [%4.4s] (%p) [%s]";
+		char *nodname =
+			acpi_ut_get_node_name(region_obj->region.node);
+		char *regname =
+			acpi_ut_get_region_name(region_obj->region.space_id);
 
-		return_ACPI_STATUS(AE_NOT_EXIST);
+		/*
+		 * RHEL6 - only
+		 * Special case the IPMI handlers, because IPMI drivers will
+		 * be loaded later in the boot.
+		 */
+		if (!strcmp(regname, "IPMI")) {
+			ACPI_INFO((AE_INFO, fmtstr,
+				   nodname, region_obj, regname));
+			return_ACPI_STATUS(AE_OK);
+		} else {
+			ACPI_ERROR((AE_INFO, fmtstr,
+				    nodname, region_obj, regname));
+			return_ACPI_STATUS(AE_NOT_EXIST);
+		}
 	}
 
 	/*

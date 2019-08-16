@@ -418,7 +418,6 @@ generic_rndis_bind(struct usbnet *dev, struct usb_interface *intf, int flags)
 		goto halt_fail_and_release;
 	}
 	memcpy(net->dev_addr, bp, ETH_ALEN);
-	memcpy(net->perm_addr, bp, ETH_ALEN);
 
 	/* set a nonzero filter to enable data transfers */
 	memset(u.set, 0, sizeof *u.set);
@@ -574,7 +573,7 @@ EXPORT_SYMBOL_GPL(rndis_tx_fixup);
 
 static const struct driver_info	rndis_info = {
 	.description =	"RNDIS device",
-	.flags =	FLAG_ETHER | FLAG_FRAMING_RN | FLAG_NO_SETINT,
+	.flags =	FLAG_ETHER | FLAG_POINTTOPOINT | FLAG_FRAMING_RN | FLAG_NO_SETINT,
 	.bind =		rndis_bind,
 	.unbind =	rndis_unbind,
 	.status =	rndis_status,
@@ -609,6 +608,7 @@ static struct usb_driver rndis_driver = {
 	.disconnect =	usbnet_disconnect,
 	.suspend =	usbnet_suspend,
 	.resume =	usbnet_resume,
+	.disable_hub_initiated_lpm = 1,
 };
 
 static int __init rndis_init(void)

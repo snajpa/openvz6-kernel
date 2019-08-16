@@ -30,6 +30,13 @@
 #define IF_PREFIX_ONLINK	0x01
 #define IF_PREFIX_AUTOCONF	0x02
 
+enum {
+	INET6_IFADDR_STATE_DAD,
+	INET6_IFADDR_STATE_POSTDAD,
+	INET6_IFADDR_STATE_UP,
+	INET6_IFADDR_STATE_DEAD,
+};
+
 #ifdef __KERNEL__
 
 struct inet6_ifaddr 
@@ -65,6 +72,9 @@ struct inet6_ifaddr
 #endif
 
 	int			dead;
+#ifndef __GENKSYMS__
+	bool			tokenized;
+#endif
 };
 
 struct ip6_sf_socklist
@@ -166,11 +176,12 @@ struct inet6_dev
 	struct ifmcaddr6	*mc_list;
 	struct ifmcaddr6	*mc_tomb;
 	rwlock_t		mc_lock;
-	unsigned char		mc_qrv;
+	unsigned char		mc_qrv;		/* Query Robustness Variable */
 	unsigned char		mc_gq_running;
 	unsigned char		mc_ifc_count;
-	unsigned long		mc_v1_seen;
+	unsigned long		mc_v1_seen;	/* Max time we stay in MLDv1 mode */
 	unsigned long		mc_maxdelay;
+
 	struct timer_list	mc_gq_timer;	/* general query timer */
 	struct timer_list	mc_ifc_timer;	/* interface change timer */
 
@@ -192,6 +203,12 @@ struct inet6_dev
 	struct ipv6_devstat	stats;
 	unsigned long		tstamp; /* ipv6InterfaceTable update timestamp */
 	struct rcu_head		rcu;
+
+#ifndef __GENKSYMS__
+	struct in6_addr		token;
+	unsigned long		mc_qi;		/* Query Interval */
+	unsigned long		mc_qri;		/* Query Response Interval */
+#endif
 };
 
 static inline void ipv6_eth_mc_map(struct in6_addr *addr, char *buf)

@@ -29,6 +29,7 @@
 #include <linux/log2.h>
 #include <linux/idr.h>
 #include <linux/fs_struct.h>
+#include <linux/proc_fs.h>
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 #include "pnode.h"
@@ -235,24 +236,22 @@ static unsigned int count_mnt_writers(struct vfsmount *mnt)
 }
 
 /*
- * Most r/o checks on a fs are for operations that take
- * discrete amounts of time, like a write() or unlink().
- * We must keep track of when those operations start
- * (for permission checks) and when they end, so that
- * we can determine when writes are able to occur to
- * a filesystem.
+ * Most r/o & frozen checks on a fs are for operations that take discrete
+ * amounts of time, like a write() or unlink().  We must keep track of when
+ * those operations start (for permission checks) and when they end, so that we
+ * can determine when writes are able to occur to a filesystem.
  */
 /**
- * mnt_want_write - get write access to a mount
+ * mnt_want_write - get write access to a mount without freeze protection
  * @mnt: the mount on which to take a write
  *
- * This tells the low-level filesystem that a write is
- * about to be performed to it, and makes sure that
- * writes are allowed before returning success.  When
- * the write operation is finished, mnt_drop_write()
- * must be called.  This is effectively a refcount.
+ * This tells the low-level filesystem that a write is about to be performed to
+ * it, and makes sure that writes are allowed (mnt it read-write) before
+ * returning success. This operation does not protect against filesystem being
+ * frozen. When the write operation is finished, __mnt_drop_write() must be
+ * called. This is effectively a refcount.
  */
-int mnt_want_write(struct vfsmount *mnt)
+int __mnt_want_write(struct vfsmount *mnt)
 {
 	int ret = 0;
 
@@ -279,6 +278,28 @@ int mnt_want_write(struct vfsmount *mnt)
 	}
 out:
 	preempt_enable();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(__mnt_want_write);
+
+/**
+ * mnt_want_write - get write access to a mount
+ * @m: the mount on which to take a write
+ *
+ * This tells the low-level filesystem that a write is about to be performed to
+ * it, and makes sure that writes are allowed (mount is read-write, filesystem
+ * is not frozen) before returning success.  When the write operation is
+ * finished, mnt_drop_write() must be called.  This is effectively a refcount.
+ */
+int mnt_want_write(struct vfsmount *m)
+{
+	int ret;
+
+	sb_start_write(m->mnt_sb);
+	ret = __mnt_want_write(m);
+	if (ret)
+		sb_end_write(m->mnt_sb);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mnt_want_write);
@@ -308,6 +329,23 @@ int mnt_clone_write(struct vfsmount *mnt)
 EXPORT_SYMBOL_GPL(mnt_clone_write);
 
 /**
+ * __mnt_want_write_file - get write access to a file's mount
+ * @file: the file who's mount on which to take a write
+ *
+ * This is like mnt_want_write, but it takes a file and can
+ * do some optimisations if the file is open for write already
+ */
+int __mnt_want_write_file(struct file *file)
+{
+	struct inode *inode = file->f_dentry->d_inode;
+	if (!(file->f_mode & FMODE_WRITE) || special_file(inode->i_mode))
+		return __mnt_want_write(file->f_path.mnt);
+	else
+		return mnt_clone_write(file->f_path.mnt);
+}
+EXPORT_SYMBOL_GPL(__mnt_want_write_file);
+
+/**
  * mnt_want_write_file - get write access to a file's mount
  * @file: the file who's mount on which to take a write
  *
@@ -316,29 +354,58 @@ EXPORT_SYMBOL_GPL(mnt_clone_write);
  */
 int mnt_want_write_file(struct file *file)
 {
-	struct inode *inode = file->f_dentry->d_inode;
-	if (!(file->f_mode & FMODE_WRITE) || special_file(inode->i_mode))
-		return mnt_want_write(file->f_path.mnt);
-	else
-		return mnt_clone_write(file->f_path.mnt);
+	int ret;
+
+	sb_start_write(file->f_path.mnt->mnt_sb);
+	ret = __mnt_want_write_file(file);
+	if (ret)
+		sb_end_write(file->f_path.mnt->mnt_sb);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mnt_want_write_file);
 
 /**
- * mnt_drop_write - give up write access to a mount
+ * __mnt_drop_write - give up write access to a mount
  * @mnt: the mount on which to give up write access
  *
  * Tells the low-level filesystem that we are done
  * performing writes to it.  Must be matched with
- * mnt_want_write() call above.
+ * __mnt_want_write() call above.
  */
-void mnt_drop_write(struct vfsmount *mnt)
+void __mnt_drop_write(struct vfsmount *mnt)
 {
 	preempt_disable();
 	dec_mnt_writers(mnt);
 	preempt_enable();
 }
+EXPORT_SYMBOL_GPL(__mnt_drop_write);
+
+/**
+ * mnt_drop_write - give up write access to a mount
+ * @mnt: the mount on which to give up write access
+ *
+ * Tells the low-level filesystem that we are done performing writes to it and
+ * also allows filesystem to be frozen again.  Must be matched with
+ * mnt_want_write() call above.
+ */
+void mnt_drop_write(struct vfsmount *mnt)
+{
+	__mnt_drop_write(mnt);
+	sb_end_write(mnt->mnt_sb);
+}
 EXPORT_SYMBOL_GPL(mnt_drop_write);
+
+void __mnt_drop_write_file(struct file *file)
+{
+	__mnt_drop_write(file->f_path.mnt);
+}
+EXPORT_SYMBOL(__mnt_drop_write_file);
+
+void mnt_drop_write_file(struct file *file)
+{
+	mnt_drop_write(file->f_path.mnt);
+}
+EXPORT_SYMBOL(mnt_drop_write_file);
 
 static int mnt_make_readonly(struct vfsmount *mnt)
 {
@@ -1119,8 +1186,15 @@ SYSCALL_DEFINE2(umount, char __user *, name, int, flags)
 {
 	struct path path;
 	int retval;
+	int lookup_flags = 0;
 
-	retval = user_path(name, &path);
+	if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+		return -EINVAL;
+
+	if (!(flags & UMOUNT_NOFOLLOW))
+		lookup_flags |= LOOKUP_FOLLOW;
+
+	retval = user_path_mountpoint_at(AT_FDCWD, name, lookup_flags, &path);
 	if (retval)
 		goto out;
 	retval = -EINVAL;
@@ -1170,6 +1244,26 @@ static int mount_is_safe(struct path *path)
 		return -EPERM;
 	return 0;
 #endif
+}
+
+static bool mnt_ns_loop(struct path *path)
+{
+	/* Could bind mounting the mount namespace inode cause a
+	 * mount namespace loop?
+	 */
+	struct inode *inode = path->dentry->d_inode;
+	struct proc_inode *ei;
+	struct mnt_namespace *mnt_ns;
+
+	if (!proc_ns_inode(inode))
+		return false;
+
+	ei = PROC_I(inode);
+	if (ei->ns_ops != &mntns_operations)
+		return false;
+
+	mnt_ns = ei->ns;
+	return current->nsproxy->mnt_ns->seq >= mnt_ns->seq;
 }
 
 struct vfsmount *copy_tree(struct vfsmount *mnt, struct dentry *dentry,
@@ -1456,9 +1550,13 @@ static int do_loopback(struct path *path, char *old_name,
 		return err;
 	if (!old_name || !*old_name)
 		return -EINVAL;
-	err = kern_path(old_name, LOOKUP_FOLLOW, &old_path);
+	err = kern_path(old_name, LOOKUP_FOLLOW|LOOKUP_AUTOMOUNT, &old_path);
 	if (err)
 		return err;
+
+	err = -EINVAL;
+	if (mnt_ns_loop(&old_path))
+		goto out_path;
 
 	down_write(&namespace_sem);
 	err = -EINVAL;
@@ -1488,6 +1586,7 @@ static int do_loopback(struct path *path, char *old_name,
 
 out:
 	up_write(&namespace_sem);
+out_path:
 	path_put(&old_path);
 	return err;
 }
@@ -1528,6 +1627,10 @@ static int do_remount(struct path *path, int flags, int mnt_flags,
 
 	if (path->dentry != path->mnt->mnt_root)
 		return -EINVAL;
+
+	err = security_sb_remount(sb, data);
+	if (err)
+		return err;
 
 	down_write(&sb->s_umount);
 	if (flags & MS_BIND)
@@ -1571,9 +1674,10 @@ static int do_move_mount(struct path *path, char *old_name)
 		return err;
 
 	down_write(&namespace_sem);
-	while (d_mountpoint(path->dentry) &&
-	       follow_down(path))
-		;
+	err = __follow_down(path, true);
+	if (err < 0)
+		goto out;
+
 	err = -EINVAL;
 	if (!check_mnt(path->mnt) || !check_mnt(old_path.mnt))
 		goto out;
@@ -1631,6 +1735,8 @@ out:
 	return err;
 }
 
+static int __do_add_mount(struct vfsmount *, struct path *, int);
+
 /*
  * create a new mount for userspace and request it to be added into the
  * namespace's tree
@@ -1639,6 +1745,7 @@ static int do_new_mount(struct path *path, char *type, int flags,
 			int mnt_flags, char *name, void *data)
 {
 	struct vfsmount *mnt;
+	int err;
 
 	if (!type)
 		return -EINVAL;
@@ -1653,26 +1760,62 @@ static int do_new_mount(struct path *path, char *type, int flags,
 	if (IS_ERR(mnt))
 		return PTR_ERR(mnt);
 
-	return do_add_mount(mnt, path, mnt_flags, NULL);
+	err = __do_add_mount(mnt, path, mnt_flags);
+	if (err)
+		mntput(mnt);
+	return err;
+}
+
+int finish_automount(struct vfsmount *m, struct path *path)
+{
+	int err;
+	/* The new mount record should have at least 2 refs to prevent it being
+	 * expired before we get a chance to add it
+	 */
+	BUG_ON(atomic_read(&m->mnt_count) < 2);
+
+	if (m->mnt_sb == path->mnt->mnt_sb &&
+	    m->mnt_root == path->dentry) {
+		err = -ELOOP;
+		goto fail;
+	}
+
+	err = __do_add_mount(m, path, path->mnt->mnt_flags | MNT_SHRINKABLE);
+	if (!err)
+		return 0;
+fail:
+	/* remove m from any expiration list it may be on */
+	if (!list_empty(&m->mnt_expire)) {
+		down_write(&namespace_sem);
+		spin_lock(&vfsmount_lock);
+		list_del_init(&m->mnt_expire);
+		spin_unlock(&vfsmount_lock);
+		up_write(&namespace_sem);
+	}
+	mntput(m);
+	mntput(m);
+	return err;
 }
 
 /*
  * add a mount into a namespace's mount tree
- * - provide the option of adding the new mount to an expiration list
  */
-int do_add_mount(struct vfsmount *newmnt, struct path *path,
-		 int mnt_flags, struct list_head *fslist)
+static int do_add_mount_unlocked(struct vfsmount *newmnt, struct path *path, int mnt_flags)
 {
 	int err;
 
-	down_write(&namespace_sem);
 	/* Something was mounted here while we slept */
-	while (d_mountpoint(path->dentry) &&
-	       follow_down(path))
-		;
+	err = __follow_down(path, true);
+	if (err < 0)
+		goto unlock;
+
 	err = -EINVAL;
 	if (!(mnt_flags & MNT_SHRINKABLE) && !check_mnt(path->mnt))
 		goto unlock;
+
+        /* and in any case, we want non-NULL ->mnt_ns */
+        if (!path->mnt->mnt_ns)
+                goto unlock;
 
 	/* Refuse the same filesystem on the same mount point */
 	err = -EBUSY;
@@ -1685,22 +1828,59 @@ int do_add_mount(struct vfsmount *newmnt, struct path *path,
 		goto unlock;
 
 	newmnt->mnt_flags = mnt_flags;
-	if ((err = graft_tree(newmnt, path)))
-		goto unlock;
-
-	if (fslist) /* add to the specified expiration list */
-		list_add_tail(&newmnt->mnt_expire, fslist);
-
-	up_write(&namespace_sem);
-	return 0;
+	err = graft_tree(newmnt, path);
 
 unlock:
-	up_write(&namespace_sem);
-	mntput(newmnt);
 	return err;
 }
 
+/*
+ * add a mount into a namespace's mount tree
+ */
+static int __do_add_mount(struct vfsmount *newmnt, struct path *path, int mnt_flags)
+{
+	int err;
+
+	down_write(&namespace_sem);
+	err = do_add_mount_unlocked(newmnt, path, mnt_flags);
+	up_write(&namespace_sem);
+	return err;
+}
+
+int do_add_mount(struct vfsmount *newmnt, struct path *path,
+		 int mnt_flags, struct list_head *fslist)
+{
+	int err;
+
+	down_write(&namespace_sem);
+	err = do_add_mount_unlocked(newmnt, path, mnt_flags);
+	if (!err) {
+		if (fslist) /* add to the specified expiration list */
+			list_add_tail(&newmnt->mnt_expire, fslist);
+	}
+	up_write(&namespace_sem);
+	if (err)
+		mntput(newmnt);
+	return err;
+}
 EXPORT_SYMBOL_GPL(do_add_mount);
+
+/**
+ * mnt_set_expiry - Put a mount on an expiration list
+ * @mnt: The mount to list.
+ * @expiry_list: The list to add the mount to.
+ */
+void mnt_set_expiry(struct vfsmount *mnt, struct list_head *expiry_list)
+{
+	down_write(&namespace_sem);
+	spin_lock(&vfsmount_lock);
+
+	list_add_tail(&mnt->mnt_expire, expiry_list);
+
+	spin_unlock(&vfsmount_lock);
+	up_write(&namespace_sem);
+}
+EXPORT_SYMBOL(mnt_set_expiry);
 
 /*
  * process a list of expirable mountpoints with the intent of discarding any
@@ -1902,7 +2082,7 @@ int copy_mount_string(const void __user *data, char **where)
  * Therefore, if this magic number is present, it carries no information
  * and must be discarded.
  */
-long do_mount(char *dev_name, char *dir_name, char *type_page,
+long do_mount(char *dev_name, const char *dir_name, char *type_page,
 		  unsigned long flags, void *data_page)
 {
 	struct path path;
@@ -1941,7 +2121,7 @@ long do_mount(char *dev_name, char *dir_name, char *type_page,
 	if (flags & MS_RDONLY)
 		mnt_flags |= MNT_READONLY;
 
-	flags &= ~(MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_ACTIVE |
+	flags &= ~(MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_ACTIVE | MS_BORN |
 		   MS_NOATIME | MS_NODIRATIME | MS_RELATIME| MS_KERNMOUNT |
 		   MS_STRICTATIME);
 
@@ -1972,13 +2152,35 @@ dput_out:
 	return retval;
 }
 
+static void free_mnt_ns(struct mnt_namespace *ns)
+{
+	proc_free_inum(ns->proc_inum);
+	kfree(ns);
+}
+
+/*
+ * Assign a sequence number so we can detect when we attempt to bind
+ * mount a reference to an older mount namespace into the current
+ * mount namespace, preventing reference counting loops.  A 64bit
+ * number incrementing at 10Ghz will take 12,427 years to wrap which
+ * is effectively never, so we can ignore the possibility.
+ */
+static atomic64_t mnt_ns_seq = ATOMIC64_INIT(1);
+
 static struct mnt_namespace *alloc_mnt_ns(void)
 {
 	struct mnt_namespace *new_ns;
+	int ret;
 
 	new_ns = kmalloc(sizeof(struct mnt_namespace), GFP_KERNEL);
 	if (!new_ns)
 		return ERR_PTR(-ENOMEM);
+	ret = proc_alloc_inum(&new_ns->proc_inum);
+	if (ret) {
+		kfree(new_ns);
+		return ERR_PTR(ret);
+	}
+	new_ns->seq = atomic64_add_return(1, &mnt_ns_seq);
 	atomic_set(&new_ns->count, 1);
 	new_ns->root = NULL;
 	INIT_LIST_HEAD(&new_ns->list);
@@ -2008,7 +2210,7 @@ static struct mnt_namespace *dup_mnt_ns(struct mnt_namespace *mnt_ns,
 					CL_COPY_ALL | CL_EXPIRE);
 	if (!new_ns->root) {
 		up_write(&namespace_sem);
-		kfree(new_ns);
+		free_mnt_ns(mnt_ns);
 		return ERR_PTR(-ENOMEM);
 	}
 	spin_lock(&vfsmount_lock);
@@ -2087,7 +2289,7 @@ SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
 {
 	int ret;
 	char *kernel_type;
-	char *kernel_dir;
+	struct filename *kernel_dir;
 	char *kernel_dev;
 	unsigned long data_page;
 
@@ -2109,7 +2311,7 @@ SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
 	if (ret < 0)
 		goto out_data;
 
-	ret = do_mount(kernel_dev, kernel_dir, kernel_type, flags,
+	ret = do_mount(kernel_dev, kernel_dir->name, kernel_type, flags,
 		(void *) data_page);
 
 	free_page(data_page);
@@ -2320,6 +2522,73 @@ void put_mnt_ns(struct mnt_namespace *ns)
 	spin_unlock(&vfsmount_lock);
 	up_write(&namespace_sem);
 	release_mounts(&umount_list);
-	kfree(ns);
+	free_mnt_ns(ns);
 }
 EXPORT_SYMBOL(put_mnt_ns);
+
+static void *mntns_get(struct task_struct *task)
+{
+	struct mnt_namespace *ns = NULL;
+	struct nsproxy *nsproxy;
+
+	rcu_read_lock();
+	nsproxy = task_nsproxy(task);
+	if (nsproxy) {
+		ns = nsproxy->mnt_ns;
+		get_mnt_ns(ns);
+	}
+	rcu_read_unlock();
+
+	return ns;
+}
+
+static void mntns_put(void *ns)
+{
+	put_mnt_ns(ns);
+}
+
+static int mntns_install(struct nsproxy *nsproxy, void *ns)
+{
+	struct fs_struct *fs = current->fs;
+	struct mnt_namespace *mnt_ns = ns;
+	struct path root;
+
+	if (!capable(CAP_SYS_ADMIN) || !capable(CAP_SYS_CHROOT))
+		return -EINVAL;
+
+	if (fs->users != 1)
+		return -EINVAL;
+
+	get_mnt_ns(mnt_ns);
+	put_mnt_ns(nsproxy->mnt_ns);
+	nsproxy->mnt_ns = mnt_ns;
+
+	/* Find the root */
+	root.mnt    = mnt_ns->root;
+	root.dentry = mnt_ns->root->mnt_root;
+	path_get(&root);
+	while(d_mountpoint(root.dentry) && follow_down(&root))
+		;
+
+	/* Update the pwd and root */
+	set_fs_pwd(fs, &root);
+	set_fs_root(fs, &root);
+
+	path_put(&root);
+	return 0;
+}
+
+static unsigned int mntns_inum(void *ns)
+{
+	struct mnt_namespace *mnt_ns = ns;
+	return mnt_ns->proc_inum;
+}
+
+const struct proc_ns_operations mntns_operations = {
+	.name		= "mnt",
+	.type		= CLONE_NEWNS,
+	.get		= mntns_get,
+	.put		= mntns_put,
+	.install	= mntns_install,
+	.inum		= mntns_inum,
+};

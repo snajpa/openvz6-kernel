@@ -10,9 +10,101 @@
 #include <linux/module.h>
 #include <linux/socket.h>
 #include <linux/netdevice.h>
+#include <linux/vmalloc.h>
 #include <linux/init.h>
 #include <net/ip.h>
 #include <net/sock.h>
+#include <net/busy_poll.h>
+#include <net/pkt_sched.h>
+
+static int rps_sock_flow_sysctl(ctl_table *table, int write,
+				void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	unsigned int orig_size, size;
+	int ret, i;
+	ctl_table tmp = {
+		.data = &size,
+		.maxlen = sizeof(size),
+		.mode = table->mode
+	};
+	struct rps_sock_flow_table *orig_sock_table, *sock_table;
+	static DEFINE_MUTEX(sock_flow_mutex);
+
+	mutex_lock(&sock_flow_mutex);
+
+	orig_sock_table = rps_sock_flow_table;
+	size = orig_size = orig_sock_table ? orig_sock_table->mask + 1 : 0;
+
+	ret = proc_dointvec(&tmp, write, buffer, lenp, ppos);
+
+	if (write) {
+		if (size) {
+			if (size > 1<<30) {
+				/* Enforce limit to prevent overflow */
+				mutex_unlock(&sock_flow_mutex);
+				return -EINVAL;
+			}
+			size = roundup_pow_of_two(size);
+			if (size != orig_size) {
+				sock_table =
+				    vmalloc(RPS_SOCK_FLOW_TABLE_SIZE(size));
+				if (!sock_table) {
+					mutex_unlock(&sock_flow_mutex);
+					return -ENOMEM;
+				}
+
+				sock_table->mask = size - 1;
+			} else
+				sock_table = orig_sock_table;
+
+			for (i = 0; i < size; i++)
+				sock_table->ents[i] = RPS_NO_CPU;
+		} else
+			sock_table = NULL;
+
+		if (sock_table != orig_sock_table) {
+			rcu_assign_pointer(rps_sock_flow_table, sock_table);
+			synchronize_rcu();
+			vfree(orig_sock_table);
+		}
+	}
+
+	mutex_unlock(&sock_flow_mutex);
+
+	return ret;
+}
+
+static int proc_do_rss_key(struct ctl_table *table, int write,
+			   void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table fake_table;
+	char buf[NETDEV_RSS_KEY_LEN * 3];
+
+	snprintf(buf, sizeof(buf), "%*phC", NETDEV_RSS_KEY_LEN, netdev_rss_key);
+	fake_table.data = buf;
+	fake_table.maxlen = sizeof(buf);
+	return proc_dostring(&fake_table, write, buffer, lenp, ppos);
+}
+
+#ifdef CONFIG_NET_SCHED
+static int set_default_qdisc(struct ctl_table *table, int write,
+			     void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	char id[IFNAMSIZ];
+	struct ctl_table tbl = {
+		.data = id,
+		.maxlen = IFNAMSIZ,
+	};
+	int ret;
+
+	qdisc_get_default(id, IFNAMSIZ);
+
+	ret = proc_dostring(&tbl, write, buffer, lenp, ppos);
+	if (write && ret == 0)
+		ret = qdisc_set_default(id);
+	return ret;
+}
+#endif
 
 static struct ctl_table net_core_table[] = {
 #ifdef CONFIG_NET
@@ -65,6 +157,13 @@ static struct ctl_table net_core_table[] = {
 		.proc_handler	= proc_dointvec
 	},
 	{
+		.procname	= "netdev_rss_key",
+		.data		= &netdev_rss_key,
+		.maxlen		= sizeof(int),
+		.mode		= 0444,
+		.proc_handler	= proc_do_rss_key,
+	},
+	{
 		.ctl_name	= NET_CORE_MSG_COST,
 		.procname	= "message_cost",
 		.data		= &net_ratelimit_state.interval,
@@ -89,6 +188,36 @@ static struct ctl_table net_core_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec
 	},
+	{
+		.procname	= "rps_sock_flow_entries",
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= rps_sock_flow_sysctl
+	},
+#ifdef CONFIG_NET_RX_BUSY_POLL
+	{
+		.procname	= "busy_poll",
+		.data		= &sysctl_net_busy_poll,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec
+	},
+	{
+		.procname	= "busy_read",
+		.data		= &sysctl_net_busy_read,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec
+	},
+#endif
+#ifdef CONFIG_NET_SCHED
+	{
+		.procname	= "default_qdisc",
+		.mode		= 0644,
+		.maxlen		= IFNAMSIZ,
+		.proc_handler	= set_default_qdisc
+	},
+#endif
 #endif /* CONFIG_NET */
 	{
 		.ctl_name	= NET_CORE_BUDGET,

@@ -372,7 +372,7 @@ static int __init pcibios_init(void)
 
 	printk(KERN_INFO "PCI: Probing PCI hardware\n");
 
-	if (ppc_pci_flags & PPC_PCI_REASSIGN_ALL_BUS)
+	if (pci_has_flag(PCI_REASSIGN_ALL_BUS))
 		pci_assign_all_buses = 1;
 
 	/* Scan all of the recorded PCI controllers.  */
@@ -436,7 +436,7 @@ long sys_pciconfig_iobase(long which, unsigned long bus, unsigned long devfn)
 	case IOBASE_BRIDGE_NUMBER:
 		return (long)hose->first_busno;
 	case IOBASE_MEMORY:
-		return (long)hose->pci_mem_offset;
+		return (long)hose->mem_offset[0];
 	case IOBASE_IO:
 		return (long)hose->io_base_phys;
 	case IOBASE_ISA_IO:

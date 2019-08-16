@@ -26,6 +26,9 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+#define KMSG_COMPONENT "zcrypt"
+#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/err.h>
@@ -80,7 +83,6 @@ static void zcrypt_pcicc_receive(struct ap_device *, struct ap_message *,
 static struct ap_driver zcrypt_pcicc_driver = {
 	.probe = zcrypt_pcicc_probe,
 	.remove = zcrypt_pcicc_remove,
-	.receive = zcrypt_pcicc_receive,
 	.ids = zcrypt_pcicc_ids,
 	.request_timeout = PCICC_CLEANUP_TIME,
 };
@@ -373,7 +375,14 @@ static int convert_type86(struct zcrypt_device *zdev,
 			zdev->max_mod_size = PCICC_MAX_MOD_SIZE_OLD;
 			return -EAGAIN;
 		}
+		if (service_rc == 8 && service_rs == 72)
+			return -EINVAL;
 		zdev->online = 0;
+		pr_err("Cryptographic device %x failed and was set offline\n",
+		       zdev->ap_dev->qid);
+		ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%drc%d",
+			       zdev->ap_dev->qid, zdev->online,
+			       msg->hdr.reply_code);
 		return -EAGAIN;	/* repeat the request on a different device. */
 	}
 	data = msg->text;
@@ -427,6 +436,10 @@ static int convert_response(struct zcrypt_device *zdev,
 		/* no break, incorrect cprb version is an unknown response */
 	default: /* Unknown response type, this should NEVER EVER happen */
 		zdev->online = 0;
+		pr_err("Cryptographic device %x failed and was set offline\n",
+		       zdev->ap_dev->qid);
+		ZCRYPT_DBF_DEV(DBF_ERR, zdev, "dev%04xo%dfail",
+			       zdev->ap_dev->qid, zdev->online);
 		return -EAGAIN;	/* repeat the request on a different device. */
 	}
 }
@@ -483,9 +496,11 @@ static long zcrypt_pcicc_modexpo(struct zcrypt_device *zdev,
 	struct completion work;
 	int rc;
 
+	ap_init_message(&ap_msg);
 	ap_msg.message = (void *) get_zeroed_page(GFP_KERNEL);
 	if (!ap_msg.message)
 		return -ENOMEM;
+	ap_msg.receive = zcrypt_pcicc_receive;
 	ap_msg.length = PAGE_SIZE;
 	ap_msg.psmid = (((unsigned long long) current->pid) << 32) +
 				atomic_inc_return(&zcrypt_step);
@@ -521,9 +536,11 @@ static long zcrypt_pcicc_modexpo_crt(struct zcrypt_device *zdev,
 	struct completion work;
 	int rc;
 
+	ap_init_message(&ap_msg);
 	ap_msg.message = (void *) get_zeroed_page(GFP_KERNEL);
 	if (!ap_msg.message)
 		return -ENOMEM;
+	ap_msg.receive = zcrypt_pcicc_receive;
 	ap_msg.length = PAGE_SIZE;
 	ap_msg.psmid = (((unsigned long long) current->pid) << 32) +
 				atomic_inc_return(&zcrypt_step);
@@ -574,6 +591,7 @@ static int zcrypt_pcicc_probe(struct ap_device *ap_dev)
 	zdev->min_mod_size = PCICC_MIN_MOD_SIZE;
 	zdev->max_mod_size = PCICC_MAX_MOD_SIZE;
 	zdev->speed_rating = PCICC_SPEED_RATING;
+	zdev->max_exp_bit_length = PCICC_MAX_MOD_SIZE;
 	ap_dev->reply = &zdev->reply;
 	ap_dev->private = zdev;
 	rc = zcrypt_device_register(zdev);

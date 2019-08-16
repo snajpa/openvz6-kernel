@@ -125,6 +125,22 @@ static struct xfrm_algo_desc aead_list[] = {
 		.sadb_alg_maxbits = 256
 	}
 },
+{
+	.name = "rfc4543(gcm(aes))",
+
+	.uinfo = {
+		.aead = {
+			.icv_truncbits = 128,
+		}
+	},
+
+	.desc = {
+		.sadb_alg_id = SADB_X_EALG_NULL_AES_GMAC,
+		.sadb_alg_ivlen = 8,
+		.sadb_alg_minbits = 128,
+		.sadb_alg_maxbits = 256
+	}
+},
 };
 
 static struct xfrm_algo_desc aalg_list[] = {
@@ -197,6 +213,40 @@ static struct xfrm_algo_desc aalg_list[] = {
 		.sadb_alg_ivlen = 0,
 		.sadb_alg_minbits = 256,
 		.sadb_alg_maxbits = 256
+	}
+},
+{
+	.name = "hmac(sha384)",
+
+	.uinfo = {
+		.auth = {
+			.icv_truncbits = 192,
+			.icv_fullbits = 384,
+		}
+	},
+
+	.desc = {
+		.sadb_alg_id = SADB_X_AALG_SHA2_384HMAC,
+		.sadb_alg_ivlen = 0,
+		.sadb_alg_minbits = 384,
+		.sadb_alg_maxbits = 384
+	}
+},
+{
+	.name = "hmac(sha512)",
+
+	.uinfo = {
+		.auth = {
+			.icv_truncbits = 256,
+			.icv_fullbits = 512,
+		}
+	},
+
+	.desc = {
+		.sadb_alg_id = SADB_X_AALG_SHA2_512HMAC,
+		.sadb_alg_ivlen = 0,
+		.sadb_alg_minbits = 512,
+		.sadb_alg_maxbits = 512
 	}
 },
 {
@@ -652,8 +702,7 @@ void xfrm_probe_algs(void)
 	}
 
 	for (i = 0; i < ealg_entries(); i++) {
-		status = crypto_has_blkcipher(ealg_list[i].name, 0,
-					      CRYPTO_ALG_ASYNC);
+		status = crypto_has_ablkcipher(ealg_list[i].name, 0, 0);
 		if (ealg_list[i].available != status)
 			ealg_list[i].available = status;
 	}

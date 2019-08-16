@@ -19,6 +19,7 @@
 #include <linux/stddef.h>
 #include <linux/personality.h>
 #include <linux/uaccess.h>
+#include <linux/user-return-notifier.h>
 
 #include <asm/processor.h>
 #include <asm/ucontext.h>
@@ -750,6 +751,27 @@ handle_signal(unsigned long sig, siginfo_t *info, struct k_sigaction *ka,
 	 */
 	regs->flags &= ~X86_EFLAGS_TF;
 
+	/*
+	 * Ensure the signal handler starts with the new fpu state.
+	 *
+	 * TS_USEDFPU was already cleared and X86_CR0_TS was already set by
+	 * save_i387_xstate(), it seems that we could just clear_used_math()
+	 * to trigger fpu_init() in math_state_restore() paths.
+	 *
+	 * However at this point we can own FPU again due to "preload_fpu"
+	 * logic in __switch_to(). So we need clear_fpu() to do this again.
+	 */
+	if (used_math()) {
+		/*
+		 * This doesn't look good without preempt_disable(), but RHEL6
+		 * doesn't use CONFIG_PREEMPT and "fpu_counter = 0" should help
+		 * anyway.
+		 */
+		current->fpu_counter = 0;
+		clear_fpu(current);
+		clear_used_math();
+	}
+
 	spin_lock_irq(&current->sighand->siglock);
 	sigorsets(&current->blocked, &current->blocked, &ka->sa.sa_mask);
 	if (!(ka->sa.sa_flags & SA_NODEFER))
@@ -872,6 +894,8 @@ do_notify_resume(struct pt_regs *regs, void *unused, __u32 thread_info_flags)
 		if (current->replacement_session_keyring)
 			key_replace_session_keyring();
 	}
+	if (thread_info_flags & _TIF_USER_RETURN_NOTIFY)
+		fire_user_return_notifiers();
 
 #ifdef CONFIG_X86_32
 	clear_thread_flag(TIF_IRET);

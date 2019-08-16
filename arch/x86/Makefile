@@ -95,8 +95,12 @@ sp-$(CONFIG_X86_64) := rsp
 cfi := $(call as-instr,.cfi_startproc\n.cfi_rel_offset $(sp-y)$(comma)0\n.cfi_endproc,-DCONFIG_AS_CFI=1)
 # is .cfi_signal_frame supported too?
 cfi-sigframe := $(call as-instr,.cfi_startproc\n.cfi_signal_frame\n.cfi_endproc,-DCONFIG_AS_CFI_SIGNAL_FRAME=1)
-KBUILD_AFLAGS += $(cfi) $(cfi-sigframe)
-KBUILD_CFLAGS += $(cfi) $(cfi-sigframe)
+cfi-sections := $(call as-instr,.cfi_sections .debug_frame,-DCONFIG_AS_CFI_SECTIONS=1)
+
+avx_instr := $(call as-instr,vxorps %ymm0$(comma)%ymm1$(comma)%ymm2,-DCONFIG_AS_AVX=1)
+
+KBUILD_AFLAGS += $(cfi) $(cfi-sigframe) $(cfi-sections) $(avx_instr)
+KBUILD_CFLAGS += $(cfi) $(cfi-sigframe) $(cfi-sections) $(avx_instr)
 
 LDFLAGS := -m elf_$(UTS_MACHINE)
 
@@ -111,6 +115,23 @@ KBUILD_CFLAGS += $(call cc-option,-mno-sse -mno-mmx -mno-sse2 -mno-3dnow,)
 
 KBUILD_CFLAGS += $(mflags-y)
 KBUILD_AFLAGS += $(mflags-y)
+
+# Avoid indirect branches in kernel to deal with Spectre
+ifdef CONFIG_RETPOLINE
+    RETPOLINE_CFLAGS += $(call cc-option,-mindirect-branch=thunk-extern -mindirect-branch-register)
+    ifneq ($(RETPOLINE_CFLAGS),)
+        KBUILD_CFLAGS += $(RETPOLINE_CFLAGS) -DRETPOLINE
+    else
+        # Fail brew build, but let other users proceed with warning
+        RETPOLINE_MSG := CONFIG_RETPOLINE=y, but not supported by the compiler. Compiler update recommended.
+        KBUILD_USER := $(shell id -un)
+        ifeq ($(KBUILD_USER), mockbuild)
+            $(error $(RETPOLINE_MSG))
+        else
+            $(warning $(RETPOLINE_MSG))
+        endif
+    endif
+endif
 
 ###
 # Kernel objects
@@ -135,9 +156,7 @@ drivers-$(CONFIG_OPROFILE) += arch/x86/oprofile/
 # suspend and hibernation support
 drivers-$(CONFIG_PM) += arch/x86/power/
 
-ifeq ($(CONFIG_X86_32),y)
 drivers-$(CONFIG_FB) += arch/x86/video/
-endif
 
 ####
 # boot loader support. Several targets are kept for legacy purposes
@@ -155,6 +174,9 @@ all: bzImage
 KBUILD_IMAGE := $(boot)/bzImage
 
 bzImage: vmlinux
+ifeq ($(CONFIG_X86_DECODER_SELFTEST),y)
+	$(Q)$(MAKE) $(build)=arch/x86/tools posttest
+endif
 	$(Q)$(MAKE) $(build)=$(boot) $(KBUILD_IMAGE)
 	$(Q)mkdir -p $(objtree)/arch/$(UTS_MACHINE)/boot
 	$(Q)ln -fsn ../../x86/boot/bzImage $(objtree)/arch/$(UTS_MACHINE)/boot/$@

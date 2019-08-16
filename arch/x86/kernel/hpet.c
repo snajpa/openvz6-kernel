@@ -9,6 +9,7 @@
 #include <linux/cpu.h>
 #include <linux/pm.h>
 #include <linux/io.h>
+#include <linux/kaiser.h>
 
 #include <asm/fixmap.h>
 #include <asm/i8253.h>
@@ -27,12 +28,18 @@
 #define HPET_DEV_FSB_CAP		0x1000
 #define HPET_DEV_PERI_CAP		0x2000
 
+#define HPET_MIN_CYCLES			128
+#define HPET_MIN_PROG_DELTA		(HPET_MIN_CYCLES + (HPET_MIN_CYCLES >> 1))
+
 #define EVT_TO_HPET_DEV(evt) container_of(evt, struct hpet_dev, evt)
 
 /*
  * HPET address is set in acpi/boot.c, when an ACPI entry exists
  */
 unsigned long				hpet_address;
+u8					hpet_blockid; /* OS timer block num */
+u8					hpet_msi_disable;
+
 #ifdef CONFIG_PCI_MSI
 static unsigned long			hpet_num_timers;
 #endif
@@ -66,6 +73,8 @@ static inline void hpet_set_mapping(void)
 	hpet_virt_address = ioremap_nocache(hpet_address, HPET_MMAP_SIZE);
 #ifdef CONFIG_X86_64
 	__set_fixmap(VSYSCALL_HPET, hpet_address, PAGE_KERNEL_VSYSCALL_NOCACHE);
+	kaiser_add_mapping(__fix_to_virt(VSYSCALL_HPET), PAGE_SIZE,
+			   __PAGE_KERNEL_VSYSCALL_NOCACHE | _PAGE_GLOBAL);
 #endif
 }
 
@@ -296,9 +305,9 @@ static void hpet_legacy_clockevent_register(void)
 	/* Calculate the min / max delta */
 	hpet_clockevent.max_delta_ns = clockevent_delta2ns(0x7FFFFFFF,
 							   &hpet_clockevent);
-	/* 5 usec minimum reprogramming delta. */
-	hpet_clockevent.min_delta_ns = 5000;
-
+	/* Setup minimum reprogramming delta. */
+	hpet_clockevent.min_delta_ns = clockevent_delta2ns(HPET_MIN_PROG_DELTA,
+							   &hpet_clockevent);
 	/*
 	 * Start hpet with the boot cpu mask and make it
 	 * global after the IO_APIC has been initialized.
@@ -377,19 +386,37 @@ static int hpet_next_event(unsigned long delta,
 			   struct clock_event_device *evt, int timer)
 {
 	u32 cnt;
+	s32 res;
 
 	cnt = hpet_readl(HPET_COUNTER);
 	cnt += (u32) delta;
 	hpet_writel(cnt, HPET_Tn_CMP(timer));
 
 	/*
-	 * We need to read back the CMP register to make sure that
-	 * what we wrote hit the chip before we compare it to the
-	 * counter.
+	 * HPETs are a complete disaster. The compare register is
+	 * based on a equal comparison and neither provides a less
+	 * than or equal functionality (which would require to take
+	 * the wraparound into account) nor a simple count down event
+	 * mode. Further the write to the comparator register is
+	 * delayed internally up to two HPET clock cycles in certain
+	 * chipsets (ATI, ICH9,10). Some newer AMD chipsets have even
+	 * longer delays. We worked around that by reading back the
+	 * compare register, but that required another workaround for
+	 * ICH9,10 chips where the first readout after write can
+	 * return the old stale value. We already had a minimum
+	 * programming delta of 5us enforced, but a NMI or SMI hitting
+	 * between the counter readout and the comparator write can
+	 * move us behind that point easily. Now instead of reading
+	 * the compare register back several times, we make the ETIME
+	 * decision based on the following: Return ETIME if the
+	 * counter value after the write is less than HPET_MIN_CYCLES
+	 * away from the event or if the counter is already ahead of
+	 * the event. The minimum programming delta for the generic
+	 * clockevents code is set to 1.5 * HPET_MIN_CYCLES.
 	 */
-	WARN_ON_ONCE((u32)hpet_readl(HPET_Tn_CMP(timer)) != cnt);
+	res = (s32)(cnt - (u32)hpet_readl(HPET_COUNTER));
 
-	return (s32)((u32)hpet_readl(HPET_COUNTER) - cnt) >= 0 ? -ETIME : 0;
+	return res < HPET_MIN_CYCLES ? -ETIME : 0;
 }
 
 static void hpet_legacy_set_mode(enum clock_event_mode mode,
@@ -467,7 +494,7 @@ static int hpet_msi_next_event(unsigned long delta,
 
 static int hpet_setup_msi_irq(unsigned int irq)
 {
-	if (arch_setup_hpet_msi(irq)) {
+	if (arch_setup_hpet_msi(irq, hpet_blockid)) {
 		destroy_irq(irq);
 		return -EINVAL;
 	}
@@ -478,7 +505,7 @@ static int hpet_assign_irq(struct hpet_dev *dev)
 {
 	unsigned int irq;
 
-	irq = create_irq();
+	irq = create_irq_nr(0, -1);
 	if (!irq)
 		return -EINVAL;
 
@@ -563,8 +590,8 @@ static void init_one_hpet_msi_clockevent(struct hpet_dev *hdev, int cpu)
 				      NSEC_PER_SEC, evt->shift);
 	/* Calculate the max delta */
 	evt->max_delta_ns = clockevent_delta2ns(0x7FFFFFFF, evt);
-	/* 5 usec minimum reprogramming delta. */
-	evt->min_delta_ns = 5000;
+	/* Setup minimum reprogramming delta. */
+	evt->min_delta_ns = clockevent_delta2ns(HPET_MIN_PROG_DELTA, evt);
 
 	evt->cpumask = cpumask_of(hdev->cpu);
 	clockevents_register_device(evt);
@@ -583,6 +610,9 @@ static void hpet_msi_capability_lookup(unsigned int start_timer)
 	unsigned int num_timers;
 	unsigned int num_timers_used = 0;
 	int i;
+
+	if (hpet_msi_disable)
+		return;
 
 	id = hpet_readl(HPET_ID);
 
@@ -872,10 +902,8 @@ int __init hpet_enable(void)
 
 	if (id & HPET_ID_LEGSUP) {
 		hpet_legacy_clockevent_register();
-		hpet_msi_capability_lookup(2);
 		return 1;
 	}
-	hpet_msi_capability_lookup(0);
 	return 0;
 
 out_nohpet:
@@ -908,8 +936,16 @@ static __init int hpet_late_init(void)
 	if (!hpet_virt_address)
 		return -ENODEV;
 
+	if (hpet_readl(HPET_ID) & HPET_ID_LEGSUP)
+		hpet_msi_capability_lookup(2);
+	else
+		hpet_msi_capability_lookup(0);
+
 	hpet_reserve_platform_timers(hpet_readl(HPET_ID));
 	hpet_print_config();
+
+	if (hpet_msi_disable)
+		return 0;
 
 	for_each_online_cpu(cpu) {
 		hpet_cpuhp_notify(NULL, CPU_ONLINE, (void *)(long)cpu);
@@ -924,16 +960,18 @@ fs_initcall(hpet_late_init);
 
 void hpet_disable(void)
 {
-	if (is_hpet_capable()) {
-		unsigned long cfg = hpet_readl(HPET_CFG);
+	unsigned long cfg;
 
-		if (hpet_legacy_int_enabled) {
-			cfg &= ~HPET_CFG_LEGACY;
-			hpet_legacy_int_enabled = 0;
-		}
-		cfg &= ~HPET_CFG_ENABLE;
-		hpet_writel(cfg, HPET_CFG);
+	if (!is_hpet_capable() || !hpet_address || !hpet_virt_address)
+		return;
+
+	cfg = hpet_readl(HPET_CFG);
+	if (hpet_legacy_int_enabled) {
+		cfg &= ~HPET_CFG_LEGACY;
+		hpet_legacy_int_enabled = 0;
 	}
+	cfg &= ~HPET_CFG_ENABLE;
+	hpet_writel(cfg, HPET_CFG);
 }
 
 #ifdef CONFIG_HPET_EMULATE_RTC
@@ -1052,6 +1090,14 @@ int hpet_rtc_timer_init(void)
 }
 EXPORT_SYMBOL_GPL(hpet_rtc_timer_init);
 
+static void hpet_disable_rtc_channel(void)
+{
+	unsigned long cfg;
+	cfg = hpet_readl(HPET_T1_CFG);
+	cfg &= ~HPET_TN_ENABLE;
+	hpet_writel(cfg, HPET_T1_CFG);
+}
+
 /*
  * The functions below are called from rtc driver.
  * Return 0 if HPET is not being used.
@@ -1063,6 +1109,9 @@ int hpet_mask_rtc_irq_bit(unsigned long bit_mask)
 		return 0;
 
 	hpet_rtc_flags &= ~bit_mask;
+	if (unlikely(!hpet_rtc_flags))
+		hpet_disable_rtc_channel();
+
 	return 1;
 }
 EXPORT_SYMBOL_GPL(hpet_mask_rtc_irq_bit);
@@ -1127,15 +1176,11 @@ EXPORT_SYMBOL_GPL(hpet_rtc_dropped_irq);
 
 static void hpet_rtc_timer_reinit(void)
 {
-	unsigned long cfg, delta;
+	unsigned long delta;
 	int lost_ints = -1;
 
-	if (unlikely(!hpet_rtc_flags)) {
-		cfg = hpet_readl(HPET_T1_CFG);
-		cfg &= ~HPET_TN_ENABLE;
-		hpet_writel(cfg, HPET_T1_CFG);
-		return;
-	}
+	if (unlikely(!hpet_rtc_flags))
+		hpet_disable_rtc_channel();
 
 	if (!(hpet_rtc_flags & RTC_PIE) || hpet_pie_limit)
 		delta = hpet_default_delta;

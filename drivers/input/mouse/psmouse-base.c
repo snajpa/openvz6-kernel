@@ -405,6 +405,20 @@ int psmouse_reset(struct psmouse *psmouse)
 	return 0;
 }
 
+/*
+ * psmouse_matches_pnp_id - check if psmouse matches one of the passed in ids.
+ */
+bool psmouse_matches_pnp_id(struct psmouse *psmouse, const char * const ids[])
+{
+	int i;
+
+	if (!strncmp(psmouse->ps2dev.serio->firmware_id, "PNP:", 4))
+		for (i = 0; ids[i]; i++)
+			if (strstr(psmouse->ps2dev.serio->firmware_id, ids[i]))
+				return true;
+
+	return false;
+}
 
 /*
  * Genius NetMouse magic init.
@@ -611,8 +625,15 @@ static int psmouse_extensions(struct psmouse *psmouse,
 		synaptics_hardware = true;
 
 		if (max_proto > PSMOUSE_IMEX) {
-			if (!set_properties || synaptics_init(psmouse) == 0)
+/*
+ * Try activating protocol, but check if support is enabled first, since
+ * we try detecting Synaptics even when protocol is disabled.
+ */
+			if (synaptics_supported() &&
+			    (!set_properties || synaptics_init(psmouse) == 0)) {
 				return PSMOUSE_SYNAPTICS;
+			}
+
 /*
  * Some Synaptics touchpads can emulate extended protocols (like IMPS/2).
  * Unfortunately Logitech/Genius probes confuse some firmware versions so
@@ -667,19 +688,6 @@ static int psmouse_extensions(struct psmouse *psmouse,
 		max_proto = PSMOUSE_IMEX;
 	}
 
-/*
- * Try Finger Sensing Pad
- */
-	if (max_proto > PSMOUSE_IMEX) {
-		if (fsp_detect(psmouse, set_properties) == 0) {
-			if (!set_properties || fsp_init(psmouse) == 0)
-				return PSMOUSE_FSP;
-/*
- * Init failed, try basic relative protocols
- */
-			max_proto = PSMOUSE_IMEX;
-		}
-	}
 
 	if (max_proto > PSMOUSE_IMEX) {
 		if (genius_detect(psmouse, set_properties) == 0)
@@ -693,6 +701,21 @@ static int psmouse_extensions(struct psmouse *psmouse,
 
 		if (touchkit_ps2_detect(psmouse, set_properties) == 0)
 			return PSMOUSE_TOUCHKIT_PS2;
+	}
+
+/*
+ * Try Finger Sensing Pad. We do it here because its probe upsets
+ * Trackpoint devices (causing TP_READ_ID command to time out).
+ */
+	if (max_proto > PSMOUSE_IMEX) {
+		if (fsp_detect(psmouse, set_properties) == 0) {
+			if (!set_properties || fsp_init(psmouse) == 0)
+				return PSMOUSE_FSP;
+/*
+ * Init failed, try basic relative protocols
+ */
+			max_proto = PSMOUSE_IMEX;
+		}
 	}
 
 /*
@@ -1679,6 +1702,8 @@ static int psmouse_get_maxproto(char *buffer, struct kernel_param *kp)
 static int __init psmouse_init(void)
 {
 	int err;
+
+	synaptics_module_init();
 
 	kpsmoused_wq = create_singlethread_workqueue("kpsmoused");
 	if (!kpsmoused_wq) {

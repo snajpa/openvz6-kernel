@@ -364,13 +364,13 @@ static int hci_sock_recvmsg(struct kiocb *iocb, struct socket *sock,
 	if (flags & (MSG_OOB))
 		return -EOPNOTSUPP;
 
+	msg->msg_namelen = 0;
+
 	if (sk->sk_state == BT_CLOSED)
 		return 0;
 
 	if (!(skb = skb_recv_datagram(sk, flags, noblock, &err)))
 		return err;
-
-	msg->msg_namelen = 0;
 
 	copied = skb->len;
 	if (len < copied) {
@@ -576,6 +576,7 @@ static int hci_sock_getsockopt(struct socket *sock, int level, int optname, char
 		{
 			struct hci_filter *f = &hci_pi(sk)->filter;
 
+			memset(&uf, 0, sizeof(uf));
 			uf.type_mask = f->type_mask;
 			uf.opcode    = f->opcode;
 			uf.event_mask[0] = *((u32 *) f->event_mask + 0);
@@ -621,7 +622,8 @@ static struct proto hci_sk_proto = {
 	.obj_size	= sizeof(struct hci_pinfo)
 };
 
-static int hci_sock_create(struct net *net, struct socket *sock, int protocol)
+static int hci_sock_create(struct net *net, struct socket *sock, int protocol,
+			   int kern)
 {
 	struct sock *sk;
 

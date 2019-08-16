@@ -192,6 +192,7 @@ struct usb_interface {
 	unsigned needs_altsetting0:1;	/* switch to altsetting 0 is pending */
 	unsigned needs_binding:1;	/* needs delayed unbind/rebind */
 	unsigned reset_running:1;
+	unsigned resetting_device:1;	/* true: bandwidth alloc after reset */
 
 	struct device dev;		/* interface specific device info */
 	struct device *usb_dev;
@@ -306,6 +307,16 @@ struct usb_host_config {
 	int extralen;
 };
 
+/* USB2.0 and USB3.0 device BOS descriptor set */
+struct usb_host_bos {
+	struct usb_bos_descriptor	*desc;
+
+	/* wireless cap descriptor is handled by wusb */
+	struct usb_ext_cap_descriptor	*ext_cap;
+	struct usb_ss_cap_descriptor	*ss_cap;
+	struct usb_ss_container_id_descriptor	*ss_id;
+};
+
 int __usb_get_extra_descriptor(char *buffer, unsigned size,
 	unsigned char type, void **ptr);
 #define usb_get_extra_descriptor(ifpoint, type, ptr) \
@@ -331,6 +342,14 @@ struct usb_bus {
 	u8 otg_port;			/* 0, or number of OTG/HNP port */
 	unsigned is_b_host:1;		/* true during some HNP roleswitches */
 	unsigned b_hnp_enable:1;	/* OTG: did A-Host enable HNP? */
+#ifndef __GENKSYMS__
+	unsigned no_stop_on_short:1;    /*
+					 * Quirk: some controllers don't stop
+					 * the ep queue on a short transfer
+					 * with the URB_SHORT_NOT_OK flag set.
+					 */
+#endif
+	unsigned sg_tablesize;		/* 0 or largest number of sg list entries */
 
 	int devnum_next;		/* Next open device number in
 					 * round-robin allocation */
@@ -374,6 +393,45 @@ struct usb_bus {
 
 struct usb_tt;
 
+/*
+ * USB 3.0 Link Power Management (LPM) parameters.
+ *
+ * PEL and SEL are USB 3.0 Link PM latencies for device-initiated LPM exit.
+ * MEL is the USB 3.0 Link PM latency for host-initiated LPM exit.
+ * All three are stored in nanoseconds.
+ */
+struct usb3_lpm_parameters {
+	/*
+	 * Maximum exit latency (MEL) for the host to send a packet to the
+	 * device (either a Ping for isoc endpoints, or a data packet for
+	 * interrupt endpoints), the hubs to decode the packet, and for all hubs
+	 * in the path to transition the links to U0.
+	 */
+	unsigned int mel;
+	/*
+	 * Maximum exit latency for a device-initiated LPM transition to bring
+	 * all links into U0.  Abbreviated as "PEL" in section 9.4.12 of the USB
+	 * 3.0 spec, with no explanation of what "P" stands for.  "Path"?
+	 */
+	unsigned int pel;
+
+	/*
+	 * The System Exit Latency (SEL) includes PEL, and three other
+	 * latencies.  After a device initiates a U0 transition, it will take
+	 * some time from when the device sends the ERDY to when it will finally
+	 * receive the data packet.  Basically, SEL should be the worse-case
+	 * latency from when a device starts initiating a U0 transition to when
+	 * it will get data.
+	 */
+	unsigned int sel;
+	/*
+	 * The idle timeout value that is currently programmed into the parent
+	 * hub for this device.  When the timer counts to zero, the parent hub
+	 * will initiate an LPM transition to either U1 or U2.
+	 */
+	int timeout;
+};
+
 /**
  * struct usb_device - kernel's representation of a USB device
  * @devnum: device number; address on a USB bus
@@ -389,6 +447,7 @@ struct usb_tt;
  * @ep0: endpoint 0 data (default control pipe)
  * @dev: generic device interface
  * @descriptor: USB device descriptor
+ * @bos: USB device BOS descriptor set
  * @config: all of the device's configs
  * @actconfig: the active configuration
  * @ep_in: array of IN endpoints
@@ -408,6 +467,11 @@ struct usb_tt;
  *	FIXME -- complete doc
  * @authenticated: Crypto authentication passed
  * @wusb: device is Wireless USB
+ * @lpm_capable: device supports LPM
+ * @usb2_hw_lpm_capable: device can perform USB2 hardware LPM
+ * @usb2_hw_lpm_besl_capable: device can perform USB2 hardware BESL LPM
+ * @usb2_hw_lpm_enabled: USB2 hardware LPM is enabled
+ * @usb2_hw_lpm_allowed: Userspace allows USB 2.0 LPM to be enabled
  * @string_langid: language ID for strings
  * @product: iProduct string, if present (static)
  * @manufacturer: iManufacturer string, if present (static)
@@ -437,6 +501,12 @@ struct usb_tt;
  * @wusb_dev: if this is a Wireless USB device, link to the WUSB
  *	specific data for the device.
  * @slot_id: Slot ID assigned by xHCI
+ * @u1_params: exit latencies for USB3 U1 LPM state, and hub-initiated timeout.
+ * @u2_params: exit latencies for USB3 U2 LPM state, and hub-initiated timeout.
+ * @lpm_disable_count: Ref count used by usb_disable_lpm() and usb_enable_lpm()
+ *	to keep track of the number of functions that require USB 3.0 Link Power
+ *	Management to be disabled for this usb_device.  This count should only
+ *	be manipulated by those functions, with the bandwidth_mutex is held.
  *
  * Notes:
  * Usbcore drivers should not set usbdev->state directly.  Instead use
@@ -480,6 +550,15 @@ struct usb_device {
 	unsigned authorized:1;
  	unsigned authenticated:1;
 	unsigned wusb:1;
+#ifndef __GENKSYMS__
+	unsigned bos_kabi_bit:1;
+	unsigned lpm_capable:1;
+	unsigned usb2_hw_lpm_capable:1;
+	unsigned usb2_hw_lpm_enabled:1;
+	unsigned usb2_hw_lpm_allowed:1;
+	unsigned usb3_lpm_enabled:1;
+	unsigned usb2_hw_lpm_besl_capable:1;
+#endif
 	int string_langid;
 
 	/* static strings from the device */
@@ -522,11 +601,31 @@ struct usb_device {
 #endif
 	struct wusb_dev *wusb_dev;
 	int slot_id;
+#ifndef __GENKSYMS__
+	struct usb_host_bos *bos;
+	struct usb3_lpm_parameters u1_params;
+	struct usb3_lpm_parameters u2_params;
+	unsigned lpm_disable_count;
+	unsigned hub_initiated_lpm_disable_count;
+#endif
 };
 #define	to_usb_device(d) container_of(d, struct usb_device, dev)
 
 extern struct usb_device *usb_get_dev(struct usb_device *dev);
 extern void usb_put_dev(struct usb_device *dev);
+extern struct usb_device *usb_hub_find_child(struct usb_device *hdev,
+	int port1);
+
+/**
+ * usb_hub_for_each_child - iterate over all child devices on the hub
+ * @hdev:  USB device belonging to the usb hub
+ * @port1: portnum associated with child device
+ * @child: child device pointer
+ */
+#define usb_hub_for_each_child(hdev, port1, child) \
+	for (port1 = 1,	child =	usb_hub_find_child(hdev, port1); \
+		port1 <= hdev->maxchild; \
+		child = usb_hub_find_child(hdev, ++port1))
 
 /* USB device locking */
 #define usb_lock_device(udev)		down(&(udev)->dev.sem)
@@ -543,6 +642,7 @@ extern struct usb_device *usb_find_device(u16 vendor_id, u16 product_id);
 
 /* USB autosuspend and autoresume */
 #ifdef CONFIG_USB_SUSPEND
+extern void usb_device_autosuspend_enable(struct usb_device *udev);
 extern int usb_autopm_set_interface(struct usb_interface *intf);
 extern int usb_autopm_get_interface(struct usb_interface *intf);
 extern void usb_autopm_put_interface(struct usb_interface *intf);
@@ -568,6 +668,9 @@ static inline void usb_mark_last_busy(struct usb_device *udev)
 
 #else
 
+static inline void usb_device_autosuspend_enable(struct usb_device *udev)
+{ }
+
 static inline int usb_autopm_set_interface(struct usb_interface *intf)
 { return 0; }
 
@@ -589,10 +692,37 @@ static inline void usb_mark_last_busy(struct usb_device *udev)
 { }
 #endif
 
+extern int usb_disable_lpm(struct usb_device *udev);
+extern void usb_enable_lpm(struct usb_device *udev);
+/* Same as above, but these functions lock/unlock the bandwidth_mutex. */
+extern int usb_unlocked_disable_lpm(struct usb_device *udev);
+extern void usb_unlocked_enable_lpm(struct usb_device *udev);
+
+extern int usb_disable_ltm(struct usb_device *udev);
+extern void usb_enable_ltm(struct usb_device *udev);
+
+static inline bool usb_device_supports_ltm(struct usb_device *udev)
+{
+	if (udev->speed != USB_SPEED_SUPER || !udev->bos || !udev->bos->ss_cap)
+		return false;
+	return udev->bos->ss_cap->bmAttributes & USB_LTM_SUPPORT;
+}
+
+
 /*-------------------------------------------------------------------------*/
 
 /* for drivers using iso endpoints */
 extern int usb_get_current_frame_number(struct usb_device *usb_dev);
+
+/* Sets up a group of bulk endpoints to support multiple stream IDs. */
+extern int usb_alloc_streams(struct usb_interface *interface,
+		struct usb_host_endpoint **eps, unsigned int num_eps,
+		unsigned int num_streams, gfp_t mem_flags);
+
+/* Reverts a group of bulk endpoints back to not using stream IDs. */
+extern void usb_free_streams(struct usb_interface *interface,
+		struct usb_host_endpoint **eps, unsigned int num_eps,
+		gfp_t mem_flags);
 
 /* used these for multi-interface device registration */
 extern int usb_driver_claim_interface(struct usb_driver *driver,
@@ -626,6 +756,10 @@ extern struct usb_interface *usb_ifnum_to_if(const struct usb_device *dev,
 		unsigned ifnum);
 extern struct usb_host_interface *usb_altnum_to_altsetting(
 		const struct usb_interface *intf, unsigned int altnum);
+extern struct usb_host_interface *usb_find_alt_setting(
+		struct usb_host_config *config,
+		unsigned int iface_num,
+		unsigned int alt_num);
 
 
 /**
@@ -775,6 +909,27 @@ static inline int usb_make_path(struct usb_device *dev, char *buf, size_t size)
 	.bInterfaceSubClass = (sc), \
 	.bInterfaceProtocol = (pr)
 
+/**
+ * USB_VENDOR_AND_INTERFACE_INFO - describe a specific usb vendor with a class of usb interfaces
+ * @vend: the 16 bit USB Vendor ID
+ * @cl: bInterfaceClass value
+ * @sc: bInterfaceSubClass value
+ * @pr: bInterfaceProtocol value
+ *
+ * This macro is used to create a struct usb_device_id that matches a
+ * specific vendor with a specific class of interfaces.
+ *
+ * This is especially useful when explicitly matching devices that have
+ * vendor specific bDeviceClass values, but standards-compliant interfaces.
+ */
+#define USB_VENDOR_AND_INTERFACE_INFO(vend, cl, sc, pr) \
+	.match_flags = USB_DEVICE_ID_MATCH_INT_INFO \
+		| USB_DEVICE_ID_MATCH_VENDOR, \
+	.idVendor = (vend), \
+	.bInterfaceClass = (cl), \
+	.bInterfaceSubClass = (sc), \
+	.bInterfaceProtocol = (pr)
+
 /* ----------------------------------------------------------------------- */
 
 /* Stuff for dynamic usb ids */
@@ -840,6 +995,9 @@ struct usbdrv_wrap {
  *	for interfaces bound to this driver.
  * @soft_unbind: if set to 1, the USB core will not kill URBs and disable
  *	endpoints before calling the driver's disconnect method.
+ * @disable_hub_initiated_lpm: if set to 0, the USB core will not allow hubs
+ *	to initiate lower power link state transitions when an idle timeout
+ *	occurs.  Device-initiated USB 3.0 link PM will still be allowed.
  *
  * USB interface drivers must provide a name, probe() and disconnect()
  * methods, and an id_table.  Other driver fields are optional.
@@ -881,6 +1039,9 @@ struct usb_driver {
 	unsigned int no_dynamic_id:1;
 	unsigned int supports_autosuspend:1;
 	unsigned int soft_unbind:1;
+#ifndef __GENKSYMS__
+	unsigned int disable_hub_initiated_lpm:1;
+#endif
 };
 #define	to_usb_driver(d) container_of(d, struct usb_driver, drvwrap.driver)
 
@@ -949,6 +1110,18 @@ static inline int usb_register(struct usb_driver *driver)
 	return usb_register_driver(driver, THIS_MODULE, KBUILD_MODNAME);
 }
 extern void usb_deregister(struct usb_driver *);
+
+/**
+ * module_usb_driver() - Helper macro for registering a USB driver
+ * @__usb_driver: usb_driver struct
+ *
+ * Helper macro for USB drivers which do not do anything special in module
+ * init/exit. This eliminates a lot of boilerplate. Each module may only
+ * use this macro once, and calling it replaces module_init() and module_exit()
+ */
+#define module_usb_driver(__usb_driver) \
+	module_driver(__usb_driver, usb_register, \
+		       usb_deregister)
 
 extern int usb_register_device_driver(struct usb_device_driver *,
 			struct module *);
@@ -1206,6 +1379,7 @@ struct urb {
 	struct usb_device *dev; 	/* (in) pointer to associated device */
 	struct usb_host_endpoint *ep;	/* (internal) pointer to endpoint */
 	unsigned int pipe;		/* (in) pipe information */
+	unsigned int stream_id;		/* (in) stream ID */
 	int status;			/* (return) non-ISO status */
 	unsigned int transfer_flags;	/* (in) URB_SHORT_NOT_OK | ...*/
 	void *transfer_buffer;		/* (in) associated data buffer */
@@ -1550,6 +1724,14 @@ static inline unsigned int __create_pipe(struct usb_device *dev,
 	((PIPE_INTERRUPT << 30) | __create_pipe(dev, endpoint))
 #define usb_rcvintpipe(dev,endpoint)	\
 	((PIPE_INTERRUPT << 30) | __create_pipe(dev, endpoint) | USB_DIR_IN)
+
+static inline struct usb_host_endpoint *
+usb_pipe_endpoint(struct usb_device *dev, unsigned int pipe)
+{
+	struct usb_host_endpoint **eps;
+	eps = usb_pipein(pipe) ? dev->ep_in : dev->ep_out;
+	return eps[usb_pipeendpoint(pipe)];
+}
 
 /*-------------------------------------------------------------------------*/
 

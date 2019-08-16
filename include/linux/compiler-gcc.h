@@ -37,6 +37,8 @@
 /* &a[0] degrades to a pointer: a different type from an array */
 #define __must_be_array(a) \
   BUILD_BUG_ON_ZERO(__builtin_types_compatible_p(typeof(a), typeof(&a[0])))
+/* Make the optimizer believe the variable can be manipulated arbitrarily. */
+#define OPTIMIZER_HIDE_VAR(var) __asm__ ("" : "=r" (var) : "0" (var))
 
 /*
  * Force always-inline if the user requests it so via the .config,
@@ -47,6 +49,11 @@
 # define inline		inline		__attribute__((always_inline))
 # define __inline__	__inline__	__attribute__((always_inline))
 # define __inline	__inline	__attribute__((always_inline))
+#else
+/* A lot of inline functions can cause havoc with function tracing */
+# define inline		inline		notrace
+# define __inline__	__inline__	notrace
+# define __inline	__inline	notrace
 #endif
 
 #define __deprecated			__attribute__((deprecated))
@@ -79,6 +86,7 @@
 #define  noinline			__attribute__((noinline))
 #define __attribute_const__		__attribute__((__const__))
 #define __maybe_unused			__attribute__((unused))
+#define __always_unused			__attribute__((unused))
 
 #define __gcc_header(x) #x
 #define _gcc_header(x) __gcc_header(linux/compiler-gcc##x.h)

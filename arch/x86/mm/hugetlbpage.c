@@ -59,7 +59,8 @@ static int vma_shareable(struct vm_area_struct *vma, unsigned long addr)
 /*
  * search for a shareable pmd page for hugetlb.
  */
-static void huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud)
+static void huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud,
+			   bool *shared)
 {
 	struct vm_area_struct *vma = find_vma(mm, addr);
 	struct address_space *mapping = vma->vm_file->f_mapping;
@@ -92,9 +93,10 @@ static void huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud)
 		goto out;
 
 	spin_lock(&mm->page_table_lock);
-	if (pud_none(*pud))
+	if (pud_none(*pud)) {
 		pud_populate(mm, pud, (pmd_t *)((unsigned long)spte & PAGE_MASK));
-	else
+		*shared = true;
+	} else
 		put_page(virt_to_page(spte));
 	spin_unlock(&mm->page_table_lock);
 out:
@@ -129,7 +131,8 @@ int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
 }
 
 pte_t *huge_pte_alloc(struct mm_struct *mm,
-			unsigned long addr, unsigned long sz)
+			unsigned long addr, unsigned long sz,
+			bool *shared)
 {
 	pgd_t *pgd;
 	pud_t *pud;
@@ -143,11 +146,11 @@ pte_t *huge_pte_alloc(struct mm_struct *mm,
 		} else {
 			BUG_ON(sz != PMD_SIZE);
 			if (pud_none(*pud))
-				huge_pmd_share(mm, addr, pud);
+				huge_pmd_share(mm, addr, pud, shared);
 			pte = (pte_t *) pmd_alloc(mm, pud, addr);
 		}
 	}
-	BUG_ON(pte && !pte_none(*pte) && !pte_huge(*pte));
+	BUG_ON(pte && pte_present(*pte) && !pte_huge(*pte));
 
 	return pte;
 }
@@ -268,8 +271,9 @@ static unsigned long hugetlb_get_unmapped_area_bottomup(struct file *file,
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
 	unsigned long start_addr;
+	unsigned int unmap_factor = sysctl_unmap_area_factor;
 
-	if (len > mm->cached_hole_size) {
+	if (len > mm->cached_hole_size || unmap_factor) {
 	        start_addr = mm->free_area_cache;
 	} else {
 	        start_addr = TASK_UNMAPPED_BASE;
@@ -288,7 +292,8 @@ full_search:
 			 */
 			if (start_addr != TASK_UNMAPPED_BASE) {
 				start_addr = TASK_UNMAPPED_BASE;
-				mm->cached_hole_size = 0;
+				if (likely(!unmap_factor))
+					mm->cached_hole_size = 0;
 				goto full_search;
 			}
 			return -ENOMEM;
@@ -297,8 +302,11 @@ full_search:
 			mm->free_area_cache = addr + len;
 			return addr;
 		}
-		if (addr + mm->cached_hole_size < vma->vm_start)
+
+		if (!unmap_factor &&
+				addr + mm->cached_hole_size < vma->vm_start)
 		        mm->cached_hole_size = vma->vm_start - addr;
+
 		addr = ALIGN(vma->vm_end, huge_page_size(h));
 	}
 }
@@ -312,14 +320,15 @@ static unsigned long hugetlb_get_unmapped_area_topdown(struct file *file,
 	struct vm_area_struct *vma, *prev_vma;
 	unsigned long base = mm->mmap_base, addr = addr0;
 	unsigned long largest_hole = mm->cached_hole_size;
+	unsigned int unmap_factor = sysctl_unmap_area_factor;
 	int first_time = 1;
 
 	/* don't allow allocations above current base */
 	if (mm->free_area_cache > base)
 		mm->free_area_cache = base;
 
-	if (len <= largest_hole) {
-	        largest_hole = 0;
+	if (len <= largest_hole && !unmap_factor) {
+		largest_hole = 0;
 		mm->free_area_cache  = base;
 	}
 try_again:
@@ -344,18 +353,20 @@ try_again:
 		if (addr + len <= vma->vm_start &&
 		            (!prev_vma || (addr >= prev_vma->vm_end))) {
 			/* remember the address as a hint for next time */
-		        mm->cached_hole_size = largest_hole;
+			if (likely(!unmap_factor))
+				mm->cached_hole_size = largest_hole;
 		        return (mm->free_area_cache = addr);
 		} else {
 			/* pull free_area_cache down to the first hole */
 		        if (mm->free_area_cache == vma->vm_end) {
 				mm->free_area_cache = vma->vm_start;
-				mm->cached_hole_size = largest_hole;
+				if (likely(!unmap_factor))
+					mm->cached_hole_size = largest_hole;
 			}
 		}
 
 		/* remember the largest hole we saw so far */
-		if (addr + largest_hole < vma->vm_start)
+		if (addr + largest_hole < vma->vm_start && !unmap_factor)
 		        largest_hole = vma->vm_start - addr;
 
 		/* try just below the current vma->vm_start */
@@ -369,7 +380,8 @@ fail:
 	 */
 	if (first_time) {
 		mm->free_area_cache = base;
-		largest_hole = 0;
+		if (likely(!unmap_factor))
+			largest_hole = 0;
 		first_time = 0;
 		goto try_again;
 	}
@@ -380,7 +392,8 @@ fail:
 	 * allocations.
 	 */
 	mm->free_area_cache = TASK_UNMAPPED_BASE;
-	mm->cached_hole_size = ~0UL;
+	if (likely(!unmap_factor))
+		mm->cached_hole_size = ~0UL;
 	addr = hugetlb_get_unmapped_area_bottomup(file, addr0,
 			len, pgoff, flags);
 
@@ -388,7 +401,8 @@ fail:
 	 * Restore the topdown base:
 	 */
 	mm->free_area_cache = base;
-	mm->cached_hole_size = ~0UL;
+	if (likely(!unmap_factor))
+		mm->cached_hole_size = ~0UL;
 
 	return addr;
 }
@@ -416,7 +430,7 @@ hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
 		addr = ALIGN(addr, huge_page_size(h));
 		vma = find_vma(mm, addr);
 		if (TASK_SIZE - len >= addr &&
-		    (!vma || addr + len <= vma->vm_start))
+		    (!vma || addr + len <= vm_start_gap(vma)))
 			return addr;
 	}
 	if (mm->get_unmapped_area == arch_get_unmapped_area)

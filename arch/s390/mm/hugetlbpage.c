@@ -68,12 +68,15 @@ void arch_release_hugepage(struct page *page)
 	ptep = (pte_t *) page[1].index;
 	if (!ptep)
 		return;
+	clear_table((unsigned long *) ptep, _PAGE_TYPE_EMPTY,
+		    PTRS_PER_PTE * sizeof(pte_t));
 	pte_free(&init_mm, ptep);
 	page[1].index = 0;
 }
 
 pte_t *huge_pte_alloc(struct mm_struct *mm,
-			unsigned long addr, unsigned long sz)
+			unsigned long addr, unsigned long sz,
+			bool *shared)
 {
 	pgd_t *pgdp;
 	pud_t *pudp;

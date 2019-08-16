@@ -117,10 +117,11 @@ extern struct pid *find_vpid(int nr);
  */
 extern struct pid *find_get_pid(int nr);
 extern struct pid *find_ge_pid(int nr, struct pid_namespace *);
-int next_pidmap(struct pid_namespace *pid_ns, int last);
+int next_pidmap(struct pid_namespace *pid_ns, unsigned int last);
 
 extern struct pid *alloc_pid(struct pid_namespace *ns);
 extern void free_pid(struct pid *pid);
+extern void disable_pid_allocation(struct pid_namespace *ns);
 
 /*
  * ns_of_pid() returns the pid namespace in which the specified pid was
@@ -138,6 +139,17 @@ static inline struct pid_namespace *ns_of_pid(struct pid *pid)
 	if (pid)
 		ns = pid->numbers[pid->level].ns;
 	return ns;
+}
+
+/*
+ * is_child_reaper returns true if the pid is the init process
+ * of the current namespace. As this one could be checked before
+ * pid_ns->child_reaper is assigned in copy_process, we check
+ * with the pid number.
+ */
+static inline bool is_child_reaper(struct pid *pid)
+{
+	return pid->numbers[pid->level].nr == 1;
 }
 
 /*

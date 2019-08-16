@@ -38,7 +38,7 @@
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/mutex.h>
-#include <linux/workqueue.h>
+#include <rdma/rdma_netlink.h>
 
 #include "core_priv.h"
 
@@ -51,6 +51,9 @@ struct ib_client_data {
 	struct ib_client *client;
 	void *            data;
 };
+
+struct workqueue_struct *ib_wq;
+EXPORT_SYMBOL_GPL(ib_wq);
 
 static LIST_HEAD(device_list);
 static LIST_HEAD(client_list);
@@ -267,7 +270,9 @@ out:
  * callback for each device that is added. @device must be allocated
  * with ib_alloc_device().
  */
-int ib_register_device(struct ib_device *device)
+int ib_register_device(struct ib_device *device,
+		       int (*port_callback)(struct ib_device *,
+					    u8, struct kobject *))
 {
 	int ret;
 
@@ -296,7 +301,7 @@ int ib_register_device(struct ib_device *device)
 		goto out;
 	}
 
-	ret = ib_device_register_sysfs(device);
+	ret = ib_device_register_sysfs(device, port_callback);
 	if (ret) {
 		printk(KERN_WARNING "Couldn't register device %s with driver model\n",
 		       device->name);
@@ -622,6 +627,9 @@ int ib_modify_device(struct ib_device *device,
 		     int device_modify_mask,
 		     struct ib_device_modify *device_modify)
 {
+	if (!device->modify_device)
+		return -ENOSYS;
+
 	return device->modify_device(device, device_modify_mask,
 				     device_modify);
 }
@@ -642,6 +650,9 @@ int ib_modify_port(struct ib_device *device,
 		   u8 port_num, int port_modify_mask,
 		   struct ib_port_modify *port_modify)
 {
+	if (!device->modify_port)
+		return -ENOSYS;
+
 	if (port_num < start_port(device) || port_num > end_port(device))
 		return -EINVAL;
 
@@ -696,18 +707,28 @@ int ib_find_pkey(struct ib_device *device,
 {
 	int ret, i;
 	u16 tmp_pkey;
+	int partial_ix = -1;
 
 	for (i = 0; i < device->pkey_tbl_len[port_num - start_port(device)]; ++i) {
 		ret = ib_query_pkey(device, port_num, i, &tmp_pkey);
 		if (ret)
 			return ret;
-
 		if ((pkey & 0x7fff) == (tmp_pkey & 0x7fff)) {
-			*index = i;
-			return 0;
+			/* if there is full-member pkey take it.*/
+			if (tmp_pkey & 0x8000) {
+				*index = i;
+				return 0;
+			}
+			if (partial_ix < 0)
+				partial_ix = i;
 		}
 	}
 
+	/*no full-member, if exists take the limited*/
+	if (partial_ix >= 0) {
+		*index = partial_ix;
+		return 0;
+	}
 	return -ENOENT;
 }
 EXPORT_SYMBOL(ib_find_pkey);
@@ -716,25 +737,48 @@ static int __init ib_core_init(void)
 {
 	int ret;
 
+	ib_wq = create_workqueue("infiniband");
+	if (!ib_wq)
+		return -ENOMEM;
+
 	ret = ib_sysfs_setup();
-	if (ret)
+	if (ret) {
 		printk(KERN_WARNING "Couldn't create InfiniBand device class\n");
+		goto err;
+	}
+
+	ret = ibnl_init();
+	if (ret) {
+		printk(KERN_WARNING "Couldn't init IB netlink interface\n");
+		goto err_sysfs;
+	}
 
 	ret = ib_cache_setup();
 	if (ret) {
 		printk(KERN_WARNING "Couldn't set up InfiniBand P_Key/GID cache\n");
-		ib_sysfs_cleanup();
+		goto err_nl;
 	}
 
+	return 0;
+
+err_nl:
+	ibnl_cleanup();
+
+err_sysfs:
+	ib_sysfs_cleanup();
+
+err:
+	destroy_workqueue(ib_wq);
 	return ret;
 }
 
 static void __exit ib_core_cleanup(void)
 {
 	ib_cache_cleanup();
+	ibnl_cleanup();
 	ib_sysfs_cleanup();
 	/* Make sure that any pending umem accounting work is done. */
-	flush_scheduled_work();
+	destroy_workqueue(ib_wq);
 }
 
 module_init(ib_core_init);

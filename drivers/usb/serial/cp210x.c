@@ -91,11 +91,12 @@ static struct usb_device_id id_table [] = {
 	{ USB_DEVICE(0x10C4, 0x81C8) }, /* Lipowsky Industrie Elektronik GmbH, Baby-JTAG */
 	{ USB_DEVICE(0x10C4, 0x81E2) }, /* Lipowsky Industrie Elektronik GmbH, Baby-LIN */
 	{ USB_DEVICE(0x10C4, 0x81E7) }, /* Aerocomm Radio */
+	{ USB_DEVICE(0x10C4, 0x81E8) }, /* Zephyr Bioharness */
 	{ USB_DEVICE(0x10C4, 0x81F2) }, /* C1007 HF band RFID controller */
 	{ USB_DEVICE(0x10C4, 0x8218) }, /* Lipowsky Industrie Elektronik GmbH, HARP-1 */
 	{ USB_DEVICE(0x10C4, 0x822B) }, /* Modem EDGE(GSM) Comander 2 */
 	{ USB_DEVICE(0x10C4, 0x826B) }, /* Cygnal Integrated Products, Inc., Fasttrax GPS demostration module */
-	{ USB_DEVICE(0x10c4, 0x8293) }, /* Telegesys ETRX2USB */
+	{ USB_DEVICE(0x10C4, 0x8293) }, /* Telegesys ETRX2USB */
 	{ USB_DEVICE(0x10C4, 0x82F9) }, /* Procyon AVS */
 	{ USB_DEVICE(0x10C4, 0x8341) }, /* Siemens MC35PU GPRS Modem */
 	{ USB_DEVICE(0x10C4, 0x8382) }, /* Cygnal Integrated Products, Inc. */
@@ -207,8 +208,8 @@ static struct usb_serial_driver cp210x_device = {
 #define BITS_STOP_2		0x0002
 
 /* CP210X_SET_BREAK */
-#define BREAK_ON		0x0000
-#define BREAK_OFF		0x0001
+#define BREAK_ON		0x0001
+#define BREAK_OFF		0x0000
 
 /* CP210X_(SET_MHS|GET_MDMSTS) */
 #define CONTROL_DTR		0x0001

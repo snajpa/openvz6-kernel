@@ -1,5 +1,8 @@
-#ifndef PARSE_OPTIONS_H
-#define PARSE_OPTIONS_H
+#ifndef __PERF_PARSE_OPTIONS_H
+#define __PERF_PARSE_OPTIONS_H
+
+#include <linux/kernel.h>
+#include <stdbool.h>
 
 enum parse_opt_type {
 	/* special types */
@@ -8,14 +11,17 @@ enum parse_opt_type {
 	OPTION_GROUP,
 	/* options with no arguments */
 	OPTION_BIT,
-	OPTION_BOOLEAN, /* _INCR would have been a better name */
-	OPTION_SET_INT,
+	OPTION_BOOLEAN,
+	OPTION_INCR,
+	OPTION_SET_UINT,
 	OPTION_SET_PTR,
 	/* options with arguments (usually) */
 	OPTION_STRING,
 	OPTION_INTEGER,
 	OPTION_LONG,
 	OPTION_CALLBACK,
+	OPTION_U64,
+	OPTION_UINTEGER,
 };
 
 enum parse_opt_flags {
@@ -32,6 +38,9 @@ enum parse_opt_option_flags {
 	PARSE_OPT_NONEG   = 4,
 	PARSE_OPT_HIDDEN  = 8,
 	PARSE_OPT_LASTARG_DEFAULT = 16,
+	PARSE_OPT_DISABLED = 32,
+	PARSE_OPT_EXCLUSIVE = 64,
+	PARSE_OPT_NOEMPTY  = 128,
 };
 
 struct option;
@@ -73,9 +82,12 @@ typedef int parse_opt_cb(const struct option *, const char *arg, int unset);
  *
  * `defval`::
  *   default value to fill (*->value) with for PARSE_OPT_OPTARG.
- *   OPTION_{BIT,SET_INT,SET_PTR} store the {mask,integer,pointer} to put in
+ *   OPTION_{BIT,SET_UINT,SET_PTR} store the {mask,integer,pointer} to put in
  *   the value when met.
  *   CALLBACKS can use it like they want.
+ *
+ * `set`::
+ *   whether an option was set by the user
  */
 struct option {
 	enum parse_opt_type type;
@@ -88,18 +100,30 @@ struct option {
 	int flags;
 	parse_opt_cb *callback;
 	intptr_t defval;
+	bool *set;
+	void *data;
 };
+
+#define check_vtype(v, type) ( BUILD_BUG_ON_ZERO(!__builtin_types_compatible_p(typeof(v), type)) + v )
 
 #define OPT_END()                   { .type = OPTION_END }
 #define OPT_ARGUMENT(l, h)          { .type = OPTION_ARGUMENT, .long_name = (l), .help = (h) }
 #define OPT_GROUP(h)                { .type = OPTION_GROUP, .help = (h) }
-#define OPT_BIT(s, l, v, h, b)      { .type = OPTION_BIT, .short_name = (s), .long_name = (l), .value = (v), .help = (h), .defval = (b) }
-#define OPT_BOOLEAN(s, l, v, h)     { .type = OPTION_BOOLEAN, .short_name = (s), .long_name = (l), .value = (v), .help = (h) }
-#define OPT_SET_INT(s, l, v, h, i)  { .type = OPTION_SET_INT, .short_name = (s), .long_name = (l), .value = (v), .help = (h), .defval = (i) }
+#define OPT_BIT(s, l, v, h, b)      { .type = OPTION_BIT, .short_name = (s), .long_name = (l), .value = check_vtype(v, int *), .help = (h), .defval = (b) }
+#define OPT_BOOLEAN(s, l, v, h)     { .type = OPTION_BOOLEAN, .short_name = (s), .long_name = (l), .value = check_vtype(v, bool *), .help = (h) }
+#define OPT_BOOLEAN_SET(s, l, v, os, h) \
+	{ .type = OPTION_BOOLEAN, .short_name = (s), .long_name = (l), \
+	.value = check_vtype(v, bool *), .help = (h), \
+	.set = check_vtype(os, bool *)}
+#define OPT_INCR(s, l, v, h)        { .type = OPTION_INCR, .short_name = (s), .long_name = (l), .value = check_vtype(v, int *), .help = (h) }
+#define OPT_SET_UINT(s, l, v, h, i)  { .type = OPTION_SET_UINT, .short_name = (s), .long_name = (l), .value = check_vtype(v, unsigned int *), .help = (h), .defval = (i) }
 #define OPT_SET_PTR(s, l, v, h, p)  { .type = OPTION_SET_PTR, .short_name = (s), .long_name = (l), .value = (v), .help = (h), .defval = (p) }
-#define OPT_INTEGER(s, l, v, h)     { .type = OPTION_INTEGER, .short_name = (s), .long_name = (l), .value = (v), .help = (h) }
-#define OPT_LONG(s, l, v, h)        { .type = OPTION_LONG, .short_name = (s), .long_name = (l), .value = (v), .help = (h) }
-#define OPT_STRING(s, l, v, a, h)   { .type = OPTION_STRING,  .short_name = (s), .long_name = (l), .value = (v), (a), .help = (h) }
+#define OPT_INTEGER(s, l, v, h)     { .type = OPTION_INTEGER, .short_name = (s), .long_name = (l), .value = check_vtype(v, int *), .help = (h) }
+#define OPT_UINTEGER(s, l, v, h)    { .type = OPTION_UINTEGER, .short_name = (s), .long_name = (l), .value = check_vtype(v, unsigned int *), .help = (h) }
+#define OPT_LONG(s, l, v, h)        { .type = OPTION_LONG, .short_name = (s), .long_name = (l), .value = check_vtype(v, long *), .help = (h) }
+#define OPT_U64(s, l, v, h)         { .type = OPTION_U64, .short_name = (s), .long_name = (l), .value = check_vtype(v, u64 *), .help = (h) }
+#define OPT_STRING(s, l, v, a, h)   { .type = OPTION_STRING,  .short_name = (s), .long_name = (l), .value = check_vtype(v, const char **), (a), .help = (h) }
+#define OPT_STRING_NOEMPTY(s, l, v, a, h)   { .type = OPTION_STRING,  .short_name = (s), .long_name = (l), .value = check_vtype(v, const char **), (a), .help = (h), .flags = PARSE_OPT_NOEMPTY}
 #define OPT_DATE(s, l, v, h) \
 	{ .type = OPTION_CALLBACK, .short_name = (s), .long_name = (l), .value = (v), .argh = "time", .help = (h), .callback = parse_opt_approxidate_cb }
 #define OPT_CALLBACK(s, l, v, a, h, f) \
@@ -108,6 +132,14 @@ struct option {
 	{ .type = OPTION_CALLBACK, .short_name = (s), .long_name = (l), .value = (v), (a), .help = (h), .callback = (f), .flags = PARSE_OPT_NOARG }
 #define OPT_CALLBACK_DEFAULT(s, l, v, a, h, f, d) \
 	{ .type = OPTION_CALLBACK, .short_name = (s), .long_name = (l), .value = (v), (a), .help = (h), .callback = (f), .defval = (intptr_t)d, .flags = PARSE_OPT_LASTARG_DEFAULT }
+#define OPT_CALLBACK_DEFAULT_NOOPT(s, l, v, a, h, f, d) \
+	{ .type = OPTION_CALLBACK, .short_name = (s), .long_name = (l),\
+	.value = (v), (a), .help = (h), .callback = (f), .defval = (intptr_t)d,\
+	.flags = PARSE_OPT_LASTARG_DEFAULT | PARSE_OPT_NOARG}
+#define OPT_CALLBACK_OPTARG(s, l, v, d, a, h, f) \
+	{ .type = OPTION_CALLBACK, .short_name = (s), .long_name = (l), \
+	  .value = (v), (a), .help = (h), .callback = (f), \
+	  .flags = PARSE_OPT_OPTARG, .data = (d) }
 
 /* parse_options() will filter out the processed options and leave the
  * non-option argments in argv[].
@@ -117,6 +149,11 @@ extern int parse_options(int argc, const char **argv,
                          const struct option *options,
                          const char * const usagestr[], int flags);
 
+extern int parse_options_subcommand(int argc, const char **argv,
+				const struct option *options,
+				const char *const subcommands[],
+				const char *usagestr[], int flags);
+
 extern NORETURN void usage_with_options(const char * const *usagestr,
                                         const struct option *options);
 
@@ -125,6 +162,8 @@ extern NORETURN void usage_with_options(const char * const *usagestr,
 enum {
 	PARSE_OPT_HELP = -1,
 	PARSE_OPT_DONE,
+	PARSE_OPT_LIST_OPTS,
+	PARSE_OPT_LIST_SUBCMDS,
 	PARSE_OPT_UNKNOWN,
 };
 
@@ -138,11 +177,14 @@ struct parse_opt_ctx_t {
 	const char **out;
 	int argc, cpidx;
 	const char *opt;
+	const struct option *excl_opt;
 	int flags;
 };
 
 extern int parse_options_usage(const char * const *usagestr,
-			       const struct option *opts);
+			       const struct option *opts,
+			       const char *optstr,
+			       bool short_opt);
 
 extern void parse_options_start(struct parse_opt_ctx_t *ctx,
 				int argc, const char **argv, int flags);
@@ -174,4 +216,5 @@ extern int parse_opt_verbosity_cb(const struct option *, const char *, int);
 
 extern const char *parse_options_fix_filename(const char *prefix, const char *file);
 
-#endif
+void set_option_flag(struct option *opts, int sopt, const char *lopt, int flag);
+#endif /* __PERF_PARSE_OPTIONS_H */

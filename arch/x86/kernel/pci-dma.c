@@ -11,10 +11,11 @@
 #include <asm/gart.h>
 #include <asm/calgary.h>
 #include <asm/amd_iommu.h>
+#include <asm/x86_init.h>
 
 static int forbid_dac __read_mostly;
 
-struct dma_map_ops *dma_ops;
+struct dma_map_ops *dma_ops = &nommu_dma_ops;
 EXPORT_SYMBOL(dma_ops);
 
 static int iommu_sac_force __read_mostly;
@@ -126,19 +127,18 @@ void __init pci_iommu_alloc(void)
 	/* free the range so iommu could get some range less than 4G */
 	dma32_free_bootmem();
 #endif
+	if (pci_swiotlb_detect())
+		goto out;
 
-	/*
-	 * The order of these functions is important for
-	 * fall-back/fail-over reasons
-	 */
 	gart_iommu_hole_init();
 
 	detect_calgary();
 
 	detect_intel_iommu();
 
+	/* needs to be called after gart_iommu_hole_init */
 	amd_iommu_detect();
-
+out:
 	pci_swiotlb_init();
 }
 
@@ -214,7 +214,7 @@ static __init int iommu_setup(char *p)
 		if (!strncmp(p, "allowdac", 8))
 			forbid_dac = 0;
 		if (!strncmp(p, "nodac", 5))
-			forbid_dac = -1;
+			forbid_dac = 1;
 		if (!strncmp(p, "usedac", 6)) {
 			forbid_dac = -1;
 			return 1;
@@ -289,24 +289,16 @@ static int __init pci_iommu_init(void)
 #ifdef CONFIG_PCI
 	dma_debug_add_bus(&pci_bus_type);
 #endif
+	x86_init.iommu.iommu_init();
 
-	calgary_iommu_init();
+	if (swiotlb) {
+		printk(KERN_INFO "PCI-DMA: "
+		       "Using software bounce buffering for IO (SWIOTLB)\n");
+		swiotlb_print_info();
+	} else
+		swiotlb_free();
 
-	intel_iommu_init();
-
-	amd_iommu_init();
-
-	gart_iommu_init();
-
-	no_iommu_init();
 	return 0;
-}
-
-void pci_iommu_shutdown(void)
-{
-	gart_iommu_shutdown();
-
-	amd_iommu_shutdown();
 }
 /* Must execute after PCI subsystem */
 rootfs_initcall(pci_iommu_init);
@@ -316,10 +308,11 @@ rootfs_initcall(pci_iommu_init);
 
 static __devinit void via_no_dac(struct pci_dev *dev)
 {
-	if ((dev->class >> 8) == PCI_CLASS_BRIDGE_PCI && forbid_dac == 0) {
+	if (forbid_dac == 0) {
 		dev_info(&dev->dev, "disabling DAC on VIA PCI bridge\n");
 		forbid_dac = 1;
 	}
 }
-DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_VIA, PCI_ANY_ID, via_no_dac);
+DECLARE_PCI_FIXUP_CLASS_FINAL(PCI_VENDOR_ID_VIA, PCI_ANY_ID,
+				PCI_CLASS_BRIDGE_PCI, 8, via_no_dac);
 #endif

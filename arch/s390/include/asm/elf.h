@@ -103,6 +103,7 @@
 #define HWCAP_S390_HPAGE	128
 #define HWCAP_S390_ETF3EH	256
 #define HWCAP_S390_HIGH_GPRS	512
+#define HWCAP_S390_TE		1024
 
 /*
  * These are used to set parameters in the core dumps.
@@ -161,8 +162,11 @@ extern unsigned int vdso_enabled;
 /* This is the location that an ET_DYN program is loaded if exec'ed.  Typical
    use of this is to invoke "./ld.so someprog" to test out a new version of
    the loader.  We need to make sure that it is out of the way of the program
-   that it will "exec", and that there is sufficient room for the brk.  */
-#define ELF_ET_DYN_BASE		(STACK_TOP / 3 * 2)
+   that it will "exec", and that there is sufficient room for the brk. 64-bit
+   tasks are aligned to 4GB. */
+#define ELF_ET_DYN_BASE (is_32bit_task() ? \
+				(STACK_TOP / 3 * 2) : \
+				(STACK_TOP / 3 * 2) & ~((1UL << 32) - 1))
 
 /* This yields a mask that user programs can use to figure out what
    instruction set this CPU supports. */
@@ -206,6 +210,10 @@ do {								\
 		disable_noexec(current->mm, current);	\
 	current->mm->context.noexec == 0;		\
 })
+
+extern unsigned long mmap_rnd_mask;
+
+#define STACK_RND_MASK	(test_thread_flag(TIF_31BIT) ? 0x7ff : mmap_rnd_mask)
 
 #define ARCH_DLINFO							    \
 do {									    \

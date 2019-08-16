@@ -34,7 +34,6 @@
 #include <linux/netdevice.h>
 #include <linux/proc_fs.h>
 #include <linux/skbuff.h>
-#include <linux/slab.h>
 #include <linux/tcp.h>
 #include <linux/types.h>
 #include <linux/wireless.h>
@@ -133,7 +132,7 @@ u8 libipw_freq_to_channel(struct libipw_device * ieee, u32 freq)
 	return 0;
 }
 
-int libipw_set_geo(struct libipw_device *ieee,
+void libipw_set_geo(struct libipw_device *ieee,
 		      const struct libipw_geo *geo)
 {
 	memcpy(ieee->geo.name, geo->name, 3);
@@ -144,7 +143,6 @@ int libipw_set_geo(struct libipw_device *ieee,
 	       sizeof(struct libipw_channel));
 	memcpy(ieee->geo.a, geo->a, ieee->geo.a_channels *
 	       sizeof(struct libipw_channel));
-	return 0;
 }
 
 const struct libipw_geo *libipw_get_geo(struct libipw_device *ieee)

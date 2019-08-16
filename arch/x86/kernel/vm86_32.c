@@ -151,7 +151,14 @@ struct pt_regs *save_v86_state(struct kernel_vm86_regs *regs)
 	tss = &per_cpu(init_tss, get_cpu());
 	current->thread.sp0 = current->thread.saved_sp0;
 	current->thread.sysenter_cs = __KERNEL_CS;
-	load_sp0(tss, &current->thread);
+
+	/*
+	 * PTI-32: Always set tss->x86_tss.sp1 for correct task switching.
+	 */
+	if (!static_cpu_has(X86_FEATURE_PTI_SUPPORT))
+		load_sp0(tss, &current->thread);
+	WRITE_ONCE(tss->x86_tss.sp1, current->thread.sp0);
+
 	current->thread.saved_sp0 = 0;
 	put_cpu();
 
@@ -172,6 +179,7 @@ static void mark_screen_rdonly(struct mm_struct *mm)
 	spinlock_t *ptl;
 	int i;
 
+	down_write(&mm->mmap_sem);
 	pgd = pgd_offset(mm, 0xA0000);
 	if (pgd_none_or_clear_bad(pgd))
 		goto out;
@@ -179,6 +187,7 @@ static void mark_screen_rdonly(struct mm_struct *mm)
 	if (pud_none_or_clear_bad(pud))
 		goto out;
 	pmd = pmd_offset(pud, 0xA0000);
+	split_huge_page_pmd(mm, pmd);
 	if (pmd_none_or_clear_bad(pmd))
 		goto out;
 	pte = pte_offset_map_lock(mm, pmd, 0xA0000, &ptl);
@@ -189,6 +198,7 @@ static void mark_screen_rdonly(struct mm_struct *mm)
 	}
 	pte_unmap_unlock(pte, ptl);
 out:
+	up_write(&mm->mmap_sem);
 	flush_tlb();
 }
 
@@ -328,16 +338,23 @@ static void do_sys_vm86(struct kernel_vm86_struct *info, struct task_struct *tsk
 	tsk->thread.sp0 = (unsigned long) &info->VM86_TSS_ESP0;
 	if (cpu_has_sep)
 		tsk->thread.sysenter_cs = 0;
-	load_sp0(tss, &tsk->thread);
+
+	/*
+	 * PTI-32: Always set tss->x86_tss.sp1 for correct task switching.
+	 */
+	if (!static_cpu_has(X86_FEATURE_PTI_SUPPORT))
+		load_sp0(tss, &tsk->thread);
+	WRITE_ONCE(tss->x86_tss.sp1, tsk->thread.sp0);
+
 	put_cpu();
 
 	tsk->thread.screen_bitmap = info->screen_bitmap;
 	if (info->flags & VM86_SCREEN_BITMAP)
 		mark_screen_rdonly(tsk->mm);
 
-	/*call audit_syscall_exit since we do not exit via the normal paths */
+	/*call __audit_syscall_exit since we do not exit via the normal paths */
 	if (unlikely(current->audit_context))
-		audit_syscall_exit(AUDITSC_RESULT(0), 0);
+		__audit_syscall_exit(1, 0);
 
 	__asm__ __volatile__(
 		"movl %0,%%esp\n\t"

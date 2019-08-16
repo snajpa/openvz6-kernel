@@ -33,7 +33,6 @@ enum trace_type {
 	TRACE_GRAPH_RET,
 	TRACE_GRAPH_ENT,
 	TRACE_USER_STACK,
-	TRACE_HW_BRANCHES,
 	TRACE_KMEM_ALLOC,
 	TRACE_KMEM_FREE,
 	TRACE_BLK,
@@ -100,6 +99,19 @@ struct syscall_trace_exit {
 	int			nr;
 	unsigned long		ret;
 };
+
+struct kprobe_trace_entry_head {
+	struct trace_entry	ent;
+	unsigned long		ip;
+};
+
+struct kretprobe_trace_entry_head {
+	struct trace_entry	ent;
+	unsigned long		func;
+	unsigned long		ret_ip;
+};
+
+
 
 /*
  * trace_flag_type is an enumeration that holds different
@@ -204,7 +216,6 @@ extern void __ftrace_bad_type(void);
 			  TRACE_GRAPH_ENT);		\
 		IF_ASSIGN(var, ent, struct ftrace_graph_ret_entry,	\
 			  TRACE_GRAPH_RET);		\
-		IF_ASSIGN(var, ent, struct hw_branch_entry, TRACE_HW_BRANCHES);\
 		IF_ASSIGN(var, ent, struct kmemtrace_alloc_entry,	\
 			  TRACE_KMEM_ALLOC);	\
 		IF_ASSIGN(var, ent, struct kmemtrace_free_entry,	\
@@ -284,6 +295,9 @@ struct tracer {
 	struct tracer		*next;
 	int			print_max;
 	struct tracer_flags	*flags;
+#ifndef __GENKSYMS__
+	int			use_max_tr;
+#endif
 };
 
 
@@ -350,6 +364,14 @@ void trace_function(struct trace_array *tr,
 		    unsigned long ip,
 		    unsigned long parent_ip,
 		    unsigned long flags, int pc);
+void trace_graph_function(struct trace_array *tr,
+		    unsigned long ip,
+		    unsigned long parent_ip,
+		    unsigned long flags, int pc);
+void trace_latency_header(struct seq_file *m);
+void trace_default_header(struct seq_file *m);
+void print_trace_header(struct seq_file *m, struct trace_iterator *iter);
+int trace_empty(struct trace_iterator *iter);
 
 void trace_graph_return(struct ftrace_graph_ret *trace);
 int trace_graph_entry(struct ftrace_graph_ent *trace);
@@ -379,6 +401,9 @@ void update_max_tr_single(struct trace_array *tr,
 void ftrace_trace_stack(struct ring_buffer *buffer, unsigned long flags,
 			int skip, int pc);
 
+void ftrace_trace_stack_regs(struct ring_buffer *buffer, unsigned long flags,
+			     int skip, int pc, struct pt_regs *regs);
+
 void ftrace_trace_userstack(struct ring_buffer *buffer, unsigned long flags,
 			    int pc);
 
@@ -387,6 +412,12 @@ void __trace_stack(struct trace_array *tr, unsigned long flags, int skip,
 #else
 static inline void ftrace_trace_stack(struct trace_array *tr,
 				      unsigned long flags, int skip, int pc)
+{
+}
+
+static inline void ftrace_trace_stack_regs(struct ring_buffer *buffer,
+					   unsigned long flags, int skip,
+					   int pc, struct pt_regs *regs)
 {
 }
 
@@ -436,8 +467,6 @@ extern int trace_selftest_startup_sysprof(struct tracer *trace,
 					       struct trace_array *tr);
 extern int trace_selftest_startup_branch(struct tracer *trace,
 					 struct trace_array *tr);
-extern int trace_selftest_startup_hw_branches(struct tracer *trace,
-					      struct trace_array *tr);
 #endif /* CONFIG_FTRACE_STARTUP_TEST */
 
 extern void *head_page(struct trace_array_cpu *data);
@@ -458,13 +487,34 @@ extern int trace_clock_id;
 
 /* Standard output formatting function used for function return traces */
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
-extern enum print_line_t print_graph_function(struct trace_iterator *iter);
+
+/* Flag options */
+#define TRACE_GRAPH_PRINT_OVERRUN       0x1
+#define TRACE_GRAPH_PRINT_CPU           0x2
+#define TRACE_GRAPH_PRINT_OVERHEAD      0x4
+#define TRACE_GRAPH_PRINT_PROC          0x8
+#define TRACE_GRAPH_PRINT_DURATION      0x10
+#define TRACE_GRAPH_PRINT_ABS_TIME      0x20
+
+extern enum print_line_t
+print_graph_function_flags(struct trace_iterator *iter, u32 flags);
+extern void print_graph_headers_flags(struct seq_file *s, u32 flags);
 extern enum print_line_t
 trace_print_graph_duration(unsigned long long duration, struct trace_seq *s);
+extern void graph_trace_open(struct trace_iterator *iter);
+extern void graph_trace_close(struct trace_iterator *iter);
+extern int __trace_graph_entry(struct trace_array *tr,
+			       struct ftrace_graph_ent *trace,
+			       unsigned long flags, int pc);
+extern void __trace_graph_return(struct trace_array *tr,
+				 struct ftrace_graph_ret *trace,
+				 unsigned long flags, int pc);
+
 
 #ifdef CONFIG_DYNAMIC_FTRACE
 /* TODO: make this variable */
 #define FTRACE_GRAPH_MAX_FUNCS		32
+extern int ftrace_graph_filter_enabled;
 extern int ftrace_graph_count;
 extern unsigned long ftrace_graph_funcs[FTRACE_GRAPH_MAX_FUNCS];
 
@@ -472,7 +522,7 @@ static inline int ftrace_graph_addr(unsigned long addr)
 {
 	int i;
 
-	if (!ftrace_graph_count || test_tsk_trace_graph(current))
+	if (!ftrace_graph_filter_enabled)
 		return 1;
 
 	for (i = 0; i < ftrace_graph_count; i++) {
@@ -494,18 +544,18 @@ static inline int ftrace_graph_addr(unsigned long addr)
 #endif /* CONFIG_DYNAMIC_FTRACE */
 #else /* CONFIG_FUNCTION_GRAPH_TRACER */
 static inline enum print_line_t
-print_graph_function(struct trace_iterator *iter)
+print_graph_function_flags(struct trace_iterator *iter, u32 flags)
 {
 	return TRACE_TYPE_UNHANDLED;
 }
 #endif /* CONFIG_FUNCTION_GRAPH_TRACER */
 
-extern struct pid *ftrace_pid_trace;
+extern struct list_head ftrace_pids;
 
 #ifdef CONFIG_FUNCTION_TRACER
 static inline int ftrace_trace_task(struct task_struct *task)
 {
-	if (!ftrace_pid_trace)
+	if (list_empty(&ftrace_pids))
 		return 1;
 
 	return test_tsk_trace_trace(task);
@@ -581,6 +631,7 @@ enum trace_iterator_flags {
 	TRACE_ITER_LATENCY_FMT		= 0x40000,
 	TRACE_ITER_SLEEP_TIME		= 0x80000,
 	TRACE_ITER_GRAPH_TIME		= 0x100000,
+	TRACE_ITER_RECORD_CMD           = 0x200000,
 };
 
 /*
@@ -687,7 +738,6 @@ struct event_filter {
 	int			n_preds;
 	struct filter_pred	**preds;
 	char			*filter_string;
-	bool			no_reset;
 };
 
 struct event_subsystem {
@@ -699,22 +749,40 @@ struct event_subsystem {
 };
 
 struct filter_pred;
+struct regex;
 
 typedef int (*filter_pred_fn_t) (struct filter_pred *pred, void *event,
 				 int val1, int val2);
 
-struct filter_pred {
-	filter_pred_fn_t fn;
-	u64 val;
-	char str_val[MAX_FILTER_STR_VAL];
-	int str_len;
-	char *field_name;
-	int offset;
-	int not;
-	int op;
-	int pop_n;
+typedef int (*regex_match_func)(char *str, struct regex *r, int len);
+
+enum regex_type {
+	MATCH_FULL = 0,
+	MATCH_FRONT_ONLY,
+	MATCH_MIDDLE_ONLY,
+	MATCH_END_ONLY,
 };
 
+struct regex {
+	char			pattern[MAX_FILTER_STR_VAL];
+	int			len;
+	int			field_len;
+	regex_match_func	match;
+};
+
+struct filter_pred {
+	filter_pred_fn_t 	fn;
+	u64 			val;
+	struct regex		regex;
+	char 			*field_name;
+	int 			offset;
+	int 			not;
+	int 			op;
+	int 			pop_n;
+};
+
+extern enum regex_type
+filter_parse_regex(char *buff, int len, char **search, int *not);
 extern void print_event_filter(struct ftrace_event_call *call,
 			       struct trace_seq *s);
 extern int apply_event_filter(struct ftrace_event_call *call,
@@ -730,13 +798,16 @@ filter_check_discard(struct ftrace_event_call *call, void *rec,
 		     struct ring_buffer *buffer,
 		     struct ring_buffer_event *event)
 {
-	if (unlikely(call->filter_active) && !filter_match_preds(call, rec)) {
+	if (unlikely(call->flags & TRACE_EVENT_FL_FILTERED) &&
+	    !filter_match_preds(call->filter, rec)) {
 		ring_buffer_discard_commit(buffer, event);
 		return 1;
 	}
 
 	return 0;
 }
+
+extern void trace_event_enable_cmd_record(bool enable);
 
 extern struct mutex event_mutex;
 extern struct list_head ftrace_events;

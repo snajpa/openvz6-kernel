@@ -73,7 +73,9 @@ struct ehci_hcd {			/* one per controller */
 
 	/* async schedule support */
 	struct ehci_qh		*async;
+	struct ehci_qh		*dummy;		/* For AMD quirk use */
 	struct ehci_qh		*reclaim;
+	struct ehci_qh		*qh_scan_next;
 	unsigned		scanning : 1;
 
 	/* periodic schedule support */
@@ -87,8 +89,9 @@ struct ehci_hcd {			/* one per controller */
 	int			next_uframe;	/* scan periodic, start here */
 	unsigned		periodic_sched;	/* periodic activity count */
 
-	/* list of itds completed while clock_frame was still active */
+	/* list of itds & sitds completed while clock_frame was still active */
 	struct list_head	cached_itd_list;
+	struct list_head	cached_sitd_list;
 	unsigned		clock_frame;
 
 	/* per root hub port */
@@ -115,7 +118,6 @@ struct ehci_hcd {			/* one per controller */
 	struct timer_list	iaa_watchdog;
 	struct timer_list	watchdog;
 	unsigned long		actions;
-	unsigned		stamp;
 	unsigned		random_frame;
 	unsigned long		next_statechange;
 	ktime_t			last_periodic_enable;
@@ -129,6 +131,8 @@ struct ehci_hcd {			/* one per controller */
 	unsigned		has_amcc_usb23:1;
 	unsigned		need_io_watchdog:1;
 	unsigned		broken_periodic:1;
+	unsigned		use_dummy_qh:1;	/* AMD Frame List table quirk*/
+	unsigned		amd_pll_fix:1;
 
 	/* required for usb32 quirk */
 	#define OHCI_CTRL_HCFS          (3 << 6)
@@ -139,7 +143,8 @@ struct ehci_hcd {			/* one per controller */
 	#define OHCI_HCCTRL_LEN         0x4
 	__hc32			*ohci_hcctrl_reg;
 	unsigned		has_hostpc:1;
-
+	unsigned		has_lpm:1;  /* support link power management */
+	unsigned		has_ppcd:1; /* support per-port change bits */
 	u8			sbrn;		/* packed release number */
 
 	/* irq statistics */
@@ -156,8 +161,12 @@ struct ehci_hcd {			/* one per controller */
 	struct dentry		*debug_async;
 	struct dentry		*debug_periodic;
 	struct dentry		*debug_registers;
+	struct dentry		*debug_lpm;
 #endif
 };
+
+/* Force IO watchdog to be always enabled */
+extern unsigned int io_watchdog_force;
 
 /* convert between an HCD pointer and the corresponding EHCI_HCD */
 static inline struct ehci_hcd *hcd_to_ehci (struct usb_hcd *hcd)
@@ -195,7 +204,7 @@ timer_action_done (struct ehci_hcd *ehci, enum ehci_timer_action action)
 	clear_bit (action, &ehci->actions);
 }
 
-static void free_cached_itd_list(struct ehci_hcd *ehci);
+static void free_cached_lists(struct ehci_hcd *ehci);
 
 /*-------------------------------------------------------------------------*/
 
@@ -333,6 +342,7 @@ struct ehci_qh {
 	struct ehci_qh		*reclaim;	/* next to reclaim */
 
 	struct ehci_hcd		*ehci;
+	unsigned long		unlink_time;
 
 	/*
 	 * Do NOT use atomic operations for QH refcounting. On some CPUs
@@ -394,9 +404,8 @@ struct ehci_iso_sched {
  * acts like a qh would, if EHCI had them for ISO.
  */
 struct ehci_iso_stream {
-	/* first two fields match QH, but info1 == 0 */
-	__hc32			hw_next;
-	__hc32			hw_info1;
+	/* first field matches ehci_hq, but is NULL */
+	struct ehci_qh_hw	*hw;
 
 	u32			refcount;
 	u8			bEndpointAddress;

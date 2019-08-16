@@ -259,7 +259,7 @@ static int proc_bus_pci_mmap(struct file *file, struct vm_area_struct *vma)
 
 	/* Make sure the caller is mapping a real resource for this device */
 	for (i = 0; i < PCI_ROM_RESOURCE; i++) {
-		if (pci_mmap_fits(dev, i, vma))
+		if (pci_mmap_fits(dev, i, vma,  PCI_MMAP_PROCFS))
 			break;
 	}
 
@@ -430,32 +430,11 @@ int pci_proc_detach_device(struct pci_dev *dev)
 	struct proc_dir_entry *e;
 
 	if ((e = dev->procent)) {
-		if (atomic_read(&e->count) > 1)
-			return -EBUSY;
 		remove_proc_entry(e->name, dev->bus->procdir);
 		dev->procent = NULL;
 	}
 	return 0;
 }
-
-#if 0
-int pci_proc_attach_bus(struct pci_bus* bus)
-{
-	struct proc_dir_entry *de = bus->procdir;
-
-	if (!proc_initialized)
-		return -EACCES;
-
-	if (!de) {
-		char name[16];
-		sprintf(name, "%02x", bus->number);
-		de = bus->procdir = proc_mkdir(name, proc_bus_pci_dir);
-		if (!de)
-			return -ENOMEM;
-	}
-	return 0;
-}
-#endif  /*  0  */
 
 int pci_proc_detach_bus(struct pci_bus* bus)
 {

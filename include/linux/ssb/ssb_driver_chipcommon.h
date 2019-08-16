@@ -8,7 +8,7 @@
  * gpio interface, extbus, and support for serial and parallel flashes.
  *
  * Copyright 2005, Broadcom Corporation
- * Copyright 2006, Michael Buesch <mb@bu3sch.de>
+ * Copyright 2006, Michael Buesch <m@bues.ch>
  *
  * Licensed under the GPL version 2. See COPYING for details.
  */
@@ -53,6 +53,7 @@
 #define  SSB_CHIPCO_CAP_64BIT		0x08000000	/* 64-bit Backplane */
 #define  SSB_CHIPCO_CAP_PMU		0x10000000	/* PMU available (rev >= 20) */
 #define  SSB_CHIPCO_CAP_ECI		0x20000000	/* ECI available (rev >= 20) */
+#define  SSB_CHIPCO_CAP_SPROM		0x40000000	/* SPROM present */
 #define SSB_CHIPCO_CORECTL		0x0008
 #define  SSB_CHIPCO_CORECTL_UARTCLK0	0x00000001	/* Drive UART with internal clock */
 #define	 SSB_CHIPCO_CORECTL_SE		0x00000002	/* sync clk out enable (corerev >= 3) */
@@ -122,6 +123,8 @@
 #define SSB_CHIPCO_FLASHDATA		0x0048
 #define SSB_CHIPCO_BCAST_ADDR		0x0050
 #define SSB_CHIPCO_BCAST_DATA		0x0054
+#define SSB_CHIPCO_GPIOPULLUP		0x0058		/* Rev >= 20 only */
+#define SSB_CHIPCO_GPIOPULLDOWN		0x005C		/* Rev >= 20 only */
 #define SSB_CHIPCO_GPIOIN		0x0060
 #define SSB_CHIPCO_GPIOOUT		0x0064
 #define SSB_CHIPCO_GPIOOUTEN		0x0068
@@ -130,6 +133,9 @@
 #define SSB_CHIPCO_GPIOIRQ		0x0074
 #define SSB_CHIPCO_WATCHDOG		0x0080
 #define SSB_CHIPCO_GPIOTIMER		0x0088		/* LED powersave (corerev >= 16) */
+#define  SSB_CHIPCO_GPIOTIMER_OFFTIME	0x0000FFFF
+#define  SSB_CHIPCO_GPIOTIMER_OFFTIME_SHIFT	0
+#define  SSB_CHIPCO_GPIOTIMER_ONTIME	0xFFFF0000
 #define  SSB_CHIPCO_GPIOTIMER_ONTIME_SHIFT	16
 #define SSB_CHIPCO_GPIOTOUTM		0x008C		/* LED powersave (corerev >= 16) */
 #define SSB_CHIPCO_CLOCK_N		0x0090
@@ -188,8 +194,10 @@
 #define  SSB_CHIPCO_CLKCTLST_HAVEALPREQ	0x00000008 /* ALP available request */
 #define  SSB_CHIPCO_CLKCTLST_HAVEHTREQ	0x00000010 /* HT available request */
 #define  SSB_CHIPCO_CLKCTLST_HWCROFF	0x00000020 /* Force HW clock request off */
-#define  SSB_CHIPCO_CLKCTLST_HAVEHT	0x00010000 /* HT available */
-#define  SSB_CHIPCO_CLKCTLST_HAVEALP	0x00020000 /* APL available */
+#define  SSB_CHIPCO_CLKCTLST_HAVEALP	0x00010000 /* ALP available */
+#define  SSB_CHIPCO_CLKCTLST_HAVEHT	0x00020000 /* HT available */
+#define  SSB_CHIPCO_CLKCTLST_4328A0_HAVEHT	0x00010000 /* 4328a0 has reversed bits */
+#define  SSB_CHIPCO_CLKCTLST_4328A0_HAVEALP	0x00020000 /* 4328a0 has reversed bits */
 #define SSB_CHIPCO_HW_WORKAROUND	0x01E4 /* Hardware workaround (rev >= 20) */
 #define SSB_CHIPCO_UART0_DATA		0x0300
 #define SSB_CHIPCO_UART0_IMR		0x0304
@@ -211,6 +219,7 @@
 #define SSB_CHIPCO_PMU_CTL			0x0600 /* PMU control */
 #define  SSB_CHIPCO_PMU_CTL_ILP_DIV		0xFFFF0000 /* ILP div mask */
 #define  SSB_CHIPCO_PMU_CTL_ILP_DIV_SHIFT	16
+#define  SSB_CHIPCO_PMU_CTL_PLL_UPD		0x00000400
 #define  SSB_CHIPCO_PMU_CTL_NOILPONW		0x00000200 /* No ILP on wait */
 #define  SSB_CHIPCO_PMU_CTL_HTREQEN		0x00000100 /* HT req enable */
 #define  SSB_CHIPCO_PMU_CTL_ALPREQEN		0x00000080 /* ALP req enable */
@@ -385,6 +394,7 @@
 
 
 /** Chip specific Chip-Status register contents. */
+#define SSB_CHIPCO_CHST_4322_SPROM_EXISTS	0x00000040 /* SPROM present */
 #define SSB_CHIPCO_CHST_4325_SPROM_OTP_SEL	0x00000003
 #define SSB_CHIPCO_CHST_4325_DEFCIS_SEL		0 /* OTP is powered up, use def. CIS, no SPROM */
 #define SSB_CHIPCO_CHST_4325_SPROM_SEL		1 /* OTP is powered up, SPROM is present */
@@ -397,6 +407,18 @@
 #define SSB_CHIPCO_CHST_4325_RCAL_VALUE		0x000001F0
 #define SSB_CHIPCO_CHST_4325_RCAL_VALUE_SHIFT	4
 #define SSB_CHIPCO_CHST_4325_PMUTOP_2B 		0x00000200 /* 1 for 2b, 0 for to 2a */
+
+/** Macros to determine SPROM presence based on Chip-Status register. */
+#define SSB_CHIPCO_CHST_4312_SPROM_PRESENT(status) \
+	((status & SSB_CHIPCO_CHST_4325_SPROM_OTP_SEL) != \
+		SSB_CHIPCO_CHST_4325_OTP_SEL)
+#define SSB_CHIPCO_CHST_4322_SPROM_PRESENT(status) \
+	(status & SSB_CHIPCO_CHST_4322_SPROM_EXISTS)
+#define SSB_CHIPCO_CHST_4325_SPROM_PRESENT(status) \
+	(((status & SSB_CHIPCO_CHST_4325_SPROM_OTP_SEL) != \
+		SSB_CHIPCO_CHST_4325_DEFCIS_SEL) && \
+	 ((status & SSB_CHIPCO_CHST_4325_SPROM_OTP_SEL) != \
+		SSB_CHIPCO_CHST_4325_OTP_SEL))
 
 
 
@@ -483,7 +505,9 @@
 #define SSB_CHIPCO_FLASHCTL_ST_SE	0x02D8		/* Sector Erase */
 #define SSB_CHIPCO_FLASHCTL_ST_BE	0x00C7		/* Bulk Erase */
 #define SSB_CHIPCO_FLASHCTL_ST_DP	0x00B9		/* Deep Power-down */
-#define SSB_CHIPCO_FLASHCTL_ST_RSIG	0x03AB		/* Read Electronic Signature */
+#define SSB_CHIPCO_FLASHCTL_ST_RES	0x03AB		/* Read Electronic Signature */
+#define SSB_CHIPCO_FLASHCTL_ST_CSA	0x1000		/* Keep chip select asserted */
+#define SSB_CHIPCO_FLASHCTL_ST_SSE	0x0220		/* Sub-sector Erase */
 
 /* Status register bits for ST flashes */
 #define SSB_CHIPCO_FLASHSTA_ST_WIP	0x01		/* Write In Progress */
@@ -564,9 +588,13 @@ struct ssb_chipcommon_pmu {
 struct ssb_chipcommon {
 	struct ssb_device *dev;
 	u32 capabilities;
+	u32 status;
 	/* Fast Powerup Delay constant */
 	u16 fast_pwrup_delay;
+	spinlock_t gpio_lock;
 	struct ssb_chipcommon_pmu pmu;
+	u32 ticks_per_ms;
+	u32 max_timer_ms;
 };
 
 static inline bool ssb_chipco_available(struct ssb_chipcommon *cc)
@@ -606,8 +634,7 @@ enum ssb_clkmode {
 extern void ssb_chipco_set_clockmode(struct ssb_chipcommon *cc,
 				     enum ssb_clkmode mode);
 
-extern void ssb_chipco_watchdog_timer_set(struct ssb_chipcommon *cc,
-					  u32 ticks);
+extern u32 ssb_chipco_watchdog_timer_set(struct ssb_chipcommon *cc, u32 ticks);
 
 void ssb_chipco_irq_mask(struct ssb_chipcommon *cc, u32 mask, u32 value);
 
@@ -620,6 +647,8 @@ u32 ssb_chipco_gpio_outen(struct ssb_chipcommon *cc, u32 mask, u32 value);
 u32 ssb_chipco_gpio_control(struct ssb_chipcommon *cc, u32 mask, u32 value);
 u32 ssb_chipco_gpio_intmask(struct ssb_chipcommon *cc, u32 mask, u32 value);
 u32 ssb_chipco_gpio_polarity(struct ssb_chipcommon *cc, u32 mask, u32 value);
+u32 ssb_chipco_gpio_pullup(struct ssb_chipcommon *cc, u32 mask, u32 value);
+u32 ssb_chipco_gpio_pulldown(struct ssb_chipcommon *cc, u32 mask, u32 value);
 
 #ifdef CONFIG_SSB_SERIAL
 extern int ssb_chipco_serial_init(struct ssb_chipcommon *cc,
@@ -639,5 +668,6 @@ enum ssb_pmu_ldo_volt_id {
 void ssb_pmu_set_ldo_voltage(struct ssb_chipcommon *cc,
 			     enum ssb_pmu_ldo_volt_id id, u32 voltage);
 void ssb_pmu_set_ldo_paref(struct ssb_chipcommon *cc, bool on);
+void ssb_pmu_spuravoid_pllupdate(struct ssb_chipcommon *cc, int spuravoid);
 
 #endif /* LINUX_SSB_CHIPCO_H_ */

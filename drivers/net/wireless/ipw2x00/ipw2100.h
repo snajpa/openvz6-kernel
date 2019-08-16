@@ -135,15 +135,6 @@ enum {
 	IPW_HW_STATE_ENABLED = 0
 };
 
-struct ssid_context {
-	char ssid[IW_ESSID_MAX_SIZE + 1];
-	int ssid_len;
-	unsigned char bssid[ETH_ALEN];
-	int port_type;
-	int channel;
-
-};
-
 extern const char *port_type_str[];
 extern const char *band_str[];
 
@@ -164,7 +155,7 @@ struct bd_status {
 		} fields;
 		u8 field;
 	} info;
-} __attribute__ ((packed));
+} __packed;
 
 struct ipw2100_bd {
 	u32 host_addr;
@@ -174,7 +165,7 @@ struct ipw2100_bd {
 	 * 1st TBD) */
 	u8 num_fragments;
 	u8 reserved[6];
-} __attribute__ ((packed));
+} __packed;
 
 #define IPW_BD_QUEUE_LENGTH(n) (1<<n)
 #define IPW_BD_ALIGNMENT(L)    (L*sizeof(struct ipw2100_bd))
@@ -232,7 +223,7 @@ struct ipw2100_status {
 #define IPW_STATUS_FLAG_WEP_ENCRYPTED	(1<<1)
 #define IPW_STATUS_FLAG_CRC_ERROR       (1<<2)
 	u8 rssi;
-} __attribute__ ((packed));
+} __packed;
 
 struct ipw2100_status_queue {
 	/* driver (virtual) pointer to queue */
@@ -293,7 +284,7 @@ struct ipw2100_cmd_header {
 	u32 reserved1[3];
 	u32 *ordinal1_ptr;
 	u32 *ordinal2_ptr;
-} __attribute__ ((packed));
+} __packed;
 
 struct ipw2100_data_header {
 	u32 host_command_reg;
@@ -307,7 +298,7 @@ struct ipw2100_data_header {
 	u8 src_addr[ETH_ALEN];
 	u8 dst_addr[ETH_ALEN];
 	u16 fragment_size;
-} __attribute__ ((packed));
+} __packed;
 
 /* Host command data structure */
 struct host_command {
@@ -316,7 +307,7 @@ struct host_command {
 	u32 host_command_sequence;	// UNIQUE COMMAND NUMBER (ID)
 	u32 host_command_length;	// LENGTH
 	u32 host_command_parameters[HOST_COMMAND_PARAMS_REG_LEN];	// COMMAND PARAMETERS
-} __attribute__ ((packed));
+} __packed;
 
 typedef enum {
 	POWER_ON_RESET,
@@ -382,7 +373,7 @@ struct ipw2100_notification {
 	u32 hnhdr_size;		/* size in bytes of data
 				   or number of entries, if table.
 				   Does NOT include header */
-} __attribute__ ((packed));
+} __packed;
 
 #define MAX_KEY_SIZE	16
 #define	MAX_KEYS	8
@@ -488,6 +479,7 @@ enum {
 #define CAP_PRIVACY_ON          (1<<1)	/* Off = No privacy */
 
 struct ipw2100_priv {
+	void __iomem *ioaddr;
 
 	int stop_hang_check;	/* Set 1 when shutting down to kill hang_check */
 	int stop_rf_kill;	/* Set 1 when shutting down to kill rf_kill */
@@ -580,14 +572,12 @@ struct ipw2100_priv {
 
 	struct tasklet_struct irq_tasklet;
 
-	struct workqueue_struct *workqueue;
 	struct delayed_work reset_work;
 	struct delayed_work security_work;
 	struct delayed_work wx_event_work;
 	struct delayed_work hang_check;
 	struct delayed_work rf_kill;
-	struct work_struct scan_event_now;
-	struct delayed_work scan_event_later;
+	struct delayed_work scan_event;
 
 	int user_requested_scan;
 
@@ -814,7 +804,7 @@ struct ipw2100_rx {
 		struct ipw2100_notification notification;
 		struct ipw2100_cmd_header command;
 	} rx_data;
-} __attribute__ ((packed));
+} __packed;
 
 /* Bit 0-7 are for 802.11b tx rates - .  Bit 5-7 are reserved */
 #define TX_RATE_1_MBIT              0x0001
@@ -1054,7 +1044,7 @@ typedef enum _ORDINAL_TABLE_1 {	// NS - means Not Supported by FW
 	IPW_ORD_POWER_MGMT_MODE,	// Power mode - 0=CAM, 1=PSP
 	IPW_ORD_POWER_MGMT_INDEX,	//NS //
 	IPW_ORD_COUNTRY_CODE,	// IEEE country code as recv'd from beacon
-	IPW_ORD_COUNTRY_CHANNELS,	// channels suported by country
+	IPW_ORD_COUNTRY_CHANNELS,	// channels supported by country
 // IPW_ORD_COUNTRY_CHANNELS:
 // For 11b the lower 2-byte are used for channels from 1-14
 //   and the higher 2-byte are not used.

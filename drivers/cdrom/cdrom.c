@@ -1186,8 +1186,12 @@ static int check_for_audio_disc(struct cdrom_device_info * cdi,
 
 void cdrom_release(struct cdrom_device_info *cdi, fmode_t mode)
 {
-	struct cdrom_device_ops *cdo = cdi->ops;
+	struct cdrom_device_ops *cdo;
 	int opened_for_data;
+
+	if (cdi == NULL)	/* device is gone */
+		return;
+	cdo = cdi->ops;
 
 	cdinfo(CD_CLOSE, "entering cdrom_release\n");
 
@@ -2108,7 +2112,7 @@ static int cdrom_read_cdda_bpc(struct cdrom_device_info *cdi, __u8 __user *ubuf,
 
 		rq = blk_get_request(q, READ, GFP_KERNEL);
 		if (!rq) {
-			ret = -ENOMEM;
+			ret = -ENODEV;
 			break;
 		}
 
@@ -2684,12 +2688,11 @@ int cdrom_ioctl(struct cdrom_device_info *cdi, struct block_device *bdev,
 {
 	void __user *argp = (void __user *)arg;
 	int ret;
-	struct gendisk *disk = bdev->bd_disk;
 
 	/*
 	 * Try the generic SCSI command ioctl's first.
 	 */
-	ret = scsi_cmd_ioctl(disk->queue, disk, mode, cmd, argp);
+	ret = scsi_cmd_blk_ioctl(bdev, mode, cmd, argp);
 	if (ret != -ENOTTY)
 		return ret;
 
@@ -2829,7 +2832,7 @@ static noinline int mmc_ioctl_cdrom_read_data(struct cdrom_device_info *cdi,
 	if (lba < 0)
 		return -EINVAL;
 
-	cgc->buffer = kmalloc(blocksize, GFP_KERNEL);
+	cgc->buffer = kzalloc(blocksize, GFP_KERNEL);
 	if (cgc->buffer == NULL)
 		return -ENOMEM;
 

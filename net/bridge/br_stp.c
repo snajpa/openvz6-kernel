@@ -208,7 +208,14 @@ static inline void br_record_config_timeout_values(struct net_bridge *br,
 /* called under bridge lock */
 void br_transmit_tcn(struct net_bridge *br)
 {
-	br_send_tcn_bpdu(br_get_port(br, br->root_port));
+	struct net_bridge_port *p;
+
+	p = br_get_port(br, br->root_port);
+	if (p)
+		br_send_tcn_bpdu(p);
+	else
+		pr_notice("%s: root port %u not found for topology notice\n",
+			  br->dev->name, br->root_port);
 }
 
 /* called under bridge lock */
@@ -376,15 +383,17 @@ static void br_make_forwarding(struct net_bridge_port *p)
 	if (p->state != BR_STATE_BLOCKING)
 		return;
 
-	if (br->forward_delay == 0) {
+	if (br->stp_enabled == BR_NO_STP || br->forward_delay == 0) {
 		p->state = BR_STATE_FORWARDING;
 		br_topology_change_detection(br);
 		del_timer(&p->forward_delay_timer);
 	}
-	else if (p->br->stp_enabled == BR_KERNEL_STP)
+	else if (br->stp_enabled == BR_KERNEL_STP)
 		p->state = BR_STATE_LISTENING;
 	else
 		p->state = BR_STATE_LEARNING;
+
+	br_multicast_enable_port(p);
 
 	br_log_state(p);
 

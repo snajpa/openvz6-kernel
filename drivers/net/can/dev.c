@@ -58,6 +58,7 @@ static int can_update_spt(const struct can_bittiming_const *btc,
 		*tseg2 = btc->tseg2_max;
 	*tseg1 = tseg - *tseg2;
 	if (*tseg1 > btc->tseg1_max) {
+		gmb();
 		*tseg1 = btc->tseg1_max;
 		*tseg2 = tseg - *tseg1;
 	}
@@ -439,7 +440,7 @@ static void can_setup(struct net_device *dev)
 
 	/* New-style flags. */
 	dev->flags = IFF_NOARP;
-	dev->features = NETIF_F_NO_CSUM;
+	dev->features = NETIF_F_HW_CSUM;
 }
 
 /*

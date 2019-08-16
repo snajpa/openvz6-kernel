@@ -101,8 +101,6 @@ source "drivers/staging/p9auth/Kconfig"
 
 source "drivers/staging/line6/Kconfig"
 
-source "drivers/gpu/drm/radeon/Kconfig"
-
 source "drivers/staging/octeon/Kconfig"
 
 source "drivers/staging/serqt_usb2/Kconfig"
@@ -115,8 +113,6 @@ source "drivers/staging/vt6656/Kconfig"
 
 source "drivers/staging/udlfb/Kconfig"
 
-source "drivers/staging/hv/Kconfig"
-
 source "drivers/staging/vme/Kconfig"
 
 source "drivers/staging/rar/Kconfig"
@@ -124,6 +120,8 @@ source "drivers/staging/rar/Kconfig"
 source "drivers/staging/sep/Kconfig"
 
 source "drivers/staging/iio/Kconfig"
+
+source "drivers/staging/zram/Kconfig"
 
 endif # !STAGING_EXCLUDE_BUILD
 endif # STAGING

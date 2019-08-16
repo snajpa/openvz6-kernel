@@ -784,7 +784,7 @@ void osd_req_write(struct osd_request *or,
 {
 	_osd_req_encode_common(or, OSD_ACT_WRITE, obj, offset, len);
 	WARN_ON(or->out.bio || or->out.total_bytes);
-	WARN_ON(0 ==  bio_rw_flagged(bio, BIO_RW));
+	WARN_ON(0 == bio_rw_flagged(bio, BIO_RW));
 	or->out.bio = bio;
 	or->out.total_bytes = len;
 }
@@ -1314,7 +1314,8 @@ static struct request *_make_request(struct request_queue *q, bool has_write,
 
 		req = blk_get_request(q, has_write ? WRITE : READ, flags);
 		if (unlikely(!req))
-			return ERR_PTR(-ENOMEM);
+			return (flags & __GFP_WAIT) ? ERR_PTR(-ENODEV) :
+						      ERR_PTR(-ENOMEM);
 
 		return req;
 	}

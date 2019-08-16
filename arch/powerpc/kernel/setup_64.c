@@ -35,6 +35,7 @@
 #include <linux/pci.h>
 #include <linux/lockdep.h>
 #include <linux/lmb.h>
+#include <linux/debugfs.h>
 #include <asm/io.h>
 #include <asm/kdump.h>
 #include <asm/prom.h>
@@ -63,6 +64,7 @@
 #include <asm/kexec.h>
 #include <asm/swiotlb.h>
 #include <asm/mmu_context.h>
+#include <asm/security_features.h>
 
 #include "setup.h"
 
@@ -96,7 +98,7 @@ int ucache_bsize;
 
 #ifdef CONFIG_SMP
 
-static int smt_enabled_cmdline;
+static char *smt_enabled_cmdline = NULL;
 
 /* Look for ibm,smt-enabled OF option */
 static void check_smt_enabled(void)
@@ -104,37 +106,46 @@ static void check_smt_enabled(void)
 	struct device_node *dn;
 	const char *smt_option;
 
+	/* Default to enabling all threads */
+	smt_enabled_at_boot = threads_per_core;
+
 	/* Allow the command line to overrule the OF option */
-	if (smt_enabled_cmdline)
-		return;
+	if (smt_enabled_cmdline) {
+		if (!strcmp(smt_enabled_cmdline, "on"))
+			smt_enabled_at_boot = threads_per_core;
+		else if (!strcmp(smt_enabled_cmdline, "off"))
+			smt_enabled_at_boot = 0;
+		else {
+			long smt;
+			int rc;
 
-	dn = of_find_node_by_path("/options");
+			rc = strict_strtol(smt_enabled_cmdline, 10, &smt);
+			if (!rc)
+				smt_enabled_at_boot =
+					min(threads_per_core, (int)smt);
+		}
+	} else {
+		dn = of_find_node_by_path("/options");
+		if (dn) {
+			smt_option = of_get_property(dn, "ibm,smt-enabled",
+						     NULL);
 
-	if (dn) {
-		smt_option = of_get_property(dn, "ibm,smt-enabled", NULL);
+	                if (smt_option) {
+				if (!strcmp(smt_option, "on"))
+					smt_enabled_at_boot = threads_per_core;
+				else if (!strcmp(smt_option, "off"))
+					smt_enabled_at_boot = 0;
+			}
 
-                if (smt_option) {
-			if (!strcmp(smt_option, "on"))
-				smt_enabled_at_boot = 1;
-			else if (!strcmp(smt_option, "off"))
-				smt_enabled_at_boot = 0;
-                }
-        }
+			of_node_put(dn);
+		}
+	}
 }
 
 /* Look for smt-enabled= cmdline option */
 static int __init early_smt_enabled(char *p)
 {
-	smt_enabled_cmdline = 1;
-
-	if (!p)
-		return 0;
-
-	if (!strcmp(p, "on") || !strcmp(p, "1"))
-		smt_enabled_at_boot = 1;
-	else if (!strcmp(p, "off") || !strcmp(p, "0"))
-		smt_enabled_at_boot = 0;
-
+	smt_enabled_cmdline = p;
 	return 0;
 }
 early_param("smt-enabled", early_smt_enabled);
@@ -398,8 +409,8 @@ void __init setup_system(void)
 	 */
 	xmon_setup();
 
-	check_smt_enabled();
 	smp_setup_cpu_maps();
+	check_smt_enabled();
 
 #ifdef CONFIG_SMP
 	/* Release secondary cpus out of their spinloops at 0x60 now that
@@ -432,9 +443,18 @@ void __init setup_system(void)
 	DBG(" <- setup_system()\n");
 }
 
+static u64 slb0_limit(void)
+{
+	if (cpu_has_feature(CPU_FTR_1T_SEGMENT)) {
+		return 1UL << SID_SHIFT_1T;
+	}
+	return 1UL << SID_SHIFT;
+}
+
 #ifdef CONFIG_IRQSTACKS
 static void __init irqstack_early_init(void)
 {
+	u64 limit = slb0_limit();
 	unsigned int i;
 
 	/*
@@ -444,10 +464,10 @@ static void __init irqstack_early_init(void)
 	for_each_possible_cpu(i) {
 		softirq_ctx[i] = (struct thread_info *)
 			__va(lmb_alloc_base(THREAD_SIZE,
-					    THREAD_SIZE, 0x10000000));
+					    THREAD_SIZE, limit));
 		hardirq_ctx[i] = (struct thread_info *)
 			__va(lmb_alloc_base(THREAD_SIZE,
-					    THREAD_SIZE, 0x10000000));
+					    THREAD_SIZE, limit));
 	}
 }
 #else
@@ -478,7 +498,7 @@ static void __init exc_lvl_early_init(void)
  */
 static void __init emergency_stack_init(void)
 {
-	unsigned long limit;
+	u64 limit;
 	unsigned int i;
 
 	/*
@@ -490,7 +510,7 @@ static void __init emergency_stack_init(void)
 	 * bringup, we need to get at them in real mode. This means they
 	 * must also be within the RMO region.
 	 */
-	limit = min(0x10000000ULL, lmb.rmo_size);
+	limit = min(slb0_limit(), lmb.rmo_size);
 
 	for_each_possible_cpu(i) {
 		unsigned long sp;
@@ -550,7 +570,7 @@ void __init setup_arch(char **cmdline_p)
 
 #ifdef CONFIG_SWIOTLB
 	if (ppc_swiotlb_enable)
-		swiotlb_init();
+		swiotlb_init(1);
 #endif
 
 	paging_init();
@@ -649,3 +669,248 @@ struct ppc_pci_io ppc_pci_io;
 EXPORT_SYMBOL(ppc_pci_io);
 #endif /* CONFIG_PPC_INDIRECT_IO */
 
+#ifdef CONFIG_PPC_BOOK3S_64
+static enum stf_barrier_type stf_enabled_flush_types;
+static bool no_stf_barrier;
+bool stf_barrier;
+
+static enum l1d_flush_type rfi_enabled_flush_types;
+#define MAX_L1D_SIZE (64 * 1024)
+static char l1d_flush_fallback_area[2 * MAX_L1D_SIZE] __page_aligned_bss;
+static bool no_rfi_flush;
+bool rfi_flush;
+
+static int __init handle_no_stf_barrier(char *p)
+{
+	pr_info("stf-barrier: disabled on command line.");
+	no_stf_barrier = true;
+	return 0;
+}
+
+early_param("no_stf_barrier", handle_no_stf_barrier);
+
+/* This is the generic flag used by other architectures */
+static int __init handle_ssbd(char *p)
+{
+	if (!p || strncmp(p, "off", 3) == 0) {
+		handle_no_stf_barrier(NULL);
+		return 0;
+	} else if (strncmp(p, "auto", 5) == 0 || strncmp(p, "on", 2) == 0 )
+		/* Until firmware tells us, we have the barrier with auto */
+		return 0;
+	else
+		return 1;
+
+	return 0;
+}
+early_param("spec_store_bypass_disable", handle_ssbd);
+
+/* This is the generic flag used by other architectures */
+static int __init handle_no_ssbd(char *p)
+{
+	handle_no_stf_barrier(NULL);
+	return 0;
+}
+early_param("nospec_store_bypass_disable", handle_no_ssbd);
+
+static int __init handle_no_rfi_flush(char *p)
+{
+	pr_info("rfi-flush: disabled on command line.");
+	no_rfi_flush = true;
+	return 0;
+}
+early_param("no_rfi_flush", handle_no_rfi_flush);
+
+/*
+ * The RFI flush is not KPTI, but because users will see doco that says to use
+ * nopti we hijack that option here to also disable the RFI flush.
+ */
+static int __init handle_no_pti(char *p)
+{
+	pr_info("rfi-flush: disabling due to 'nopti' on command line.\n");
+	handle_no_rfi_flush(NULL);
+	return 0;
+}
+early_param("nopti", handle_no_pti);
+
+static void do_nothing(void *unused)
+{
+	/*
+	 * We don't need to do the flush explicitly, just enter+exit kernel is
+	 * sufficient, the RFI exit handlers will do the right thing.
+	 */
+}
+
+static void stf_barrier_enable(bool enable)
+{
+	if (enable && num_online_cpus() > 1)
+		on_each_cpu(do_nothing, NULL, 1);
+
+	if (enable)
+		do_stf_barrier_fixups(stf_enabled_flush_types);
+	else
+		do_stf_barrier_fixups(STF_BARRIER_NONE);
+
+	stf_barrier = enable;
+}
+
+void rfi_flush_enable(bool enable)
+{
+	if (enable && num_online_cpus() > 1)
+		on_each_cpu(do_nothing, NULL, 1);
+
+	if (enable)
+		do_rfi_flush_fixups(rfi_enabled_flush_types);
+	else
+		do_rfi_flush_fixups(L1D_FLUSH_NONE);
+
+	rfi_flush = enable;
+}
+
+static void init_fallback_flush(void)
+{
+	u64 l1d_size;
+	int cpu;
+
+	l1d_size = ppc64_caches.dsize;
+
+	/*
+	 * We allocate 2x L1d size for the dummy area, to
+	 * catch possible hardware prefetch runoff.
+	 *
+	 * We can't use memblock_alloc here because bootmem has
+	 * been initialized, and the bootmem APIs don't work well
+	 * with an upper limit we need, so we allocate it statically
+	 * from BSS. The biggest L1d supported by this kernel is
+	 * 64kB (POWER8), so 128kB is reserved above.
+	 */
+	WARN_ON(l1d_size > MAX_L1D_SIZE);
+
+	for_each_possible_cpu(cpu) {
+		struct paca_aux_struct *paca_aux = paca[cpu].aux_ptr;
+		paca_aux->rfi_flush_fallback_area = l1d_flush_fallback_area;
+		paca_aux->l1d_flush_size = l1d_size;
+	}
+}
+
+void setup_stf_barrier(void)
+{
+	enum stf_barrier_type type;
+	bool enable, hv;
+
+#ifdef CPU_FTR_HVMODE
+	hv = cpu_has_feature(CPU_FTR_HVMODE);
+#else
+	hv = false;
+#endif
+
+	/* Default to fallback in case fw-features are not available */
+
+	/*
+	 * RHEL 6 does not support POWER9 nor POWER8, only POWER7.
+	 * Use CPU_FTR_ASYM_SMT to detect POWER7 (no CPU_FTR_ARCH_206 yet).
+	 * */
+	if (cpu_has_feature(CPU_FTR_ASYM_SMT))
+		type = STF_BARRIER_FALLBACK;
+	else
+		type = STF_BARRIER_NONE;
+
+	enable = security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) &&
+		(security_ftr_enabled(SEC_FTR_L1D_FLUSH_PR) ||
+		 (security_ftr_enabled(SEC_FTR_L1D_FLUSH_HV) && hv));
+
+	if (type == STF_BARRIER_FALLBACK) {
+		pr_info("stf-barrier: fallback barrier available\n");
+	} else if (type == STF_BARRIER_SYNC_ORI) {
+		pr_info("stf-barrier: hwsync barrier available\n");
+	} else if (type == STF_BARRIER_EIEIO) {
+		pr_info("stf-barrier: eieio barrier available\n");
+	}
+
+	stf_enabled_flush_types = type;
+
+	if (!no_stf_barrier)
+		stf_barrier_enable(enable);
+}
+
+void setup_rfi_flush(enum l1d_flush_type types, bool enable)
+{
+	if (types & L1D_FLUSH_FALLBACK) {
+		pr_info("rfi-flush: fallback displacement flush available\n");
+		init_fallback_flush();
+	}
+
+	if (types & L1D_FLUSH_ORI)
+		pr_info("rfi-flush: ori type flush available\n");
+
+	if (types & L1D_FLUSH_MTTRIG)
+		pr_info("rfi-flush: mttrig type flush available\n");
+
+	rfi_enabled_flush_types = types;
+
+	if (!no_rfi_flush)
+		rfi_flush_enable(enable);
+}
+
+#ifdef CONFIG_DEBUG_FS
+static int stf_barrier_set(void *data, u64 val)
+{
+	bool enable;
+
+	if (val == 1)
+		enable = true;
+	else if (val == 0)
+		enable = false;
+	else
+		return -EINVAL;
+
+	/* Only do anything if we're changing state */
+	if (enable != stf_barrier)
+		stf_barrier_enable(enable);
+
+	return 0;
+}
+
+static int stf_barrier_get(void *data, u64 *val)
+{
+	*val = stf_barrier ? 1 : 0;
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(fops_stf_barrier, stf_barrier_get, stf_barrier_set, "%llu\n");
+
+static int rfi_flush_set(void *data, u64 val)
+{
+	bool enable;
+
+	if (val == 1)
+		enable = true;
+	else if (val == 0)
+		enable = false;
+	else
+		return -EINVAL;
+
+	/* Only do anything if we're changing state */
+	if (enable != rfi_flush)
+		rfi_flush_enable(enable);
+
+	return 0;
+}
+
+static int rfi_flush_get(void *data, u64 *val)
+{
+	*val = rfi_flush ? 1 : 0;
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(fops_rfi_flush, rfi_flush_get, rfi_flush_set, "%llu\n");
+
+static __init int rfi_flush_debugfs_init(void)
+{
+	debugfs_create_file("rfi_flush", 0600, powerpc_debugfs_root, NULL, &fops_rfi_flush);
+	debugfs_create_file("stf_barrier", 0600, powerpc_debugfs_root, NULL, &fops_stf_barrier);
+	return 0;
+}
+device_initcall(rfi_flush_debugfs_init);
+#endif
+#endif /* CONFIG_PPC_BOOK3S_64 */

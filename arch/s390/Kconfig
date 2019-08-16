@@ -40,9 +40,6 @@ config ARCH_HAS_ILOG2_U64
 config GENERIC_HWEIGHT
 	def_bool y
 
-config GENERIC_TIME
-	def_bool y
-
 config GENERIC_TIME_VSYSCALL
 	def_bool y
 
@@ -59,6 +56,9 @@ config NO_IOMEM
 
 config NO_DMA
 	def_bool y
+
+config ARCH_DMA_ADDR_T_64BIT
+	def_bool 64BIT
 
 config GENERIC_LOCKBREAK
 	bool
@@ -83,18 +83,23 @@ config S390
 	select HAVE_SYSCALL_WRAPPERS
 	select HAVE_FUNCTION_TRACER
 	select HAVE_FUNCTION_TRACE_MCOUNT_TEST
+	select ARCH_HAS_ELF_RANDOMIZE
 	select HAVE_FTRACE_MCOUNT_RECORD
 	select HAVE_SYSCALL_TRACEPOINTS
 	select HAVE_DYNAMIC_FTRACE
 	select HAVE_FUNCTION_GRAPH_TRACER
-	select HAVE_DEFAULT_NO_SPIN_MUTEXES
+	select HAVE_ARCH_MUTEX_CPU_RELAX
 	select HAVE_OPROFILE
 	select HAVE_KPROBES
 	select HAVE_KRETPROBES
 	select HAVE_KVM if 64BIT
 	select HAVE_ARCH_TRACEHOOK
 	select INIT_ALL_POSSIBLE
+	select HAVE_IRQ_WORK
 	select HAVE_PERF_EVENTS
+	select ARCH_HAVE_NMI_SAFE_CMPXCHG
+	select ARCH_USE_CMPXCHG_LOCKREF
+	select GENERIC_CPU_VULNERABILITIES
 
 config SCHED_OMIT_FRAME_POINTER
 	bool
@@ -165,6 +170,13 @@ config HOTPLUG_CPU
 	  can be controlled through /sys/devices/system/cpu/cpu#.
 	  Say N if you want to disable CPU hotplug.
 
+config SCHED_BOOK
+	bool "Book scheduler support"
+	depends on SMP
+	help
+	  Book scheduler support improves the CPU scheduler's decision making
+	  when dealing with machines that have several books.
+
 config MATHEMU
 	bool "IEEE FPU emulation"
 	depends on MARCH_G5
@@ -192,23 +204,8 @@ config AUDIT_ARCH
 	bool
 	default y
 
-config S390_SWITCH_AMODE
-	bool "Switch kernel/user addressing modes"
-	help
-	  This option allows to switch the addressing modes of kernel and user
-	  space. The kernel parameter switch_amode=on will enable this feature,
-	  default is disabled. Enabling this (via kernel parameter) on machines
-	  earlier than IBM System z9-109 EC/BC will reduce system performance.
-
-	  Note that this option will also be selected by selecting the execute
-	  protection option below. Enabling the execute protection via the
-	  noexec kernel parameter will also switch the addressing modes,
-	  independent of the switch_amode kernel parameter.
-
-
 config S390_EXEC_PROTECT
 	bool "Data execute protection"
-	select S390_SWITCH_AMODE
 	help
 	  This option allows to enable a buffer overflow protection for user
 	  space programs and it also selects the addressing mode option above.
@@ -359,6 +356,52 @@ config ARCH_ENABLE_MEMORY_HOTREMOVE
 config ARCH_HIBERNATION_POSSIBLE
        def_bool y if 64BIT
 
+config KERNEL_NOBP
+	def_bool n
+	prompt "Enable modified branch prediction for the kernel by default"
+	help
+	  If this option is selected the kernel will switch to a modified
+	  branch prediction mode if the firmware interface is available.
+	  The modified branch prediction mode improves the behaviour in
+	  regard to speculative execution.
+
+	  With the option enabled the kernel parameter "nobp=0" or "nospec"
+	  can be used to run the kernel in the normal branch prediction mode.
+
+	  With the option disabled the modified branch prediction mode is
+	  enabled with the "nobp=1" kernel parameter.
+
+	  If unsure, say N.
+
+config EXPOLINE
+	def_bool n
+	prompt "Avoid speculative indirect branches in the kernel"
+	depends on 64BIT
+	help
+	  Compile the kernel with the expoline compiler options to guard
+	  against kernel-to-user data leaks by avoiding speculative indirect
+	  branches.
+	  Requires a compiler with -mindirect-branch=thunk support for full
+	  protection. The kernel may run slower.
+
+	  If unsure, say N.
+
+choice
+	prompt "Expoline default"
+	depends on EXPOLINE
+	default EXPOLINE_FULL
+
+config EXPOLINE_OFF
+	bool "spectre_v2=off"
+
+config EXPOLINE_AUTO
+	bool "spectre_v2=auto"
+
+config EXPOLINE_FULL
+	bool "spectre_v2=on"
+
+endchoice
+
 source "mm/Kconfig"
 
 comment "I/O subsystem configuration"
@@ -389,6 +432,24 @@ config CHSC_SCH
 	  module will be called chsc_sch.
 
 	  If unsure, say N.
+
+config SCM_BUS
+	def_bool y
+	depends on 64BIT
+	prompt "SCM bus driver"
+	help
+	  Bus driver for Storage Class Memory.
+
+config EADM_SCH
+	def_tristate m
+	prompt "Support for EADM subchannels"
+	depends on SCM_BUS
+	help
+	  This driver allows usage of EADM subchannels. EADM subchannels act
+	  as a communication vehicle for SCM increments.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called eadm_sch.
 
 comment "Misc"
 
@@ -557,6 +618,30 @@ config KEXEC
 	  current kernel, and to start another kernel.  It is like a reboot
 	  but is independent of hardware/microcode support.
 
+config KEXEC_AUTO_RESERVE
+	bool "automatically reserve memory for kexec kernel"
+	depends on KEXEC
+	default y
+	---help---
+	  Automatically reserve memory for a kexec kernel, so that you don't
+	  need to specify numbers for the "crashkernel=X@Y" boot option,
+	  instead you can use "crashkernel=auto". This option works for
+	  systems that have at least 4 GiB memory. Then 128 MiB plus a small
+	  amount of additional memory that grows linearly with the 1st kernel
+	  memory size is reserved. When "crashkernel=auto" is used for
+	  systems with less than 4 GiB memory, no crashkernel memory will be
+	  reserved.
+
+config CRASH_DUMP
+	bool "kernel crash dumps"
+	depends on 64BIT
+	help
+	  Generate crash dump after being started by kexec.
+	  Crash dump kernels are loaded in the main kernel with kexec-tools
+	  into a specially reserved region and then later executed after
+	  a crash by kdump/kexec.
+	  For more details see Documentation/kdump/kdump.txt
+
 config ZFCPDUMP
 	bool "zfcpdump support"
 	select SMP
@@ -617,6 +702,11 @@ source "fs/Kconfig"
 source "arch/s390/Kconfig.debug"
 
 source "security/Kconfig"
+
+config KEYS_COMPAT
+	bool
+	depends on COMPAT && KEYS
+	default y
 
 source "crypto/Kconfig"
 

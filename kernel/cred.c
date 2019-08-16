@@ -22,10 +22,6 @@
 #define kdebug(FMT, ...) \
 	printk("[%-5.5s%5u] "FMT"\n", current->comm, current->pid ,##__VA_ARGS__)
 #else
-static inline __attribute__((format(printf, 1, 2)))
-void no_printk(const char *fmt, ...)
-{
-}
 #define kdebug(FMT, ...) \
 	no_printk("[%-5.5s%5u] "FMT"\n", current->comm, current->pid ,##__VA_ARGS__)
 #endif
@@ -209,6 +205,31 @@ void exit_creds(struct task_struct *tsk)
 	}
 }
 
+/**
+ * get_task_cred - Get another task's objective credentials
+ * @task: The task to query
+ *
+ * Get the objective credentials of a task, pinning them so that they can't go
+ * away.  Accessing a task's credentials directly is not permitted.
+ *
+ * The caller must also make sure task doesn't get deleted, either by holding a
+ * ref on task or by holding tasklist_lock to prevent it from being unlinked.
+ */
+const struct cred *get_task_cred(struct task_struct *task)
+{
+	const struct cred *cred;
+
+	rcu_read_lock();
+
+	do {
+		cred = __task_cred((task));
+		BUG_ON(!cred);
+	} while (!atomic_inc_not_zero(&((struct cred *)cred)->usage));
+
+	rcu_read_unlock();
+	return cred;
+}
+
 /*
  * Allocate blank credentials, such that the credentials can be filled in at a
  * later date without risk of ENOMEM.
@@ -224,20 +245,20 @@ struct cred *cred_alloc_blank(void)
 #ifdef CONFIG_KEYS
 	new->tgcred = kzalloc(sizeof(*new->tgcred), GFP_KERNEL);
 	if (!new->tgcred) {
-		kfree(new);
+		kmem_cache_free(cred_jar, new);
 		return NULL;
 	}
 	atomic_set(&new->tgcred->usage, 1);
 #endif
 
 	atomic_set(&new->usage, 1);
+#ifdef CONFIG_DEBUG_CREDENTIALS
+	new->magic = CRED_MAGIC;
+#endif
 
 	if (security_cred_alloc_blank(new, GFP_KERNEL) < 0)
 		goto error;
 
-#ifdef CONFIG_DEBUG_CREDENTIALS
-	new->magic = CRED_MAGIC;
-#endif
 	return new;
 
 error:
@@ -364,7 +385,7 @@ struct cred *prepare_usermodehelper_creds(void)
 
 	new = kmem_cache_alloc(cred_jar, GFP_ATOMIC);
 	if (!new)
-		return NULL;
+		goto free_tgcred;
 
 	kdebug("prepare_usermodehelper_creds() alloc %p", new);
 
@@ -398,6 +419,12 @@ struct cred *prepare_usermodehelper_creds(void)
 error:
 	put_cred(new);
 	return NULL;
+
+free_tgcred:
+#ifdef CONFIG_KEYS
+	kfree(tgcred);
+#endif
+	return NULL;
 }
 
 /*
@@ -418,6 +445,7 @@ int copy_creds(struct task_struct *p, unsigned long clone_flags)
 	int ret;
 
 	mutex_init(&p->cred_guard_mutex);
+	p->replacement_session_keyring = NULL;
 
 	if (
 #ifdef CONFIG_KEYS
@@ -786,10 +814,12 @@ bool creds_are_invalid(const struct cred *cred)
 {
 	if (cred->magic != CRED_MAGIC)
 		return true;
-	if (atomic_read(&cred->usage) < atomic_read(&cred->subscribers))
-		return true;
 #ifdef CONFIG_SECURITY_SELINUX
-	if (selinux_is_enabled()) {
+	/*
+	 * cred->security == NULL if security_cred_alloc_blank() or
+	 * security_prepare_creds() returned an error.
+	 */
+	if (selinux_is_enabled() && cred->security) {
 		if ((unsigned long) cred->security < PAGE_SIZE)
 			return true;
 		if ((*(u32 *)cred->security & 0xffffff00) ==

@@ -1083,9 +1083,10 @@ static int fr_add_pvc(struct net_device *frad, unsigned int dlci, int type)
 
 	used = pvc_is_used(pvc);
 
-	if (type == ARPHRD_ETHER)
+	if (type == ARPHRD_ETHER) {
 		dev = alloc_netdev(0, "pvceth%d", ether_setup);
-	else
+		netdev_extended(dev)->ext_priv_flags &= ~IFF_TX_SKB_SHARING;
+	} else
 		dev = alloc_netdev(0, "pvc%d", pvc_setup);
 
 	if (!dev) {
@@ -1096,7 +1097,7 @@ static int fr_add_pvc(struct net_device *frad, unsigned int dlci, int type)
 	}
 
 	if (type == ARPHRD_ETHER)
-		random_ether_addr(dev->dev_addr);
+		eth_hw_addr_random(dev);
 	else {
 		*(__be16*)dev->dev_addr = htons(dlci);
 		dlci_to_q922(dev->broadcast, dlci);

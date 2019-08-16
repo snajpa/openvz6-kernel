@@ -42,6 +42,10 @@
 #include <linux/kprobes.h>
 #include <linux/user_namespace.h>
 
+#include <linux/nospec.h>
+
+#include <linux/kmsg_dump.h>
+
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <asm/unistd.h>
@@ -163,7 +167,7 @@ SYSCALL_DEFINE3(setpriority, int, which, int, who, int, niceval)
 	if (niceval > 19)
 		niceval = 19;
 
-	read_lock(&tasklist_lock);
+	tasklist_read_lock();
 	switch (which) {
 		case PRIO_PROCESS:
 			if (who)
@@ -221,7 +225,7 @@ SYSCALL_DEFINE2(getpriority, int, which, int, who)
 	if (which > PRIO_USER || which < PRIO_PROCESS)
 		return -EINVAL;
 
-	read_lock(&tasklist_lock);
+	tasklist_read_lock();
 	switch (which) {
 		case PRIO_PROCESS:
 			if (who)
@@ -280,6 +284,7 @@ out_unlock:
  */
 void emergency_restart(void)
 {
+	kmsg_dump(KMSG_DUMP_EMERG);
 	machine_emergency_restart();
 }
 EXPORT_SYMBOL_GPL(emergency_restart);
@@ -307,6 +312,7 @@ void kernel_restart(char *cmd)
 		printk(KERN_EMERG "Restarting system.\n");
 	else
 		printk(KERN_EMERG "Restarting system with command '%s'.\n", cmd);
+	kmsg_dump(KMSG_DUMP_RESTART);
 	machine_restart(cmd);
 }
 EXPORT_SYMBOL_GPL(kernel_restart);
@@ -328,6 +334,7 @@ void kernel_halt(void)
 	kernel_shutdown_prepare(SYSTEM_HALT);
 	sysdev_shutdown();
 	printk(KERN_EMERG "System halted.\n");
+	kmsg_dump(KMSG_DUMP_HALT);
 	machine_halt();
 }
 
@@ -346,6 +353,7 @@ void kernel_power_off(void)
 	disable_nonboot_cpus();
 	sysdev_shutdown();
 	printk(KERN_EMERG "Power down.\n");
+	kmsg_dump(KMSG_DUMP_POWEROFF);
 	machine_power_off();
 }
 EXPORT_SYMBOL_GPL(kernel_power_off);
@@ -374,6 +382,15 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 			magic2 != LINUX_REBOOT_MAGIC2B &&
 	                magic2 != LINUX_REBOOT_MAGIC2C))
 		return -EINVAL;
+
+	/*
+	 * If pid namespaces are enabled and the current task is in a child
+	 * pid_namespace, the command is handled by reboot_pid_ns() which will
+	 * call do_exit().
+	 */
+	ret = reboot_pid_ns(task_active_pid_ns(current), cmd);
+	if (ret)
+		return ret;
 
 	/* Instead of trying to make the power_off code look like
 	 * halt when pm_power_off is not set do it the easy way.
@@ -911,16 +928,15 @@ change_okay:
 
 void do_sys_times(struct tms *tms)
 {
-	struct task_cputime cputime;
-	cputime_t cutime, cstime;
+	cputime_t tgutime, tgstime, cutime, cstime;
 
-	thread_group_cputime(current, &cputime);
 	spin_lock_irq(&current->sighand->siglock);
+	thread_group_times(current, &tgutime, &tgstime);
 	cutime = current->signal->cutime;
 	cstime = current->signal->cstime;
 	spin_unlock_irq(&current->sighand->siglock);
-	tms->tms_utime = cputime_to_clock_t(cputime.utime);
-	tms->tms_stime = cputime_to_clock_t(cputime.stime);
+	tms->tms_utime = cputime_to_clock_t(tgutime);
+	tms->tms_stime = cputime_to_clock_t(tgstime);
 	tms->tms_cutime = cputime_to_clock_t(cutime);
 	tms->tms_cstime = cputime_to_clock_t(cstime);
 }
@@ -967,7 +983,7 @@ SYSCALL_DEFINE2(setpgid, pid_t, pid, pid_t, pgid)
 	/* From this point forward we keep holding onto the tasklist lock
 	 * so that our parent does not change from under us. -DaveM
 	 */
-	write_lock_irq(&tasklist_lock);
+	tasklist_write_lock_irq();
 
 	err = -ESRCH;
 	p = find_task_by_vpid(pid);
@@ -1091,7 +1107,7 @@ SYSCALL_DEFINE0(setsid)
 	pid_t session = pid_vnr(sid);
 	int err = -EPERM;
 
-	write_lock_irq(&tasklist_lock);
+	tasklist_write_lock_irq();
 	/* Fail if I am already a session leader */
 	if (group_leader->signal->leader)
 		goto out;
@@ -1110,8 +1126,10 @@ SYSCALL_DEFINE0(setsid)
 	err = session;
 out:
 	write_unlock_irq(&tasklist_lock);
-	if (err > 0)
+	if (err > 0) {
 		proc_sid_connector(group_leader);
+		sched_autogroup_create_attach(group_leader);
+	}
 	return err;
 }
 
@@ -1238,43 +1256,52 @@ SYSCALL_DEFINE2(old_getrlimit, unsigned int, resource,
 
 #endif
 
-SYSCALL_DEFINE2(setrlimit, unsigned int, resource, struct rlimit __user *, rlim)
+/* make sure you are allowed to change @tsk limits before calling this */
+int setrlimit(struct task_struct *tsk, unsigned int resource,
+		struct rlimit *new_rlim)
 {
-	struct rlimit new_rlim, *old_rlim;
+	struct rlimit *old_rlim;
 	int retval;
 
-	if (resource >= RLIM_NLIMITS)
+	if (new_rlim->rlim_cur > new_rlim->rlim_max)
 		return -EINVAL;
-	if (copy_from_user(&new_rlim, rlim, sizeof(*rlim)))
-		return -EFAULT;
-	if (new_rlim.rlim_cur > new_rlim.rlim_max)
-		return -EINVAL;
-	old_rlim = current->signal->rlim + resource;
-	if ((new_rlim.rlim_max > old_rlim->rlim_max) &&
-	    !capable(CAP_SYS_RESOURCE))
-		return -EPERM;
-	if (resource == RLIMIT_NOFILE && new_rlim.rlim_max > sysctl_nr_open)
+	if (resource == RLIMIT_NOFILE && new_rlim->rlim_max > sysctl_nr_open)
 		return -EPERM;
 
-	retval = security_task_setrlimit(resource, &new_rlim);
+	/* optimization: 'current' doesn't need locking, e.g. setrlimit */
+	if (tsk != current) {
+		/* protect tsk->signal and tsk->sighand from disappearing */
+		tasklist_read_lock();
+		if (!tsk->sighand) {
+			retval = -ESRCH;
+			goto out;
+		}
+	}
+
+	retval = security_task_setrlimit(tsk, resource, new_rlim);
 	if (retval)
-		return retval;
+		goto out;
 
-	if (resource == RLIMIT_CPU && new_rlim.rlim_cur == 0) {
+	if (resource == RLIMIT_CPU && new_rlim->rlim_cur == 0) {
 		/*
 		 * The caller is asking for an immediate RLIMIT_CPU
 		 * expiry.  But we use the zero value to mean "it was
 		 * never set".  So let's cheat and make it one second
 		 * instead
 		 */
-		new_rlim.rlim_cur = 1;
+		new_rlim->rlim_cur = 1;
 	}
 
-	task_lock(current->group_leader);
-	*old_rlim = new_rlim;
-	task_unlock(current->group_leader);
+	old_rlim = tsk->signal->rlim + resource;
+	task_lock(tsk->group_leader);
+	if ((new_rlim->rlim_max <= old_rlim->rlim_max) ||
+				capable(CAP_SYS_RESOURCE))
+		*old_rlim = *new_rlim;
+	else
+		retval = -EPERM;
+	task_unlock(tsk->group_leader);
 
-	if (resource != RLIMIT_CPU)
+	if (retval || resource != RLIMIT_CPU)
 		goto out;
 
 	/*
@@ -1283,12 +1310,25 @@ SYSCALL_DEFINE2(setrlimit, unsigned int, resource, struct rlimit __user *, rlim)
 	 * very long-standing error, and fixing it now risks breakage of
 	 * applications, so we live with it
 	 */
-	if (new_rlim.rlim_cur == RLIM_INFINITY)
+	if (new_rlim->rlim_cur == RLIM_INFINITY)
 		goto out;
 
-	update_rlimit_cpu(new_rlim.rlim_cur);
+	update_rlimit_cpu(tsk, new_rlim->rlim_cur);
 out:
-	return 0;
+	if (tsk != current)
+		read_unlock(&tasklist_lock);
+	return retval;
+}
+
+SYSCALL_DEFINE2(setrlimit, unsigned int, resource, struct rlimit __user *, rlim)
+{
+	struct rlimit new_rlim;
+
+	if (resource >= RLIM_NLIMITS)
+		return -EINVAL;
+	if (copy_from_user(&new_rlim, rlim, sizeof(*rlim)))
+		return -EFAULT;
+	return setrlimit(current, resource, &new_rlim);
 }
 
 /*
@@ -1338,16 +1378,14 @@ static void k_getrusage(struct task_struct *p, int who, struct rusage *r)
 {
 	struct task_struct *t;
 	unsigned long flags;
-	cputime_t utime, stime;
-	struct task_cputime cputime;
+	cputime_t tgutime, tgstime, utime, stime;
 	unsigned long maxrss = 0;
 
 	memset((char *) r, 0, sizeof *r);
 	utime = stime = cputime_zero;
 
 	if (who == RUSAGE_THREAD) {
-		utime = task_utime(current);
-		stime = task_stime(current);
+		task_times(current, &utime, &stime);
 		accumulate_thread_rusage(p, r);
 		maxrss = p->signal->maxrss;
 		goto out;
@@ -1373,9 +1411,9 @@ static void k_getrusage(struct task_struct *p, int who, struct rusage *r)
 				break;
 
 		case RUSAGE_SELF:
-			thread_group_cputime(p, &cputime);
-			utime = cputime_add(utime, cputime.utime);
-			stime = cputime_add(stime, cputime.stime);
+			thread_group_times(p, &tgutime, &tgstime);
+			utime = cputime_add(utime, tgutime);
+			stime = cputime_add(stime, tgstime);
 			r->ru_nvcsw += p->signal->nvcsw;
 			r->ru_nivcsw += p->signal->nivcsw;
 			r->ru_minflt += p->signal->min_flt;
@@ -1429,6 +1467,16 @@ SYSCALL_DEFINE1(umask, int, mask)
 {
 	mask = xchg(&current->fs->umask, mask & S_IRWXUGO);
 	return mask;
+}
+
+int __weak arch_prctl_spec_ctrl_get(unsigned long which)
+{
+	return -EINVAL;
+}
+
+int __weak arch_prctl_spec_ctrl_set(unsigned long which, unsigned long ctrl)
+{
+	return -EINVAL;
 }
 
 SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
@@ -1579,6 +1627,26 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			else
 				error = PR_MCE_KILL_DEFAULT;
 			break;
+		case PR_SET_NO_NEW_PRIVS:
+			if (arg2 != 1 || arg3 || arg4 || arg5)
+				return -EINVAL;
+
+			current->no_new_privs = 1;
+			break;
+		case PR_GET_NO_NEW_PRIVS:
+			if (arg2 || arg3 || arg4 || arg5)
+				return -EINVAL;
+			return current->no_new_privs ? 1 : 0;
+		case PR_GET_SPECULATION_CTRL:
+			if (arg3 || arg4 || arg5)
+				return -EINVAL;
+			error = arch_prctl_spec_ctrl_get(arg2);
+			break;
+		case PR_SET_SPECULATION_CTRL:
+			if (arg4 || arg5)
+				return -EINVAL;
+			error = arch_prctl_spec_ctrl_set(arg2, arg3);
+			break;
 		default:
 			error = -EINVAL;
 			break;
@@ -1600,9 +1668,9 @@ SYSCALL_DEFINE3(getcpu, unsigned __user *, cpup, unsigned __user *, nodep,
 
 char poweroff_cmd[POWEROFF_CMD_PATH_LEN] = "/sbin/poweroff";
 
-static void argv_cleanup(char **argv, char **envp)
+static void argv_cleanup(struct subprocess_info *info)
 {
-	argv_free(argv);
+	argv_free(info->argv);
 }
 
 /**
@@ -1636,7 +1704,7 @@ int orderly_poweroff(bool force)
 		goto out;
 	}
 
-	call_usermodehelper_setcleanup(info, argv_cleanup);
+	call_usermodehelper_setfns(info, NULL, argv_cleanup, NULL);
 
 	ret = call_usermodehelper_exec(info, UMH_NO_WAIT);
 

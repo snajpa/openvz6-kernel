@@ -43,6 +43,8 @@ static void ext2_sync_super(struct super_block *sb,
 static int ext2_remount (struct super_block * sb, int * flags, char * data);
 static int ext2_statfs (struct dentry * dentry, struct kstatfs * buf);
 static int ext2_sync_fs(struct super_block *sb, int wait);
+static int ext2_freeze(struct super_block *sb);
+static int ext2_unfreeze(struct super_block *sb);
 
 void ext2_error (struct super_block * sb, const char * function,
 		 const char * fmt, ...)
@@ -295,6 +297,8 @@ static const struct super_operations ext2_sops = {
 	.put_super	= ext2_put_super,
 	.write_super	= ext2_write_super,
 	.sync_fs	= ext2_sync_fs,
+	.freeze_fs	= ext2_freeze,
+	.unfreeze_fs	= ext2_unfreeze,
 	.statfs		= ext2_statfs,
 	.remount_fs	= ext2_remount,
 	.clear_inode	= ext2_clear_inode,
@@ -1089,9 +1093,30 @@ failed_sbi:
 	return ret;
 }
 
+static void ext2_clear_super_error(struct super_block *sb)
+{
+	struct buffer_head *sbh = EXT2_SB(sb)->s_sbh;
+
+	if (buffer_write_io_error(sbh)) {
+		/*
+		 * Oh, dear.  A previous attempt to write the
+		 * superblock failed.  This could happen because the
+		 * USB device was yanked out.  Or it could happen to
+		 * be a transient write error and maybe the block will
+		 * be remapped.  Nothing we can do but to retry the
+		 * write and hope for the best.
+		 */
+		printk(KERN_ERR "EXT2-fs (%s): previous I/O error to "
+		       "superblock detected", sb->s_id);
+		clear_buffer_write_io_error(sbh);
+		set_buffer_uptodate(sbh);
+	}
+}
+
 static void ext2_commit_super (struct super_block * sb,
 			       struct ext2_super_block * es)
 {
+	ext2_clear_super_error(sb);
 	es->s_wtime = cpu_to_le32(get_seconds());
 	mark_buffer_dirty(EXT2_SB(sb)->s_sbh);
 	sb->s_dirt = 0;
@@ -1099,6 +1124,7 @@ static void ext2_commit_super (struct super_block * sb,
 
 static void ext2_sync_super(struct super_block *sb, struct ext2_super_block *es)
 {
+	ext2_clear_super_error(sb);
 	es->s_free_blocks_count = cpu_to_le32(ext2_count_free_blocks(sb));
 	es->s_free_inodes_count = cpu_to_le32(ext2_count_free_inodes(sb));
 	es->s_wtime = cpu_to_le32(get_seconds());
@@ -1123,6 +1149,8 @@ static int ext2_sync_fs(struct super_block *sb, int wait)
 	struct ext2_super_block *es = EXT2_SB(sb)->s_es;
 
 	lock_kernel();
+	ext2_clear_super_error(sb);
+
 	if (es->s_state & cpu_to_le16(EXT2_VALID_FS)) {
 		ext2_debug("setting valid to 0\n");
 		es->s_state &= cpu_to_le16(~EXT2_VALID_FS);
@@ -1141,6 +1169,26 @@ static int ext2_sync_fs(struct super_block *sb, int wait)
 	return 0;
 }
 
+static int ext2_freeze(struct super_block *sb)
+{
+	struct ext2_sb_info *sbi = EXT2_SB(sb);
+
+	/* Set EXT2_FS_VALID flag */
+	lock_kernel();
+	sbi->s_es->s_state = cpu_to_le16(sbi->s_mount_state);
+	unlock_kernel();
+	ext2_sync_super(sb, sbi->s_es);
+
+	return 0;
+}
+
+static int ext2_unfreeze(struct super_block *sb)
+{
+	/* Just write sb to clear EXT2_VALID_FS flag */
+	ext2_write_super(sb);
+
+	return 0;
+}
 
 void ext2_write_super(struct super_block *sb)
 {
@@ -1190,7 +1238,7 @@ static int ext2_remount (struct super_block * sb, int * flags, char * data)
 	es = sbi->s_es;
 	if (((sbi->s_mount_opt & EXT2_MOUNT_XIP) !=
 	    (old_mount_opt & EXT2_MOUNT_XIP)) &&
-	    invalidate_inodes(sb)) {
+	    invalidate_inodes(sb, true)) {
 		ext2_warning(sb, __func__, "refusing change of xip flag "
 			     "with busy inodes while remounting");
 		sbi->s_mount_opt &= ~EXT2_MOUNT_XIP;
@@ -1206,12 +1254,19 @@ static int ext2_remount (struct super_block * sb, int * flags, char * data)
 			unlock_kernel();
 			return 0;
 		}
+
 		/*
 		 * OK, we are remounting a valid rw partition rdonly, so set
 		 * the rdonly flag and then mark the partition as valid again.
 		 */
 		es->s_state = cpu_to_le16(sbi->s_mount_state);
 		es->s_mtime = cpu_to_le32(get_seconds());
+
+		err = vfs_dq_off(sb, 1);
+		if (err < 0 && err != -ENOSYS) {
+			err = -EBUSY;
+			goto restore_opts;
+		}
 	} else {
 		__le32 ret = EXT2_HAS_RO_COMPAT_FEATURE(sb,
 					       ~EXT2_FEATURE_RO_COMPAT_SUPP);
@@ -1230,6 +1285,8 @@ static int ext2_remount (struct super_block * sb, int * flags, char * data)
 		sbi->s_mount_state = le16_to_cpu(es->s_state);
 		if (!ext2_setup_super (sb, es, 0))
 			sb->s_flags &= ~MS_RDONLY;
+
+		vfs_dq_quota_on_remount(sb);
 	}
 	ext2_sync_super(sb, es);
 	unlock_kernel();
@@ -1382,6 +1439,7 @@ static ssize_t ext2_quota_write(struct super_block *sb, int type,
 				sb->s_blocksize - offset : towrite;
 
 		tmp_bh.b_state = 0;
+		tmp_bh.b_size = sb->s_blocksize;
 		err = ext2_get_block(inode, blk, &tmp_bh, 1);
 		if (err < 0)
 			goto out;
@@ -1426,7 +1484,7 @@ static struct file_system_type ext2_fs_type = {
 	.name		= "ext2",
 	.get_sb		= ext2_get_sb,
 	.kill_sb	= kill_block_super,
-	.fs_flags	= FS_REQUIRES_DEV,
+	.fs_flags	= FS_REQUIRES_DEV | FS_HAS_NEW_FREEZE | FS_HANDLE_QUOTA,
 };
 
 static int __init init_ext2_fs(void)

@@ -34,8 +34,11 @@ EXPORT_SYMBOL(inet_csk_timer_bug_msg);
  */
 struct local_ports sysctl_local_ports __read_mostly = {
 	.lock = SEQLOCK_UNLOCKED,
-	.range = { 32768, 61000 },
+	.range = { 32768, 60999 },
 };
+
+unsigned long *sysctl_local_reserved_ports;
+EXPORT_SYMBOL(sysctl_local_reserved_ports);
 
 void inet_get_local_port_range(int *low, int *high)
 {
@@ -56,6 +59,9 @@ int inet_csk_bind_conflict(const struct sock *sk,
 	struct sock *sk2;
 	struct hlist_node *node;
 	int reuse = sk->sk_reuse;
+	int relax = test_bit(SOCK_RELAX, &sk->sk_flags);
+	int reuseport = sk->sk_reuseport;
+	uid_t uid = sock_i_uid((struct sock *)sk);
 
 	/*
 	 * Unlike other sk lookup places we do not check
@@ -70,11 +76,22 @@ int inet_csk_bind_conflict(const struct sock *sk,
 		    (!sk->sk_bound_dev_if ||
 		     !sk2->sk_bound_dev_if ||
 		     sk->sk_bound_dev_if == sk2->sk_bound_dev_if)) {
-			if (!reuse || !sk2->sk_reuse ||
-			    sk2->sk_state == TCP_LISTEN) {
+			if ((!reuse || !sk2->sk_reuse ||
+			    sk2->sk_state == TCP_LISTEN) &&
+			    (!reuseport || !sk2->sk_reuseport ||
+			    (sk2->sk_state != TCP_TIME_WAIT &&
+			     uid != sock_i_uid(sk2)))) {
 				const __be32 sk2_rcv_saddr = inet_rcv_saddr(sk2);
 				if (!sk2_rcv_saddr || !sk_rcv_saddr ||
 				    sk2_rcv_saddr == sk_rcv_saddr)
+					break;
+			}
+			if (!relax && reuse && sk2->sk_reuse &&
+			    sk2->sk_state != TCP_LISTEN) {
+				const __be32 sk2_rcv_saddr = inet_rcv_saddr(sk2);
+
+				if (!sk2_rcv_saddr || !inet_rcv_saddr(sk) ||
+				    sk2_rcv_saddr == inet_rcv_saddr(sk))
 					break;
 			}
 		}
@@ -83,6 +100,17 @@ int inet_csk_bind_conflict(const struct sock *sk,
 }
 
 EXPORT_SYMBOL_GPL(inet_csk_bind_conflict);
+
+static int inet_csk_bind_conflict_relax(struct sock *sk,
+					struct inet_bind_bucket *tb)
+{
+	int ret;
+
+	sock_set_flag(sk, SOCK_RELAX);
+	ret = inet_csk(sk)->icsk_af_ops->bind_conflict(sk, tb);
+	sock_reset_flag(sk, SOCK_RELAX);
+	return ret;
+}
 
 /* Obtain a reference to a local port for the given sock,
  * if snum is zero it means select any available local port.
@@ -96,6 +124,8 @@ int inet_csk_get_port(struct sock *sk, unsigned short snum)
 	int ret, attempts = 5;
 	struct net *net = sock_net(sk);
 	int smallest_size = -1, smallest_rover;
+	uid_t uid = sock_i_uid(sk);
+	int attempt_half = sk->sk_reuse ? 1 : 0;
 
 	local_bh_disable();
 	if (!snum) {
@@ -103,33 +133,51 @@ int inet_csk_get_port(struct sock *sk, unsigned short snum)
 
 again:
 		inet_get_local_port_range(&low, &high);
+		if (attempt_half) {
+			int half = low + ((high - low) >> 1);
+
+			if (attempt_half == 1)
+				high = half;
+			else
+				low = half;
+		}
 		remaining = (high - low) + 1;
 		smallest_rover = rover = net_random() % remaining + low;
 
 		smallest_size = -1;
 		do {
+			if (inet_is_reserved_local_port(rover))
+				goto next_nolock;
 			head = &hashinfo->bhash[inet_bhashfn(net, rover,
 					hashinfo->bhash_size)];
 			spin_lock(&head->lock);
 			inet_bind_bucket_for_each(tb, node, &head->chain)
 				if (ib_net(tb) == net && tb->port == rover) {
-					if (tb->fastreuse > 0 &&
-					    sk->sk_reuse &&
-					    sk->sk_state != TCP_LISTEN &&
+					if (((tb->fastreuse > 0 &&
+					      sk->sk_reuse &&
+					      sk->sk_state != TCP_LISTEN) ||
+					     (tb->fastreuseport > 0 &&
+					      sk->sk_reuseport &&
+					      tb->fastuid == uid)) &&
 					    (tb->num_owners < smallest_size || smallest_size == -1)) {
 						smallest_size = tb->num_owners;
 						smallest_rover = rover;
-						if (atomic_read(&hashinfo->bsockets) > (high - low) + 1) {
-							spin_unlock(&head->lock);
+						if (atomic_read(&hashinfo->bsockets) > (high - low) + 1 &&
+						    !inet_csk(sk)->icsk_af_ops->bind_conflict(sk, tb)) {
 							snum = smallest_rover;
-							goto have_snum;
+							goto tb_found;
 						}
+					}
+					if (!inet_csk(sk)->icsk_af_ops->bind_conflict(sk, tb)) {
+						snum = rover;
+						goto tb_found;
 					}
 					goto next;
 				}
 			break;
 		next:
 			spin_unlock(&head->lock);
+		next_nolock:
 			if (++rover > high)
 				rover = low;
 		} while (--remaining > 0);
@@ -145,6 +193,11 @@ again:
 			if (smallest_size != -1) {
 				snum = smallest_rover;
 				goto have_snum;
+			}
+			if (attempt_half == 1) {
+				/* OK we now try the upper half of the range */
+				attempt_half = 2;
+				goto again;
 			}
 			goto fail;
 		}
@@ -165,14 +218,17 @@ have_snum:
 	goto tb_not_found;
 tb_found:
 	if (!hlist_empty(&tb->owners)) {
-		if (tb->fastreuse > 0 &&
-		    sk->sk_reuse && sk->sk_state != TCP_LISTEN &&
+		if (((tb->fastreuse > 0 &&
+		      sk->sk_reuse && sk->sk_state != TCP_LISTEN) ||
+		     (tb->fastreuseport > 0 &&
+		      sk->sk_reuseport && tb->fastuid == uid)) &&
 		    smallest_size == -1) {
 			goto success;
 		} else {
 			ret = 1;
-			if (inet_csk(sk)->icsk_af_ops->bind_conflict(sk, tb)) {
-				if (sk->sk_reuse && sk->sk_state != TCP_LISTEN &&
+			if (inet_csk_bind_conflict_relax(sk, tb)) {
+				if (((sk->sk_reuse && sk->sk_state != TCP_LISTEN) ||
+				     (sk->sk_reuseport && tb->fastuid == uid)) &&
 				    smallest_size != -1 && --attempts >= 0) {
 					spin_unlock(&head->lock);
 					goto again;
@@ -191,9 +247,23 @@ tb_not_found:
 			tb->fastreuse = 1;
 		else
 			tb->fastreuse = 0;
-	} else if (tb->fastreuse &&
-		   (!sk->sk_reuse || sk->sk_state == TCP_LISTEN))
-		tb->fastreuse = 0;
+		if (sk->sk_reuseport) {
+			tb->fastreuseport = 1;
+			tb->fastuid = uid;
+		} else {
+			tb->fastreuseport = 0;
+			tb->fastuid = 0;
+		}
+	} else {
+		if (tb->fastreuse &&
+		    (!sk->sk_reuse || sk->sk_state == TCP_LISTEN))
+			tb->fastreuse = 0;
+		if (tb->fastreuseport &&
+		    (!sk->sk_reuseport || tb->fastuid != uid)) {
+			tb->fastreuseport = 0;
+			tb->fastuid = 0;
+		}
+	}
 success:
 	if (!inet_csk(sk)->icsk_bind_hash)
 		inet_bind_hash(sk, tb, snum);
@@ -578,6 +648,8 @@ struct sock *inet_csk_clone(struct sock *sk, const struct request_sock *req,
 		inet_sk(newsk)->num = ntohs(inet_rsk(req)->loc_port);
 		inet_sk(newsk)->sport = inet_rsk(req)->loc_port;
 		newsk->sk_write_space = sk_stream_write_space;
+
+		inet_sk(newsk)->mc_list = NULL;
 
 		newicsk->icsk_retransmits = 0;
 		newicsk->icsk_backoff	  = 0;

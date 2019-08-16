@@ -77,24 +77,96 @@ s64 div_s64_rem(s64 dividend, s32 divisor, s32 *remainder)
 EXPORT_SYMBOL(div_s64_rem);
 #endif
 
-/* 64bit divisor, dividend and result. dynamic precision */
+/**
+ * div64_u64_rem - unsigned 64bit divide with 64bit divisor and remainder
+ * @dividend:	64bit dividend
+ * @divisor:	64bit divisor
+ * @remainder:  64bit remainder
+ *
+ * This implementation is a comparable to algorithm used by div64_u64.
+ * But this operation, which includes math for calculating the remainder,
+ * is kept distinct to avoid slowing down the div64_u64 operation on 32bit
+ * systems.
+ */
+#ifndef div64_u64_rem
+u64 div64_u64_rem(u64 dividend, u64 divisor, u64 *remainder)
+{
+	u32 high = divisor >> 32;
+	u64 quot;
+
+	if (high == 0) {
+		u32 rem32;
+		quot = div_u64_rem(dividend, divisor, &rem32);
+		*remainder = rem32;
+	} else {
+		int n = 1 + fls(high);
+		quot = div_u64(dividend >> n, divisor >> n);
+
+		if (quot != 0)
+			quot--;
+
+		*remainder = dividend - quot * divisor;
+		if (*remainder >= divisor) {
+			quot++;
+			*remainder -= divisor;
+		}
+	}
+
+	return quot;
+}
+EXPORT_SYMBOL(div64_u64_rem);
+#endif
+
+/**
+ * div64_u64 - unsigned 64bit divide with 64bit divisor
+ * @dividend:	64bit dividend
+ * @divisor:	64bit divisor
+ *
+ * This implementation is a modified version of the algorithm proposed
+ * by the book 'Hacker's Delight'.  The original source and full proof
+ * can be found here and is available for use without restriction.
+ *
+ * 'http://www.hackersdelight.org/HDcode/newCode/divDouble.c'
+ */
 #ifndef div64_u64
 u64 div64_u64(u64 dividend, u64 divisor)
 {
-	u32 high, d;
+	u32 high = divisor >> 32;
+	u64 quot;
 
-	high = divisor >> 32;
-	if (high) {
-		unsigned int shift = fls(high);
+	if (high == 0) {
+		quot = div_u64(dividend, divisor);
+	} else {
+		int n = 1 + fls(high);
+		quot = div_u64(dividend >> n, divisor >> n);
 
-		d = divisor >> shift;
-		dividend >>= shift;
-	} else
-		d = divisor;
+		if (quot != 0)
+			quot--;
+		if ((dividend - quot * divisor) >= divisor)
+			quot++;
+	}
 
-	return div_u64(dividend, d);
+	return quot;
 }
 EXPORT_SYMBOL(div64_u64);
+#endif
+
+/**
+ * div64_s64 - signed 64bit divide with 64bit divisor
+ * @dividend:	64bit dividend
+ * @divisor:	64bit divisor
+ */
+#ifndef div64_s64
+s64 div64_s64(s64 dividend, s64 divisor)
+{
+	s64 quot, t;
+
+	quot = div64_u64(abs64(dividend), abs64(divisor));
+	t = (dividend ^ divisor) >> 63;
+
+	return (quot ^ t) - t;
+}
+EXPORT_SYMBOL(div64_s64);
 #endif
 
 #endif /* BITS_PER_LONG == 32 */

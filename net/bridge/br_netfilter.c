@@ -65,24 +65,35 @@ static int brnf_filter_pppoe_tagged __read_mostly = 0;
 #define brnf_filter_pppoe_tagged 0
 #endif
 
+#define IS_IP(skb) \
+	(!skb_vlan_tag_present(skb) && skb->protocol == htons(ETH_P_IP))
+
+#define IS_IPV6(skb) \
+	(!skb_vlan_tag_present(skb) && skb->protocol == htons(ETH_P_IPV6))
+
+#define IS_ARP(skb) \
+	(!skb_vlan_tag_present(skb) && skb->protocol == htons(ETH_P_ARP))
+
 static inline __be16 vlan_proto(const struct sk_buff *skb)
 {
-	return vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
+	if (skb_vlan_tag_present(skb))
+		return skb->protocol;
+	else if (skb->protocol == htons(ETH_P_8021Q))
+		return vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
+	else
+		return 0;
 }
 
 #define IS_VLAN_IP(skb) \
-	(skb->protocol == htons(ETH_P_8021Q) && \
-	 vlan_proto(skb) == htons(ETH_P_IP) && 	\
+	(vlan_proto(skb) == htons(ETH_P_IP) && \
 	 brnf_filter_vlan_tagged)
 
 #define IS_VLAN_IPV6(skb) \
-	(skb->protocol == htons(ETH_P_8021Q) && \
-	 vlan_proto(skb) == htons(ETH_P_IPV6) &&\
+	(vlan_proto(skb) == htons(ETH_P_IPV6) && \
 	 brnf_filter_vlan_tagged)
 
 #define IS_VLAN_ARP(skb) \
-	(skb->protocol == htons(ETH_P_8021Q) &&	\
-	 vlan_proto(skb) == htons(ETH_P_ARP) &&	\
+	(vlan_proto(skb) == htons(ETH_P_ARP) &&	\
 	 brnf_filter_vlan_tagged)
 
 static inline __be16 pppoe_proto(const struct sk_buff *skb)
@@ -127,7 +138,7 @@ void br_netfilter_rtable_init(struct net_bridge *br)
 	rt->u.dst.dev = br->dev;
 	rt->u.dst.path = &rt->u.dst;
 	rt->u.dst.metrics[RTAX_MTU - 1] = 1500;
-	rt->u.dst.flags	= DST_NOXFRM;
+	rt->u.dst.flags	= DST_NOXFRM | DST_FAKE_RTABLE;
 	rt->u.dst.ops = &fake_dst_ops;
 }
 
@@ -560,8 +571,7 @@ static unsigned int br_nf_pre_routing(unsigned int hook, struct sk_buff *skb,
 	if (unlikely(!pskb_may_pull(skb, len)))
 		goto out;
 
-	if (skb->protocol == htons(ETH_P_IPV6) || IS_VLAN_IPV6(skb) ||
-	    IS_PPPOE_IPV6(skb)) {
+	if (IS_IPV6(skb) || IS_VLAN_IPV6(skb) || IS_PPPOE_IPV6(skb)) {
 #ifdef CONFIG_SYSCTL
 		if (!brnf_call_ip6tables)
 			return NF_ACCEPT;
@@ -574,8 +584,7 @@ static unsigned int br_nf_pre_routing(unsigned int hook, struct sk_buff *skb,
 		return NF_ACCEPT;
 #endif
 
-	if (skb->protocol != htons(ETH_P_IP) && !IS_VLAN_IP(skb) &&
-	    !IS_PPPOE_IP(skb))
+	if (!IS_IP(skb) && !IS_VLAN_IP(skb) && !IS_PPPOE_IP(skb))
 		return NF_ACCEPT;
 
 	nf_bridge_pull_encap_header_rcsum(skb);
@@ -599,6 +608,9 @@ static unsigned int br_nf_pre_routing(unsigned int hook, struct sk_buff *skb,
 		goto inhdr_error;
 
 	pskb_trim_rcsum(skb, len);
+
+	/* BUG: Should really parse the IP options here. */
+	memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));
 
 	nf_bridge_put(skb->nf_bridge);
 	if (!nf_bridge_alloc(skb))
@@ -631,11 +643,7 @@ static unsigned int br_nf_local_in(unsigned int hook, struct sk_buff *skb,
 				   const struct net_device *out,
 				   int (*okfn)(struct sk_buff *))
 {
-	struct rtable *rt = skb_rtable(skb);
-
-	if (rt && rt == bridge_parent_rtable(in))
-		skb_dst_drop(skb);
-
+	br_drop_fake_rtable(skb);
 	return NF_ACCEPT;
 }
 
@@ -645,7 +653,7 @@ static int br_nf_forward_finish(struct sk_buff *skb)
 	struct nf_bridge_info *nf_bridge = skb->nf_bridge;
 	struct net_device *in;
 
-	if (skb->protocol != htons(ETH_P_ARP) && !IS_VLAN_ARP(skb)) {
+	if (!IS_ARP(skb) && !IS_VLAN_ARP(skb)) {
 		in = nf_bridge->physindev;
 		if (nf_bridge->mask & BRNF_PKT_TYPE) {
 			skb->pkt_type = PACKET_OTHERHOST;
@@ -659,6 +667,7 @@ static int br_nf_forward_finish(struct sk_buff *skb)
 		       skb->dev, br_forward_finish, 1);
 	return 0;
 }
+
 
 /* This is the 'purely bridged' case.  For IP, we pass the packet to
  * netfilter with indev and outdev set to the bridge device,
@@ -677,6 +686,9 @@ static unsigned int br_nf_forward_ip(unsigned int hook, struct sk_buff *skb,
 	if (!skb->nf_bridge)
 		return NF_ACCEPT;
 
+	if (skb_dst(skb) == NULL)
+		return NF_ACCEPT;
+
 	/* Need exclusive nf_bridge_info since we might have multiple
 	 * different physoutdevs. */
 	if (!nf_bridge_unshare(skb))
@@ -686,11 +698,9 @@ static unsigned int br_nf_forward_ip(unsigned int hook, struct sk_buff *skb,
 	if (!parent)
 		return NF_DROP;
 
-	if (skb->protocol == htons(ETH_P_IP) || IS_VLAN_IP(skb) ||
-	    IS_PPPOE_IP(skb))
+	if (IS_IP(skb) || IS_VLAN_IP(skb) || IS_PPPOE_IP(skb))
 		pf = PF_INET;
-	else if (skb->protocol == htons(ETH_P_IPV6) || IS_VLAN_IPV6(skb) ||
-		 IS_PPPOE_IPV6(skb))
+	else if (IS_IPV6(skb) || IS_VLAN_IPV6(skb) || IS_PPPOE_IPV6(skb))
 		pf = PF_INET6;
 	else
 		return NF_ACCEPT;
@@ -702,6 +712,9 @@ static unsigned int br_nf_forward_ip(unsigned int hook, struct sk_buff *skb,
 		skb->pkt_type = PACKET_HOST;
 		nf_bridge->mask |= BRNF_PKT_TYPE;
 	}
+
+	/* BUG: Should really parse the IP options here. */
+	memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));
 
 	/* The physdev module checks on this */
 	nf_bridge->mask |= BRNF_BRIDGED;
@@ -725,7 +738,7 @@ static unsigned int br_nf_forward_arp(unsigned int hook, struct sk_buff *skb,
 		return NF_ACCEPT;
 #endif
 
-	if (skb->protocol != htons(ETH_P_ARP)) {
+	if (!IS_ARP(skb)) {
 		if (!IS_VLAN_ARP(skb))
 			return NF_ACCEPT;
 		nf_bridge_pull_encap_header(skb);
@@ -766,6 +779,9 @@ static unsigned int br_nf_local_out(unsigned int hook, struct sk_buff *skb,
 	if (!skb->nf_bridge)
 		return NF_ACCEPT;
 
+	if (skb_dst(skb) == NULL)
+		return NF_ACCEPT;
+
 	/* Need exclusive nf_bridge_info since we might have multiple
 	 * different physoutdevs. */
 	if (!nf_bridge_unshare(skb))
@@ -786,6 +802,9 @@ static unsigned int br_nf_local_out(unsigned int hook, struct sk_buff *skb,
 	}
 	nf_bridge_push_encap_header(skb);
 
+	/* BUG: Should really parse the IP options here. */
+	memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));
+
 	NF_HOOK(PF_BRIDGE, NF_BR_FORWARD, skb, realindev, skb->dev,
 		br_forward_finish);
 	return NF_STOLEN;
@@ -797,9 +816,11 @@ static int br_nf_dev_queue_xmit(struct sk_buff *skb)
 	if (skb->nfct != NULL &&
 	    (skb->protocol == htons(ETH_P_IP) || IS_VLAN_IP(skb)) &&
 	    skb->len > skb->dev->mtu &&
-	    !skb_is_gso(skb))
+	    !skb_is_gso(skb)) {
+		/* BUG: Should really parse the IP options here. */
+		memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));
 		return ip_fragment(skb, br_dev_queue_push_xmit);
-	else
+	} else
 		return br_dev_queue_push_xmit(skb);
 }
 #else
@@ -833,17 +854,18 @@ static unsigned int br_nf_post_routing(unsigned int hook, struct sk_buff *skb,
 	if (!nf_bridge)
 		return NF_ACCEPT;
 
+	if (skb_dst(skb) == NULL)
+		return NF_ACCEPT;
+
 	if (!(nf_bridge->mask & (BRNF_BRIDGED | BRNF_BRIDGED_DNAT)))
 		return NF_ACCEPT;
 
 	if (!realoutdev)
 		return NF_DROP;
 
-	if (skb->protocol == htons(ETH_P_IP) || IS_VLAN_IP(skb) ||
-	    IS_PPPOE_IP(skb))
+	if (IS_IP(skb) || IS_VLAN_IP(skb) || IS_PPPOE_IP(skb))
 		pf = PF_INET;
-	else if (skb->protocol == htons(ETH_P_IPV6) || IS_VLAN_IPV6(skb) ||
-		 IS_PPPOE_IPV6(skb))
+	else if (IS_IPV6(skb) || IS_VLAN_IPV6(skb) || IS_PPPOE_IPV6(skb))
 		pf = PF_INET6;
 	else
 		return NF_ACCEPT;

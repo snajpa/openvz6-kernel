@@ -50,6 +50,37 @@ acpi_evaluate_reference(acpi_handle handle,
 			acpi_string pathname,
 			struct acpi_object_list *arguments,
 			struct acpi_handle_list *list);
+acpi_status
+acpi_evaluate_hotplug_ost(acpi_handle handle, u32 source_event,
+			u32 status_code, struct acpi_buffer *status_buf);
+
+bool acpi_has_method(acpi_handle handle, char *name);
+
+bool acpi_check_dsm(acpi_handle handle, const u8 *uuid, int rev, u64 funcs);
+union acpi_object *acpi_evaluate_dsm(acpi_handle handle, const u8 *uuid,
+			int rev, int func, union acpi_object *argv4);
+
+static inline union acpi_object *
+acpi_evaluate_dsm_typed(acpi_handle handle, const u8 *uuid, int rev, int func,
+			union acpi_object *argv4, acpi_object_type type)
+{
+	union acpi_object *obj;
+
+	obj = acpi_evaluate_dsm(handle, uuid, rev, func, argv4);
+	if (obj && obj->type != type) {
+		ACPI_FREE(obj);
+		obj = NULL;
+	}
+
+	return obj;
+}
+
+#define	ACPI_INIT_DSM_ARGV4(cnt, eles)			\
+	{						\
+	  .package.type = ACPI_TYPE_PACKAGE,		\
+	  .package.count = (cnt),			\
+	  .package.elements = (eles)			\
+	}
 
 #ifdef CONFIG_ACPI
 
@@ -150,7 +181,12 @@ struct acpi_device_flags {
 	u32 performance_manageable:1;
 	u32 wake_capable:1;	/* Wakeup(_PRW) supported? */
 	u32 force_power_state:1;
+#ifndef __GENKSYMS__
+	u32 eject_pending:1;
+	u32 reserved:21;
+#else
 	u32 reserved:22;
+#endif
 };
 
 /* File System */
@@ -242,6 +278,8 @@ struct acpi_device_perf {
 struct acpi_device_wakeup_flags {
 	u8 valid:1;		/* Can successfully enable wakeup? */
 	u8 run_wake:1;		/* Run-Wake GPE devices */
+	u8 always_enabled:1;
+	u8 notifier_present:1;
 };
 
 struct acpi_device_wakeup_state {
@@ -256,6 +294,7 @@ struct acpi_device_wakeup {
 	struct acpi_device_wakeup_state state;
 	struct acpi_device_wakeup_flags flags;
 	int prepare_count;
+	int run_wake_count;
 };
 
 /* Device */
@@ -306,6 +345,11 @@ struct acpi_bus_event {
 	u32 data;
 };
 
+struct acpi_eject_event {
+	acpi_handle	handle;
+	u32		event;
+};
+
 extern struct kobject *acpi_kobj;
 extern int acpi_bus_generate_netlink_event(const char*, const char*, u8, int);
 void acpi_bus_private_data_handler(acpi_handle, void *);
@@ -341,6 +385,7 @@ int acpi_bus_register_driver(struct acpi_driver *driver);
 void acpi_bus_unregister_driver(struct acpi_driver *driver);
 int acpi_bus_add(struct acpi_device **child, struct acpi_device *parent,
 		 acpi_handle handle, int type);
+void acpi_bus_hot_remove_device(void *context);
 int acpi_bus_trim(struct acpi_device *start, int rmdevice);
 int acpi_bus_start(struct acpi_device *device);
 acpi_status acpi_bus_get_ejd(acpi_handle handle, acpi_handle * ejd);
@@ -348,6 +393,19 @@ int acpi_match_device_ids(struct acpi_device *device,
 			  const struct acpi_device_id *ids);
 int acpi_create_dir(struct acpi_device *);
 void acpi_remove_dir(struct acpi_device *);
+
+
+/**
+ * module_acpi_driver(acpi_driver) - Helper macro for registering an ACPI driver
+ * @__acpi_driver: acpi_driver struct
+ *
+ * Helper macro for ACPI drivers which do not do anything special in module
+ * init/exit. This eliminates a lot of boilerplate. Each module may only
+ * use this macro once, and calling it replaces module_init() and module_exit()
+ */
+#define module_acpi_driver(__acpi_driver) \
+	module_driver(__acpi_driver, acpi_bus_register_driver, \
+		      acpi_bus_unregister_driver)
 
 /*
  * Bind physical devices with ACPI devices
@@ -370,7 +428,7 @@ struct acpi_pci_root {
 	struct acpi_pci_id id;
 	struct pci_bus *bus;
 	u16 segment;
-	u8 bus_nr;
+	struct resource secondary;	/* downstream bus range */
 
 	u32 osc_support_set;	/* _OSC state of support bits */
 	u32 osc_control_set;	/* _OSC state of control bits */
@@ -401,6 +459,8 @@ static inline int acpi_pm_device_sleep_wake(struct device *dev, bool enable)
 	return -ENODEV;
 }
 #endif /* !CONFIG_PM_SLEEP */
+
+u32 acpi_target_system_state(void);
 
 #endif				/* CONFIG_ACPI */
 

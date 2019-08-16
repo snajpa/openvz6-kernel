@@ -66,6 +66,12 @@ async_memcpy(struct page *dest, struct page *src, unsigned int dest_offset,
 
 		tx = device->device_prep_dma_memcpy(chan, dma_dest, dma_src,
 						    len, dma_prep_flags);
+		if (!tx) {
+			dma_unmap_page(device->dev, dma_dest, len,
+				       DMA_FROM_DEVICE);
+			dma_unmap_page(device->dev, dma_src, len,
+				       DMA_TO_DEVICE);
+		}
 	}
 
 	if (tx) {
@@ -83,8 +89,8 @@ async_memcpy(struct page *dest, struct page *src, unsigned int dest_offset,
 
 		memcpy(dest_buf, src_buf, len);
 
-		kunmap_atomic(dest_buf, KM_USER0);
 		kunmap_atomic(src_buf, KM_USER1);
+		kunmap_atomic(dest_buf, KM_USER0);
 
 		async_tx_sync_epilog(submit);
 	}

@@ -16,6 +16,7 @@
 #include <linux/init.h>
 #include <linux/sysctl.h>
 #include <linux/moduleparam.h>
+#include <linux/inetdevice.h>
 
 #include <linux/sched.h>
 #include <linux/errno.h>
@@ -33,7 +34,10 @@
 #include <linux/sunrpc/clnt.h>
 #include <linux/sunrpc/svc.h>
 #include <linux/sunrpc/svcsock.h>
+#include <linux/sunrpc/svc_xprt.h>
 #include <net/ip.h>
+#include <net/addrconf.h>
+#include <net/ipv6.h>
 #include <linux/lockd/lockd.h>
 #include <linux/nfs.h>
 
@@ -207,7 +211,7 @@ static int create_lockd_listener(struct svc_serv *serv, const char *name,
 
 	xprt = svc_find_xprt(serv, name, family, 0);
 	if (xprt == NULL)
-		return svc_create_xprt(serv, name, family, port,
+		return svc_create_xprt(serv, name, &init_net, family, port,
 						SVC_SOCK_DEFAULTS);
 	svc_xprt_put(xprt);
 	return 0;
@@ -243,11 +247,9 @@ static int make_socks(struct svc_serv *serv)
 	if (err < 0)
 		goto out_err;
 
-#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
 	err = create_lockd_family(serv, PF_INET6);
 	if (err < 0 && err != -EAFNOSUPPORT)
 		goto out_err;
-#endif	/* CONFIG_IPV6 || CONFIG_IPV6_MODULE */
 
 	warned = 0;
 	return 0;
@@ -259,6 +261,77 @@ out_err:
 	return err;
 }
 
+static int lockd_inetaddr_event(struct notifier_block *this,
+	unsigned long event, void *ptr)
+{
+	struct in_ifaddr *ifa = (struct in_ifaddr *)ptr;
+	struct sockaddr_in sin;
+
+	if (event != NETDEV_DOWN)
+		goto out;
+
+	if (nlmsvc_rqst) {
+		dprintk("lockd_inetaddr_event: removed %pI4\n",
+			&ifa->ifa_local);
+		sin.sin_family = AF_INET;
+		sin.sin_addr.s_addr = ifa->ifa_local;
+		svc_age_temp_xprts_now(nlmsvc_rqst->rq_server,
+			(struct sockaddr *)&sin);
+	}
+out:
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block lockd_inetaddr_notifier = {
+	.notifier_call = lockd_inetaddr_event,
+};
+
+#if IS_ENABLED(CONFIG_IPV6)
+static int lockd_inet6addr_event(struct notifier_block *this,
+	unsigned long event, void *ptr)
+{
+	struct inet6_ifaddr *ifa = (struct inet6_ifaddr *)ptr;
+	struct sockaddr_in6 sin6;
+
+	if (event != NETDEV_DOWN)
+		goto out;
+
+	if (nlmsvc_rqst) {
+		dprintk("lockd_inet6addr_event: removed %pI6\n", &ifa->addr);
+		sin6.sin6_family = AF_INET6;
+		sin6.sin6_addr = ifa->addr;
+		svc_age_temp_xprts_now(nlmsvc_rqst->rq_server,
+			(struct sockaddr *)&sin6);
+	}
+out:
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block lockd_inet6addr_notifier = {
+	.notifier_call = lockd_inet6addr_event,
+};
+#endif
+
+static void lockd_unregister_notifiers(void)
+{
+#if IS_ENABLED(CONFIG_IPV6)
+	int (*fn)(struct notifier_block *);
+
+	fn = symbol_get(unregister_inet6addr_notifier);
+	if (fn) {
+		fn(&lockd_inet6addr_notifier);
+		symbol_put_addr(fn);
+	}
+#endif
+	unregister_inetaddr_notifier(&lockd_inetaddr_notifier);
+}
+
+static void lockd_svc_exit_thread(void)
+{
+	lockd_unregister_notifiers();
+	svc_exit_thread(nlmsvc_rqst);
+}
+
 /*
  * Bring up the lockd process if it's not already up.
  */
@@ -266,6 +339,9 @@ int lockd_up(void)
 {
 	struct svc_serv *serv;
 	int		error = 0;
+#if IS_ENABLED(CONFIG_IPV6)
+	int (*fn)(struct notifier_block *);
+#endif
 
 	mutex_lock(&nlmsvc_mutex);
 	/*
@@ -289,9 +365,18 @@ int lockd_up(void)
 		goto out;
 	}
 
+	register_inetaddr_notifier(&lockd_inetaddr_notifier);
+#if IS_ENABLED(CONFIG_IPV6)
+	fn = symbol_get(register_inet6addr_notifier);
+	if (fn) {
+		fn(&lockd_inet6addr_notifier);
+		symbol_put_addr(fn);
+	}
+#endif
+
 	error = make_socks(serv);
 	if (error < 0)
-		goto destroy_and_out;
+		goto err_start;
 
 	/*
 	 * Create the kernel thread and wait for it to start.
@@ -303,7 +388,7 @@ int lockd_up(void)
 		printk(KERN_WARNING
 			"lockd_up: svc_rqst allocation failed, error=%d\n",
 			error);
-		goto destroy_and_out;
+		goto err_start;
 	}
 
 	svc_sock_update_bufs(serv);
@@ -312,7 +397,7 @@ int lockd_up(void)
 	nlmsvc_task = kthread_run(lockd, nlmsvc_rqst, serv->sv_name);
 	if (IS_ERR(nlmsvc_task)) {
 		error = PTR_ERR(nlmsvc_task);
-		svc_exit_thread(nlmsvc_rqst);
+		lockd_svc_exit_thread();
 		nlmsvc_task = NULL;
 		nlmsvc_rqst = NULL;
 		printk(KERN_WARNING
@@ -331,6 +416,9 @@ out:
 		nlmsvc_users++;
 	mutex_unlock(&nlmsvc_mutex);
 	return error;
+err_start:
+	lockd_unregister_notifiers();
+	goto destroy_and_out;
 }
 EXPORT_SYMBOL_GPL(lockd_up);
 
@@ -355,7 +443,7 @@ lockd_down(void)
 		BUG();
 	}
 	kthread_stop(nlmsvc_task);
-	svc_exit_thread(nlmsvc_rqst);
+	lockd_svc_exit_thread();
 	nlmsvc_task = NULL;
 	nlmsvc_rqst = NULL;
 out:

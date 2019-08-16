@@ -14,6 +14,7 @@
 #include <linux/string.h>
 #include <linux/sunrpc/clnt.h>
 #include <linux/vfs.h>
+#include <linux/sunrpc/gss_api.h>
 #include "internal.h"
 
 #define NFSDBG_FACILITY		NFSDBG_VFS
@@ -27,7 +28,8 @@ int nfs_mountpoint_expiry_timeout = 500 * HZ;
 static struct vfsmount *nfs_do_submount(const struct vfsmount *mnt_parent,
 					const struct dentry *dentry,
 					struct nfs_fh *fh,
-					struct nfs_fattr *fattr);
+					struct nfs_fattr *fattr,
+					rpc_authflavor_t authflavor);
 
 /*
  * nfs_path - reconstruct the path given an arbitrary dentry
@@ -86,10 +88,38 @@ Elong:
 	return ERR_PTR(-ENAMETOOLONG);
 }
 
+#ifdef CONFIG_NFS_V4
+static struct rpc_clnt *nfs_lookup_mountpoint(struct inode *dir,
+					      struct qstr *name,
+					      struct nfs_fh *fh,
+					      struct nfs_fattr *fattr)
+{
+	int err;
+
+	if (NFS_PROTO(dir)->version == 4)
+		return nfs4_proc_lookup_mountpoint(dir, name, fh, fattr);
+
+	err = NFS_PROTO(dir)->lookup(NFS_SERVER(dir)->client, dir, name, fh, fattr);
+	if (err)
+		return ERR_PTR(err);
+	return rpc_clone_client(NFS_SERVER(dir)->client);
+}
+#else /* CONFIG_NFS_V4 */
+static inline struct rpc_clnt *nfs_lookup_mountpoint(struct inode *dir,
+						     struct qstr *name,
+						     struct nfs_fh *fh,
+						     struct nfs_fattr *fattr)
+{
+	int err = NFS_PROTO(dir)->lookup(NFS_SERVER(dir)->client, dir, name, fh, fattr);
+	if (err)
+		return ERR_PTR(err);
+	return rpc_clone_client(NFS_SERVER(dir)->client);
+}
+#endif /* CONFIG_NFS_V4 */
+
 /*
- * nfs_follow_mountpoint - handle crossing a mountpoint on the server
- * @dentry - dentry of mountpoint
- * @nd - nameidata info
+ * nfs_d_automount - Handle crossing a mountpoint on the server
+ * @path - The mountpoint
  *
  * When we encounter a mountpoint on the server, we want to set up
  * a mountpoint on the client too, to prevent inode numbers from
@@ -99,79 +129,64 @@ Elong:
  * situation, and that different filesystems may want to use
  * different security flavours.
  */
-static void * nfs_follow_mountpoint(struct dentry *dentry, struct nameidata *nd)
+struct vfsmount *nfs_d_automount(struct path *path)
 {
 	struct vfsmount *mnt;
-	struct nfs_server *server = NFS_SERVER(dentry->d_inode);
 	struct dentry *parent;
-	struct nfs_fh fh;
-	struct nfs_fattr fattr;
-	int err;
+	struct nfs_fh *fh = NULL;
+	struct nfs_fattr *fattr = NULL;
+	struct rpc_clnt *client;
 
-	dprintk("--> nfs_follow_mountpoint()\n");
+	dprintk("--> nfs_d_automount()\n");
 
-	err = -ESTALE;
-	if (IS_ROOT(dentry))
-		goto out_err;
+	mnt = ERR_PTR(-ESTALE);
+	if (IS_ROOT(path->dentry))
+		goto out_nofree;
+
+	mnt = ERR_PTR(-ENOMEM);
+	fh = nfs_alloc_fhandle();
+	fattr = nfs_alloc_fattr();
+	if (fh == NULL || fattr == NULL)
+		goto out;
 
 	dprintk("%s: enter\n", __func__);
-	dput(nd->path.dentry);
-	nd->path.dentry = dget(dentry);
 
-	/* Look it up again */
-	parent = dget_parent(nd->path.dentry);
-	err = server->nfs_client->rpc_ops->lookup(parent->d_inode,
-						  &nd->path.dentry->d_name,
-						  &fh, &fattr);
+	/* Look it up again to get its attributes */
+	parent = dget_parent(path->dentry);
+	client = nfs_lookup_mountpoint(parent->d_inode, &path->dentry->d_name, fh, fattr);
 	dput(parent);
-	if (err != 0)
-		goto out_err;
-
-	if (fattr.valid & NFS_ATTR_FATTR_V4_REFERRAL)
-		mnt = nfs_do_refmount(nd->path.mnt, nd->path.dentry);
-	else
-		mnt = nfs_do_submount(nd->path.mnt, nd->path.dentry, &fh,
-				      &fattr);
-	err = PTR_ERR(mnt);
-	if (IS_ERR(mnt))
-		goto out_err;
-
-	mntget(mnt);
-	err = do_add_mount(mnt, &nd->path, nd->path.mnt->mnt_flags|MNT_SHRINKABLE,
-			   &nfs_automount_list);
-	if (err < 0) {
-		mntput(mnt);
-		if (err == -EBUSY)
-			goto out_follow;
-		goto out_err;
+	if (IS_ERR(client)) {
+		mnt = ERR_CAST(client);
+		goto out;
 	}
-	path_put(&nd->path);
-	nd->path.mnt = mnt;
-	nd->path.dentry = dget(mnt->mnt_root);
-	schedule_delayed_work(&nfs_automount_task, nfs_mountpoint_expiry_timeout);
-out:
-	dprintk("%s: done, returned %d\n", __func__, err);
 
-	dprintk("<-- nfs_follow_mountpoint() = %d\n", err);
-	return ERR_PTR(err);
-out_err:
-	path_put(&nd->path);
-	goto out;
-out_follow:
-	while (d_mountpoint(nd->path.dentry) &&
-	       follow_down(&nd->path))
-		;
-	err = 0;
-	goto out;
+	if (fattr->valid & NFS_ATTR_FATTR_V4_REFERRAL)
+		mnt = nfs_do_refmount(client, path->mnt, path->dentry);
+	else
+		mnt = nfs_do_submount(path->mnt, path->dentry, fh, fattr, client->cl_auth->au_flavor);
+	rpc_shutdown_client(client);
+
+	if (IS_ERR(mnt))
+		goto out;
+
+	dprintk("%s: done, success\n", __func__);
+	mntget(mnt); /* prevent immediate expiration */
+	mnt_set_expiry(mnt, &nfs_automount_list);
+	schedule_delayed_work(&nfs_automount_task, nfs_mountpoint_expiry_timeout);
+
+out:
+	nfs_free_fattr(fattr);
+	nfs_free_fhandle(fh);
+out_nofree:
+	dprintk("<-- nfs_follow_mountpoint() = %p\n", mnt);
+	return mnt;
 }
 
 const struct inode_operations nfs_mountpoint_inode_operations = {
-	.follow_link	= nfs_follow_mountpoint,
 	.getattr	= nfs_getattr,
 };
 
 const struct inode_operations nfs_referral_inode_operations = {
-	.follow_link	= nfs_follow_mountpoint,
 };
 
 static void nfs_expire_automounts(struct work_struct *work)
@@ -218,18 +233,21 @@ static struct vfsmount *nfs_do_clone_mount(struct nfs_server *server,
  * @dentry - parent directory
  * @fh - filehandle for new root dentry
  * @fattr - attributes for new root inode
+ * @authflavor - security flavor to use when performing the mount
  *
  */
 static struct vfsmount *nfs_do_submount(const struct vfsmount *mnt_parent,
 					const struct dentry *dentry,
 					struct nfs_fh *fh,
-					struct nfs_fattr *fattr)
+					struct nfs_fattr *fattr,
+					rpc_authflavor_t authflavor)
 {
 	struct nfs_clone_mount mountdata = {
 		.sb = mnt_parent->mnt_sb,
 		.dentry = dentry,
 		.fh = fh,
 		.fattr = fattr,
+		.authflavor = authflavor,
 	};
 	struct vfsmount *mnt = ERR_PTR(-ENOMEM);
 	char *page = (char *) __get_free_page(GFP_USER);

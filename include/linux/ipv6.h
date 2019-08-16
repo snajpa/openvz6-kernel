@@ -240,11 +240,12 @@ struct inet6_skb_parm {
 	__u16			srcrt;
 	__u16			dst1;
 	__u16			lastopt;
-	__u32			nhoff;
+	__u16			nhoff;
 	__u16			flags;
 #if defined(CONFIG_IPV6_MIP6) || defined(CONFIG_IPV6_MIP6_MODULE)
 	__u16			dsthao;
 #endif
+	__u16			frag_max_size;
 
 #define IP6SKB_XFRM_TRANSFORMED	1
 #define IP6SKB_FORWARDED	2
@@ -333,11 +334,15 @@ struct ipv6_pinfo {
 				odstopts:1,
                                 rxflow:1,
 				rxtclass:1;
+#ifndef __GENKSYMS__
+			__u8	rxorigdstaddr:1;
+#endif
 		} bits;
 		__u16		all;
 	} rxopt;
 
 	/* sockopt flags */
+#ifdef __GENKSYMS__
 	__u8			recverr:1,
 	                        sndflow:1,
 				pmtudisc:2,
@@ -346,6 +351,16 @@ struct ipv6_pinfo {
 						 * 010: prefer public address
 						 * 100: prefer care-of address
 						 */
+#else /* __GENKSYMS__ */
+	__u16			recverr:1,
+	                        sndflow:1,
+				pmtudisc:3,
+				ipv6only:1,
+				srcprefs:3;	/* 001: prefer temporary address
+						 * 010: prefer public address
+						 * 100: prefer care-of address
+						 */
+#endif
 	__u8			tclass;
 
 	__u32			dst_cookie;
@@ -354,7 +369,7 @@ struct ipv6_pinfo {
 	struct ipv6_ac_socklist	*ipv6_ac_list;
 	struct ipv6_fl_socklist *ipv6_fl_list;
 
-	struct ipv6_txoptions	*opt;
+	struct ipv6_txoptions __rcu	*opt;
 	struct sk_buff		*pktoptions;
 	struct {
 		struct ipv6_txoptions *opt;

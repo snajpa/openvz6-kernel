@@ -41,6 +41,27 @@ static inline void poll_wait(struct file * filp, wait_queue_head_t * wait_addres
 		p->qproc(filp, wait_address, p);
 }
 
+/*
+ * Return true if it is guaranteed that poll will not wait. This is the case
+ * if the poll() of another file descriptor in the set got an event, so there
+ * is no need for waiting.
+ */
+static inline bool poll_does_not_wait(const poll_table *p)
+{
+	return p == NULL || p->qproc == NULL;
+}
+
+/*
+ * Return the set of events that the application wants to poll for.
+ * This is useful for drivers that need to know whether a DMA transfer has
+ * to be started implicitly on poll(). You typically only want to do that
+ * if the application is actually polling for POLLIN and/or POLLOUT.
+ */
+static inline unsigned long poll_requested_events(const poll_table *p)
+{
+	return p ? p->key : ~0UL;
+}
+
 static inline void init_poll_funcptr(poll_table *pt, poll_queue_proc qproc)
 {
 	pt->qproc = qproc;
@@ -71,6 +92,8 @@ extern void poll_initwait(struct poll_wqueues *pwq);
 extern void poll_freewait(struct poll_wqueues *pwq);
 extern int poll_schedule_timeout(struct poll_wqueues *pwq, int state,
 				 ktime_t *expires, unsigned long slack);
+extern long select_estimate_accuracy(struct timespec *tv);
+
 
 static inline int poll_schedule(struct poll_wqueues *pwq, int state)
 {

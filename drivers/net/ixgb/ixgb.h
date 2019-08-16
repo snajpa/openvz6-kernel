@@ -117,6 +117,7 @@ struct ixgb_buffer {
 	unsigned long time_stamp;
 	u16 length;
 	u16 next_to_watch;
+	u16 mapped_as_page;
 };
 
 struct ixgb_desc_ring {
@@ -156,9 +157,6 @@ struct ixgb_adapter {
 	u16 link_speed;
 	u16 link_duplex;
 	struct work_struct tx_timeout_task;
-
-	struct timer_list blink_timer;
-	unsigned long led_status;
 
 	/* TX */
 	struct ixgb_desc_ring tx_ring ____cacheline_aligned_in_smp;

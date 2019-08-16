@@ -73,10 +73,6 @@
 #define MMCR1_PMCSEL_MSK	0x7f
 
 /*
- * Bits in MMCRA
- */
-
-/*
  * Layout of constraint bits:
  * 6666555555555544444444443333333333222222222211111111110000000000
  * 3210987654321098765432109876543210987654321098765432109876543210
@@ -670,7 +666,7 @@ static struct power_pmu power5p_pmu = {
 	.get_alternatives	= power5p_get_alternatives,
 	.disable_pmc		= power5p_disable_pmc,
 	.limited_pmc_event	= power5p_limited_pmc_event,
-	.flags			= PPMU_LIMITED_PMC5_6,
+	.flags			= PPMU_LIMITED_PMC5_6 | PPMU_HAS_SSLOT,
 	.n_generic		= ARRAY_SIZE(power5p_generic_events),
 	.generic_events		= power5p_generic_events,
 	.cache_events		= &power5p_cache_events,
@@ -686,4 +682,4 @@ static int init_power5p_pmu(void)
 	return register_power_pmu(&power5p_pmu);
 }
 
-arch_initcall(init_power5p_pmu);
+early_initcall(init_power5p_pmu);

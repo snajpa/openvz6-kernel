@@ -34,6 +34,7 @@
 #include <linux/if.h>
 #include <linux/if_vlan.h>
 #include <linux/jhash.h>
+#include <linux/export.h>
 #include <net/neighbour.h>
 #include "common.h"
 #include "t3cdev.h"
@@ -297,16 +298,36 @@ static inline void reuse_entry(struct l2t_entry *e, struct neighbour *neigh)
 	spin_unlock(&e->lock);
 }
 
-struct l2t_entry *t3_l2t_get(struct t3cdev *cdev, struct neighbour *neigh,
+struct l2t_entry *t3_l2t_get(struct t3cdev *cdev, struct dst_entry *dst,
 			     struct net_device *dev)
 {
-	struct l2t_entry *e;
-	struct l2t_data *d = L2DATA(cdev);
-	u32 addr = *(u32 *) neigh->primary_key;
-	int ifidx = neigh->dev->ifindex;
-	int hash = arp_hash(addr, ifidx, d);
-	struct port_info *p = netdev_priv(dev);
-	int smt_idx = p->port_id;
+	struct l2t_entry *e = NULL;
+	struct neighbour *neigh;
+	struct port_info *p;
+	struct l2t_data *d;
+	int hash;
+	u32 addr;
+	int ifidx;
+	int smt_idx;
+
+	rcu_read_lock();
+	neigh = dst->neighbour;
+	if (!neigh)
+		goto done_rcu;
+
+	addr = *(u32 *) neigh->primary_key;
+	ifidx = neigh->dev->ifindex;
+
+	if (!dev)
+		dev = neigh->dev;
+	p = netdev_priv(dev);
+	smt_idx = p->port_id;
+
+	d = L2DATA(cdev);
+	if (!d)
+		goto done_rcu;
+
+	hash = arp_hash(addr, ifidx, d);
 
 	write_lock_bh(&d->lock);
 	for (e = d->l2tab[hash].first; e; e = e->next)
@@ -315,7 +336,7 @@ struct l2t_entry *t3_l2t_get(struct t3cdev *cdev, struct neighbour *neigh,
 			l2t_hold(d, e);
 			if (atomic_read(&e->refcnt) == 1)
 				reuse_entry(e, neigh);
-			goto done;
+			goto done_unlock;
 		}
 
 	/* Need to allocate a new entry */
@@ -336,8 +357,10 @@ struct l2t_entry *t3_l2t_get(struct t3cdev *cdev, struct neighbour *neigh,
 			e->vlan = VLAN_NONE;
 		spin_unlock(&e->lock);
 	}
-done:
+done_unlock:
 	write_unlock_bh(&d->lock);
+done_rcu:
+	rcu_read_unlock();
 	return e;
 }
 

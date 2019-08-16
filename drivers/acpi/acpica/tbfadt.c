@@ -277,14 +277,15 @@ void acpi_tb_create_local_fadt(struct acpi_table_header *table, u32 length)
 {
 	/*
 	 * Check if the FADT is larger than the largest table that we expect
-	 * (the ACPI 2.0/3.0 version). If so, truncate the table, and issue
-	 * a warning.
+	 * (typically the current ACPI specification version). If so, truncate
+	 * the table, and issue a warning.
 	 */
 	if (length > sizeof(struct acpi_table_fadt)) {
 		ACPI_WARNING((AE_INFO,
-			      "FADT (revision %u) is longer than ACPI 2.0 version, "
-			      "truncating length 0x%X to 0x%X",
-			      table->revision, length,
+			      "FADT (revision %u) is longer than %s length, "
+			      "truncating length %u to %u",
+			      table->revision, ACPI_FADT_CONFORMANCE,
+			      length,
 			      (u32)sizeof(struct acpi_table_fadt)));
 	}
 
@@ -350,10 +351,6 @@ static void acpi_tb_convert_fadt(void)
 	u32 address32;
 	u32 i;
 
-	/* Update the local FADT table header length */
-
-	acpi_gbl_FADT.header.length = sizeof(struct acpi_table_fadt);
-
 	/*
 	 * Expand the 32-bit FACS and DSDT addresses to 64-bit as necessary.
 	 * Later code will always use the X 64-bit field. Also, check for an
@@ -384,13 +381,20 @@ static void acpi_tb_convert_fadt(void)
 	 *
 	 * The ACPI 1.0 reserved fields that will be zeroed are the bytes located at
 	 * offset 45, 55, 95, and the word located at offset 109, 110.
+	 *
+	 * Note: The FADT revision value is unreliable. Only the length can be
+	 * trusted.
 	 */
-	if (acpi_gbl_FADT.header.revision < FADT2_REVISION_ID) {
+	if (acpi_gbl_FADT.header.length <= ACPI_FADT_V2_SIZE) {
 		acpi_gbl_FADT.preferred_profile = 0;
 		acpi_gbl_FADT.pstate_control = 0;
 		acpi_gbl_FADT.cst_control = 0;
 		acpi_gbl_FADT.boot_flags = 0;
 	}
+
+	/* Update the local FADT table header length */
+
+	acpi_gbl_FADT.header.length = sizeof(struct acpi_table_fadt);
 
 	/*
 	 * Expand the ACPI 1.0 32-bit addresses to the ACPI 2.0 64-bit "X"
@@ -422,7 +426,7 @@ static void acpi_tb_convert_fadt(void)
 		if (address64->address && address32 &&
 		    (address64->address != (u64) address32)) {
 			ACPI_ERROR((AE_INFO,
-				    "32/64X address mismatch in %s: %8.8X/%8.8X%8.8X, using 32",
+				    "32/64X address mismatch in %s: 0x%8.8X/0x%8.8X%8.8X, using 32",
 				    fadt_info_table[i].name, address32,
 				    ACPI_FORMAT_UINT64(address64->address)));
 		}
@@ -481,7 +485,7 @@ static void acpi_tb_validate_fadt(void)
 	    (acpi_gbl_FADT.Xfacs != (u64) acpi_gbl_FADT.facs)) {
 		ACPI_WARNING((AE_INFO,
 			      "32/64X FACS address mismatch in FADT - "
-			      "%8.8X/%8.8X%8.8X, using 32",
+			      "0x%8.8X/0x%8.8X%8.8X, using 32",
 			      acpi_gbl_FADT.facs,
 			      ACPI_FORMAT_UINT64(acpi_gbl_FADT.Xfacs)));
 
@@ -492,7 +496,7 @@ static void acpi_tb_validate_fadt(void)
 	    (acpi_gbl_FADT.Xdsdt != (u64) acpi_gbl_FADT.dsdt)) {
 		ACPI_WARNING((AE_INFO,
 			      "32/64X DSDT address mismatch in FADT - "
-			      "%8.8X/%8.8X%8.8X, using 32",
+			      "0x%8.8X/0x%8.8X%8.8X, using 32",
 			      acpi_gbl_FADT.dsdt,
 			      ACPI_FORMAT_UINT64(acpi_gbl_FADT.Xdsdt)));
 
@@ -517,11 +521,15 @@ static void acpi_tb_validate_fadt(void)
 		/*
 		 * For each extended field, check for length mismatch between the
 		 * legacy length field and the corresponding 64-bit X length field.
+		 * Note: If the legacy length field is > 0xFF bits, ignore this
+		 * check. (GPE registers can be larger than the 64-bit GAS structure
+		 * can accomodate, 0xFF bits).
 		 */
 		if (address64->address &&
+		    (ACPI_MUL_8(length) <= ACPI_UINT8_MAX) &&
 		    (address64->bit_width != ACPI_MUL_8(length))) {
 			ACPI_WARNING((AE_INFO,
-				      "32/64X length mismatch in %s: %d/%d",
+				      "32/64X length mismatch in %s: %u/%u",
 				      name, ACPI_MUL_8(length),
 				      address64->bit_width));
 		}
@@ -534,7 +542,7 @@ static void acpi_tb_validate_fadt(void)
 			if (!address64->address || !length) {
 				ACPI_ERROR((AE_INFO,
 					    "Required field %s has zero address and/or length:"
-					    " %8.8X%8.8X/%X",
+					    " 0x%8.8X%8.8X/0x%X",
 					    name,
 					    ACPI_FORMAT_UINT64(address64->
 							       address),
@@ -550,7 +558,7 @@ static void acpi_tb_validate_fadt(void)
 			    (!address64->address && length)) {
 				ACPI_WARNING((AE_INFO,
 					      "Optional field %s has zero address or length: "
-					      "%8.8X%8.8X/%X",
+					      "0x%8.8X%8.8X/0x%X",
 					      name,
 					      ACPI_FORMAT_UINT64(address64->
 								 address),
@@ -600,7 +608,7 @@ static void acpi_tb_setup_fadt_registers(void)
 			    (fadt_info_table[i].default_length !=
 			     target64->bit_width)) {
 				ACPI_WARNING((AE_INFO,
-					      "Invalid length for %s: %d, using default %d",
+					      "Invalid length for %s: %u, using default %u",
 					      fadt_info_table[i].name,
 					      target64->bit_width,
 					      fadt_info_table[i].

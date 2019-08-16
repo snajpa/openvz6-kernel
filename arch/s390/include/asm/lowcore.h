@@ -69,6 +69,7 @@
 #define __LC_INT_CLOCK			0x02c8
 #define __LC_MACHINE_FLAGS		0x02d8
 #define __LC_FTRACE_FUNC		0x02dc
+#define __LC_CURRENT_PID		0x02f0
 #define __LC_IRB			0x0300
 #define __LC_PFAULT_INTPARM		0x0080
 #define __LC_CPU_TIMER_SAVE_AREA	0x00d8
@@ -116,6 +117,9 @@
 #define __LC_VDSO_PER_CPU		0x0350
 #define __LC_MACHINE_FLAGS		0x0358
 #define __LC_FTRACE_FUNC		0x0360
+#define __LC_SIE_HOOK			0x0368
+#define __LC_CMF_HPP			0x0370
+#define __LC_CURRENT_PID		0x0378
 #define __LC_IRB			0x0380
 #define __LC_PASTE			0x03c0
 #define __LC_PFAULT_INTPARM		0x11b8
@@ -143,6 +147,7 @@ void system_call(void);
 void pgm_check_handler(void);
 void mcck_int_handler(void);
 void io_int_handler(void);
+void psw_restart_int_handler(void);
 
 struct save_area_s390 {
 	u32	ext_save;
@@ -293,12 +298,14 @@ struct _lowcore
 	__u64	clock_comparator;		/* 0x02d0 */
 	__u32	machine_flags;			/* 0x02d8 */
 	__u32	ftrace_func;			/* 0x02dc */
-	__u8	pad_0x02f0[0x0300-0x02f0];	/* 0x02f0 */
+	__u32	current_pid;			/* 0x02f0 */
+	__u8	pad_0x02f4[0x0300-0x02f4];	/* 0x02f4 */
 
 	/* Interrupt response block */
 	__u8	irb[64];			/* 0x0300 */
 
-	__u8	pad_0x0400[0x0e00-0x0400];	/* 0x0400 */
+	__u32	spinlock_lockval;		/* 0x0340 */
+	__u8	pad_0x0344[0x0e00-0x0344];	/* 0x0344 */
 
 	/*
 	 * 0xe00 contains the address of the IPL Parameter Information
@@ -307,9 +314,10 @@ struct _lowcore
 	 */
 	__u32	ipib;				/* 0x0e00 */
 	__u32	ipib_checksum;			/* 0x0e04 */
+	__u32	vmcore_info;			/* 0x0e08 */
 
 	/* Align to the top 1k of prefix area */
-	__u8	pad_0x0e08[0x1000-0x0e08];	/* 0x0e08 */
+	__u8	pad_0x0e0c[0x1000-0x0e0c];	/* 0x0e0c */
 #else /* !__s390x__ */
 	/* 0x0000 - 0x01ff: defined by architecture */
 	__u32	ccw1[2];			/* 0x0000 */
@@ -399,7 +407,9 @@ struct _lowcore
 	__u64	vdso_per_cpu_data;		/* 0x0350 */
 	__u64	machine_flags;			/* 0x0358 */
 	__u64	ftrace_func;			/* 0x0360 */
-	__u8	pad_0x0368[0x0380-0x0368];	/* 0x0368 */
+	__u64	sie_hook;			/* 0x0368 */
+	__u64	cmf_hpp;			/* 0x0370 */
+	__u64   current_pid;			/* 0x0378 */
 
 	/* Interrupt response block. */
 	__u8	irb[64];			/* 0x0380 */
@@ -407,7 +417,12 @@ struct _lowcore
 	/* Per cpu primary space access list */
 	__u32	paste[16];			/* 0x03c0 */
 
-	__u8	pad_0x0400[0x0e00-0x0400];	/* 0x0400 */
+	__u32   spinlock_lockval;		/* 0x0400 */
+	__u8	pad_0x0404[0x0500-0x0404];	/* 0x0404 */
+
+	/* br %r1 trampoline */
+	__u16	br_r1_trampoline;		/* 0x0500 */
+	__u8	pad_0x0502[0x0e00-0x0502];	/* 0x0502 */
 
 	/*
 	 * 0xe00 contains the address of the IPL Parameter Information
@@ -416,7 +431,8 @@ struct _lowcore
 	 */
 	__u64	ipib;				/* 0x0e00 */
 	__u32	ipib_checksum;			/* 0x0e08 */
-	__u8	pad_0x0e0c[0x11b8-0x0e0c];	/* 0x0e0c */
+	__u64	vmcore_info;			/* 0x0e0c */
+	__u8	pad_0x0e14[0x11b8-0x0e14];	/* 0x0e14 */
 
 	/* 64 bit extparam used for pfault/diag 250: defined by architecture */
 	__u64	ext_params2;			/* 0x11B8 */
@@ -436,9 +452,13 @@ struct _lowcore
 	__u8	pad_0x1338[0x1340-0x1338];	/* 0x1338 */
 	__u32	access_regs_save_area[16];	/* 0x1340 */
 	__u64	cregs_save_area[16];		/* 0x1380 */
+	__u8	pad_0x1400[0x1800-0x1400];	/* 0x1400 */
+
+	/* Transaction abort diagnostic block */
+	__u8	pgm_tdb[256];			/* 0x1800 */
 
 	/* align to the top of the prefix area */
-	__u8	pad_0x1400[0x2000-0x1400];	/* 0x1400 */
+	__u8	pad_0x1900[0x2000-0x1900];	/* 0x1900 */
 #endif /* !__s390x__ */
 } __attribute__((packed)); /* End structure*/
 

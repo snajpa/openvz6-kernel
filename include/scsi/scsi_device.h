@@ -49,10 +49,23 @@ enum scsi_device_state {
 	SDEV_CREATED_BLOCK,	/* same as above but for created devices */
 };
 
+#define SDEV_TRANSPORT_OFFLINE	(SDEV_CREATED_BLOCK + 1) /* Offlined by transport class error handler */
+
 enum scsi_device_event {
 	SDEV_EVT_MEDIA_CHANGE	= 1,	/* media has changed */
+#ifndef __GENKSYMS__
+	SDEV_EVT_INQUIRY_CHANGE_REPORTED,		/* 3F 03  UA reported */
+	SDEV_EVT_CAPACITY_CHANGE_REPORTED,		/* 2A 09  UA reported */
+	SDEV_EVT_SOFT_THRESHOLD_REACHED_REPORTED,	/* 38 07  UA reported */
+	SDEV_EVT_MODE_PARAMETER_CHANGE_REPORTED,	/* 2A 01  UA reported */
+	SDEV_EVT_LUN_CHANGE_REPORTED,			/* 3F 0E  UA reported */
+	SDEV_EVT_ALUA_STATE_CHANGE_REPORTED,		/* 2A 06  UA reported */
 
+	SDEV_EVT_FIRST		= SDEV_EVT_MEDIA_CHANGE,
+	SDEV_EVT_LAST		= SDEV_EVT_ALUA_STATE_CHANGE_REPORTED,
+#else
 	SDEV_EVT_LAST		= SDEV_EVT_MEDIA_CHANGE,
+#endif
 	SDEV_EVT_MAXBITS	= SDEV_EVT_LAST + 1
 };
 
@@ -81,11 +94,14 @@ struct scsi_device {
 	struct list_head starved_entry;
 	struct scsi_cmnd *current_cmnd;	/* currently active command */
 	unsigned short queue_depth;	/* How deep of a queue we want */
+	unsigned short max_queue_depth;	/* max queue depth */
 	unsigned short last_queue_full_depth; /* These two are used by */
 	unsigned short last_queue_full_count; /* scsi_track_queue_full() */
-	unsigned long last_queue_full_time;/* don't let QUEUE_FULLs on the same
-					   jiffie count on our counter, they
-					   could all be from the same event. */
+	unsigned long last_queue_full_time;	/* last queue full time */
+	unsigned long queue_ramp_up_period;	/* ramp up period in jiffies */
+#define SCSI_DEFAULT_RAMP_UP_PERIOD	(120 * HZ)
+
+	unsigned long last_queue_ramp_up;	/* last queue ramp up time */
 
 	unsigned int id, lun, channel;
 
@@ -146,6 +162,12 @@ struct scsi_device {
 	unsigned last_sector_bug:1;	/* do not use multisector accesses on
 					   SD_LAST_BUGGY_SECTORS */
 	unsigned is_visible:1;	/* is the device visible in sysfs */
+#ifndef __GENKSYMS__
+	unsigned no_dif:1;	/* T10 PI (DIF) should be disabled */
+	unsigned skip_vpd_pages:1;	/* do not read VPD pages */
+	unsigned try_rc_10_first:1;	/* Try READ_CAPACACITY_10 first */
+	unsigned lun_in_cdb:1;		/* Store LUN bits in CDB[1] */
+#endif
 
 	DECLARE_BITMAP(supported_events, SDEV_EVT_MAXBITS); /* supported events */
 	struct list_head event_list;	/* asserted events */
@@ -167,7 +189,14 @@ struct scsi_device {
 
 	struct scsi_dh_data	*scsi_dh_data;
 	enum scsi_device_state sdev_state;
+#ifdef __GENKSYMS__
 	unsigned long		sdev_data[0];
+#else
+	struct work_struct	requeue_work;
+	unsigned int eh_timeout; /* Error handling timeout */
+	DECLARE_BITMAP(pending_events, SDEV_EVT_MAXBITS); /* pending events */
+	unsigned long		sdev_data[0];
+#endif
 } __attribute__((aligned(sizeof(unsigned long))));
 
 struct scsi_dh_devlist {
@@ -175,6 +204,7 @@ struct scsi_dh_devlist {
 	char *model;
 };
 
+typedef void (*activate_complete)(void *, int);
 struct scsi_device_handler {
 	/* Used by the infrastructure */
 	struct list_head list; /* list of scsi_device_handlers */
@@ -186,9 +216,23 @@ struct scsi_device_handler {
 	int (*check_sense)(struct scsi_device *, struct scsi_sense_hdr *);
 	int (*attach)(struct scsi_device *);
 	void (*detach)(struct scsi_device *);
-	int (*activate)(struct scsi_device *);
+	int (*activate)(struct scsi_device *, activate_complete, void *);
 	int (*prep_fn)(struct scsi_device *, struct request *);
 	int (*set_params)(struct scsi_device *, const char *);
+};
+
+/*
+ * RHEL specific structure needed to extend 'struct scsi_device_handler'
+ * because that structure is statically allocated by each hardware handler.
+ * - hardware handlers must allocate this structure and pass it when calling
+ *   scsi_register_device_handler() -- avoids further static allocations.
+ */
+struct scsi_device_handler_aux {
+	struct list_head list; /* list of scsi_device_handler_auxs */
+	struct scsi_device_handler *scsi_dh;
+
+	/* Filled by the hardware handler */
+	bool (*match)(struct scsi_device *);
 };
 
 struct scsi_dh_data {
@@ -208,16 +252,32 @@ struct scsi_dh_data {
 #define sdev_printk(prefix, sdev, fmt, a...)	\
 	dev_printk(prefix, &(sdev)->sdev_gendev, fmt, ##a)
 
+#define sdev_dbg(sdev, fmt, a...) \
+	dev_dbg(&(sdev)->sdev_gendev, fmt, ##a)
+
 #define scmd_printk(prefix, scmd, fmt, a...)				\
         (scmd)->request->rq_disk ?					\
 	sdev_printk(prefix, (scmd)->device, "[%s] " fmt,		\
 		    (scmd)->request->rq_disk->disk_name, ##a) :		\
 	sdev_printk(prefix, (scmd)->device, fmt, ##a)
 
+#define scmd_dbg(scmd, fmt, a...)					   \
+	do {								   \
+		if ((scmd)->request->rq_disk)				   \
+			sdev_dbg((scmd)->device, "[%s] " fmt,		   \
+				 (scmd)->request->rq_disk->disk_name, ##a);\
+		else							   \
+			sdev_dbg((scmd)->device, fmt, ##a);		   \
+	} while (0)
+
 enum scsi_target_state {
 	STARGET_CREATED = 1,
 	STARGET_RUNNING,
 	STARGET_DEL,
+#ifndef __GENKSYMS__
+	STARGET_REMOVE,
+	STARGET_CREATED_REMOVE,
+#endif
 };
 
 /*
@@ -230,7 +290,11 @@ struct scsi_target {
 	struct list_head	siblings;
 	struct list_head	devices;
 	struct device		dev;
+#ifndef __GENKSYMS__
+	struct kref		reap_ref; /* last put renders target invisible */
+#else
 	unsigned int		reap_ref; /* protected by the host lock */
+#endif
 	unsigned int		channel;
 	unsigned int		id; /* target id ... replace
 				     * scsi_device.id eventually */
@@ -238,6 +302,13 @@ struct scsi_target {
 	unsigned int		single_lun:1;	/* Indicates we should only
 						 * allow I/O to one of the luns
 						 * for the device at a time. */
+#ifndef __GENKSYMS__
+	unsigned int		expecting_lun_change:1;	/* A device has reported
+						 * a 3F/0E UA, other devices on
+						 * the same target will also. */
+	unsigned int		no_report_luns:1;	/* Don't use
+						 * REPORT LUNS for scanning. */
+#endif
 	unsigned int		pdt_1f_for_no_lun;	/* PDT = 0x1f */
 						/* means no lun present */
 	/* commands actually active on LLD. protected by host lock. */
@@ -274,7 +345,8 @@ extern struct scsi_device *__scsi_add_device(struct Scsi_Host *,
 		uint, uint, uint, void *hostdata);
 extern int scsi_add_device(struct Scsi_Host *host, uint channel,
 			   uint target, uint lun);
-extern int scsi_register_device_handler(struct scsi_device_handler *scsi_dh);
+extern int scsi_register_device_handler(struct scsi_device_handler *scsi_dh,
+					struct scsi_device_handler_aux *scsi_dh_aux);
 extern void scsi_remove_device(struct scsi_device *);
 extern int scsi_unregister_device_handler(struct scsi_device_handler *scsi_dh);
 
@@ -344,7 +416,8 @@ extern int scsi_mode_select(struct scsi_device *sdev, int pf, int sp,
 			    struct scsi_sense_hdr *);
 extern int scsi_test_unit_ready(struct scsi_device *sdev, int timeout,
 				int retries, struct scsi_sense_hdr *sshdr);
-extern unsigned char *scsi_get_vpd_page(struct scsi_device *, u8 page);
+extern int scsi_get_vpd_page(struct scsi_device *, u8 page, unsigned char *buf,
+			     int buf_len);
 extern int scsi_device_set_state(struct scsi_device *sdev,
 				 enum scsi_device_state state);
 extern struct scsi_event *sdev_evt_alloc(enum scsi_device_event evt_type,
@@ -361,6 +434,7 @@ extern void scsi_scan_target(struct device *parent, unsigned int channel,
 extern void scsi_target_reap(struct scsi_target *);
 extern void scsi_target_block(struct device *);
 extern void scsi_target_unblock(struct device *);
+extern void __scsi_target_unblock(struct device *dev, enum scsi_device_state new_state);
 extern void scsi_remove_target(struct device *);
 extern void int_to_scsilun(unsigned int, struct scsi_lun *);
 extern int scsilun_to_int(struct scsi_lun *);
@@ -400,6 +474,7 @@ static inline unsigned int sdev_id(struct scsi_device *sdev)
 static inline int scsi_device_online(struct scsi_device *sdev)
 {
 	return (sdev->sdev_state != SDEV_OFFLINE &&
+		sdev->sdev_state != SDEV_TRANSPORT_OFFLINE &&
 		sdev->sdev_state != SDEV_DEL);
 }
 static inline int scsi_device_blocked(struct scsi_device *sdev)
@@ -446,12 +521,20 @@ static inline int scsi_device_qas(struct scsi_device *sdev)
 }
 static inline int scsi_device_enclosure(struct scsi_device *sdev)
 {
-	return sdev->inquiry[6] & (1<<6);
+	return sdev->inquiry ? (sdev->inquiry[6] & (1<<6)) : 1;
 }
 
 static inline int scsi_device_protection(struct scsi_device *sdev)
 {
+	if (sdev->no_dif)
+		return 0;
+
 	return sdev->scsi_level > SCSI_2 && sdev->inquiry[5] & (1<<0);
+}
+
+static inline int scsi_device_tpgs(struct scsi_device *sdev)
+{
+	return sdev->inquiry ? (sdev->inquiry[5] >> 4) & 0x3 : 0;
 }
 
 #define MODULE_ALIAS_SCSI_DEVICE(type) \

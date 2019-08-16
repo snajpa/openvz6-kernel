@@ -32,27 +32,42 @@ static inline unsigned int optlen(const u_int8_t *opt, unsigned int offset)
 static unsigned int
 tcpoptstrip_mangle_packet(struct sk_buff *skb,
 			  const struct xt_tcpoptstrip_target_info *info,
-			  unsigned int tcphoff, unsigned int minlen)
+			  unsigned int tcphoff, unsigned int minlen,
+			  int fragoff)
 {
 	unsigned int optl, i, j;
 	struct tcphdr *tcph;
 	u_int16_t n, o;
 	u_int8_t *opt;
+	int len, tcp_hdrlen;
+
+	/* This is a fragment, no TCP header is available */
+	if (fragoff)
+		return XT_CONTINUE;
 
 	if (!skb_make_writable(skb, skb->len))
 		return NF_DROP;
 
+	len = skb->len - tcphoff;
+	if (len < (int)sizeof(struct tcphdr))
+		return NF_DROP;
+
 	tcph = (struct tcphdr *)(skb_network_header(skb) + tcphoff);
+	tcp_hdrlen = tcph->doff * 4;
+
+	if (len < tcp_hdrlen)
+		return NF_DROP;
+
 	opt  = (u_int8_t *)tcph;
 
 	/*
 	 * Walk through all TCP options - if we find some option to remove,
 	 * set all octets to %TCPOPT_NOP and adjust checksum.
 	 */
-	for (i = sizeof(struct tcphdr); i < tcp_hdrlen(skb); i += optl) {
+	for (i = sizeof(struct tcphdr); i < tcp_hdrlen - 1; i += optl) {
 		optl = optlen(opt, i);
 
-		if (i + optl > tcp_hdrlen(skb))
+		if (i + optl > tcp_hdrlen)
 			break;
 
 		if (!tcpoptstrip_test_bit(info->strip_bmap, opt[i]))
@@ -78,7 +93,8 @@ static unsigned int
 tcpoptstrip_tg4(struct sk_buff *skb, const struct xt_target_param *par)
 {
 	return tcpoptstrip_mangle_packet(skb, par->targinfo, ip_hdrlen(skb),
-	       sizeof(struct iphdr) + sizeof(struct tcphdr));
+	       sizeof(struct iphdr) + sizeof(struct tcphdr),
+	       ntohs(ip_hdr(skb)->frag_off) & IP_OFFSET);
 }
 
 #if defined(CONFIG_IP6_NF_MANGLE) || defined(CONFIG_IP6_NF_MANGLE_MODULE)
@@ -88,14 +104,16 @@ tcpoptstrip_tg6(struct sk_buff *skb, const struct xt_target_param *par)
 	struct ipv6hdr *ipv6h = ipv6_hdr(skb);
 	int tcphoff;
 	u_int8_t nexthdr;
+	__be16 fragoff;
 
 	nexthdr = ipv6h->nexthdr;
-	tcphoff = ipv6_skip_exthdr(skb, sizeof(*ipv6h), &nexthdr);
+	tcphoff = ipv6_skip_exthdr_fragoff(skb, sizeof(*ipv6h), &nexthdr,
+					   &fragoff);
 	if (tcphoff < 0)
 		return NF_DROP;
 
 	return tcpoptstrip_mangle_packet(skb, par->targinfo, tcphoff,
-	       sizeof(*ipv6h) + sizeof(struct tcphdr));
+	       sizeof(*ipv6h) + sizeof(struct tcphdr), ntohs(fragoff));
 }
 #endif
 

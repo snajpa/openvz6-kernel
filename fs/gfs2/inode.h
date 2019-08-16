@@ -80,24 +80,58 @@ static inline void gfs2_inum_out(const struct gfs2_inode *ip,
 	dent->de_inum.no_addr = cpu_to_be64(ip->i_no_addr);
 }
 
+static inline int gfs2_check_internal_file_size(struct inode *inode,
+						u64 minsize, u64 maxsize)
+{
+	u64 size = i_size_read(inode);
+	if (size < minsize || size > maxsize)
+		goto err;
+	if (size & ((1 << inode->i_blkbits) - 1))
+		goto err;
+	return 0;
+err:
+	gfs2_consist_inode(GFS2_I(inode));
+	return -EIO;
+}
 
-extern void gfs2_set_iop(struct inode *inode);
+/**
+ * gfs2_size_hint - Give a hint to the size of a write request
+ * @file: The struct file
+ * @offset: The file offset of the write
+ * @size: The length of the write
+ *
+ * When we are about to do a write, this function records the total
+ * write size in order to provide a suitable hint to the lower layers
+ * about how many blocks will be required.
+ *
+ */
+
+static inline void gfs2_size_hint(struct inode *inode, loff_t offset,
+				  size_t size)
+{
+	struct gfs2_sbd *sdp = GFS2_SB(inode);
+	struct gfs2_inode *ip = GFS2_I(inode);
+	size_t blks = (size + sdp->sd_sb.sb_bsize - 1) >> sdp->sd_sb.sb_bsize_shift;
+	int hint = min_t(size_t, INT_MAX, blks);
+	atomic_set(&ip->i_res.rs_sizehint, hint);
+}
+
 extern struct inode *gfs2_inode_lookup(struct super_block *sb, unsigned type, 
 				       u64 no_addr, u64 no_formal_ino,
-				       int skip_freeing);
-extern struct inode *gfs2_ilookup(struct super_block *sb, u64 no_addr);
+				       unsigned int blktype);
+extern struct inode *gfs2_lookup_by_inum(struct gfs2_sbd *sdp, u64 no_addr,
+					 u64 *no_formal_ino,
+					 unsigned int blktype);
 
 extern int gfs2_inode_refresh(struct gfs2_inode *ip);
 
-extern int gfs2_dinode_dealloc(struct gfs2_inode *inode);
-extern int gfs2_change_nlink(struct gfs2_inode *ip, int diff);
 extern struct inode *gfs2_lookupi(struct inode *dir, const struct qstr *name,
 				  int is_root);
-extern struct inode *gfs2_createi(struct gfs2_holder *ghs,
-				  const struct qstr *name,
-				  unsigned int mode, dev_t dev);
+extern int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
+			     unsigned int mode, dev_t dev, const char *symname,
+			     unsigned int size, int excl);
 extern int gfs2_permission(struct inode *inode, int mask);
-extern int gfs2_setattr_simple(struct gfs2_inode *ip, struct iattr *attr);
+extern int gfs2_setattr_simple(struct inode *inode, struct iattr *attr);
 extern struct inode *gfs2_lookup_simple(struct inode *dip, const char *name);
 extern void gfs2_dinode_out(const struct gfs2_inode *ip, void *buf);
 extern void gfs2_dinode_print(const struct gfs2_inode *ip);

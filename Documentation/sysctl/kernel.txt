@@ -21,16 +21,20 @@ show up in /proc/sys/kernel:
 - acct
 - callhome		     [ S390 only ]
 - auto_msgmni
+- cap_last_cap
 - core_pattern
 - core_pipe_limit
 - core_uses_pid
 - ctrl-alt-del
 - dentry-state
+- dmesg_restrict
 - domainname
 - hostname
 - hotplug
+- hardlockup_all_cpu_backtrace
 - java-appletviewer           [ binfmt_java, obsolete ]
 - java-interpreter            [ binfmt_java, obsolete ]
+- kptr_restrict
 - kstack_depth_to_print       [ X86 only ]
 - l2cr                        [ PPC only ]
 - modprobe                    ==> Documentation/debugging-modules.txt
@@ -47,6 +51,7 @@ show up in /proc/sys/kernel:
 - pid_max
 - powersave-nap               [ PPC only ]
 - panic_on_unrecovered_nmi
+- panic_on_warn               [ X86 only ]
 - printk
 - randomize_va_space
 - real-root-dev               ==> Documentation/initrd.txt
@@ -55,9 +60,11 @@ show up in /proc/sys/kernel:
 - rtsig-nr
 - sem
 - sg-big-buff                 [ generic SCSI device (sg) ]
+- shm_rmid_forced
 - shmall
 - shmmax                      [ sysv ipc ]
 - shmmni
+- softlockup_all_cpu_backtrace
 - stop-a                      [ SPARC only ]
 - sysrq                       ==> Documentation/sysrq.txt
 - tainted
@@ -108,6 +115,13 @@ on has a service contract with IBM.
 
 ==============================================================
 
+cap_last_cap
+
+Highest valid capability of the running kernel.  Exports
+CAP_LAST_CAP from the kernel.
+
+==============================================================
+
 core_pattern:
 
 core_pattern is used to specify a core dumpfile pattern name.
@@ -128,7 +142,8 @@ core_pattern is used to specify a core dumpfile pattern name.
 	%s	signal number
 	%t	UNIX time of dump
 	%h	hostname
-	%e	executable filename
+	%e	executable filename (may be shortened)
+	%E	executable path
 	%<OTHER> both are dropped
 . If the first character of the pattern is a '|', the kernel will treat
   the rest of the pattern as a command to run.  The core dump will be
@@ -182,6 +197,19 @@ to decide what to do with it.
 
 ==============================================================
 
+dmesg_restrict:
+
+This toggle indicates whether unprivileged users are prevented from using
+dmesg(8) to view messages from the kernel's log buffer.  When
+dmesg_restrict is set to (0) there are no restrictions.  When
+dmesg_restrict is set set to (1), users must have CAP_SYS_ADMIN to use
+dmesg(8).
+
+The kernel config option CONFIG_SECURITY_DMESG_RESTRICT sets the default
+value of dmesg_restrict.
+
+==============================================================
+
 domainname & hostname:
 
 These files can be used to set the NIS/YP domainname and the
@@ -201,6 +229,17 @@ domain names are in general different. For a detailed discussion
 see the hostname(1) man page.
 
 ==============================================================
+hardlockup_all_cpu_backtrace:
+
+This value controls the hard lockup detector behavior when a hard
+lockup condition is detected as to whether or not to gather further
+debug information. If enabled, arch-specific all-CPU stack dumping
+will be initiated.
+
+0: do nothing. This is the default behavior.
+
+1: on detection capture more debug information.
+==============================================================
 
 hotplug:
 
@@ -213,6 +252,19 @@ l2cr: (PPC only)
 
 This flag controls the L2 cache of G3 processor boards. If
 0, the cache is disabled. Enabled if nonzero.
+
+==============================================================
+
+kptr_restrict:
+
+This toggle indicates whether restrictions are placed on
+exposing kernel addresses via /proc and other interfaces.  When
+kptr_restrict is set to (0), there are no restrictions.  When
+kptr_restrict is set to (1), the default, kernel pointers
+printed using the %pK format specifier will be replaced with 0's
+unless the user has CAP_SYSLOG.  When kptr_restrict is set to
+(2), kernel pointers printed using %pK will be replaced with 0's
+regardless of privileges.
 
 ==============================================================
 
@@ -278,6 +330,30 @@ Controls the kernel's behaviour when an oops or BUG is encountered.
 
 1: panic immediately.  If the `panic' sysctl is also non-zero then the
    machine will be rebooted.
+
+==============================================================
+
+panic_on_unrecovered_nmi:
+
+The default Linux behaviour on an NMI of either memory or unknown is to continue
+operation. For many environments such as scientific computing it is preferable
+that the box is taken out and the error dealt with than an uncorrected
+parity/ECC error get propogated.
+
+A small number of systems do generate NMI's for bizarre random reasons such as
+power management so the default is off. That sysctl works like the existing
+panic controls already in that directory.
+
+==============================================================
+
+panic_on_warn:
+
+Calls panic() in the WARN() path when set to 1.  This is useful to avoid
+a kernel rebuild when attempting to kdump at the location of a WARN().
+
+0: only WARN(), default behaviour.
+
+1: call panic() after printing out WARN() location.
 
 ==============================================================
 
@@ -415,12 +491,49 @@ kernel.  This value defaults to SHMMAX.
 
 ==============================================================
 
+shm_rmid_forced:
+
+Linux lets you set resource limits, including how much memory one
+process can consume, via setrlimit(2).  Unfortunately, shared memory
+segments are allowed to exist without association with any process, and
+thus might not be counted against any resource limits.  If enabled,
+shared memory segments are automatically destroyed when their attach
+count becomes zero after a detach or a process termination.  It will
+also destroy segments that were created, but never attached to, on exit
+from the process.  The only use left for IPC_RMID is to immediately
+destroy an unattached segment.  Of course, this breaks the way things are
+defined, so some applications might stop working.  Note that this
+feature will do you no good unless you also configure your resource
+limits (in particular, RLIMIT_AS and RLIMIT_NPROC).  Most systems don't
+need this.
+
+Note that if you change this from 0 to 1, already created segments
+without users and with a dead originative process will be destroyed.
+
+==============================================================
+
 softlockup_thresh:
 
 This value can be used to lower the softlockup tolerance threshold.  The
 default threshold is 60 seconds.  If a cpu is locked up for 60 seconds,
 the kernel complains.  Valid values are 1-60 seconds.  Setting this
 tunable to zero will disable the softlockup detection altogether.
+
+==============================================================
+
+softlockup_all_cpu_backtrace:
+
+This value controls the soft lockup detector thread's behavior
+when a soft lockup condition is detected as to whether or not
+to gather further debug information. If enabled, each cpu will
+be issued an NMI and instructed to capture stack trace.
+
+This feature is only applicable for architectures which support
+NMI.
+
+0: do nothing. This is the default behavior.
+
+1: on detection capture more debug information.
 
 ==============================================================
 
@@ -446,6 +559,7 @@ can be ORed together:
         instead of using the one provided by the hardware.
  512 - A kernel warning has occurred.
 1024 - A module from drivers/staging was loaded.
+16384 - A soft lockup has previously occurred on the system.
 
 ==============================================================
 
@@ -481,17 +595,3 @@ debugging information is displayed on console.
 
 NMI switch that most IA32 servers have fires unknown NMI up, for example.
 If a system hangs up, try pressing the NMI switch.
-
-==============================================================
-
-panic_on_unrecovered_nmi:
-
-The default Linux behaviour on an NMI of either memory or unknown is to continue
-operation. For many environments such as scientific computing it is preferable
-that the box is taken out and the error dealt with than an uncorrected
-parity/ECC error get propogated.
-
-A small number of systems do generate NMI's for bizarre random reasons such as
-power management so the default is off. That sysctl works like the existing
-panic controls already in that directory.
-

@@ -21,10 +21,13 @@
 #include "util.h"
 
 struct kmem_cache *gfs2_glock_cachep __read_mostly;
+struct kmem_cache *gfs2_glock_aspace_cachep __read_mostly;
 struct kmem_cache *gfs2_inode_cachep __read_mostly;
 struct kmem_cache *gfs2_bufdata_cachep __read_mostly;
 struct kmem_cache *gfs2_rgrpd_cachep __read_mostly;
 struct kmem_cache *gfs2_quotad_cachep __read_mostly;
+struct kmem_cache *gfs2_qadata_cachep __read_mostly;
+mempool_t *gfs2_bh_pool __read_mostly;
 
 void gfs2_assert_i(struct gfs2_sbd *sdp)
 {
@@ -51,6 +54,9 @@ int gfs2_lm_withdraw(struct gfs2_sbd *sdp, char *fmt, ...)
 		BUG_ON(sdp->sd_args.ar_debug);
 
 		kobject_uevent(&sdp->sd_kobj, KOBJ_OFFLINE);
+
+		if (!strcmp(sdp->sd_lockstruct.ls_ops->lm_proto_name, "lock_dlm"))
+			wait_for_completion(&sdp->sd_wdack);
 
 		if (lm->lm_unmount) {
 			fs_err(sdp, "telling LM to unmount\n");

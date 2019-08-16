@@ -14,12 +14,10 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place - Suite 330, Boston,
- * MA  02111-1307, USA.
+ * along with this program; if not, see <http://www.gnu.org/licenses/>.
  *
  * The full GNU General Public License is included in this distribution
- * in the file called LICENSE.
+ * in the file called "COPYING".
  *
  */
 
@@ -664,40 +662,45 @@ enum {
 #define NETXEN_NIU_AP_STATION_ADDR_0(I)    (NETXEN_CRB_NIU+0xa0040+(I)*0x10000)
 #define NETXEN_NIU_AP_STATION_ADDR_1(I)    (NETXEN_CRB_NIU+0xa0044+(I)*0x10000)
 
+
+#define TEST_AGT_CTRL	(0x00)
+
+#define TA_CTL_START	1
+#define TA_CTL_ENABLE	2
+#define TA_CTL_WRITE	4
+#define TA_CTL_BUSY	8
+
 /*
  *   Register offsets for MN
  */
-#define	MIU_CONTROL	       (0x000)
-#define MIU_TEST_AGT_CTRL      (0x090)
-#define MIU_TEST_AGT_ADDR_LO   (0x094)
-#define MIU_TEST_AGT_ADDR_HI   (0x098)
-#define MIU_TEST_AGT_WRDATA_LO (0x0a0)
-#define MIU_TEST_AGT_WRDATA_HI (0x0a4)
-#define MIU_TEST_AGT_WRDATA(i) (0x0a0+(4*(i)))
-#define MIU_TEST_AGT_RDDATA_LO (0x0a8)
-#define MIU_TEST_AGT_RDDATA_HI (0x0ac)
-#define MIU_TEST_AGT_RDDATA(i) (0x0a8+(4*(i)))
-#define MIU_TEST_AGT_ADDR_MASK 0xfffffff8
-#define MIU_TEST_AGT_UPPER_ADDR(off) (0)
+#define MIU_TEST_AGT_BASE		(0x90)
 
-/* MIU_TEST_AGT_CTRL flags. work for SIU as well */
-#define MIU_TA_CTL_START        1
-#define MIU_TA_CTL_ENABLE       2
-#define MIU_TA_CTL_WRITE        4
-#define MIU_TA_CTL_BUSY         8
+#define MIU_TEST_AGT_ADDR_LO		(0x04)
+#define MIU_TEST_AGT_ADDR_HI		(0x08)
+#define MIU_TEST_AGT_WRDATA_LO		(0x10)
+#define MIU_TEST_AGT_WRDATA_HI		(0x14)
+#define MIU_TEST_AGT_RDDATA_LO		(0x18)
+#define MIU_TEST_AGT_RDDATA_HI		(0x1c)
 
-#define SIU_TEST_AGT_CTRL      (0x060)
-#define SIU_TEST_AGT_ADDR_LO   (0x064)
-#define SIU_TEST_AGT_ADDR_HI   (0x078)
-#define SIU_TEST_AGT_WRDATA_LO (0x068)
-#define SIU_TEST_AGT_WRDATA_HI (0x06c)
-#define SIU_TEST_AGT_WRDATA(i) (0x068+(4*(i)))
-#define SIU_TEST_AGT_RDDATA_LO (0x070)
-#define SIU_TEST_AGT_RDDATA_HI (0x074)
-#define SIU_TEST_AGT_RDDATA(i) (0x070+(4*(i)))
+#define MIU_TEST_AGT_ADDR_MASK		0xfffffff8
+#define MIU_TEST_AGT_UPPER_ADDR(off)	(0)
 
-#define SIU_TEST_AGT_ADDR_MASK 0x3ffff8
-#define SIU_TEST_AGT_UPPER_ADDR(off) ((off)>>22)
+/*
+ *   Register offsets for MS
+ */
+#define SIU_TEST_AGT_BASE		(0x60)
+
+#define SIU_TEST_AGT_ADDR_LO		(0x04)
+#define SIU_TEST_AGT_ADDR_HI		(0x18)
+#define SIU_TEST_AGT_WRDATA_LO		(0x08)
+#define SIU_TEST_AGT_WRDATA_HI		(0x0c)
+#define SIU_TEST_AGT_WRDATA(i)		(0x08+(4*(i)))
+#define SIU_TEST_AGT_RDDATA_LO		(0x10)
+#define SIU_TEST_AGT_RDDATA_HI		(0x14)
+#define SIU_TEST_AGT_RDDATA(i)		(0x10+(4*(i)))
+
+#define SIU_TEST_AGT_ADDR_MASK		0x3ffff8
+#define SIU_TEST_AGT_UPPER_ADDR(off)	((off)>>22)
 
 /* XG Link status */
 #define XG_LINK_UP	0x10
@@ -729,6 +732,9 @@ enum {
 #define NIC_CRB_BASE_2		(NETXEN_CAM_RAM(0x700))
 #define NETXEN_NIC_REG(X)	(NIC_CRB_BASE+(X))
 #define NETXEN_NIC_REG_2(X)	(NIC_CRB_BASE_2+(X))
+#define NETXEN_INTR_MODE_REG	NETXEN_NIC_REG(0x44)
+#define NETXEN_MSI_MODE		0x1
+#define NETXEN_INTX_MODE	0x2
 
 #define NX_CDRP_CRB_OFFSET		(NETXEN_NIC_REG(0x18))
 #define NX_ARG1_CRB_OFFSET		(NETXEN_NIC_REG(0x1c))
@@ -771,16 +777,15 @@ enum {
 #define CRB_SW_INT_MASK_3		(NETXEN_NIC_REG(0x1e8))
 
 #define CRB_FW_CAPABILITIES_1		(NETXEN_CAM_RAM(0x128))
+#define CRB_FW_CAPABILITIES_2		(NETXEN_CAM_RAM(0x12c))
 #define CRB_MAC_BLOCK_START		(NETXEN_CAM_RAM(0x1c0))
 
 /*
  * capabilities register, can be used to selectively enable/disable features
- * for backward compability
+ * for backward compatibility
  */
 #define CRB_NIC_CAPABILITIES_HOST	NETXEN_NIC_REG(0x1a8)
-#define CRB_NIC_CAPABILITIES_FW	  	NETXEN_NIC_REG(0x1dc)
 #define CRB_NIC_MSI_MODE_HOST		NETXEN_NIC_REG(0x270)
-#define CRB_NIC_MSI_MODE_FW	  	NETXEN_NIC_REG(0x274)
 
 #define INTR_SCHEME_PERPORT	      	0x1
 #define MSI_MODE_MULTIFUNC	      	0x1
@@ -858,6 +863,9 @@ enum {
 #define PCIE_SN_WINDOW_REG(func)	(((func) < 4) ? \
 		(PCIX_SN_WINDOW_F0 + (0x20 * (func))) :\
 		(PCIX_SN_WINDOW_F4 + (0x10 * ((func)-4))))
+
+#define PCIX_OCM_WINDOW		(0x10800)
+#define PCIX_OCM_WINDOW_REG(func)	(PCIX_OCM_WINDOW + 0x20 * (func))
 
 #define PCIX_TARGET_STATUS	(0x10118)
 #define PCIX_TARGET_STATUS_F1	(0x10160)
@@ -948,6 +956,32 @@ enum {
 #define NETXEN_PEG_HALT_STATUS2 	(NETXEN_CAM_RAM(0xac))
 #define NX_CRB_DEV_REF_COUNT		(NETXEN_CAM_RAM(0x138))
 #define NX_CRB_DEV_STATE		(NETXEN_CAM_RAM(0x140))
+#define NETXEN_ULA_KEY			(NETXEN_CAM_RAM(0x178))
+
+/* MiniDIMM related macros */
+#define NETXEN_DIMM_CAPABILITY		(NETXEN_CAM_RAM(0x258))
+#define NETXEN_DIMM_PRESENT			0x1
+#define NETXEN_DIMM_MEMTYPE_DDR2_SDRAM	0x2
+#define NETXEN_DIMM_SIZE			0x4
+#define NETXEN_DIMM_MEMTYPE(VAL)		((VAL >> 3) & 0xf)
+#define	NETXEN_DIMM_NUMROWS(VAL)		((VAL >> 7) & 0xf)
+#define	NETXEN_DIMM_NUMCOLS(VAL)		((VAL >> 11) & 0xf)
+#define	NETXEN_DIMM_NUMRANKS(VAL)		((VAL >> 15) & 0x3)
+#define NETXEN_DIMM_DATAWIDTH(VAL)		((VAL >> 18) & 0x3)
+#define NETXEN_DIMM_NUMBANKS(VAL)		((VAL >> 21) & 0xf)
+#define NETXEN_DIMM_TYPE(VAL)		((VAL >> 25) & 0x3f)
+#define NETXEN_DIMM_VALID_FLAG		0x80000000
+
+#define NETXEN_DIMM_MEM_DDR2_SDRAM	0x8
+
+#define NETXEN_DIMM_STD_MEM_SIZE	512
+
+#define NETXEN_DIMM_TYPE_RDIMM	0x1
+#define NETXEN_DIMM_TYPE_UDIMM	0x2
+#define NETXEN_DIMM_TYPE_SO_DIMM	0x4
+#define NETXEN_DIMM_TYPE_Micro_DIMM	0x8
+#define NETXEN_DIMM_TYPE_Mini_RDIMM	0x10
+#define NETXEN_DIMM_TYPE_Mini_UDIMM	0x20
 
 /* Device State */
 #define NX_DEV_COLD		1
@@ -955,13 +989,15 @@ enum {
 #define NX_DEV_READY		3
 #define NX_DEV_NEED_RESET	4
 #define NX_DEV_NEED_QUISCENT	5
-#define NX_DEV_FAILED		6
+#define NX_DEV_NEED_AER 	6
+#define NX_DEV_FAILED		7
 
 #define NX_RCODE_DRIVER_INFO		0x20000000
 #define NX_RCODE_DRIVER_CAN_RELOAD	0x40000000
 #define NX_RCODE_FATAL_ERROR		0x80000000
 #define NX_FWERROR_PEGNUM(code)		((code) & 0xff)
 #define NX_FWERROR_CODE(code)		((code >> 8) & 0xfffff)
+#define NX_FWERROR_PEGSTAT1(code)	((code >> 8) & 0x1fffff)
 
 #define FW_POLL_DELAY			(2 * HZ)
 #define FW_FAIL_THRESH			3

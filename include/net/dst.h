@@ -48,6 +48,8 @@ struct dst_entry
 #define DST_NOXFRM		2
 #define DST_NOPOLICY		4
 #define DST_NOHASH		8
+#define DST_NOCOUNT		16
+#define DST_FAKE_RTABLE		0x0080
 	unsigned long		expires;
 
 	unsigned short		header_len;	/* more space at head required */
@@ -70,7 +72,15 @@ struct dst_entry
 
 	struct  dst_ops	        *ops;
 
+/* This Red Hat kABI workaround will shift tclassid 32 bit, while we
+ * still keep the original size of dst_entry and assures alignment
+ * (see further down).
+ */
+#ifdef __GENKSYMS__
+	u32			metrics[RTAX_MAX_ORIG];
+#else
 	u32			metrics[RTAX_MAX];
+#endif
 
 #ifdef CONFIG_NET_CLS_ROUTE
 	__u32			tclassid;
@@ -83,11 +93,23 @@ struct dst_entry
 	 * Align __refcnt to a 64 bytes alignment
 	 * (L1_CACHE_SIZE would be too much)
 	 */
+/* Red Hat kABI workaround to assure aligning __refcnt, while
+ * consuming 32 bit of padding for our metrics expansion above.
+ * On 32bit archs not padding remains.
+ */
+#ifdef __GENKSYMS__
 #ifdef CONFIG_64BIT
 	long			__pad_to_align_refcnt[2];
 #else
 	long			__pad_to_align_refcnt[1];
 #endif
+#else  /* __GENKSYMS__ */
+#ifdef CONFIG_64BIT
+	u32			__pad_hole_in_struct;
+	long			__pad_to_align_refcnt[1];
+#endif
+#endif /* __GENKSYMS__ */
+
 	/*
 	 * __refcnt wants to be on a different cache line from
 	 * input/output/ops or performance tanks badly
@@ -109,6 +131,24 @@ static inline u32
 dst_metric(const struct dst_entry *dst, int metric)
 {
 	return dst->metrics[metric-1];
+}
+
+static inline u32
+dst_metric_advmss(const struct dst_entry *dst)
+{
+	u32 advmss = dst_metric(dst, RTAX_ADVMSS);
+
+	if (!advmss) {
+		struct dst_ops_extend *ext;
+
+		rcu_read_lock();
+		ext = dst_ops_extend_get_rcu(dst->ops);
+		if (ext)
+			advmss = ext->default_advmss(dst);
+		rcu_read_unlock();
+	}
+
+	return advmss;
 }
 
 static inline u32 dst_mtu(const struct dst_entry *dst)
@@ -181,6 +221,41 @@ static inline void skb_dst_drop(struct sk_buff *skb)
 	skb->_skb_dst = 0UL;
 }
 
+
+/**
+ *	__skb_tunnel_rx - prepare skb for rx reinsert
+ *	@skb: buffer
+ *	@dev: tunnel device
+ *
+ *	After decapsulation, packet is going to re-enter (netif_rx()) our stack,
+ *	so make some cleanups. (no accounting done)
+ */
+static inline void __skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev)
+{
+	skb->dev = dev;
+	skb->rxhash = 0;
+	skb_set_queue_mapping(skb, 0);
+	skb_dst_drop(skb);
+	nf_reset(skb);
+}
+
+/**
+ *	skb_tunnel_rx - prepare skb for rx reinsert
+ *	@skb: buffer
+ *	@dev: tunnel device
+ *
+ *	After decapsulation, packet is going to re-enter (netif_rx()) our stack,
+ *	so make some cleanups, and perform accounting.
+ *	Note: this accounting is not SMP safe.
+ */
+static inline void skb_tunnel_rx(struct sk_buff *skb, struct net_device *dev)
+{
+	/* TODO : stats should be SMP safe */
+	dev->stats.rx_packets++;
+	dev->stats.rx_bytes += skb->len;
+	__skb_tunnel_rx(skb, dev);
+}
+
 /* Children define the path of the packet through the
  * Linux networking.  Thus, destinations are stackable.
  */
@@ -195,6 +270,7 @@ static inline struct dst_entry *dst_pop(struct dst_entry *dst)
 
 extern int dst_discard(struct sk_buff *skb);
 extern void * dst_alloc(struct dst_ops * ops);
+extern void *__dst_alloc(struct dst_ops * ops, int flags);
 extern void __dst_free(struct dst_entry * dst);
 extern struct dst_entry *dst_destroy(struct dst_entry * dst);
 

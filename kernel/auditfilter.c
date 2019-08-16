@@ -306,6 +306,18 @@ static u32 audit_to_op(u32 op)
 	return n;
 }
 
+/* check if a field is valid for a given list */
+static int audit_field_valid(struct audit_entry *entry, struct audit_field *f)
+{
+	switch(f->type) {
+	case AUDIT_MSGTYPE:
+		if (entry->rule.listnr != AUDIT_FILTER_TYPE &&
+		    entry->rule.listnr != AUDIT_FILTER_USER)
+			return -EINVAL;
+		break;
+	};
+	return 0;
+}
 
 /* Translate struct audit_rule to kernel's rule respresentation.
  * Exists for backward compatibility with userspace. */
@@ -383,7 +395,7 @@ static struct audit_entry *audit_rule_to_entry(struct audit_rule *rule)
 				goto exit_free;
 			break;
 		case AUDIT_FILETYPE:
-			if ((f->val & ~S_IFMT) > S_IFMT)
+			if (f->val & ~S_IFMT)
 				goto exit_free;
 			break;
 		case AUDIT_INODE:
@@ -435,6 +447,13 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 		f->val = data->values[i];
 		f->lsm_str = NULL;
 		f->lsm_rule = NULL;
+
+		err = audit_field_valid(entry, f);
+		if (err)
+			goto exit_free;
+
+		err = -EINVAL;
+
 		switch(f->type) {
 		case AUDIT_PID:
 		case AUDIT_UID:
@@ -457,6 +476,8 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 		case AUDIT_ARG1:
 		case AUDIT_ARG2:
 		case AUDIT_ARG3:
+		case AUDIT_OBJ_UID:
+		case AUDIT_OBJ_GID:
 			break;
 		case AUDIT_ARCH:
 			entry->rule.arch_f = f;
@@ -520,7 +541,6 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 				goto exit_free;
 			break;
 		case AUDIT_FILTERKEY:
-			err = -EINVAL;
 			if (entry->rule.filterkey || f->val > AUDIT_MAX_KEY_LEN)
 				goto exit_free;
 			str = audit_unpack_string(&bufp, &remain, f->val);
@@ -534,7 +554,11 @@ static struct audit_entry *audit_data_to_entry(struct audit_rule_data *data,
 				goto exit_free;
 			break;
 		case AUDIT_FILETYPE:
-			if ((f->val & ~S_IFMT) > S_IFMT)
+			if (f->val & ~S_IFMT)
+				goto exit_free;
+			break;
+		case AUDIT_FIELD_COMPARE:
+			if (f->val > AUDIT_MAX_FIELD_COMPARE)
 				goto exit_free;
 			break;
 		default:
@@ -1145,7 +1169,7 @@ int audit_receive_filter(int type, int pid, int uid, int seq, void *data,
 			return PTR_ERR(entry);
 
 		err = audit_add_rule(entry);
-		audit_log_rule_change(loginuid, sessionid, sid, "add rule",
+		audit_log_rule_change(loginuid, sessionid, sid, "add_rule",
 				      &entry->rule, !err);
 
 		if (err)
@@ -1161,7 +1185,7 @@ int audit_receive_filter(int type, int pid, int uid, int seq, void *data,
 			return PTR_ERR(entry);
 
 		err = audit_del_rule(entry);
-		audit_log_rule_change(loginuid, sessionid, sid, "remove rule",
+		audit_log_rule_change(loginuid, sessionid, sid, "remove_rule",
 				      &entry->rule, !err);
 
 		audit_free_rule(entry);
@@ -1198,46 +1222,65 @@ int audit_comparator(u32 left, u32 op, u32 right)
 	}
 }
 
-/* Compare given dentry name with last component in given path,
- * return of 0 indicates a match. */
-int audit_compare_dname_path(const char *dname, const char *path,
-			     int *dirlen)
+/**
+ * parent_len - find the length of the parent portion of a pathname
+ * @path: pathname of which to determine length
+ */
+int parent_len(const char *path)
 {
-	int dlen, plen;
+	int plen;
 	const char *p;
 
-	if (!dname || !path)
-		return 1;
-
-	dlen = strlen(dname);
 	plen = strlen(path);
-	if (plen < dlen)
-		return 1;
+
+	if (plen == 0)
+		return plen;
 
 	/* disregard trailing slashes */
 	p = path + plen - 1;
 	while ((*p == '/') && (p > path))
 		p--;
 
-	/* find last path component */
-	p = p - dlen + 1;
-	if (p < path)
-		return 1;
-	else if (p > path) {
-		if (*--p != '/')
-			return 1;
-		else
-			p++;
-	}
+	/* walk backward until we find the next slash or hit beginning */
+	while ((*p != '/') && (p > path))
+		p--;
 
-	/* return length of path's directory component */
-	if (dirlen)
-		*dirlen = p - path;
+	/* did we find a slash? Then increment to include it in path */
+	if (*p == '/')
+		p++;
+
+	return p - path;
+}
+
+/**
+ * audit_compare_dname_path - compare given dentry name with last component in
+ * 			      given path. Return of 0 indicates a match.
+ * @dname:	dentry name that we're comparing
+ * @path:	full pathname that we're comparing
+ * @parentlen:	length of the parent if known. Passing in AUDIT_NAME_FULL
+ * 		here indicates that we must compute this value.
+ */
+int audit_compare_dname_path(const char *dname, const char *path, int parentlen)
+{
+	int dlen, pathlen;
+	const char *p;
+
+	dlen = strlen(dname);
+	pathlen = strlen(path);
+	if (pathlen < dlen)
+		return 1;
+
+	parentlen = parentlen == AUDIT_NAME_FULL ? parent_len(path) : parentlen;
+	if (pathlen - parentlen != dlen)
+		return 1;
+
+	p = path + parentlen;
+
 	return strncmp(p, dname, dlen);
 }
 
 static int audit_filter_user_rules(struct netlink_skb_parms *cb,
-				   struct audit_krule *rule,
+				   struct audit_krule *rule, int type,
 				   enum audit_state *state)
 {
 	int i;
@@ -1245,6 +1288,7 @@ static int audit_filter_user_rules(struct netlink_skb_parms *cb,
 	for (i = 0; i < rule->field_count; i++) {
 		struct audit_field *f = &rule->fields[i];
 		int result = 0;
+		u32 sid;
 
 		switch (f->type) {
 		case AUDIT_PID:
@@ -1257,7 +1301,25 @@ static int audit_filter_user_rules(struct netlink_skb_parms *cb,
 			result = audit_comparator(cb->creds.gid, f->op, f->val);
 			break;
 		case AUDIT_LOGINUID:
-			result = audit_comparator(cb->loginuid, f->op, f->val);
+			result = audit_comparator(audit_get_loginuid(current),
+						  f->op, f->val);
+			break;
+		case AUDIT_MSGTYPE:
+			result = audit_comparator(type, f->op, f->val);
+			break;
+		case AUDIT_SUBJ_USER:
+		case AUDIT_SUBJ_ROLE:
+		case AUDIT_SUBJ_TYPE:
+		case AUDIT_SUBJ_SEN:
+		case AUDIT_SUBJ_CLR:
+			if (f->lsm_rule) {
+				security_task_getsecid(current, &sid);
+				result = security_audit_rule_match(sid,
+								   f->type,
+								   f->op,
+								   f->lsm_rule,
+								   NULL);
+			}
 			break;
 		}
 
@@ -1271,7 +1333,7 @@ static int audit_filter_user_rules(struct netlink_skb_parms *cb,
 	return 1;
 }
 
-int audit_filter_user(struct netlink_skb_parms *cb)
+int audit_filter_user(struct netlink_skb_parms *cb, int type)
 {
 	enum audit_state state = AUDIT_DISABLED;
 	struct audit_entry *e;
@@ -1279,7 +1341,7 @@ int audit_filter_user(struct netlink_skb_parms *cb)
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(e, &audit_filter_list[AUDIT_FILTER_USER], list) {
-		if (audit_filter_user_rules(cb, &e->rule, &state)) {
+		if (audit_filter_user_rules(cb, &e->rule, type, &state)) {
 			if (state == AUDIT_DISABLED)
 				ret = 0;
 			break;

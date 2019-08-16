@@ -884,14 +884,20 @@ static int __posix_lock_file(struct inode *inode, struct file_lock *request, str
 			 * lock yielding from the lower start address of both
 			 * locks to the higher end address.
 			 */
-			if (fl->fl_start > request->fl_start)
+			if (fl->fl_start > request->fl_start) {
+				gmb();
 				fl->fl_start = request->fl_start;
-			else
+			} else {
+				gmb();
 				request->fl_start = fl->fl_start;
-			if (fl->fl_end < request->fl_end)
+			}
+			if (fl->fl_end < request->fl_end) {
+				gmb();
 				fl->fl_end = request->fl_end;
-			else
+			} else {
+				gmb();
 				request->fl_end = fl->fl_end;
+			}
 			if (added) {
 				locks_delete_lock(before);
 				continue;
@@ -1182,8 +1188,9 @@ int __break_lease(struct inode *inode, unsigned int mode)
 	struct file_lock *fl;
 	unsigned long break_time;
 	int i_have_this_lease = 0;
+	int want_write = (mode & O_ACCMODE) != O_RDONLY;
 
-	new_fl = lease_alloc(NULL, mode & FMODE_WRITE ? F_WRLCK : F_RDLCK);
+	new_fl = lease_alloc(NULL, want_write ? F_WRLCK : F_RDLCK);
 
 	lock_kernel();
 
@@ -1197,7 +1204,7 @@ int __break_lease(struct inode *inode, unsigned int mode)
 		if (fl->fl_owner == current->files)
 			i_have_this_lease = 1;
 
-	if (mode & FMODE_WRITE) {
+	if (want_write) {
 		/* If we want write access, we have to revoke any lease. */
 		future = F_UNLCK | F_INPROGRESS;
 	} else if (flock->fl_type & F_INPROGRESS) {
@@ -2024,16 +2031,28 @@ void locks_remove_flock(struct file *filp)
 
 	while ((fl = *before) != NULL) {
 		if (fl->fl_file == filp) {
-			if (IS_FLOCK(fl)) {
-				locks_delete_lock(before);
-				continue;
-			}
 			if (IS_LEASE(fl)) {
 				lease_modify(before, F_UNLCK);
 				continue;
 			}
-			/* What? */
-			BUG();
+
+			/*
+			 * There's a leftover lock on the list of a type that
+			 * we didn't expect to see. Most likely a classic
+			 * POSIX lock that ended up not getting released
+			 * properly, or that raced onto the list somehow. Log
+			 * some info about it and then just remove it from
+			 * the list.
+			 */
+			WARN(!IS_FLOCK(fl),
+				"leftover lock: dev=%u:%u ino=%lu type=%hhd flags=0x%x start=%lld end=%lld\n",
+				MAJOR(inode->i_sb->s_dev),
+				MINOR(inode->i_sb->s_dev), inode->i_ino,
+				fl->fl_type, fl->fl_flags,
+				fl->fl_start, fl->fl_end);
+
+			locks_delete_lock(before);
+			continue;
  		}
 		before = &fl->fl_next;
 	}
@@ -2084,7 +2103,7 @@ EXPORT_SYMBOL_GPL(vfs_cancel_lock);
 #include <linux/seq_file.h>
 
 static void lock_get_status(struct seq_file *f, struct file_lock *fl,
-							int id, char *pfx)
+			    loff_t id, char *pfx)
 {
 	struct inode *inode = NULL;
 	unsigned int fl_pid;
@@ -2097,7 +2116,7 @@ static void lock_get_status(struct seq_file *f, struct file_lock *fl,
 	if (fl->fl_file != NULL)
 		inode = fl->fl_file->f_path.dentry->d_inode;
 
-	seq_printf(f, "%d:%s ", id, pfx);
+	seq_printf(f, "%lld:%s ", id, pfx);
 	if (IS_POSIX(fl)) {
 		seq_printf(f, "%6s %s ",
 			     (fl->fl_flags & FL_ACCESS) ? "ACCESS" : "POSIX ",
@@ -2160,24 +2179,27 @@ static int locks_show(struct seq_file *f, void *v)
 
 	fl = list_entry(v, struct file_lock, fl_link);
 
-	lock_get_status(f, fl, (long)f->private, "");
+	lock_get_status(f, fl, *((loff_t *)f->private), "");
 
 	list_for_each_entry(bfl, &fl->fl_block, fl_block)
-		lock_get_status(f, bfl, (long)f->private, " ->");
+		lock_get_status(f, bfl, *((loff_t *)f->private), " ->");
 
-	f->private++;
 	return 0;
 }
 
 static void *locks_start(struct seq_file *f, loff_t *pos)
 {
+	loff_t *p = f->private;
+
 	lock_kernel();
-	f->private = (void *)1;
+	*p = (*pos + 1);
 	return seq_list_start(&file_lock_list, *pos);
 }
 
 static void *locks_next(struct seq_file *f, void *v, loff_t *pos)
 {
+	loff_t *p = f->private;
+	++*p;
 	return seq_list_next(v, &file_lock_list, pos);
 }
 
@@ -2195,14 +2217,14 @@ static const struct seq_operations locks_seq_operations = {
 
 static int locks_open(struct inode *inode, struct file *filp)
 {
-	return seq_open(filp, &locks_seq_operations);
+	return seq_open_private(filp, &locks_seq_operations, sizeof(loff_t));
 }
 
 static const struct file_operations proc_locks_operations = {
 	.open		= locks_open,
 	.read		= seq_read,
 	.llseek		= seq_lseek,
-	.release	= seq_release,
+	.release	= seq_release_private,
 };
 
 static int __init proc_locks_init(void)

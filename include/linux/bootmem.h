@@ -53,6 +53,7 @@ extern void free_bootmem_node(pg_data_t *pgdat,
 			      unsigned long addr,
 			      unsigned long size);
 extern void free_bootmem(unsigned long addr, unsigned long size);
+extern void free_bootmem_late(unsigned long addr, unsigned long size);
 
 /*
  * Flags for reserve_bootmem (also if CONFIG_HAVE_ARCH_BOOTMEM_NODE,
@@ -97,6 +98,8 @@ extern void *__alloc_bootmem_low_node(pg_data_t *pgdat,
 
 #define alloc_bootmem(x) \
 	__alloc_bootmem(x, SMP_CACHE_BYTES, __pa(MAX_DMA_ADDRESS))
+#define alloc_bootmem_align(x, align) \
+	__alloc_bootmem(x, align, __pa(MAX_DMA_ADDRESS))
 #define alloc_bootmem_nopanic(x) \
 	__alloc_bootmem_nopanic(x, SMP_CACHE_BYTES, __pa(MAX_DMA_ADDRESS))
 #define alloc_bootmem_pages(x) \
@@ -155,5 +158,12 @@ extern void *alloc_large_system_hash(const char *tablename,
 #endif
 extern int hashdist;		/* Distribute hashes across NUMA nodes? */
 
+#ifdef CONFIG_X86_64
+#define bootmem_test_and_set_bit   test_and_set_bit_long
+#define bootmem_test_and_clear_bit test_and_clear_bit_long
+#else
+#define bootmem_test_and_set_bit   test_and_set_bit
+#define bootmem_test_and_clear_bit test_and_clear_bit
+#endif
 
 #endif /* _LINUX_BOOTMEM_H */

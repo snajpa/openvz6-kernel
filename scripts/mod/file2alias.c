@@ -211,10 +211,13 @@ static int do_hid_entry(const char *filename,
 			     struct hid_device_id *id, char *alias)
 {
 	id->bus = TO_NATIVE(id->bus);
+	id->group = TO_NATIVE(id->group);
 	id->vendor = TO_NATIVE(id->vendor);
 	id->product = TO_NATIVE(id->product);
 
-	sprintf(alias, "hid:b%04X", id->bus);
+	sprintf(alias, "hid:");
+	ADD(alias, "b", id->bus != HID_BUS_ANY, id->bus);
+	ADD(alias, "g", id->group != HID_GROUP_ANY, id->group);
 	ADD(alias, "v", id->vendor != HID_ANY_ID, id->vendor);
 	ADD(alias, "p", id->product != HID_ANY_ID, id->product);
 
@@ -633,6 +636,24 @@ static int do_ssb_entry(const char *filename,
 	return 1;
 }
 
+/* Looks like: bcma:mNidNrevNclN. */
+static int do_bcma_entry(const char *filename,
+			 struct bcma_device_id *id, char *alias)
+{
+	id->manuf = TO_NATIVE(id->manuf);
+	id->id = TO_NATIVE(id->id);
+	id->rev = TO_NATIVE(id->rev);
+	id->class = TO_NATIVE(id->class);
+
+	strcpy(alias, "bcma:");
+	ADD(alias, "m", id->manuf != BCMA_ANY_MANUF, id->manuf);
+	ADD(alias, "id", id->id != BCMA_ANY_ID, id->id);
+	ADD(alias, "rev", id->rev != BCMA_ANY_REV, id->rev);
+	ADD(alias, "cl", id->class != BCMA_ANY_CLASS, id->class);
+	add_wildcard(alias);
+	return 1;
+}
+
 /* Looks like: virtio:dNvN */
 static int do_virtio_entry(const char *filename, struct virtio_device_id *id,
 			   char *alias)
@@ -645,6 +666,27 @@ static int do_virtio_entry(const char *filename, struct virtio_device_id *id,
 	ADD(alias, "v", id->vendor != VIRTIO_DEV_ANY_ID, id->vendor);
 
 	add_wildcard(alias);
+	return 1;
+}
+
+/*
+ * Looks like: vmbus:guid
+ * Each byte of the guid will be represented by two hex characters
+ * in the name.
+ */
+
+static int do_vmbus_entry(const char *filename, struct hv_vmbus_device_id *id,
+			  char *alias)
+{
+	int i;
+	char guid_name[((sizeof(id->guid) + 1)) * 2];
+
+	for (i = 0; i < (sizeof(id->guid) * 2); i += 2)
+		sprintf(&guid_name[i], "%02x", id->guid[i/2]);
+
+	strcpy(alias, "vmbus:");
+	strcat(alias, guid_name);
+
 	return 1;
 }
 
@@ -705,8 +747,8 @@ static int do_dmi_entry(const char *filename, struct dmi_system_id *id,
 
 	for (i = 0; i < ARRAY_SIZE(dmi_fields); i++) {
 		for (j = 0; j < 4; j++) {
-			if (id->matches[j].slot &&
-			    id->matches[j].slot == dmi_fields[i].field) {
+			int s = dmi_strmatch_slot(&id->matches[j]);
+			if (s && s == dmi_fields[i].field) {
 				sprintf(alias + strlen(alias), ":%s*",
 					dmi_fields[i].prefix);
 				dmi_ascii_filter(alias + strlen(alias),
@@ -726,6 +768,53 @@ static int do_platform_entry(const char *filename,
 	sprintf(alias, PLATFORM_MODULE_PREFIX "%s", id->name);
 	return 1;
 }
+
+static int do_mdio_entry(const char *filename,
+			 struct mdio_device_id *id, char *alias)
+{
+	int i;
+
+	alias += sprintf(alias, MDIO_MODULE_PREFIX);
+
+	for (i = 0; i < 32; i++) {
+		if (!((id->phy_id_mask >> (31-i)) & 1))
+			*(alias++) = '?';
+		else if ((id->phy_id >> (31-i)) & 1)
+			*(alias++) = '1';
+		else
+			*(alias++) = '0';
+	}
+
+	/* Terminate the string */
+	*alias = 0;
+
+	return 1;
+}
+
+/* LOOKS like x86cpu:vendor:VVVV:family:FFFF:model:MMMM:feature:*,FEAT,*
+ * All fields are numbers. It would be nicer to use strings for vendor
+ * and feature, but getting those out of the build system here is too
+ * complicated.
+ */
+
+#if 0 /* RHEL6 */
+static int do_x86cpu_entry(const char *filename, struct x86_cpu_id *id,
+			   char *alias)
+{
+	id->feature = TO_NATIVE(id->feature);
+	id->family = TO_NATIVE(id->family);
+	id->model = TO_NATIVE(id->model);
+	id->vendor = TO_NATIVE(id->vendor);
+
+	strcpy(alias, "x86cpu:");
+	ADD(alias, "vendor:",  id->vendor != X86_VENDOR_ANY, id->vendor);
+	ADD(alias, ":family:", id->family != X86_FAMILY_ANY, id->family);
+	ADD(alias, ":model:",  id->model  != X86_MODEL_ANY,  id->model);
+	ADD(alias, ":feature:*,", id->feature != X86_FEATURE_ANY, id->feature);
+	strcat(alias, ",*");
+	return 1;
+}
+#endif
 
 /* Ignore any prefix, eg. some architectures prepend _ */
 static inline int sym_is(const char *symbol, const char *name)
@@ -854,10 +943,18 @@ void handle_moddevtable(struct module *mod, struct elf_info *info,
 		do_table(symval, sym->st_size,
 			 sizeof(struct ssb_device_id), "ssb",
 			 do_ssb_entry, mod);
+	else if (sym_is(symname, "__mod_bcma_device_table"))
+		do_table(symval, sym->st_size,
+			 sizeof(struct bcma_device_id), "bcma",
+			 do_bcma_entry, mod);
 	else if (sym_is(symname, "__mod_virtio_device_table"))
 		do_table(symval, sym->st_size,
 			 sizeof(struct virtio_device_id), "virtio",
 			 do_virtio_entry, mod);
+	else if (sym_is(symname, "__mod_vmbus_device_table"))
+		do_table(symval, sym->st_size,
+			 sizeof(struct hv_vmbus_device_id), "vmbus",
+			 do_vmbus_entry, mod);
 	else if (sym_is(symname, "__mod_i2c_device_table"))
 		do_table(symval, sym->st_size,
 			 sizeof(struct i2c_device_id), "i2c",
@@ -874,6 +971,10 @@ void handle_moddevtable(struct module *mod, struct elf_info *info,
 		do_table(symval, sym->st_size,
 			 sizeof(struct platform_device_id), "platform",
 			 do_platform_entry, mod);
+	else if (sym_is(symname, "__mod_mdio_device_table"))
+		do_table(symval, sym->st_size,
+			 sizeof(struct mdio_device_id), "mdio",
+			 do_mdio_entry, mod);
 	free(zeros);
 }
 

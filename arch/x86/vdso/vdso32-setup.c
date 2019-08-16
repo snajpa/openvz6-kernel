@@ -25,6 +25,7 @@
 #include <asm/tlbflush.h>
 #include <asm/vdso.h>
 #include <asm/proto.h>
+#include <asm/asm-offsets.h>
 
 enum {
 	VDSO_DISABLED = 0,
@@ -227,6 +228,7 @@ void enable_sep_cpu(void)
 {
 	int cpu = get_cpu();
 	struct tss_struct *tss = &per_cpu(init_tss, cpu);
+	unsigned long tss_stack;
 
 	if (!boot_cpu_has(X86_FEATURE_SEP)) {
 		put_cpu();
@@ -234,9 +236,9 @@ void enable_sep_cpu(void)
 	}
 
 	tss->x86_tss.ss1 = __KERNEL_CS;
-	tss->x86_tss.sp1 = sizeof(struct tss_struct) + (unsigned long) tss;
+	tss_stack = TSS_stack + TSS_stack_size + (unsigned long) tss;
 	wrmsr(MSR_IA32_SYSENTER_CS, __KERNEL_CS, 0);
-	wrmsr(MSR_IA32_SYSENTER_ESP, tss->x86_tss.sp1, 0);
+	wrmsr(MSR_IA32_SYSENTER_ESP, tss_stack, 0);
 	wrmsr(MSR_IA32_SYSENTER_EIP, (unsigned long) ia32_sysenter_target, 0);
 	put_cpu();	
 }
@@ -250,13 +252,7 @@ static int __init gate_vma_init(void)
 	gate_vma.vm_end = FIXADDR_USER_END;
 	gate_vma.vm_flags = VM_READ | VM_MAYREAD | VM_EXEC | VM_MAYEXEC;
 	gate_vma.vm_page_prot = __P101;
-	/*
-	 * Make sure the vDSO gets into every core dump.
-	 * Dumping its contents makes post-mortem fully interpretable later
-	 * without matching up the same kernel and hardware config to see
-	 * what PC values meant.
-	 */
-	gate_vma.vm_flags |= VM_ALWAYSDUMP;
+
 	return 0;
 }
 
@@ -331,7 +327,7 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 	if (compat)
 		addr = VDSO_HIGH_BASE;
 	else {
-		addr = get_unmapped_area(NULL, 0, PAGE_SIZE, 0, 0);
+		addr = get_unmapped_area_prot(NULL, 0, PAGE_SIZE, 0, 0, 1);
 		if (IS_ERR_VALUE(addr)) {
 			ret = addr;
 			goto up_fail;
@@ -343,17 +339,10 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 	if (compat_uses_vma || !compat) {
 		/*
 		 * MAYWRITE to allow gdb to COW and set breakpoints
-		 *
-		 * Make sure the vDSO gets into every core dump.
-		 * Dumping its contents makes post-mortem fully
-		 * interpretable later without matching up the same
-		 * kernel and hardware config to see what PC values
-		 * meant.
 		 */
 		ret = install_special_mapping(mm, addr, PAGE_SIZE,
 					      VM_READ|VM_EXEC|
-					      VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC|
-					      VM_ALWAYSDUMP,
+					      VM_MAYREAD|VM_MAYWRITE|VM_MAYEXEC,
 					      vdso32_pages);
 
 		if (ret)
@@ -418,24 +407,25 @@ const char *arch_vma_name(struct vm_area_struct *vma)
 	return NULL;
 }
 
-struct vm_area_struct *get_gate_vma(struct task_struct *tsk)
+struct vm_area_struct *get_gate_vma(struct mm_struct *mm)
 {
-	struct mm_struct *mm = tsk->mm;
-
-	/* Check to see if this task was created in compat vdso mode */
+	/*
+	 * Check to see if the corresponding task was created in compat vdso
+	 * mode.
+	 */
 	if (mm && mm->context.vdso == (void *)VDSO_HIGH_BASE)
 		return &gate_vma;
 	return NULL;
 }
 
-int in_gate_area(struct task_struct *task, unsigned long addr)
+int in_gate_area(struct mm_struct *mm, unsigned long addr)
 {
-	const struct vm_area_struct *vma = get_gate_vma(task);
+	const struct vm_area_struct *vma = get_gate_vma(mm);
 
 	return vma && addr >= vma->vm_start && addr < vma->vm_end;
 }
 
-int in_gate_area_no_task(unsigned long addr)
+int in_gate_area_no_mm(unsigned long addr)
 {
 	return 0;
 }

@@ -126,10 +126,16 @@ enum fc_vport_state {
 					     incapable of reporting */
 #define FC_PORTSPEED_1GBIT		1
 #define FC_PORTSPEED_2GBIT		2
-#define FC_PORTSPEED_4GBIT		4
-#define FC_PORTSPEED_10GBIT		8
+#define FC_PORTSPEED_10GBIT		4
+#define FC_PORTSPEED_4GBIT		8
 #define FC_PORTSPEED_8GBIT		0x10
 #define FC_PORTSPEED_16GBIT		0x20
+#define FC_PORTSPEED_32GBIT		0x40
+#define FC_PORTSPEED_20GBIT		0x80
+#define FC_PORTSPEED_40GBIT		0x100
+#define FC_PORTSPEED_50GBIT		0x200
+#define FC_PORTSPEED_100GBIT		0x400
+#define FC_PORTSPEED_25GBIT		0x800
 #define FC_PORTSPEED_NOT_NEGOTIATED	(1 << 15) /* Speed not established */
 
 /*
@@ -352,6 +358,9 @@ struct fc_rport {	/* aka fc_starget_attrs */
  	struct work_struct stgt_delete_work;
 	struct work_struct rport_delete_work;
 	struct request_queue *rqst_q;	/* bsg support */
+#ifndef __GENKSYMS__
+	struct work_struct rport_terminate_io_work;
+#endif
 } __attribute__((aligned(sizeof(unsigned long))));
 
 /* bit field values for struct fc_rport "flags" field: */
@@ -496,6 +505,7 @@ struct fc_host_attrs {
 	u64 fabric_name;
 	char symbolic_name[FC_SYMBOLIC_NAME_SIZE];
 	char system_hostname[FC_SYMBOLIC_NAME_SIZE];
+	u32 dev_loss_tmo;
 
 	/* Private (Transport-managed) Attributes */
 	enum fc_tgtid_binding_type  tgtid_bind_type;
@@ -517,6 +527,15 @@ struct fc_host_attrs {
 
 	/* bsg support */
 	struct request_queue *rqst_q;
+#ifndef __GENKSYMS__
+	char manufacturer[FC_SERIAL_NUMBER_SIZE];
+	char model[FC_SYMBOLIC_NAME_SIZE];
+	char model_description[FC_SYMBOLIC_NAME_SIZE];
+	char hardware_version[FC_VERSION_STRING_SIZE];
+	char driver_version[FC_VERSION_STRING_SIZE];
+	char firmware_version[FC_VERSION_STRING_SIZE];
+	char optionrom_version[FC_VERSION_STRING_SIZE];
+#endif
 };
 
 #define shost_to_fc_host(x) \
@@ -540,6 +559,20 @@ struct fc_host_attrs {
 	(((struct fc_host_attrs *)(x)->shost_data)->max_npiv_vports)
 #define fc_host_serial_number(x)	\
 	(((struct fc_host_attrs *)(x)->shost_data)->serial_number)
+#define fc_host_manufacturer(x)	\
+	(((struct fc_host_attrs *)(x)->shost_data)->manufacturer)
+#define fc_host_model(x)	\
+	(((struct fc_host_attrs *)(x)->shost_data)->model)
+#define fc_host_model_description(x)	\
+	(((struct fc_host_attrs *)(x)->shost_data)->model_description)
+#define fc_host_hardware_version(x)	\
+	(((struct fc_host_attrs *)(x)->shost_data)->hardware_version)
+#define fc_host_driver_version(x)	\
+	(((struct fc_host_attrs *)(x)->shost_data)->driver_version)
+#define fc_host_firmware_version(x)	\
+	(((struct fc_host_attrs *)(x)->shost_data)->firmware_version)
+#define fc_host_optionrom_version(x)	\
+	(((struct fc_host_attrs *)(x)->shost_data)->optionrom_version)
 #define fc_host_port_id(x)	\
 	(((struct fc_host_attrs *)(x)->shost_data)->port_id)
 #define fc_host_port_type(x)	\
@@ -580,6 +613,8 @@ struct fc_host_attrs {
 	(((struct fc_host_attrs *)(x)->shost_data)->devloss_work_q_name)
 #define fc_host_devloss_work_q(x) \
 	(((struct fc_host_attrs *)(x)->shost_data)->devloss_work_q)
+#define fc_host_dev_loss_tmo(x) \
+	(((struct fc_host_attrs *)(x)->shost_data)->dev_loss_tmo)
 
 
 struct fc_bsg_buffer {
@@ -708,6 +743,20 @@ struct fc_function_template {
 	unsigned long	show_host_system_hostname:1;
 
 	unsigned long	disable_target_scan:1;
+#ifndef __GENKSYMS__
+	/* Note: These belong in the fixed attr. area above
+	 * We move them down here to accomodate abi.  Note that
+	 * we can only do this because there are leftover bits
+	 * in the unsigned long area that these go in
+	 */
+	unsigned long	show_host_manufacturer:1;
+	unsigned long	show_host_model:1;
+	unsigned long	show_host_model_description:1;
+	unsigned long	show_host_hardware_version:1;
+	unsigned long	show_host_driver_version:1;
+	unsigned long	show_host_firmware_version:1;
+	unsigned long	show_host_optionrom_version:1;
+#endif
 };
 
 
@@ -807,5 +856,6 @@ void fc_host_post_vendor_event(struct Scsi_Host *shost, u32 event_number,
 struct fc_vport *fc_vport_create(struct Scsi_Host *shost, int channel,
 		struct fc_vport_identifiers *);
 int fc_vport_terminate(struct fc_vport *vport);
+int fc_block_scsi_eh(struct scsi_cmnd *cmnd);
 
 #endif /* SCSI_TRANSPORT_FC_H */

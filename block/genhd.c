@@ -29,10 +29,10 @@ struct kobject *block_depr;
 /* for extended dynamic devt allocation, currently only one major is used */
 #define MAX_EXT_DEVT		(1 << MINORBITS)
 
-/* For extended devt allocation.  ext_devt_mutex prevents look up
+/* For extended devt allocation.  ext_devt_lock prevents look up
  * results from going away underneath its user.
  */
-static DEFINE_MUTEX(ext_devt_mutex);
+static DEFINE_SPINLOCK(ext_devt_lock);
 static DEFINE_IDR(ext_devt_idr);
 
 static struct device_type disk_type;
@@ -230,6 +230,46 @@ struct hd_struct *disk_map_sector_rcu(struct gendisk *disk, sector_t sector)
 }
 EXPORT_SYMBOL_GPL(disk_map_sector_rcu);
 
+/**
+ * part_valid - see if @check corresponds to a partition within @disk
+ * @disk: gendisk of interest
+ * @check: hd_struct pointer to check against the partition table
+ *
+ * Check to see if it is safe to dereference @check.  We don't always
+ * know if req->part is filled in by the block layer.  This routine
+ * is called to avoid dereferencing a bogus pointer.  See req_to_part.
+ *
+ * CONTEXT:
+ * RCU read locked.
+ *
+ * RETURNS:
+ * true on success, false on failure
+ */
+bool part_valid(struct gendisk *disk, struct hd_struct *check)
+{
+	struct disk_part_tbl *ptbl;
+	struct hd_struct *part;
+	int i;
+
+	ptbl = rcu_dereference(disk->part_tbl);
+
+	part = rcu_dereference(ptbl->last_lookup);
+	if (part && part == check)
+		return true;
+
+	for (i = 1; i < ptbl->len; i++) {
+		part = rcu_dereference(ptbl->part[i]);
+
+		if (part && part == check)
+			return true;
+	}
+
+	if (check == &disk->part0)
+		return true;
+
+	return false;
+}
+
 /*
  * Can be deleted altogether. Later.
  *
@@ -417,14 +457,18 @@ int blk_alloc_devt(struct hd_struct *part, dev_t *devt)
 	do {
 		if (!idr_pre_get(&ext_devt_idr, GFP_KERNEL))
 			return -ENOMEM;
+		spin_lock_bh(&ext_devt_lock);
 		rc = idr_get_new(&ext_devt_idr, part, &idx);
+		spin_unlock_bh(&ext_devt_lock);
 	} while (rc == -EAGAIN);
 
 	if (rc)
 		return rc;
 
 	if (idx > MAX_EXT_DEVT) {
+		spin_lock_bh(&ext_devt_lock);
 		idr_remove(&ext_devt_idr, idx);
+		spin_unlock_bh(&ext_devt_lock);
 		return -EBUSY;
 	}
 
@@ -443,15 +487,13 @@ int blk_alloc_devt(struct hd_struct *part, dev_t *devt)
  */
 void blk_free_devt(dev_t devt)
 {
-	might_sleep();
-
 	if (devt == MKDEV(0, 0))
 		return;
 
 	if (MAJOR(devt) == BLOCK_EXT_MAJOR) {
-		mutex_lock(&ext_devt_mutex);
+		spin_lock_bh(&ext_devt_lock);
 		idr_remove(&ext_devt_idr, blk_mangle_minor(MINOR(devt)));
-		mutex_unlock(&ext_devt_mutex);
+		spin_unlock_bh(&ext_devt_lock);
 	}
 }
 
@@ -541,13 +583,21 @@ void add_disk(struct gendisk *disk)
 	disk->major = MAJOR(devt);
 	disk->first_minor = MINOR(devt);
 
+	/* Register BDI before referencing it from bdev */ 
+	bdi = &disk->queue->backing_dev_info;
+	bdi_register_dev(bdi, disk_devt(disk));
+
 	blk_register_region(disk_devt(disk), disk->minors, NULL,
 			    exact_match, exact_lock, disk);
 	register_disk(disk);
 	blk_register_queue(disk);
 
-	bdi = &disk->queue->backing_dev_info;
-	bdi_register_dev(bdi, disk_devt(disk));
+	/*
+	 * Take an extra ref on queue which will be put on disk_release()
+	 * so that it sticks around as long as @disk is there.
+	 */
+	WARN_ON_ONCE(!blk_get_request_queue(disk->queue));
+
 	retval = sysfs_create_link(&disk_to_dev(disk)->kobj, &bdi->dev->kobj,
 				   "bdi");
 	WARN_ON(retval);
@@ -585,13 +635,13 @@ struct gendisk *get_gendisk(dev_t devt, int *partno)
 	} else {
 		struct hd_struct *part;
 
-		mutex_lock(&ext_devt_mutex);
+		spin_lock_bh(&ext_devt_lock);
 		part = idr_find(&ext_devt_idr, blk_mangle_minor(MINOR(devt)));
 		if (part && get_disk(part_to_disk(part))) {
 			*partno = part->partno;
 			disk = part_to_disk(part);
 		}
-		mutex_unlock(&ext_devt_mutex);
+		spin_unlock_bh(&ext_devt_lock);
 	}
 
 	return disk;
@@ -721,6 +771,7 @@ static void disk_seqf_stop(struct seq_file *seqf, void *v)
 	if (iter) {
 		class_dev_iter_exit(iter);
 		kfree(iter);
+		seqf->private = NULL;
 	}
 }
 
@@ -861,12 +912,23 @@ static ssize_t disk_alignment_offset_show(struct device *dev,
 	return sprintf(buf, "%d\n", queue_alignment_offset(disk->queue));
 }
 
+static ssize_t disk_discard_alignment_show(struct device *dev,
+					   struct device_attribute *attr,
+					   char *buf)
+{
+	struct gendisk *disk = dev_to_disk(dev);
+
+	return sprintf(buf, "%d\n", queue_discard_alignment(disk->queue));
+}
+
 static DEVICE_ATTR(range, S_IRUGO, disk_range_show, NULL);
 static DEVICE_ATTR(ext_range, S_IRUGO, disk_ext_range_show, NULL);
 static DEVICE_ATTR(removable, S_IRUGO, disk_removable_show, NULL);
 static DEVICE_ATTR(ro, S_IRUGO, disk_ro_show, NULL);
 static DEVICE_ATTR(size, S_IRUGO, part_size_show, NULL);
 static DEVICE_ATTR(alignment_offset, S_IRUGO, disk_alignment_offset_show, NULL);
+static DEVICE_ATTR(discard_alignment, S_IRUGO, disk_discard_alignment_show,
+		   NULL);
 static DEVICE_ATTR(capability, S_IRUGO, disk_capability_show, NULL);
 static DEVICE_ATTR(stat, S_IRUGO, part_stat_show, NULL);
 static DEVICE_ATTR(inflight, S_IRUGO, part_inflight_show, NULL);
@@ -887,6 +949,7 @@ static struct attribute *disk_attrs[] = {
 	&dev_attr_ro.attr,
 	&dev_attr_size.attr,
 	&dev_attr_alignment_offset.attr,
+	&dev_attr_discard_alignment.attr,
 	&dev_attr_capability.attr,
 	&dev_attr_stat.attr,
 	&dev_attr_inflight.attr,
@@ -989,9 +1052,12 @@ static void disk_release(struct device *dev)
 {
 	struct gendisk *disk = dev_to_disk(dev);
 
+	blk_free_devt(dev->devt);
 	kfree(disk->random);
 	disk_replace_part_tbl(disk, NULL);
 	free_part_stats(&disk->part0);
+	if (disk->queue)
+		blk_put_queue(disk->queue);
 	kfree(disk);
 }
 struct class block_class = {
@@ -1176,6 +1242,8 @@ struct gendisk *alloc_disk_node(int minors, int node_id)
 		}
 		disk->part_tbl->part[0] = &disk->part0;
 
+		hd_ref_init(&disk->part0);
+
 		disk->minors = minors;
 		rand_initialize_disk(disk);
 		disk_to_dev(disk)->class = &block_class;
@@ -1267,7 +1335,7 @@ int invalidate_partition(struct gendisk *disk, int partno)
 	struct block_device *bdev = bdget_disk(disk, partno);
 	if (bdev) {
 		fsync_bdev(bdev);
-		res = __invalidate_device(bdev);
+		res = __invalidate_device(bdev, true);
 		bdput(bdev);
 	}
 	return res;

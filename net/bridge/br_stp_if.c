@@ -108,6 +108,7 @@ void br_stp_disable_port(struct net_bridge_port *p)
 	del_timer(&p->hold_timer);
 
 	br_fdb_delete_by_port(br, p, 0);
+	br_multicast_disable_port(p);
 
 	br_configuration_update(br);
 
@@ -207,7 +208,7 @@ void br_stp_change_bridge_id(struct net_bridge *br, const unsigned char *addr)
 static const unsigned short br_mac_zero_aligned[ETH_ALEN >> 1];
 
 /* called under bridge lock */
-void br_stp_recalculate_bridge_id(struct net_bridge *br)
+bool br_stp_recalculate_bridge_id(struct net_bridge *br)
 {
 	const unsigned char *br_mac_zero =
 			(const unsigned char *)br_mac_zero_aligned;
@@ -216,7 +217,7 @@ void br_stp_recalculate_bridge_id(struct net_bridge *br)
 
 	/* user has chosen a value so keep it */
 	if (br->flags & BR_SET_MAC_ADDR)
-		return;
+		return false;
 
 	list_for_each_entry(p, &br->port_list, list) {
 		if (addr == br_mac_zero ||
@@ -225,8 +226,11 @@ void br_stp_recalculate_bridge_id(struct net_bridge *br)
 
 	}
 
-	if (compare_ether_addr(br->bridge_id.addr, addr))
-		br_stp_change_bridge_id(br, addr);
+	if (compare_ether_addr(br->bridge_id.addr, addr) == 0)
+		return false;	/* no change */
+
+	br_stp_change_bridge_id(br, addr);
+	return true;
 }
 
 /* called under bridge lock */

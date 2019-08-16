@@ -31,6 +31,10 @@ int inet6_csk_bind_conflict(const struct sock *sk,
 {
 	const struct sock *sk2;
 	const struct hlist_node *node;
+	int relax = test_bit(SOCK_RELAX, &sk->sk_flags);
+	int reuse = sk->sk_reuse;
+	int reuseport = sk->sk_reuseport;
+	int uid = sock_i_uid((struct sock *)sk);
 
 	/* We must walk the whole port owner list in this case. -DaveM */
 	/*
@@ -41,11 +45,20 @@ int inet6_csk_bind_conflict(const struct sock *sk,
 		if (sk != sk2 &&
 		    (!sk->sk_bound_dev_if ||
 		     !sk2->sk_bound_dev_if ||
-		     sk->sk_bound_dev_if == sk2->sk_bound_dev_if) &&
-		    (!sk->sk_reuse || !sk2->sk_reuse ||
-		     sk2->sk_state == TCP_LISTEN) &&
-		     ipv6_rcv_saddr_equal(sk, sk2))
-			break;
+		     sk->sk_bound_dev_if == sk2->sk_bound_dev_if)) {
+			if ((!reuse || !sk2->sk_reuse ||
+			     sk2->sk_state == TCP_LISTEN) &&
+			    (!reuseport || !sk2->sk_reuseport ||
+			     (sk2->sk_state != TCP_TIME_WAIT &&
+			      uid != sock_i_uid((struct sock *)sk2)))) {
+				if (ipv6_rcv_saddr_equal(sk, sk2))
+					break;
+			}
+			if (!relax && reuse && sk2->sk_reuse &&
+			    sk2->sk_state != TCP_LISTEN &&
+			    ipv6_rcv_saddr_equal(sk, sk2))
+				break;
+		}
 	}
 
 	return node != NULL;
@@ -57,20 +70,18 @@ EXPORT_SYMBOL_GPL(inet6_csk_bind_conflict);
  * request_sock (formerly open request) hash tables.
  */
 static u32 inet6_synq_hash(const struct in6_addr *raddr, const __be16 rport,
-			   const u32 rnd, const u16 synq_hsize)
+			   const u32 rnd, const u32 synq_hsize)
 {
-	u32 a = (__force u32)raddr->s6_addr32[0];
-	u32 b = (__force u32)raddr->s6_addr32[1];
-	u32 c = (__force u32)raddr->s6_addr32[2];
+	u32 c;
 
-	a += JHASH_GOLDEN_RATIO;
-	b += JHASH_GOLDEN_RATIO;
-	c += rnd;
-	__jhash_mix(a, b, c);
+	c = jhash_3words((__force u32)raddr->s6_addr32[0],
+			 (__force u32)raddr->s6_addr32[1],
+			 (__force u32)raddr->s6_addr32[2],
+			 rnd);
 
-	a += (__force u32)raddr->s6_addr32[3];
-	b += (__force u32)rport;
-	__jhash_mix(a, b, c);
+	c = jhash_2words((__force u32)raddr->s6_addr32[3],
+			 (__force u32)rport,
+			 c);
 
 	return c & (synq_hsize - 1);
 }
@@ -185,7 +196,8 @@ int inet6_csk_xmit(struct sk_buff *skb, int ipfragok)
 	struct ipv6_pinfo *np = inet6_sk(sk);
 	struct flowi fl;
 	struct dst_entry *dst;
-	struct in6_addr *final_p = NULL, final;
+	struct in6_addr *final_p, final;
+	int res;
 
 	memset(&fl, 0, sizeof(fl));
 	fl.proto = sk->sk_protocol;
@@ -198,12 +210,9 @@ int inet6_csk_xmit(struct sk_buff *skb, int ipfragok)
 	fl.fl_ip_dport = inet->dport;
 	security_sk_classify_flow(sk, &fl);
 
-	if (np->opt && np->opt->srcrt) {
-		struct rt0_hdr *rt0 = (struct rt0_hdr *)np->opt->srcrt;
-		ipv6_addr_copy(&final, &fl.fl6_dst);
-		ipv6_addr_copy(&fl.fl6_dst, rt0->addr);
-		final_p = &final;
-	}
+	rcu_read_lock();
+	final_p = fl6_update_dst(&fl, rcu_dereference(np->opt), &final);
+	rcu_read_unlock();
 
 	dst = __inet6_csk_dst_check(sk, np->dst_cookie);
 
@@ -233,7 +242,10 @@ int inet6_csk_xmit(struct sk_buff *skb, int ipfragok)
 	/* Restore final destination back after routing done */
 	ipv6_addr_copy(&fl.fl6_dst, &np->daddr);
 
-	return ip6_xmit(sk, skb, &fl, np->opt, 0);
+	rcu_read_lock();
+	res = ip6_xmit(sk, skb, &fl, rcu_dereference(np->opt), 0);
+	rcu_read_unlock();
+	return res;
 }
 
 EXPORT_SYMBOL_GPL(inet6_csk_xmit);

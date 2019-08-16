@@ -54,6 +54,7 @@
 #include <linux/notifier.h>
 #include <linux/cpu.h>
 #include <linux/mutex.h>
+#include <linux/async.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
@@ -67,16 +68,14 @@
 #include "scsi_priv.h"
 #include "scsi_logging.h"
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/scsi.h>
+
 static void scsi_done(struct scsi_cmnd *cmd);
 
 /*
  * Definitions and constants.
  */
-
-#define MIN_RESET_DELAY (2*HZ)
-
-/* Do not call reset on error if we just did a reset within 15 sec. */
-#define MIN_RESET_PERIOD (15*HZ)
 
 /*
  * Note - the initial logging level can be set here to log events at boot time.
@@ -86,6 +85,10 @@ unsigned int scsi_logging_level;
 #if defined(CONFIG_SCSI_LOGGING)
 EXPORT_SYMBOL(scsi_logging_level);
 #endif
+
+/* sd and scsi_pm need to coordinate flushing async actions */
+ASYNC_DOMAIN(scsi_sd_probe_domain);
+EXPORT_SYMBOL(scsi_sd_probe_domain);
 
 /* NB: These are exposed through /proc/scsi/scsi and form part of the ABI.
  * You may not alter any existing entry (although adding new ones is
@@ -649,7 +652,6 @@ int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
 {
 	struct Scsi_Host *host = cmd->device->host;
 	unsigned long flags = 0;
-	unsigned long timeout;
 	int rtn = 0;
 
 	atomic_inc(&cmd->device->iorequest_cnt);
@@ -686,36 +688,10 @@ int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
 		goto out;
 	}
 
-	/* 
-	 * If SCSI-2 or lower, store the LUN value in cmnd.
-	 */
-	if (cmd->device->scsi_level <= SCSI_2 &&
-	    cmd->device->scsi_level != SCSI_UNKNOWN) {
+	/* Store the LUN value in cmnd, if needed. */
+	if (cmd->device->lun_in_cdb)
 		cmd->cmnd[1] = (cmd->cmnd[1] & 0x1f) |
 			       (cmd->device->lun << 5 & 0xe0);
-	}
-
-	/*
-	 * We will wait MIN_RESET_DELAY clock ticks after the last reset so
-	 * we can avoid the drive not being ready.
-	 */
-	timeout = host->last_reset + MIN_RESET_DELAY;
-
-	if (host->resetting && time_before(jiffies, timeout)) {
-		int ticks_remaining = timeout - jiffies;
-		/*
-		 * NOTE: This may be executed from within an interrupt
-		 * handler!  This is bad, but for now, it'll do.  The irq
-		 * level of the interrupt handler has been masked out by the
-		 * platform dependent interrupt handling code already, so the
-		 * sti() here will not cause another call to the SCSI host's
-		 * interrupt handler (assuming there is one irq-level per
-		 * host).
-		 */
-		while (--ticks_remaining >= 0)
-			mdelay(1 + 999 / HZ);
-		host->resetting = 0;
-	}
 
 	scsi_log_send(cmd);
 
@@ -734,23 +710,30 @@ int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
 		goto out;
 	}
 
-	spin_lock_irqsave(host->host_lock, flags);
-	/*
-	 * AK: unlikely race here: for some reason the timer could
-	 * expire before the serial number is set up below.
-	 *
-	 * TODO: kill serial or move to blk layer
-	 */
-	scsi_cmd_get_serial(host, cmd); 
+	if (!host->hostt->lockless) {
+		spin_lock_irqsave(host->host_lock, flags);
+		/*
+		 * AK: unlikely race here: for some reason the timer could
+		 * expire before the serial number is set up below.
+		 *
+		 * TODO: kill serial or move to blk layer
+		 */
+		scsi_cmd_get_serial(host, cmd); 
+	}
 
 	if (unlikely(host->shost_state == SHOST_DEL)) {
 		cmd->result = (DID_NO_CONNECT << 16);
 		scsi_done(cmd);
 	} else {
+		trace_scsi_dispatch_cmd_start(cmd);
 		rtn = host->hostt->queuecommand(cmd, scsi_done);
 	}
-	spin_unlock_irqrestore(host->host_lock, flags);
+
+	if (!host->hostt->lockless)
+		spin_unlock_irqrestore(host->host_lock, flags);
+
 	if (rtn) {
+		trace_scsi_dispatch_cmd_error(cmd, rtn);
 		if (rtn != SCSI_MLQUEUE_DEVICE_BUSY &&
 		    rtn != SCSI_MLQUEUE_TARGET_BUSY)
 			rtn = SCSI_MLQUEUE_HOST_BUSY;
@@ -781,13 +764,8 @@ int scsi_dispatch_cmd(struct scsi_cmnd *cmd)
  */
 static void scsi_done(struct scsi_cmnd *cmd)
 {
+	trace_scsi_dispatch_cmd_done(cmd);
 	blk_complete_request(cmd->request);
-}
-
-/* Move this to a header if it becomes more generally useful */
-static struct scsi_driver *scsi_cmd_to_driver(struct scsi_cmnd *cmd)
-{
-	return *(struct scsi_driver **)cmd->request->rq_disk->private_data;
 }
 
 /**
@@ -940,10 +918,16 @@ EXPORT_SYMBOL(scsi_adjust_queue_depth);
  */
 int scsi_track_queue_full(struct scsi_device *sdev, int depth)
 {
-	if ((jiffies >> 4) == sdev->last_queue_full_time)
+
+	/*
+	 * Don't let QUEUE_FULLs on the same
+	 * jiffies count, they could all be from
+	 * same event.
+	 */
+	if ((jiffies >> 4) == (sdev->last_queue_full_time >> 4))
 		return 0;
 
-	sdev->last_queue_full_time = (jiffies >> 4);
+	sdev->last_queue_full_time = jiffies;
 	if (sdev->last_queue_full_depth != depth) {
 		sdev->last_queue_full_count = 1;
 		sdev->last_queue_full_depth = depth;
@@ -1020,55 +1004,39 @@ static int scsi_vpd_inquiry(struct scsi_device *sdev, unsigned char *buffer,
  * responsible for calling kfree() on this pointer when it is no longer
  * needed.  If we cannot retrieve the VPD page this routine returns %NULL.
  */
-unsigned char *scsi_get_vpd_page(struct scsi_device *sdev, u8 page)
+int scsi_get_vpd_page(struct scsi_device *sdev, u8 page, unsigned char *buf,
+		      int buf_len)
 {
 	int i, result;
-	unsigned int len;
-	const unsigned int init_vpd_len = 255;
-	unsigned char *buf = kmalloc(init_vpd_len, GFP_KERNEL);
-
-	if (!buf)
-		return NULL;
 
 	/* Ask for all the pages supported by this device */
-	result = scsi_vpd_inquiry(sdev, buf, 0, init_vpd_len);
+	result = scsi_vpd_inquiry(sdev, buf, 0, buf_len);
 	if (result)
 		goto fail;
 
 	/* If the user actually wanted this page, we can skip the rest */
 	if (page == 0)
-		return buf;
+		return 0;
 
-	for (i = 0; i < buf[3]; i++)
+	for (i = 0; i < min((int)buf[3], buf_len - 4); i++)
 		if (buf[i + 4] == page)
 			goto found;
+
+	if (i < buf[3] && i >= buf_len - 4)
+		/* ran off the end of the buffer, give us benefit of doubt */
+		goto found;
 	/* The device claims it doesn't support the requested page */
 	goto fail;
 
  found:
-	result = scsi_vpd_inquiry(sdev, buf, page, 255);
+	result = scsi_vpd_inquiry(sdev, buf, page, buf_len);
 	if (result)
 		goto fail;
 
-	/*
-	 * Some pages are longer than 255 bytes.  The actual length of
-	 * the page is returned in the header.
-	 */
-	len = ((buf[2] << 8) | buf[3]) + 4;
-	if (len <= init_vpd_len)
-		return buf;
-
-	kfree(buf);
-	buf = kmalloc(len, GFP_KERNEL);
-	result = scsi_vpd_inquiry(sdev, buf, page, len);
-	if (result)
-		goto fail;
-
-	return buf;
+	return 0;
 
  fail:
-	kfree(buf);
-	return NULL;
+	return -EINVAL;
 }
 EXPORT_SYMBOL_GPL(scsi_get_vpd_page);
 
@@ -1079,18 +1047,24 @@ EXPORT_SYMBOL_GPL(scsi_get_vpd_page);
  * Description: Gets a reference to the scsi_device and increments the use count
  * of the underlying LLDD module.  You must hold host_lock of the
  * parent Scsi_Host or already have a reference when calling this.
+ *
+ * This will fail if a device is deleted or cancelled, or when the LLD module
+ * is in the process of being unloaded.
  */
 int scsi_device_get(struct scsi_device *sdev)
 {
-	if (sdev->sdev_state == SDEV_DEL)
-		return -ENXIO;
+	if (sdev->sdev_state == SDEV_DEL || sdev->sdev_state == SDEV_CANCEL)
+		goto fail;
 	if (!get_device(&sdev->sdev_gendev))
-		return -ENXIO;
-	/* We can fail this if we're doing SCSI operations
-	 * from module exit (like cache flush) */
-	try_module_get(sdev->host->hostt->module);
-
+		goto fail;
+	if (!try_module_get(sdev->host->hostt->module))
+		goto fail_put_device;
 	return 0;
+
+fail_put_device:
+	put_device(&sdev->sdev_gendev);
+fail:
+	return -ENXIO;
 }
 EXPORT_SYMBOL(scsi_device_get);
 
@@ -1104,14 +1078,7 @@ EXPORT_SYMBOL(scsi_device_get);
  */
 void scsi_device_put(struct scsi_device *sdev)
 {
-#ifdef CONFIG_MODULE_UNLOAD
-	struct module *module = sdev->host->hostt->module;
-
-	/* The module refcount will be zero if scsi_device_get()
-	 * was called from a module removal routine */
-	if (module && module_refcount(module) != 0)
-		module_put(module);
-#endif
+	module_put(sdev->host->hostt->module);
 	put_device(&sdev->sdev_gendev);
 }
 EXPORT_SYMBOL(scsi_device_put);
@@ -1366,6 +1333,7 @@ static void __exit exit_scsi(void)
 	scsi_exit_devinfo();
 	scsi_exit_procfs();
 	scsi_exit_queue();
+	async_unregister_domain(&scsi_sd_probe_domain);
 }
 
 subsys_initcall(init_scsi);

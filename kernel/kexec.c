@@ -31,21 +31,29 @@
 #include <linux/cpu.h>
 #include <linux/console.h>
 #include <linux/vmalloc.h>
+#include <linux/swap.h>
+#include <linux/kmsg_dump.h>
+#include <linux/hugetlb.h>
 
 #include <asm/page.h>
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <asm/system.h>
 #include <asm/sections.h>
+#include <asm/setup.h>
 
 /* Per cpu memory for storing cpu states in case of system crash. */
-note_buf_t* crash_notes;
+note_buf_t __percpu *crash_notes;
 
 /* vmcoreinfo stuff */
 static unsigned char vmcoreinfo_data[VMCOREINFO_BYTES];
 u32 vmcoreinfo_note[VMCOREINFO_NOTE_SIZE/4];
 size_t vmcoreinfo_size;
 size_t vmcoreinfo_max_size = sizeof(vmcoreinfo_data);
+int kexec_load_disabled;
+
+/* Flag to indicate we are going to kexec a new kernel */
+bool kexec_in_progress = false;
 
 /* Location of the reserved area for the crash kernel */
 struct resource crashk_res = {
@@ -493,7 +501,7 @@ static struct page *kimage_alloc_crash_control_pages(struct kimage *image,
 	while (hole_end <= crashk_res.end) {
 		unsigned long i;
 
-		if (hole_end > KEXEC_CONTROL_MEMORY_LIMIT)
+		if (hole_end > KEXEC_CRASH_CONTROL_MEMORY_LIMIT)
 			break;
 		if (hole_end > crashk_res.end)
 			break;
@@ -944,6 +952,9 @@ SYSCALL_DEFINE4(kexec_load, unsigned long, entry, unsigned long, nr_segments,
 	if (!capable(CAP_SYS_BOOT))
 		return -EPERM;
 
+	if (kexec_load_disabled)
+		return -EPERM;
+
 	/*
 	 * Verify we have a legal set of flags
 	 * This leaves us room for future extensions.
@@ -994,6 +1005,7 @@ SYSCALL_DEFINE4(kexec_load, unsigned long, entry, unsigned long, nr_segments,
 			kimage_free(xchg(&kexec_crash_image, NULL));
 			result = kimage_crash_alloc(&image, entry,
 						     nr_segments, segments);
+			crash_map_reserved_pages();
 		}
 		if (result)
 			goto out;
@@ -1010,6 +1022,8 @@ SYSCALL_DEFINE4(kexec_load, unsigned long, entry, unsigned long, nr_segments,
 				goto out;
 		}
 		kimage_terminate(image);
+		if (flags & KEXEC_ON_CRASH)
+			crash_unmap_reserved_pages();
 	}
 	/* Install the new kernel, and  Uninstall the old */
 	image = xchg(dest_image, image);
@@ -1020,6 +1034,18 @@ out:
 
 	return result;
 }
+
+/*
+ * Add and remove page tables for crashkernel memory
+ *
+ * Provide an empty default implementation here -- architecture
+ * code may override this
+ */
+void __weak crash_map_reserved_pages(void)
+{}
+
+void __weak crash_unmap_reserved_pages(void)
+{}
 
 #ifdef CONFIG_COMPAT
 asmlinkage long compat_sys_kexec_load(unsigned long entry,
@@ -1073,6 +1099,9 @@ void crash_kexec(struct pt_regs *regs)
 	if (mutex_trylock(&kexec_mutex)) {
 		if (kexec_crash_image) {
 			struct pt_regs fixed_regs;
+
+			kmsg_dump(KMSG_DUMP_KEXEC);
+
 			crash_setup_regs(&fixed_regs, regs);
 			crash_save_vmcoreinfo();
 			machine_crash_shutdown(&fixed_regs);
@@ -1080,6 +1109,79 @@ void crash_kexec(struct pt_regs *regs)
 		}
 		mutex_unlock(&kexec_mutex);
 	}
+}
+
+size_t crash_get_memory_size(void)
+{
+	size_t size = 0;
+	mutex_lock(&kexec_mutex);
+	if (crashk_res.end > crashk_res.start)
+		size = crashk_res.end - crashk_res.start + 1;
+	mutex_unlock(&kexec_mutex);
+	return size;
+}
+
+void __weak crash_free_reserved_phys_range(unsigned long begin,
+					   unsigned long end)
+{
+	unsigned long addr;
+
+	for (addr = begin; addr < end; addr += PAGE_SIZE) {
+		ClearPageReserved(pfn_to_page(addr >> PAGE_SHIFT));
+		init_page_count(pfn_to_page(addr >> PAGE_SHIFT));
+		free_page((unsigned long)__va(addr));
+		totalram_pages++;
+	}
+}
+
+int crash_shrink_memory(unsigned long new_size)
+{
+	int ret = 0;
+	unsigned long start, end, old_size;
+	struct resource *ram_res;
+
+	mutex_lock(&kexec_mutex);
+
+	if (kexec_crash_image) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+	start = crashk_res.start;
+	end = crashk_res.end;
+	old_size = (end == 0) ? 0 : end - start + 1;
+	if (new_size >= old_size) {
+		ret = (new_size == old_size) ? 0 : -EINVAL;
+		goto unlock;
+	}
+
+	ram_res = kzalloc(sizeof(*ram_res), GFP_KERNEL);
+	if (!ram_res) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+
+	start = roundup(start, KEXEC_CRASH_MEM_ALIGN);
+	end = roundup(start + new_size, KEXEC_CRASH_MEM_ALIGN);
+
+	crash_map_reserved_pages();
+	crash_free_reserved_phys_range(end, crashk_res.end);
+
+	if ((start == end) && (crashk_res.parent != NULL))
+		release_resource(&crashk_res);
+
+	ram_res->start = end;
+	ram_res->end = crashk_res.end;
+	ram_res->flags = IORESOURCE_BUSY | IORESOURCE_MEM;
+	ram_res->name = "System RAM";
+
+	crashk_res.end = end - 1;
+
+	insert_resource(&iomem_resource, ram_res);
+	crash_unmap_reserved_pages();
+
+unlock:
+	mutex_unlock(&kexec_mutex);
+	return ret;
 }
 
 static u32 *append_elf_note(u32 *buf, char *name, unsigned type, void *data,
@@ -1147,7 +1249,7 @@ static int __init crash_notes_memory_init(void)
 	}
 	return 0;
 }
-module_init(crash_notes_memory_init)
+subsys_initcall(crash_notes_memory_init);
 
 
 /*
@@ -1269,6 +1371,50 @@ static int __init parse_crashkernel_simple(char 		*cmdline,
 	return 0;
 }
 
+#ifdef CONFIG_KEXEC_AUTO_RESERVE
+/*
+ * This function proposes a crash size which can be adjusted/overridden
+ * by architecture code by implementing arch_crash_auto_scale().
+ */
+unsigned long long __init __weak
+arch_crash_auto_scale(unsigned long long total_size, unsigned long long size)
+{
+	return size;
+}
+
+unsigned long long __init __weak arch_default_crash_base(void)
+{
+	/* 0 means find the base address automatically. */
+	return 0;
+}
+
+static unsigned long long __init
+default_crash_size(unsigned long long total_size)
+{
+	unsigned long long size;
+	/*
+	 * BIOS usually will reserve some memory regions for it's own use.
+	 * so we will get less than actual memory in e820 usable areas.
+	 * We workaround this by round up the total size to 128M which is
+	 * enough for our current 2G kdump auto reserve threshold.
+	 */
+	if (roundup(total_size, 0x8000000) < KEXEC_AUTO_THRESHOLD)
+		size = 0;
+	else {
+		/*
+		 * Filtering logic in kdump initrd requires 2bits per 4K page.
+		 * Hence reserve 2bits per 4K of RAM (or 1byte per 16K of RAM)
+		 * on top of base of 128M (KEXEC_AUTO_RESERVED_SIZE).
+		 */
+		size = KEXEC_AUTO_RESERVED_SIZE +
+			roundup((total_size - KEXEC_AUTO_RESERVED_SIZE)
+				/ (1ULL<<14), 1ULL<<20);
+	}
+
+	return arch_crash_auto_scale(total_size, size);
+}
+#endif /*CONFIG_KEXEC_AUTO_RESERVE*/
+
 /*
  * That function is the entry point for command line parsing and should be
  * called from the arch-specific code.
@@ -1297,6 +1443,40 @@ int __init parse_crashkernel(char 		 *cmdline,
 
 	ck_cmdline += 12; /* strlen("crashkernel=") */
 
+#ifdef CONFIG_KEXEC_AUTO_RESERVE
+	if (strncmp(ck_cmdline, "auto", 4) == 0) {
+		unsigned long long size;
+		int len;
+		char tmp[32];
+
+		size = default_crash_size(system_ram);
+		if (size != 0) {
+			*crash_size = size;
+			*crash_base = arch_default_crash_base();
+			len = scnprintf(tmp, sizeof(tmp), "%luM@%luM",
+					(unsigned long)(*crash_size)>>20,
+					(unsigned long)(*crash_base)>>20);
+			/* 'len' can't be <= 4. */
+			if (likely((len - 4 + strlen(cmdline))
+					< COMMAND_LINE_SIZE - 1)) {
+				memmove(ck_cmdline + len, ck_cmdline + 4,
+					strlen(cmdline) - (ck_cmdline + 4 - cmdline) + 1);
+				memcpy(ck_cmdline, tmp, len);
+			}
+			return 0;
+		} else {
+			/*
+			 * We can't reserve memory auotmatcally,
+			 * remove "crashkernel=auto" from cmdline.
+			 */
+			ck_cmdline += 4; /* strlen("auto") */
+			memmove(ck_cmdline - 16, ck_cmdline,
+				strlen(cmdline) - (ck_cmdline - cmdline) + 1);
+			pr_warning("crashkernel=auto resulted in zero bytes of reserved memory.\n");
+			return -ENOMEM;
+		}
+	}
+#endif
 	/*
 	 * if the commandline contains a ':', then that's the extended
 	 * syntax -- if not, it must be the classic syntax
@@ -1314,22 +1494,21 @@ int __init parse_crashkernel(char 		 *cmdline,
 }
 
 
-
-void crash_save_vmcoreinfo(void)
+static void update_vmcoreinfo_note(void)
 {
-	u32 *buf;
+	u32 *buf = vmcoreinfo_note;
 
 	if (!vmcoreinfo_size)
 		return;
-
-	vmcoreinfo_append_str("CRASHTIME=%ld", get_seconds());
-
-	buf = (u32 *)vmcoreinfo_note;
-
 	buf = append_elf_note(buf, VMCOREINFO_NOTE_NAME, 0, vmcoreinfo_data,
 			      vmcoreinfo_size);
-
 	final_note(buf);
+}
+
+void crash_save_vmcoreinfo(void)
+{
+	vmcoreinfo_append_str("CRASHTIME=%ld", get_seconds());
+	update_vmcoreinfo_note();
 }
 
 void vmcoreinfo_append_str(const char *fmt, ...)
@@ -1393,6 +1572,7 @@ static int __init crash_save_vmcoreinfo_init(void)
 	VMCOREINFO_OFFSET(page, _count);
 	VMCOREINFO_OFFSET(page, mapping);
 	VMCOREINFO_OFFSET(page, lru);
+	VMCOREINFO_OFFSET(page, private);
 	VMCOREINFO_OFFSET(pglist_data, node_zones);
 	VMCOREINFO_OFFSET(pglist_data, nr_zones);
 #ifdef CONFIG_FLAT_NODE_MEM_MAP
@@ -1415,8 +1595,17 @@ static int __init crash_save_vmcoreinfo_init(void)
 	VMCOREINFO_NUMBER(PG_lru);
 	VMCOREINFO_NUMBER(PG_private);
 	VMCOREINFO_NUMBER(PG_swapcache);
+	VMCOREINFO_NUMBER(PG_buddy);
+#ifdef CONFIG_MEMORY_FAILURE
+	VMCOREINFO_NUMBER(PG_hwpoison);
+#endif
+	VMCOREINFO_NUMBER(PG_head_mask);
+#ifdef CONFIG_HUGETLBFS
+	VMCOREINFO_SYMBOL(free_huge_page);
+#endif
 
 	arch_crash_save_vmcoreinfo();
+	update_vmcoreinfo_note();
 
 	return 0;
 }
@@ -1472,6 +1661,7 @@ int kernel_kexec(void)
 	} else
 #endif
 	{
+		kexec_in_progress = true;
 		kernel_restart_prepare(NULL);
 		printk(KERN_EMERG "Starting new kernel\n");
 		machine_shutdown();

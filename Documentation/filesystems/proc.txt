@@ -33,12 +33,16 @@ Table of Contents
   2	Modifying System Parameters
 
   3	Per-Process Parameters
-  3.1	/proc/<pid>/oom_adj - Adjust the oom-killer score
+  3.1	/proc/<pid>/oom_adj & /proc/<pid>/oom_score_adj - Adjust the oom-killer
+								score
   3.2	/proc/<pid>/oom_score - Display current oom-killer score
   3.3	/proc/<pid>/io - Display the IO accounting fields
   3.4	/proc/<pid>/coredump_filter - Core dump filtering settings
   3.5	/proc/<pid>/mountinfo - Information about mounts
+  3.6	/proc/<pid>/comm  & /proc/<pid>/task/<tid>/comm
 
+  4	Configuring procfs
+  4.1	Mount options
 
 ------------------------------------------------------------------------------
 Preface
@@ -136,7 +140,9 @@ Table 1-1: Process specific entries in /proc
  wchan		If CONFIG_KALLSYMS is set, a pre-decoded wchan
  stack		Report full stack trace, enable via CONFIG_STACKTRACE
  smaps		a extension based on maps, showing the memory consumption of
-		each mapping
+		each mapping and flags associated with it
+ numa_maps	an extension based on maps, showing the memory locality and
+		binding policy as well as mem usage (in pages) of each mapping.
 ..............................................................................
 
 For example, to get the status information of a process, all you have to do is
@@ -163,6 +169,7 @@ read the file /proc/PID/status:
   VmExe:        68 kB
   VmLib:      1412 kB
   VmPTE:        20 kb
+  VmSwap:        0 kB
   Threads:        1
   SigQ:   0/28578
   SigPnd: 0000000000000000
@@ -176,7 +183,6 @@ read the file /proc/PID/status:
   CapBnd: ffffffffffffffff
   voluntary_ctxt_switches:        0
   nonvoluntary_ctxt_switches:     1
-  Stack usage:    12 kB
 
 This shows you nearly the same information you would get if you viewed it with
 the ps  command.  In  fact,  ps  uses  the  proc  file  system  to  obtain its
@@ -213,6 +219,7 @@ Table 1-2: Contents of the statm files (as of 2.6.30-rc7)
  VmExe                       size of text segment
  VmLib                       size of shared library code
  VmPTE                       size of page table entries
+ VmSwap                      size of swap usage (the number of referred swapents)
  Threads                     number of threads
  SigQ                        number of signals queued/max. number for queue
  SigPnd                      bitmap of pending signals for the thread
@@ -230,7 +237,6 @@ Table 1-2: Contents of the statm files (as of 2.6.30-rc7)
  Mems_allowed_list           Same as previous, but in "list format"
  voluntary_ctxt_switches     number of voluntary context switches
  nonvoluntary_ctxt_switches  number of non voluntary context switches
- Stack usage:                stack usage high water mark (round up to page size)
 ..............................................................................
 
 Table 1-3: Contents of the statm files (as of 2.6.8-rc3)
@@ -309,7 +315,7 @@ address           perms offset  dev   inode      pathname
 08049000-0804a000 rw-p 00001000 03:00 8312       /opt/test
 0804a000-0806b000 rw-p 00000000 00:00 0          [heap]
 a7cb1000-a7cb2000 ---p 00000000 00:00 0
-a7cb2000-a7eb2000 rw-p 00000000 00:00 0          [threadstack:001ff4b4]
+a7cb2000-a7eb2000 rw-p 00000000 00:00 0
 a7eb2000-a7eb3000 ---p 00000000 00:00 0
 a7eb3000-a7ed5000 rw-p 00000000 00:00 0
 a7ed5000-a8008000 r-xp 00000000 03:00 4222       /lib/libc.so.6
@@ -345,7 +351,6 @@ is not associated with a file:
  [stack]                  = the stack of the main process
  [vdso]                   = the "virtual dynamic shared object",
                             the kernel system call handler
- [threadstack:xxxxxxxx]   = the stack of the thread, xxxxxxxx is the stack size
 
  or if empty, the mapping is anonymous.
 
@@ -363,17 +368,60 @@ Shared_Dirty:          0 kB
 Private_Clean:         0 kB
 Private_Dirty:         0 kB
 Referenced:          892 kB
+Anonymous:             0 kB
 Swap:                  0 kB
 KernelPageSize:        4 kB
 MMUPageSize:           4 kB
+VmFlags: rd ex mr mw me de
 
-The first  of these lines shows  the same information  as is displayed for the
-mapping in /proc/PID/maps.  The remaining lines show  the size of the mapping,
-the amount of the mapping that is currently resident in RAM, the "proportional
-set size” (divide each shared page by the number of processes sharing it), the
-number of clean and dirty shared pages in the mapping, and the number of clean
-and dirty private pages in the mapping.  The "Referenced" indicates the amount
-of memory currently marked as referenced or accessed.
+the first of these lines shows the same information as is displayed for the
+mapping in /proc/PID/maps.  The remaining lines show the size of the mapping
+(size), the amount of the mapping that is currently resident in RAM (RSS), the
+process' proportional share of this mapping (PSS), the number of clean and
+dirty private pages in the mapping.  Note that even a page which is part of a
+MAP_SHARED mapping, but has only a single pte mapped, i.e.  is currently used
+by only one process, is accounted as private and not as shared.  "Referenced"
+indicates the amount of memory currently marked as referenced or accessed.
+"Anonymous" shows the amount of memory that does not belong to any file.  Even
+a mapping associated with a file may contain anonymous pages: when MAP_PRIVATE
+and a page is modified, the file page is replaced by a private anonymous copy.
+"Swap" shows how much would-be-anonymous memory is also used, but out on
+swap.
+
+"VmFlags" field deserves a separate description. This member represents the kernel
+flags associated with the particular virtual memory area in two letter encoded
+manner. The codes are the following:
+    rd  - readable
+    wr  - writeable
+    ex  - executable
+    sh  - shared
+    mr  - may read
+    mw  - may write
+    me  - may execute
+    ms  - may share
+    gd  - stack segment growns down
+    pf  - pure PFN range
+    dw  - disabled write to the mapped file
+    lo  - pages are locked in memory
+    io  - memory mapped I/O area
+    sr  - sequential read advise provided
+    rr  - random read advise provided
+    dc  - do not copy area on fork
+    de  - do not expand area on remapping
+    ac  - area is accountable
+    nr  - swap space is not reserved for the area
+    ht  - area uses huge tlb pages
+    nl  - non-linear mapping
+    ar  - architecture specific flag
+    dd  - do not include area into core dump
+    mm  - mixed map area
+    hg  - huge page advise flag
+    nh  - no-huge page advise flag
+    mg  - mergable advise flag
+
+Note that there is no guarantee that every flag and associated mnemonic will
+be present in all further kernel releases. Things get changed, the flags may
+be vanished or the reverse -- new added.
 
 This file is only present if the CONFIG_MMU kernel configuration option is
 enabled.
@@ -390,6 +438,37 @@ To clear the bits for the file mapped pages associated with the process
     > echo 3 > /proc/PID/clear_refs
 Any other value written to /proc/PID/clear_refs will have no effect.
 
+
+The /proc/pid/numa_maps is an extension based on maps, showing the memory
+locality and binding policy, as well as the memory usage (in pages) of
+each mapping. The output follows a general format where mapping details get
+summarized separated by blank spaces, one mapping per each file line:
+
+address   policy    mapping details
+
+00400000 default file=/usr/local/bin/app mapped=1 active=0 N3=1 kernelpagesize_kB=4
+00600000 default file=/usr/local/bin/app anon=1 dirty=1 N3=1 kernelpagesize_kB=4
+3206000000 default file=/lib64/ld-2.12.so mapped=26 mapmax=6 N0=24 N3=2 kernelpagesize_kB=4
+320621f000 default file=/lib64/ld-2.12.so anon=1 dirty=1 N3=1 kernelpagesize_kB=4
+3206220000 default file=/lib64/ld-2.12.so anon=1 dirty=1 N3=1 kernelpagesize_kB=4
+3206221000 default anon=1 dirty=1 N3=1 kernelpagesize_kB=4
+3206800000 default file=/lib64/libc-2.12.so mapped=59 mapmax=21 active=55 N0=41 N3=18 kernelpagesize_kB=4
+320698b000 default file=/lib64/libc-2.12.so
+3206b8a000 default file=/lib64/libc-2.12.so anon=2 dirty=2 N3=2 kernelpagesize_kB=4
+3206b8e000 default file=/lib64/libc-2.12.so anon=1 dirty=1 N3=1 kernelpagesize_kB=4
+3206b8f000 default anon=3 dirty=3 active=1 N3=3 kernelpagesize_kB=4
+7f4dc10a2000 default anon=3 dirty=3 N3=3 kernelpagesize_kB=4
+7f4dc10b4000 default anon=2 dirty=2 active=1 N3=2 kernelpagesize_kB=4
+7f4dc1200000 default file=/anon_hugepage\040(deleted) huge anon=1 dirty=1 N3=1 kernelpagesize_kB=2048
+7fff335f0000 default stack anon=3 dirty=3 N3=3 kernelpagesize_kB=4
+7fff3369d000 default mapped=1 mapmax=35 active=0 N3=1 kernelpagesize_kB=4
+
+Where:
+"address" is the starting address for the mapping;
+"policy" reports the NUMA memory policy set for the mapping (see vm/numa_memory_policy.txt);
+"mapping details" summarizes mapping data such as mapping type, page usage counters,
+node locality page counters (N0 == node0, N1 == node1, ...) and the kernel page
+size, in KB, that is backing the mapping up.
 
 1.2 Kernel data
 ---------------
@@ -554,17 +633,28 @@ The contents of each smp_affinity file is the same by default:
   > cat /proc/irq/0/smp_affinity
   ffffffff
 
+There is an alternate interface, smp_affinity_list which allows specifying
+a cpu range instead of a bitmask:
+
+  > cat /proc/irq/0/smp_affinity_list
+  1024-1031
+
 The default_smp_affinity mask applies to all non-active IRQs, which are the
 IRQs which have not yet been allocated/activated, and hence which lack a
 /proc/irq/[0-9]* directory.
 
+The node file on an SMP system shows the node to which the device using the IRQ
+reports itself as being attached.  This hardware locality information does not
+include information about any possible driver locality preference.
+
 prof_cpu_mask specifies which CPUs are to be profiled by the system wide
-profiler. Default value is ffffffff (all cpus).
+profiler. Default value is ffffffff (all cpus if there are only 32 of them).
 
 The way IRQs are routed is handled by the IO-APIC, and it's Round Robin
 between all the CPUs which are allowed to handle it. As usual the kernel has
 more info than you and does a better job than you, so the defaults are the
-best choice for almost everyone.
+best choice for almost everyone.  [Note this applies only to those IO-APIC's
+that support "Round Robin" interrupt distribution.]
 
 There are  three  more  important subdirectories in /proc: net, scsi, and sys.
 The general  rule  is  that  the  contents,  or  even  the  existence of these
@@ -623,6 +713,7 @@ Dirty:             968 kB
 Writeback:           0 kB
 AnonPages:      861800 kB
 Mapped:         280372 kB
+Shmem:             644 kB
 Slab:           284364 kB
 SReclaimable:   159856 kB
 SUnreclaim:     124508 kB
@@ -635,10 +726,21 @@ Committed_AS:   100056 kB
 VmallocTotal:   112216 kB
 VmallocUsed:       428 kB
 VmallocChunk:   111088 kB
+AnonHugePages:   49152 kB
+MemAvailable: 14836172 kB    (Only if sysctl vm.meminfo_legacy_layout = 0)
 
     MemTotal: Total usable ram (i.e. physical ram minus a few reserved
               bits and the kernel binary code)
      MemFree: The sum of LowFree+HighFree
+MemAvailable: An estimate of how much memory is available for starting new
+              applications, without swapping. Calculated from MemFree,
+              SReclaimable, the size of the file LRU lists, and the low
+              watermarks in each zone.
+              The estimate takes into account that the system needs some
+              page cache to function well, and that not all reclaimable
+              slab will be reclaimable, due to items being in use. The
+              impact of those factors will vary from system to system.
+	      This line is only reported if sysctl vm.meminfo_legacy_layout = 0
      Buffers: Relatively temporary storage for raw disk blocks
               shouldn't get tremendously large (20MB or so)
       Cached: in-memory cache for files read from the disk (the
@@ -668,7 +770,9 @@ VmallocChunk:   111088 kB
        Dirty: Memory which is waiting to get written back to the disk
    Writeback: Memory which is actively being written back to the disk
    AnonPages: Non-file backed pages mapped into userspace page tables
+AnonHugePages: Non-file backed huge pages mapped into userspace page tables
       Mapped: files which have been mmaped, such as libraries
+       Shmem: Total memory used by shared memory (shmem) and tmpfs
         Slab: in-kernel data structures cache
 SReclaimable: Part of Slab, that might be reclaimed, such as caches
   SUnreclaim: Part of Slab, that cannot be reclaimed on memory pressure
@@ -684,7 +788,8 @@ WritebackTmp: Memory used by FUSE for temporary writeback buffers
               if strict overcommit accounting is enabled (mode 2 in
               'vm.overcommit_memory').
               The CommitLimit is calculated with the following formula:
-              CommitLimit = ('vm.overcommit_ratio' * Physical RAM) + Swap
+              CommitLimit = ([total RAM pages] - [total huge TLB pages]) *
+              overcommit_ratio / 100 + [total swap pages]
               For example, on a system with 1G of physical RAM and 7G
               of swap with a `vm.overcommit_ratio` of 30 it would
               yield a CommitLimit of 7.3G.
@@ -694,16 +799,15 @@ Committed_AS: The amount of memory presently allocated on the system.
               The committed memory is a sum of all of the memory which
               has been allocated by processes, even if it has not been
               "used" by them as of yet. A process which malloc()'s 1G
-              of memory, but only touches 300M of it will only show up
-              as using 300M of memory even if it has the address space
-              allocated for the entire 1G. This 1G is memory which has
-              been "committed" to by the VM and can be used at any time
-              by the allocating application. With strict overcommit
-              enabled on the system (mode 2 in 'vm.overcommit_memory'),
-              allocations which would exceed the CommitLimit (detailed
-              above) will not be permitted. This is useful if one needs
-              to guarantee that processes will not fail due to lack of
-              memory once that memory has been successfully allocated.
+              of memory, but only touches 300M of it will show up as
+	      using 1G. This 1G is memory which has been "committed" to
+              by the VM and can be used at any time by the allocating
+              application. With strict overcommit enabled on the system
+              (mode 2 in 'vm.overcommit_memory'),allocations which would
+              exceed the CommitLimit (detailed above) will not be permitted.
+              This is useful if one needs to guarantee that processes will
+              not fail due to lack of memory once that memory has been
+              successfully allocated.
 VmallocTotal: total size of vmalloc memory area
  VmallocUsed: amount of vmalloc area which is used
 VmallocChunk: largest contiguous block of vmalloc area which is free
@@ -1180,42 +1284,65 @@ of the kernel.
 CHAPTER 3: PER-PROCESS PARAMETERS
 ------------------------------------------------------------------------------
 
-3.1 /proc/<pid>/oom_adj - Adjust the oom-killer score
-------------------------------------------------------
+3.1 /proc/<pid>/oom_adj & /proc/<pid>/oom_score_adj- Adjust the oom-killer score
+--------------------------------------------------------------------------------
 
-This file can be used to adjust the score used to select which processes
-should be killed in an  out-of-memory  situation.  Giving it a high score will
-increase the likelihood of this process being killed by the oom-killer.  Valid
-values are in the range -16 to +15, plus the special value -17, which disables
-oom-killing altogether for this process.
+These file can be used to adjust the badness heuristic used to select which
+process gets killed in out of memory conditions.
 
-The process to be killed in an out-of-memory situation is selected among all others
-based on its badness score. This value equals the original memory size of the process
-and is then updated according to its CPU time (utime + stime) and the
-run time (uptime - start time). The longer it runs the smaller is the score.
-Badness score is divided by the square root of the CPU time and then by
-the double square root of the run time.
+The badness heuristic assigns a value to each candidate task ranging from 0
+(never kill) to 1000 (always kill) to determine which process is targeted.  The
+units are roughly a proportion along that range of allowed memory the process
+may allocate from based on an estimation of its current memory and swap use.
+For example, if a task is using all allowed memory, its badness score will be
+1000.  If it is using half of its allowed memory, its score will be 500.
 
-Swapped out tasks are killed first. Half of each child's memory size is added to
-the parent's score if they do not share the same memory. Thus forking servers
-are the prime candidates to be killed. Having only one 'hungry' child will make
-parent less preferable than the child.
+There is an additional factor included in the badness score: root
+processes are given 3% extra memory over other tasks.
 
-/proc/<pid>/oom_score shows process' current badness score.
+The amount of "allowed" memory depends on the context in which the oom killer
+was called.  If it is due to the memory assigned to the allocating task's cpuset
+being exhausted, the allowed memory represents the set of mems assigned to that
+cpuset.  If it is due to a mempolicy's node(s) being exhausted, the allowed
+memory represents the set of mempolicy nodes.  If it is due to a memory
+limit (or swap limit) being reached, the allowed memory is that configured
+limit.  Finally, if it is due to the entire system being out of memory, the
+allowed memory represents all allocatable resources.
 
-The following heuristics are then applied:
- * if the task was reniced, its score doubles
- * superuser or direct hardware access tasks (CAP_SYS_ADMIN, CAP_SYS_RESOURCE
- 	or CAP_SYS_RAWIO) have their score divided by 4
- * if oom condition happened in one cpuset and checked process does not belong
- 	to it, its score is divided by 8
- * the resulting score is multiplied by two to the power of oom_adj, i.e.
-	points <<= oom_adj when it is positive and
-	points >>= -(oom_adj) otherwise
+The value of /proc/<pid>/oom_score_adj is added to the badness score before it
+is used to determine which task to kill.  Acceptable values range from -1000
+(OOM_SCORE_ADJ_MIN) to +1000 (OOM_SCORE_ADJ_MAX).  This allows userspace to
+polarize the preference for oom killing either by always preferring a certain
+task or completely disabling it.  The lowest possible value, -1000, is
+equivalent to disabling oom killing entirely for that task since it will always
+report a badness score of 0.
 
-The task with the highest badness score is then selected and its children
-are killed, process itself will be killed in an OOM situation when it does
-not have children or some of them disabled oom like described above.
+Consequently, it is very simple for userspace to define the amount of memory to
+consider for each task.  Setting a /proc/<pid>/oom_score_adj value of +500, for
+example, is roughly equivalent to allowing the remainder of tasks sharing the
+same system, cpuset, mempolicy, or memory controller resources to use at least
+50% more memory.  A value of -500, on the other hand, would be roughly
+equivalent to discounting 50% of the task's allowed memory from being considered
+as scoring against the task.
+
+For backwards compatibility with previous kernels, /proc/<pid>/oom_adj may also
+be used to tune the badness score.  Its acceptable values range from -16
+(OOM_ADJUST_MIN) to +15 (OOM_ADJUST_MAX) and a special value of -17
+(OOM_DISABLE) to disable oom killing entirely for that task.  Its value is
+scaled linearly with /proc/<pid>/oom_score_adj.
+
+Writing to /proc/<pid>/oom_score_adj or /proc/<pid>/oom_adj will change the
+other with its scaled value.
+
+The value of /proc/<pid>/oom_score_adj may be reduced no lower than the last
+value set by a CAP_SYS_RESOURCE process. To reduce the value any lower
+requires CAP_SYS_RESOURCE.
+
+Caveat: when a parent task is selected, the oom killer will sacrifice any first
+generation children with seperate address spaces instead, if possible.  This
+avoids servers and important system daemons from being killed and loses the
+minimal amount of work.
+
 
 3.2 /proc/<pid>/oom_score - Display current oom-killer score
 -------------------------------------------------------------
@@ -1408,3 +1535,46 @@ For more information on mount propagation see:
 
   Documentation/filesystems/sharedsubtree.txt
 
+
+3.6	/proc/<pid>/comm  & /proc/<pid>/task/<tid>/comm
+--------------------------------------------------------
+These files provide a method to access a tasks comm value. It also allows for
+a task to set its own or one of its thread siblings comm value. The comm value
+is limited in size compared to the cmdline value, so writing anything longer
+then the kernel's TASK_COMM_LEN (currently 16 chars) will result in a truncated
+comm value.
+------------------------------------------------------------------------------
+Configuring procfs
+------------------------------------------------------------------------------
+
+4.1	Mount options
+---------------------
+
+The following mount options are supported:
+
+	hidepid=	Set /proc/<pid>/ access mode.
+	gid=		Set the group authorized to learn processes information.
+
+hidepid=0 means classic mode - everybody may access all /proc/<pid>/ directories
+(default).
+
+hidepid=1 means users may not access any /proc/<pid>/ directories but their
+own.  Sensitive files like cmdline, sched*, status are now protected against
+other users.  This makes it impossible to learn whether any user runs
+specific program (given the program doesn't reveal itself by its behaviour).
+As an additional bonus, as /proc/<pid>/cmdline is unaccessible for other users,
+poorly written programs passing sensitive information via program arguments are
+now protected against local eavesdroppers.
+
+hidepid=2 means hidepid=1 plus all /proc/<pid>/ will be fully invisible to other
+users.  It doesn't mean that it hides a fact whether a process with a specific
+pid value exists (it can be learned by other means, e.g. by "kill -0 $PID"),
+but it hides process' uid and gid, which may be learned by stat()'ing
+/proc/<pid>/ otherwise.  It greatly complicates an intruder's task of gathering
+information about running processes, whether some daemon runs with elevated
+privileges, whether other user runs some sensitive program, whether other users
+run any program at all, etc.
+
+gid= defines a group authorized to learn processes information otherwise
+prohibited by hidepid=.  If you use some daemon like identd which needs to learn
+information about processes information, just add identd to this group.

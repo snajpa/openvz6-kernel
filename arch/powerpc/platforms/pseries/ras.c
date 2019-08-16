@@ -36,6 +36,8 @@
 #include <linux/random.h>
 #include <linux/sysrq.h>
 #include <linux/bitops.h>
+#include <linux/fs.h>
+#include <linux/reboot.h>
 
 #include <asm/uaccess.h>
 #include <asm/system.h>
@@ -63,6 +65,9 @@ static int ras_check_exception_token;
 #define EPOW_SENSOR_TOKEN	9
 #define EPOW_SENSOR_INDEX	0
 #define RAS_VECTOR_OFFSET	0x500
+
+/* EPOW events counter variable */
+static int num_epow_events;
 
 static irqreturn_t ras_epow_interrupt(int irq, void *dev_id);
 static irqreturn_t ras_error_interrupt(int irq, void *dev_id);
@@ -152,26 +157,133 @@ static int __init init_ras_IRQ(void)
 
 	return 0;
 }
-__initcall(init_ras_IRQ);
+subsys_initcall(init_ras_IRQ);
 
-/*
- * Handle power subsystem events (EPOW).
- *
- * Presently we just log the event has occurred.  This should be fixed
- * to examine the type of power failure and take appropriate action where
- * the time horizon permits something useful to be done.
- */
+#define EPOW_SHUTDOWN_NORMAL				1
+#define EPOW_SHUTDOWN_ON_UPS				2
+#define EPOW_SHUTDOWN_LOSS_OF_CRITICAL_FUNCTIONS	3
+#define EPOW_SHUTDOWN_AMBIENT_TEMPERATURE_TOO_HIGH	4
+
+static void handle_system_shutdown(char event_modifier)
+{
+	switch (event_modifier) {
+	case EPOW_SHUTDOWN_NORMAL:
+		pr_emerg("Power off requested\n");
+		orderly_poweroff(1);
+		break;
+
+	case EPOW_SHUTDOWN_ON_UPS:
+		pr_emerg("Loss of system power detected. System is running on"
+			 " UPS/battery. Check RTAS error log for details\n");
+		break;
+
+	case EPOW_SHUTDOWN_LOSS_OF_CRITICAL_FUNCTIONS:
+		pr_emerg("Loss of system critical functions detected. Check"
+			 " RTAS error log for details\n");
+		orderly_poweroff(1);
+		break;
+
+	case EPOW_SHUTDOWN_AMBIENT_TEMPERATURE_TOO_HIGH:
+		pr_emerg("High ambient temperature detected. Check RTAS"
+			 " error log for details\n");
+		orderly_poweroff(1);
+		break;
+
+	default:
+		pr_err("Unknown power/cooling shutdown event (modifier = %d)\n",
+			event_modifier);
+	}
+}
+
+struct epow_errorlog {
+	unsigned char sensor_value;
+	unsigned char event_modifier;
+	unsigned char extended_modifier;
+	unsigned char reserved;
+	unsigned char platform_reason;
+};
+
+#define EPOW_RESET			0
+#define EPOW_WARN_COOLING		1
+#define EPOW_WARN_POWER			2
+#define EPOW_SYSTEM_SHUTDOWN		3
+#define EPOW_SYSTEM_HALT		4
+#define EPOW_MAIN_ENCLOSURE		5
+#define EPOW_POWER_OFF			7
+
+void rtas_parse_epow_errlog(struct rtas_error_log *log)
+{
+	struct pseries_errorlog *pseries_log;
+	struct epow_errorlog *epow_log;
+	char action_code;
+	char modifier;
+
+	pseries_log = get_pseries_errorlog(log, PSERIES_ELOG_SECT_ID_EPOW);
+	if (pseries_log == NULL)
+		return;
+
+	epow_log = (struct epow_errorlog *)pseries_log->data;
+	action_code = epow_log->sensor_value & 0xF;	/* bottom 4 bits */
+	modifier = epow_log->event_modifier & 0xF;	/* bottom 4 bits */
+
+	switch (action_code) {
+	case EPOW_RESET:
+		if (num_epow_events) {
+			pr_info("Non critical power/cooling issue cleared\n");
+			num_epow_events--;
+		}
+		break;
+
+	case EPOW_WARN_COOLING:
+		pr_info("Non-critical cooling issue detected. Check RTAS error"
+			" log for details\n");
+		break;
+
+	case EPOW_WARN_POWER:
+		pr_info("Non-critical power issue detected. Check RTAS error"
+			" log for details\n");
+		break;
+
+	case EPOW_SYSTEM_SHUTDOWN:
+		handle_system_shutdown(epow_log->event_modifier);
+		break;
+
+	case EPOW_SYSTEM_HALT:
+		pr_emerg("Critical power/cooling issue detected. Check RTAS"
+			 " error log for details. Powering off.\n");
+		orderly_poweroff(1);
+		break;
+
+	case EPOW_MAIN_ENCLOSURE:
+	case EPOW_POWER_OFF:
+		pr_emerg("System about to lose power. Check RTAS error log "
+			 " for details. Powering off immediately.\n");
+		emergency_sync();
+		kernel_power_off();
+		break;
+
+	default:
+		pr_err("Unknown power/cooling event (action code  = %d)\n",
+			action_code);
+	}
+
+	/* Increment epow events counter variable */
+	if (action_code != EPOW_RESET)
+		num_epow_events++;
+}
+
+/* Handle environmental and power warning (EPOW) interrupts. */
 static irqreturn_t ras_epow_interrupt(int irq, void *dev_id)
 {
-	int status = 0xdeadbeef;
-	int state = 0;
+	int status;
+	int state;
 	int critical;
 
 	status = rtas_call(ras_get_sensor_state_token, 2, 2, &state,
 			   EPOW_SENSOR_TOKEN, EPOW_SENSOR_INDEX);
 
 	if (state > 3)
-		critical = 1;  /* Time Critical */
+		critical = 1;		/* Time Critical */
 	else
 		critical = 0;
 
@@ -184,13 +296,9 @@ static irqreturn_t ras_epow_interrupt(int irq, void *dev_id)
 			   critical, __pa(&ras_log_buf),
 				rtas_get_error_log_max());
 
-	udbg_printf("EPOW <0x%lx 0x%x 0x%x>\n",
-		    *((unsigned long *)&ras_log_buf), status, state);
-	printk(KERN_WARNING "EPOW <0x%lx 0x%x 0x%x>\n",
-	       *((unsigned long *)&ras_log_buf), status, state);
-
-	/* format and print the extended information */
 	log_error(ras_log_buf, ERR_TYPE_RTAS_LOG, 0);
+
+	rtas_parse_epow_errlog((struct rtas_error_log *)ras_log_buf);
 
 	spin_unlock(&ras_log_buf_lock);
 	return IRQ_HANDLED;
@@ -232,8 +340,9 @@ static irqreturn_t ras_error_interrupt(int irq, void *dev_id)
 	if (fatal) {
 		udbg_printf("Fatal HW Error <0x%lx 0x%x>\n",
 			    *((unsigned long *)&ras_log_buf), status);
-		printk(KERN_EMERG "Error: Fatal hardware error <0x%lx 0x%x>\n",
-		       *((unsigned long *)&ras_log_buf), status);
+		pr_emerg("Fatal hardware error detected. Check RTAS error"
+			 " log for details. Powering off immediately\n");
+
 
 #ifndef DEBUG_RTAS_POWER_OFF
 		/* Don't actually power off when debugging so we can test
@@ -245,9 +354,7 @@ static irqreturn_t ras_error_interrupt(int irq, void *dev_id)
 	} else {
 		udbg_printf("Recoverable HW Error <0x%lx 0x%x>\n",
 			    *((unsigned long *)&ras_log_buf), status);
-		printk(KERN_WARNING
-		       "Warning: Recoverable hardware error <0x%lx 0x%x>\n",
-		       *((unsigned long *)&ras_log_buf), status);
+		pr_err("Recoverable hardware error detected\n");
 	}
 
 	spin_unlock(&ras_log_buf_lock);

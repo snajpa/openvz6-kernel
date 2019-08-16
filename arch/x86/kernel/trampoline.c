@@ -1,6 +1,7 @@
 #include <linux/io.h>
 
 #include <asm/trampoline.h>
+#include <asm/pgtable.h>
 #include <asm/e820.h>
 
 #if defined(CONFIG_X86_64) && defined(CONFIG_ACPI_SLEEP)
@@ -38,4 +39,24 @@ unsigned long __trampinit setup_trampoline(void)
 {
 	memcpy(trampoline_base, trampoline_data, TRAMPOLINE_SIZE);
 	return virt_to_phys(trampoline_base);
+}
+
+void __init setup_trampoline_page_table(void)
+{
+#ifdef CONFIG_X86_32
+	/*
+	 * The trampoline page table is 4k only. So no PTI user table
+	 * update is allowed.
+	 */
+	__clone_pgd_range(trampoline_pg_dir + KERNEL_PGD_BOUNDARY,
+			swapper_pg_dir + KERNEL_PGD_BOUNDARY,
+			min_t(unsigned long, KERNEL_PGD_PTRS,
+			      KERNEL_PGD_BOUNDARY));
+
+	/* Initialize low mappings */
+	__clone_pgd_range(trampoline_pg_dir,
+			swapper_pg_dir + KERNEL_PGD_BOUNDARY,
+			min_t(unsigned long, KERNEL_PGD_PTRS,
+			      KERNEL_PGD_BOUNDARY));
+#endif
 }

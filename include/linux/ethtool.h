@@ -14,6 +14,7 @@
 #define _LINUX_ETHTOOL_H
 
 #include <linux/types.h>
+#include <linux/if_ether.h>
 
 /* This should work for both 32 and 64 bit userland. */
 struct ethtool_cmd {
@@ -30,8 +31,14 @@ struct ethtool_cmd {
 	__u32	maxtxpkt;	/* Tx pkts before generating tx int */
 	__u32	maxrxpkt;	/* Rx pkts before generating rx int */
 	__u16	speed_hi;
-	__u8	eth_tp_mdix;
+	__u8	eth_tp_mdix;	/* twisted pair MDI-X status */
+#ifndef __GENKSYMS__
+	__u8	eth_tp_mdix_ctrl; /* twisted pair MDI-X control, when set,
+				   * link should be renegotiated if necessary
+				   */
+#else
 	__u8	reserved2;
+#endif
 	__u32	lp_advertising;	/* Features the link partner advertises */
 	__u32	reserved[2];
 };
@@ -49,17 +56,25 @@ static inline __u32 ethtool_cmd_speed(struct ethtool_cmd *ep)
 	return (ep->speed_hi << 16) | ep->speed;
 }
 
+#define ETHTOOL_FWVERS_LEN	32
 #define ETHTOOL_BUSINFO_LEN	32
 /* these strings are set to whatever the driver author decides... */
 struct ethtool_drvinfo {
 	__u32	cmd;
 	char	driver[32];	/* driver short name, "tulip", "eepro100" */
 	char	version[32];	/* driver version string */
-	char	fw_version[32];	/* firmware version string, if applicable */
+	char	fw_version[ETHTOOL_FWVERS_LEN];	/* firmware version string */
 	char	bus_info[ETHTOOL_BUSINFO_LEN];	/* Bus info for this IF. */
 				/* For PCI devices, use pci_name(pci_dev). */
 	char	reserved1[32];
 	char	reserved2[12];
+				/*
+				 * Some struct members below are filled in
+				 * using ops->get_sset_count().  Obtaining
+				 * this info from ethtool_drvinfo is now
+				 * deprecated; Use ETHTOOL_GSSET_INFO
+				 * instead.
+				 */
 	__u32	n_priv_flags;	/* number of flags valid in ETHTOOL_GPFLAGS */
 	__u32	n_stats;	/* number of u64's from ETHTOOL_GSTATS */
 	__u32	testinfo_len;
@@ -97,6 +112,52 @@ struct ethtool_eeprom {
 	__u32	offset; /* in bytes */
 	__u32	len; /* in bytes */
 	__u8	data[0];
+};
+
+/**
+ * struct ethtool_modinfo - plugin module eeprom information
+ * @cmd: %ETHTOOL_GMODULEINFO
+ * @type: Standard the module information conforms to %ETH_MODULE_SFF_xxxx
+ * @eeprom_len: Length of the eeprom
+ *
+ * This structure is used to return the information to
+ * properly size memory for a subsequent call to %ETHTOOL_GMODULEEEPROM.
+ * The type code indicates the eeprom data format
+ */
+struct ethtool_modinfo {
+	__u32   cmd;
+	__u32   type;
+	__u32   eeprom_len;
+	__u32   reserved[8];
+};
+
+/**
+ * struct ethtool_eee - Energy Efficient Ethernet information
+ * @cmd: ETHTOOL_{G,S}EEE
+ * @supported: Mask of %SUPPORTED_* flags for the speed/duplex combinations
+ *	for which there is EEE support.
+ * @advertised: Mask of %ADVERTISED_* flags for the speed/duplex combinations
+ *	advertised as eee capable.
+ * @lp_advertised: Mask of %ADVERTISED_* flags for the speed/duplex
+ *	combinations advertised by the link partner as eee capable.
+ * @eee_active: Result of the eee auto negotiation.
+ * @eee_enabled: EEE configured mode (enabled/disabled).
+ * @tx_lpi_enabled: Whether the interface should assert its tx lpi, given
+ *	that eee was negotiated.
+ * @tx_lpi_timer: Time in microseconds the interface delays prior to asserting
+ *	its tx lpi (after reaching 'idle' state). Effective only when eee
+ *	was negotiated and tx_lpi_enabled was set.
+ */
+struct ethtool_eee {
+	__u32	cmd;
+	__u32	supported;
+	__u32	advertised;
+	__u32	lp_advertised;
+	__u32	eee_active;
+	__u32	eee_enabled;
+	__u32	tx_lpi_enabled;
+	__u32	tx_lpi_timer;
+	__u32	reserved[2];
 };
 
 /* for configuring coalescing parameters of chip */
@@ -217,6 +278,34 @@ struct ethtool_ringparam {
 	__u32	tx_pending;
 };
 
+/**
+ * struct ethtool_channels - configuring number of network channel
+ * @cmd: ETHTOOL_{G,S}CHANNELS
+ * @max_rx: Read only. Maximum number of receive channel the driver support.
+ * @max_tx: Read only. Maximum number of transmit channel the driver support.
+ * @max_other: Read only. Maximum number of other channel the driver support.
+ * @max_combined: Read only. Maximum number of combined channel the driver
+ *	support. Set of queues RX, TX or other.
+ * @rx_count: Valid values are in the range 1 to the max_rx.
+ * @tx_count: Valid values are in the range 1 to the max_tx.
+ * @other_count: Valid values are in the range 1 to the max_other.
+ * @combined_count: Valid values are in the range 1 to the max_combined.
+ *
+ * This can be used to configure RX, TX and other channels.
+ */
+
+struct ethtool_channels {
+	__u32	cmd;
+	__u32	max_rx;
+	__u32	max_tx;
+	__u32	max_other;
+	__u32	max_combined;
+	__u32	rx_count;
+	__u32	tx_count;
+	__u32	other_count;
+	__u32	combined_count;
+};
+
 /* for configuring link flow control parameters */
 struct ethtool_pauseparam {
 	__u32	cmd;	/* ETHTOOL_{G,S}PAUSEPARAM */
@@ -241,6 +330,9 @@ enum ethtool_stringset {
 	ETH_SS_TEST		= 0,
 	ETH_SS_STATS,
 	ETH_SS_PRIV_FLAGS,
+	ETH_SS_NTUPLE_FILTERS,
+	ETH_SS_FEATURES,
+	ETH_SS_RSS_HASH_FUNCS,
 };
 
 /* for passing string sets for data tagging */
@@ -251,9 +343,32 @@ struct ethtool_gstrings {
 	__u8	data[0];
 };
 
+struct ethtool_sset_info {
+	__u32	cmd;		/* ETHTOOL_GSSET_INFO */
+	__u32	reserved;
+	__u64	sset_mask;	/* input: each bit selects an sset to query */
+				/* output: each bit a returned sset */
+	__u32	data[0];	/* ETH_SS_xxx count, in order, based on bits
+				   in sset_mask.  One bit implies one
+				   __u32, two bits implies two
+				   __u32's, etc. */
+};
+
+/**
+ * enum ethtool_test_flags - flags definition of ethtool_test
+ * @ETH_TEST_FL_OFFLINE: if set perform online and offline tests, otherwise
+ *	only online tests.
+ * @ETH_TEST_FL_FAILED: Driver set this flag if test fails.
+ * @ETH_TEST_FL_EXTERNAL_LB: Application request to perform external loopback
+ *	test.
+ * @ETH_TEST_FL_EXTERNAL_LB_DONE: Driver performed the external loopback test
+ */
+
 enum ethtool_test_flags {
-	ETH_TEST_FL_OFFLINE	= (1 << 0),	/* online / offline */
-	ETH_TEST_FL_FAILED	= (1 << 1),	/* test passed / failed */
+	ETH_TEST_FL_OFFLINE	= (1 << 0),
+	ETH_TEST_FL_FAILED	= (1 << 1),
+	ETH_TEST_FL_EXTERNAL_LB	= (1 << 2),
+	ETH_TEST_FL_EXTERNAL_LB_DONE	= (1 << 3),
 };
 
 /* for requesting NIC test and getting results*/
@@ -288,7 +403,11 @@ struct ethtool_perm_addr {
  * flag differs from the read-only value.
  */
 enum ethtool_flags {
+	ETH_FLAG_TXVLAN		= (1 << 7),	/* TX VLAN offload enabled */
+	ETH_FLAG_RXVLAN		= (1 << 8),	/* RX VLAN offload enabled */
 	ETH_FLAG_LRO		= (1 << 15),	/* LRO is enabled */
+	ETH_FLAG_NTUPLE		= (1 << 27),	/* N-tuple filters enabled */
+	ETH_FLAG_RXHASH		= (1 << 28),
 };
 
 /* The following structures are for supporting RX network flow
@@ -311,20 +430,7 @@ struct ethtool_ah_espip4_spec {
 	__u8    tos;
 };
 
-struct ethtool_rawip4_spec {
-	__be32	ip4src;
-	__be32	ip4dst;
-	__u8	hdata[64];
-};
-
-struct ethtool_ether_spec {
-	__be16	ether_type;
-	__u8	frame_size;
-	__u8	eframe[16];
-};
-
 #define	ETH_RX_NFC_IP4	1
-#define	ETH_RX_NFC_IP6	2
 
 struct ethtool_usrip4_spec {
 	__be32	ip4src;
@@ -335,19 +441,71 @@ struct ethtool_usrip4_spec {
 	__u8    proto;
 };
 
+union ethtool_flow_union {
+	struct ethtool_tcpip4_spec		tcp_ip4_spec;
+	struct ethtool_tcpip4_spec		udp_ip4_spec;
+	struct ethtool_tcpip4_spec		sctp_ip4_spec;
+	struct ethtool_ah_espip4_spec		ah_ip4_spec;
+	struct ethtool_ah_espip4_spec		esp_ip4_spec;
+	struct ethtool_usrip4_spec		usr_ip4_spec;
+	struct ethhdr				ether_spec;
+	__u8					hdata[52];
+};
+
+struct ethtool_flow_ext {
+	__u8		padding[2];
+	unsigned char	h_dest[ETH_ALEN];	/* destination eth addr	*/
+	__be16		vlan_etype;
+	__be16		vlan_tci;
+	__be32		data[2];
+};
+
+struct ethtool_rawip4_spec {
+	__be32  ip4src;
+	__be32  ip4dst;
+	__u8    hdata[64];
+};
+
+struct ethtool_ether_spec {
+	__be16  ether_type;
+	__u8    frame_size;
+	__u8    eframe[16];
+};
+
+ /**
+  * struct ethtool_rx_flow_spec - specification for RX flow filter
+  * @flow_type: Type of match to perform, e.g. %TCP_V4_FLOW
+  * @h_u: Flow fields to match (dependent on @flow_type)
+ * @h_ext: Additional fields to match
+ * @m_u: Masks for flow field bits to be matched
+ * @m_ext: Masks for additional field bits to be matched
+ *	Note, all additional fields must be ignored unless @flow_type
+ *	includes the %FLOW_EXT flag.
+  * @ring_cookie: RX ring/queue index to deliver to, or %RX_CLS_FLOW_DISC
+  *	if packets should be discarded
+  * @location: Index of filter in hardware table
+  */
 struct ethtool_rx_flow_spec {
 	__u32		flow_type;
+#ifdef	__GENKSYMS__
 	union {
-		struct ethtool_tcpip4_spec		tcp_ip4_spec;
-		struct ethtool_tcpip4_spec		udp_ip4_spec;
-		struct ethtool_tcpip4_spec		sctp_ip4_spec;
-		struct ethtool_ah_espip4_spec		ah_ip4_spec;
-		struct ethtool_ah_espip4_spec		esp_ip4_spec;
-		struct ethtool_rawip4_spec		raw_ip4_spec;
-		struct ethtool_ether_spec		ether_spec;
-		struct ethtool_usrip4_spec		usr_ip4_spec;
-		__u8					hdata[64];
+		struct ethtool_tcpip4_spec	tcp_ip4_spec;
+		struct ethtool_tcpip4_spec	udp_ip4_spec;
+		struct ethtool_tcpip4_spec	sctp_ip4_spec;
+		struct ethtool_ah_espip4_spec	ah_ip4_spec;
+		struct ethtool_ah_espip4_spec	esp_ip4_spec;
+		struct ethtool_rawip4_spec	raw_ip4_spec;
+		struct ethtool_ether_spec	ether_spec;
+		struct ethtool_usrip4_spec	usr_ip4_spec;
+		__u8				hdata[64];
 	} h_u, m_u; /* entry, mask */
+
+#else
+	union ethtool_flow_union h_u;
+	struct ethtool_flow_ext h_ext;
+	union ethtool_flow_union m_u;
+	struct ethtool_flow_ext m_ext;
+#endif
 	__u64		ring_cookie;
 	__u32		location;
 };
@@ -374,12 +532,228 @@ struct ethtool_flash {
 	char	data[ETHTOOL_FLASH_MAX_FILENAME];
 };
 
+/**
+ * struct ethtool_rxfh_indir - command to get or set RX flow hash indirection
+ * @cmd: Specific command number - %ETHTOOL_GRXFHINDIR or %ETHTOOL_SRXFHINDIR
+ * @size: On entry, the array size of the user buffer, which may be zero.
+ *      On return from %ETHTOOL_GRXFHINDIR, the array size of the hardware
+ *      indirection table.
+ * @ring_index: RX ring/queue index for each hash value
+ *
+ * For %ETHTOOL_GRXFHINDIR, a @size of zero means that only the size
+ * should be returned.  For %ETHTOOL_SRXFHINDIR, a @size of zero means
+ * the table should be reset to default values.  This last feature
+ * is not supported by the original implementations.
+ */
+struct ethtool_rxfh_indir {
+	__u32	cmd;
+	__u32	size;
+	__u32	ring_index[0];
+};
+
+/**
+ * struct ethtool_rxfh - command to get/set RX flow hash indir or/and hash key.
+ * @cmd: Specific command number - %ETHTOOL_GRSSH or %ETHTOOL_SRSSH
+ * @rss_context: RSS context identifier.
+ * @indir_size: On entry, the array size of the user buffer for the
+ * 	indirection table, which may be zero, or (for %ETHTOOL_SRSSH),
+ * 	%ETH_RXFH_INDIR_NO_CHANGE.  On return from %ETHTOOL_GRSSH,
+ * 	the array size of the hardware indirection table.
+ * @key_size: On entry, the array size of the user buffer for the hash key,
+ * 	which may be zero.  On return from %ETHTOOL_GRSSH, the size of the
+ * @hfunc: Defines the current RSS hash function used by HW (or to be set to).
+ * 	Valid values are one of the %ETH_RSS_HASH_*.
+ * 	hardware hash key.
+ * @rsvd:	Reserved for future extensions.
+ * @rss_config: RX ring/queue index for each hash value i.e., indirection table
+ *	of @indir_size __u32 elements, followed by hash key of @key_size
+ *	bytes.
+ *
+ * For %ETHTOOL_GRSSH, a @indir_size and key_size of zero means that only the
+ * size should be returned.  For %ETHTOOL_SRSSH, an @indir_size of
+ * %ETH_RXFH_INDIR_NO_CHANGE means that indir table setting is not requested
+ * and a @indir_size of zero means the indir table should be reset to default
+ * values.
+ */
+struct ethtool_rxfh {
+	__u32   cmd;
+	__u32	rss_context;
+	__u32   indir_size;
+	__u32   key_size;
+	__u8	hfunc;
+	__u8	rsvd8[3];
+	__u32	rsvd32;
+	__u32   rss_config[0];
+};
+#define ETH_RXFH_INDIR_NO_CHANGE	0xffffffff
+
+/**
+ * struct ethtool_ts_info - holds a device's timestamping and PHC association
+ * @cmd: command number = %ETHTOOL_GET_TS_INFO
+ * @so_timestamping: bit mask of the sum of the supported SO_TIMESTAMPING flags
+ * @phc_index: device index of the associated PHC, or -1 if there is none
+ * @tx_types: bit mask of the supported hwtstamp_tx_types enumeration values
+ * @rx_filters: bit mask of the supported hwtstamp_rx_filters enumeration values
+ *
+ * The bits in the 'tx_types' and 'rx_filters' fields correspond to
+ * the 'hwtstamp_tx_types' and 'hwtstamp_rx_filters' enumeration values,
+ * respectively.  For example, if the device supports HWTSTAMP_TX_ON,
+ * then (1 << HWTSTAMP_TX_ON) in 'tx_types' will be set.
+ */
+struct ethtool_ts_info {
+	__u32	cmd;
+	__u32	so_timestamping;
+	__s32	phc_index;
+	__u32	tx_types;
+	__u32	tx_reserved[3];
+	__u32	rx_filters;
+	__u32	rx_reserved[3];
+};
+
+/* for returning and changing feature sets */
+
+/**
+ * struct ethtool_get_features_block - block with state of 32 features
+ * @available: mask of changeable features
+ * @requested: mask of features requested to be enabled if possible
+ * @active: mask of currently enabled features
+ * @never_changed: mask of features not changeable for any device
+ */
+struct ethtool_get_features_block {
+	__u32	available;
+	__u32	requested;
+	__u32	active;
+	__u32	never_changed;
+};
+
+/**
+ * struct ethtool_gfeatures - command to get state of device's features
+ * @cmd: command number = %ETHTOOL_GFEATURES
+ * @size: in: number of elements in the features[] array;
+ *       out: number of elements in features[] needed to hold all features
+ * @features: state of features
+ */
+struct ethtool_gfeatures {
+	__u32	cmd;
+	__u32	size;
+	struct ethtool_get_features_block features[0];
+};
+
+/**
+ * struct ethtool_set_features_block - block with request for 32 features
+ * @valid: mask of features to be changed
+ * @requested: values of features to be changed
+ */
+struct ethtool_set_features_block {
+	__u32	valid;
+	__u32	requested;
+};
+
+/**
+ * struct ethtool_sfeatures - command to request change in device's features
+ * @cmd: command number = %ETHTOOL_SFEATURES
+ * @size: array size of the features[] array
+ * @features: feature change masks
+ */
+struct ethtool_sfeatures {
+	__u32	cmd;
+	__u32	size;
+	struct ethtool_set_features_block features[0];
+};
+
+/*
+ * %ETHTOOL_SFEATURES changes features present in features[].valid to the
+ * values of corresponding bits in features[].requested. Bits in .requested
+ * not set in .valid or not changeable are ignored.
+ *
+ * Returns %EINVAL when .valid contains undefined or never-changable bits
+ * or size is not equal to required number of features words (32-bit blocks).
+ * Returns >= 0 if request was completed; bits set in the value mean:
+ *   %ETHTOOL_F_UNSUPPORTED - there were bits set in .valid that are not
+ *	changeable (not present in %ETHTOOL_GFEATURES' features[].available)
+ *	those bits were ignored.
+ *   %ETHTOOL_F_WISH - some or all changes requested were recorded but the
+ *      resulting state of bits masked by .valid is not equal to .requested.
+ *      Probably there are other device-specific constraints on some features
+ *      in the set. When %ETHTOOL_F_UNSUPPORTED is set, .valid is considered
+ *      here as though ignored bits were cleared.
+ *   %ETHTOOL_F_COMPAT - some or all changes requested were made by calling
+ *      compatibility functions. Requested offload state cannot be properly
+ *      managed by kernel.
+ *
+ * Meaning of bits in the masks are obtained by %ETHTOOL_GSSET_INFO (number of
+ * bits in the arrays - always multiple of 32) and %ETHTOOL_GSTRINGS commands
+ * for ETH_SS_FEATURES string set. First entry in the table corresponds to least
+ * significant bit in features[0] fields. Empty strings mark undefined features.
+ */
+enum ethtool_sfeatures_retval_bits {
+	ETHTOOL_F_UNSUPPORTED__BIT,
+	ETHTOOL_F_WISH__BIT,
+	ETHTOOL_F_COMPAT__BIT,
+};
+
+#define ETHTOOL_F_UNSUPPORTED   (1 << ETHTOOL_F_UNSUPPORTED__BIT)
+#define ETHTOOL_F_WISH          (1 << ETHTOOL_F_WISH__BIT)
+#define ETHTOOL_F_COMPAT        (1 << ETHTOOL_F_COMPAT__BIT)
+
 #ifdef __KERNEL__
+
+/**
+ * enum ethtool_phys_id_state - indicator state for physical identification
+ * @ETHTOOL_ID_INACTIVE: Physical ID indicator should be deactivated
+ * @ETHTOOL_ID_ACTIVE: Physical ID indicator should be activated
+ * @ETHTOOL_ID_ON: LED should be turned on (used iff %ETHTOOL_ID_ACTIVE
+ *	is not supported)
+ * @ETHTOOL_ID_OFF: LED should be turned off (used iff %ETHTOOL_ID_ACTIVE
+ *	is not supported)
+ */
+enum ethtool_phys_id_state {
+	ETHTOOL_ID_INACTIVE,
+	ETHTOOL_ID_ACTIVE,
+	ETHTOOL_ID_ON,
+	ETHTOOL_ID_OFF
+};
+
+enum {
+	ETH_RSS_HASH_TOP_BIT, /* Configurable RSS hash function - Toeplitz */
+	ETH_RSS_HASH_XOR_BIT, /* Configurable RSS hash function - Xor */
+
+	/*
+	 * Add your fresh new hash function bits above and remember to update
+	 * rss_hash_func_strings[] in ethtool.c
+	 */
+	ETH_RSS_HASH_FUNCS_COUNT
+};
+
+#define __ETH_RSS_HASH_BIT(bit)	((u32)1 << (bit))
+#define __ETH_RSS_HASH(name)	__ETH_RSS_HASH_BIT(ETH_RSS_HASH_##name##_BIT)
+
+#define ETH_RSS_HASH_TOP	__ETH_RSS_HASH(TOP)
+#define ETH_RSS_HASH_XOR	__ETH_RSS_HASH(XOR)
+
+#define ETH_RSS_HASH_UNKNOWN	0
+#define ETH_RSS_HASH_NO_CHANGE	0
+
+/* needed by dev_disable_lro() */
+extern int __ethtool_set_flags(struct net_device *dev, u32 flags);
 
 struct net_device;
 
+/**
+ * ethtool_rxfh_indir_default - get default value for RX flow hash indirection
+ * @index: Index in RX flow hash indirection table
+ * @n_rx_rings: Number of RX rings to use
+ *
+ * This function provides the default policy for RX flow hash indirection.
+ */
+static inline u32 ethtool_rxfh_indir_default(u32 index, u32 n_rx_rings)
+{
+	return index % n_rx_rings;
+}
+
 /* Some generic methods drivers may use in their ethtool_ops */
 u32 ethtool_op_get_link(struct net_device *dev);
+int ethtool_op_get_ts_info(struct net_device *dev, struct ethtool_ts_info *eti);
 u32 ethtool_op_get_rx_csum(struct net_device *dev);
 u32 ethtool_op_get_tx_csum(struct net_device *dev);
 int ethtool_op_set_tx_csum(struct net_device *dev, u32 data);
@@ -503,6 +877,106 @@ struct ethtool_ops {
 	int	(*set_rxnfc)(struct net_device *, struct ethtool_rxnfc *);
 	int     (*flash_device)(struct net_device *, struct ethtool_flash *);
 };
+
+/**
+ * struct ethtool_dump - used for retrieving, setting device dump
+ * @cmd: Command number - %ETHTOOL_GET_DUMP_FLAG, %ETHTOOL_GET_DUMP_DATA, or
+ * 	%ETHTOOL_SET_DUMP
+ * @version: FW version of the dump, filled in by driver
+ * @flag: driver dependent flag for dump setting, filled in by driver during
+ * 	  get and filled in by ethtool for set operation
+ * @len: length of dump data, used as the length of the user buffer on entry to
+ * 	 %ETHTOOL_GET_DUMP_DATA and this is returned as dump length by driver
+ * 	 for %ETHTOOL_GET_DUMP_FLAG command
+ * @data: data collected for get dump data operation
+ */
+struct ethtool_dump {
+	__u32	cmd;
+	__u32	version;
+	__u32	flag;
+	__u32	len;
+	__u8	data[0];
+};
+ 
+/**
+ * ethtool_ops_ext - structure used to extend ethtool_ops methods
+ * @size: This field should be initialized to the size of the structure 
+ *	  by the drivers.
+ * @get_rxfh_key_size: Get the size of the RX flow hash key.
+ *	Returns zero if not supported for this specific device.
+ * @get_rxfh_indir_size: Get the size of the RX flow hash indirection table.
+ *	Returns zero if not supported for this specific device.
+ * @get_rxfh: Get the contents of the RX flow hash indirection table, hash key
+ *	and/or hash function.
+ *	Returns a negative error code or zero.
+ * @set_rxfh: Set the contents of the RX flow hash indirection table, hash
+ *	key, and/or hash function.  Arguments which are set to %NULL or zero
+ *	will remain unchanged.
+ *	Returns a negative error code or zero. An error code must be returned
+ *	if at least one unsupported change was requested.
+ * @get_rxfh_indir: Get the contents of the RX flow hash indirection table.
+ *	Will not be called if @get_rxfh_indir_size returns zero.
+ * @set_rxfh_indir: Set the contents of the RX flow hash indirection table.
+ *	Will not be called if @get_rxfh_indir_size returns zero.
+ * @get_channels: Get number of channels.
+ * @set_channels: Set number of channels.  Returns a negative error code or
+ *	zero.
+ * @get_dump_flag: Get dump flag indicating current dump length, version,
+ *	and flag of the device.
+ * @get_dump_data: Get dump data.
+ * @set_dump: Set dump specific flags to the device.
+ * @get_module_info: Get the size and type of the eeprom contained within
+ *	a plug-in module.
+ * @get_module_eeprom: Get the eeprom information from the plug-in module
+ * @set_phys_id: Identify the physical devices, e.g. by flashing an LED
+ *	attached to it.  The implementation may update the indicator
+ *	asynchronously or synchronously, but in either case it must return
+ *	quickly.  It is initially called with the argument %ETHTOOL_ID_ACTIVE,
+ *	and must either activate asynchronous updates and return zero, return
+ *	a negative error or return a positive frequency for synchronous
+ *	indication (e.g. 1 for one on/off cycle per second).  If it returns
+ *	a frequency then it will be called again at intervals with the
+ *	argument %ETHTOOL_ID_ON or %ETHTOOL_ID_OFF and should set the state of
+ *	the indicator accordingly.  Finally, it is called with the argument
+ *	%ETHTOOL_ID_INACTIVE and must deactivate the indicator.  Returns a
+ *	negative error code or zero.
+ * @reset: Reset (part of) the device, as specified by a bitmask of
+ *	flags from &enum ethtool_reset_flags.  Returns a negative
+ *	error code or zero.
+ * @get_eee: Get Energy-Efficient (EEE) supported and status.
+ * @set_eee: Set EEE status (enable/disable) as well as LPI timers.
+ * @get_ts_info: Get the time stamping and PTP hardware clock capabilities.
+ *	Drivers supporting transmit time stamps in software should set this to
+ *	ethtool_op_get_ts_info().
+ */
+struct  ethtool_ops_ext {
+	size_t    size;
+
+	u32	(*get_rxfh_key_size)(struct net_device *);
+	u32	(*get_rxfh_indir_size)(struct net_device *);
+	int	(*get_rxfh)(struct net_device *, u32 *indir, u8 *key,
+			    u8 *hfunc);
+	int	(*set_rxfh)(struct net_device *, const u32 *indir,
+			    const u8 *key, const u8 hfunc);
+	int	(*get_rxfh_indir)(struct net_device *, u32 *);
+	int	(*set_rxfh_indir)(struct net_device *, const u32 *);
+	void	(*get_channels)(struct net_device *, struct ethtool_channels *);
+	int	(*set_channels)(struct net_device *, struct ethtool_channels *);
+	int	(*get_dump_flag)(struct net_device *, struct ethtool_dump *);
+	int	(*get_dump_data)(struct net_device *,
+				 struct ethtool_dump *, void *);
+	int	(*set_dump)(struct net_device *, struct ethtool_dump *);
+	int	(*get_module_info)(struct net_device *,
+				   struct ethtool_modinfo *);
+	int	(*get_module_eeprom)(struct net_device *,
+				     struct ethtool_eeprom *, u8 *);
+	int	(*set_phys_id)(struct net_device *, enum ethtool_phys_id_state);
+	int	(*reset)(struct net_device *, u32 *);
+	int	(*get_eee)(struct net_device *, struct ethtool_eee *);
+	int	(*set_eee)(struct net_device *, struct ethtool_eee *);
+	int	(*get_ts_info)(struct net_device *, struct ethtool_ts_info *);
+};
+
 #endif /* __KERNEL__ */
 
 /* CMDs currently supported */
@@ -515,7 +989,9 @@ struct ethtool_ops {
 #define ETHTOOL_GMSGLVL		0x00000007 /* Get driver message level */
 #define ETHTOOL_SMSGLVL		0x00000008 /* Set driver msg level. */
 #define ETHTOOL_NWAY_RST	0x00000009 /* Restart autonegotiation. */
-#define ETHTOOL_GLINK		0x0000000a /* Get link status (ethtool_value) */
+/* Get link status for host, i.e. whether the interface *and* the
+ * physical port (if there is one) are up (ethtool_value). */
+#define ETHTOOL_GLINK		0x0000000a
 #define ETHTOOL_GEEPROM		0x0000000b /* Get EEPROM data */
 #define ETHTOOL_SEEPROM		0x0000000c /* Set EEPROM data. */
 #define ETHTOOL_GCOALESCE	0x0000000e /* Get coalesce config */
@@ -559,6 +1035,27 @@ struct ethtool_ops {
 #define	ETHTOOL_SRXCLSRLDEL	0x00000031 /* Delete RX classification rule */
 #define	ETHTOOL_SRXCLSRLINS	0x00000032 /* Insert RX classification rule */
 #define	ETHTOOL_FLASHDEV	0x00000033 /* Flash firmware to device */
+#define	ETHTOOL_RESET		0x00000034 /* Reset hardware */
+
+#define ETHTOOL_GSSET_INFO	0x00000037 /* Get string set info */
+#define ETHTOOL_GRXFHINDIR	0x00000038 /* Get RX flow hash indir'n table */
+#define ETHTOOL_SRXFHINDIR	0x00000039 /* Set RX flow hash indir'n table */
+
+#define ETHTOOL_GFEATURES	0x0000003a /* Get device offload settings */
+#define ETHTOOL_SFEATURES	0x0000003b /* Change device offload settings */
+#define ETHTOOL_GCHANNELS	0x0000003c /* Get no of channels */
+#define ETHTOOL_SCHANNELS	0x0000003d /* Set no of channels */
+#define ETHTOOL_SET_DUMP	0x0000003e /* Set dump settings */
+#define ETHTOOL_GET_DUMP_FLAG	0x0000003f /* Get dump settings */
+#define ETHTOOL_GET_DUMP_DATA	0x00000040 /* Get dump data */
+#define ETHTOOL_GET_TS_INFO	0x00000041 /* Get time stamping and PHC info */
+#define ETHTOOL_GMODULEINFO	0x00000042 /* Get plug-in module information */
+#define ETHTOOL_GMODULEEEPROM	0x00000043 /* Get plug-in module eeprom */
+#define ETHTOOL_GEEE		0x00000044 /* Get EEE settings */
+#define ETHTOOL_SEEE		0x00000045 /* Set EEE settings */
+
+#define ETHTOOL_GRSSH		0x00000046 /* Get RX flow hash configuration */
+#define ETHTOOL_SRSSH		0x00000047 /* Set RX flow hash configuration */
 
 /* compatibility with older code */
 #define SPARC_ETH_GSET		ETHTOOL_GSET
@@ -586,6 +1083,16 @@ struct ethtool_ops {
 #define SUPPORTED_10000baseKX4_Full	(1 << 18)
 #define SUPPORTED_10000baseKR_Full	(1 << 19)
 #define SUPPORTED_10000baseR_FEC	(1 << 20)
+#define SUPPORTED_20000baseMLD2_Full	(1 << 21)
+#define SUPPORTED_20000baseKR2_Full	(1 << 22)
+#define SUPPORTED_40000baseKR4_Full	(1 << 23)
+#define SUPPORTED_40000baseCR4_Full	(1 << 24)
+#define SUPPORTED_40000baseSR4_Full	(1 << 25)
+#define SUPPORTED_40000baseLR4_Full	(1 << 26)
+#define SUPPORTED_56000baseKR4_Full	(1 << 27)
+#define SUPPORTED_56000baseCR4_Full	(1 << 28)
+#define SUPPORTED_56000baseSR4_Full	(1 << 29)
+#define SUPPORTED_56000baseLR4_Full	(1 << 30)
 
 /* Indicates what features are advertised by the interface. */
 #define ADVERTISED_10baseT_Half		(1 << 0)
@@ -609,6 +1116,16 @@ struct ethtool_ops {
 #define ADVERTISED_10000baseKX4_Full	(1 << 18)
 #define ADVERTISED_10000baseKR_Full	(1 << 19)
 #define ADVERTISED_10000baseR_FEC	(1 << 20)
+#define ADVERTISED_20000baseMLD2_Full	(1 << 21)
+#define ADVERTISED_20000baseKR2_Full	(1 << 22)
+#define ADVERTISED_40000baseKR4_Full	(1 << 23)
+#define ADVERTISED_40000baseCR4_Full	(1 << 24)
+#define ADVERTISED_40000baseSR4_Full	(1 << 25)
+#define ADVERTISED_40000baseLR4_Full	(1 << 26)
+#define ADVERTISED_56000baseKR4_Full	(1 << 27)
+#define ADVERTISED_56000baseCR4_Full	(1 << 28)
+#define ADVERTISED_56000baseSR4_Full	(1 << 29)
+#define ADVERTISED_56000baseLR4_Full	(1 << 30)
 
 /* The following are all involved in forcing a particular link
  * mode for the device for setting things.  When getting the
@@ -616,16 +1133,26 @@ struct ethtool_ops {
  * it was foced up into this mode or autonegotiated.
  */
 
-/* The forced speed, 10Mb, 100Mb, gigabit, 2.5Gb, 10GbE. */
+/* The forced speed, 10Mb, 100Mb, gigabit, [2.5|5|10|20|25|40|50|56|100]GbE. */
 #define SPEED_10		10
 #define SPEED_100		100
 #define SPEED_1000		1000
 #define SPEED_2500		2500
+#define SPEED_5000		5000
 #define SPEED_10000		10000
+#define SPEED_20000		20000
+#define SPEED_25000		25000
+#define SPEED_40000		40000
+#define SPEED_50000		50000
+#define SPEED_56000		56000
+#define SPEED_100000		100000
+
+#define SPEED_UNKNOWN		-1
 
 /* Duplex, half or full. */
 #define DUPLEX_HALF		0x00
 #define DUPLEX_FULL		0x01
+#define DUPLEX_UNKNOWN		0xff
 
 /* Which connector port. */
 #define PORT_TP			0x00
@@ -633,6 +1160,8 @@ struct ethtool_ops {
 #define PORT_MII		0x02
 #define PORT_FIBRE		0x03
 #define PORT_BNC		0x04
+#define PORT_DA			0x05
+#define PORT_NONE		0xef
 #define PORT_OTHER		0xff
 
 /* Which transceiver to use. */
@@ -648,10 +1177,13 @@ struct ethtool_ops {
 #define AUTONEG_DISABLE		0x00
 #define AUTONEG_ENABLE		0x01
 
-/* Mode MDI or MDI-X */
-#define ETH_TP_MDI_INVALID	0x00
-#define ETH_TP_MDI		0x01
-#define ETH_TP_MDI_X		0x02
+/* MDI or MDI-X status/control - if MDI/MDI_X/AUTO is set then
+ * the driver is required to renegotiate link
+ */
+#define ETH_TP_MDI_INVALID	0x00 /* status: unknown; control: unsupported */
+#define ETH_TP_MDI		0x01 /* status: MDI;     control: force MDI */
+#define ETH_TP_MDI_X		0x02 /* status: MDI-X;   control: force MDI-X */
+#define ETH_TP_MDI_AUTO		0x03 /*                  control: auto-select */
 
 /* Wake-On-Lan options. */
 #define WAKE_PHY		(1 << 0)
@@ -676,6 +1208,12 @@ struct ethtool_ops {
 #define	AH_V6_FLOW	0x0b
 #define	ESP_V6_FLOW	0x0c
 #define	IP_USER_FLOW	0x0d
+#define	IPV4_FLOW	0x10	/* hash only */
+#define	IPV6_FLOW	0x11	/* hash only */
+#define	ETHER_FLOW	0x12	/* spec only (ether_spec) */
+/* Flag to enable additional fields in struct ethtool_rx_flow_spec */
+#define	FLOW_EXT	0x80000000
+#define	FLOW_MAC_EXT	0x40000000
 
 /* L3-L4 network traffic flow hash options */
 #define	RXH_L2DA	(1 << 1)
@@ -688,5 +1226,45 @@ struct ethtool_ops {
 #define	RXH_DISCARD	(1 << 31)
 
 #define	RX_CLS_FLOW_DISC	0xffffffffffffffffULL
+
+/* Special RX classification rule insert location values */
+#define RX_CLS_LOC_SPECIAL	0x80000000	/* flag */
+#define RX_CLS_LOC_ANY		0xffffffff
+#define RX_CLS_LOC_FIRST	0xfffffffe
+#define RX_CLS_LOC_LAST	0xfffffffd
+
+/* EEPROM Standards for plug in modules */
+#define ETH_MODULE_SFF_8079		0x1
+#define ETH_MODULE_SFF_8079_LEN		256
+#define ETH_MODULE_SFF_8472		0x2
+#define ETH_MODULE_SFF_8472_LEN		512
+#define ETH_MODULE_SFF_8636		0x3
+#define ETH_MODULE_SFF_8636_LEN		256
+#define ETH_MODULE_SFF_8436		0x4
+#define ETH_MODULE_SFF_8436_LEN		256
+
+
+enum ethtool_reset_flags {
+	/* These flags represent components dedicated to the interface
+	 * the command is addressed to.  Shift any flag left by
+	 * ETH_RESET_SHARED_SHIFT to reset a shared component of the
+	 * same type.
+	 */
+	ETH_RESET_MGMT		= 1 << 0,	/* Management processor */
+	ETH_RESET_IRQ		= 1 << 1,	/* Interrupt requester */
+	ETH_RESET_DMA		= 1 << 2,	/* DMA engine */
+	ETH_RESET_FILTER	= 1 << 3,	/* Filtering/flow direction */
+	ETH_RESET_OFFLOAD	= 1 << 4,	/* Protocol offload */
+	ETH_RESET_MAC		= 1 << 5,	/* Media access controller */
+	ETH_RESET_PHY		= 1 << 6,	/* Transceiver/PHY */
+	ETH_RESET_RAM		= 1 << 7,	/* RAM shared between
+						 * multiple components */
+
+	ETH_RESET_DEDICATED	= 0x0000ffff,	/* All components dedicated to
+						 * this interface */
+	ETH_RESET_ALL		= 0xffffffff,	/* All components used by this
+						 * interface, even if shared */
+};
+#define ETH_RESET_SHARED_SHIFT	16
 
 #endif /* _LINUX_ETHTOOL_H */

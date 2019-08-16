@@ -112,6 +112,14 @@ u8 ACPI_INIT_GLOBAL(acpi_gbl_leave_wake_gpes_disabled, TRUE);
  */
 u8 ACPI_INIT_GLOBAL(acpi_gbl_use_default_register_widths, TRUE);
 
+/*
+ * Optionally truncate I/O addresses to 16 bits. Provides compatibility
+ * with other ACPI implementations. NOTE: During ACPICA initialization,
+ * this value is set to TRUE if any Windows OSI strings have been
+ * requested by the BIOS.
+ */
+u8 ACPI_INIT_GLOBAL(acpi_gbl_truncate_io_addresses, FALSE);
+
 /* acpi_gbl_FADT is a local copy of the FADT, converted to a common format. */
 
 struct acpi_table_fadt acpi_gbl_FADT;
@@ -200,10 +208,10 @@ ACPI_EXTERN u8 acpi_gbl_global_lock_present;
  * Spinlocks are used for interfaces that can be possibly called at
  * interrupt level
  */
-ACPI_EXTERN spinlock_t _acpi_gbl_gpe_lock;	/* For GPE data structs and registers */
-ACPI_EXTERN spinlock_t _acpi_gbl_hardware_lock;	/* For ACPI H/W except GPE registers */
-#define acpi_gbl_gpe_lock	&_acpi_gbl_gpe_lock
-#define acpi_gbl_hardware_lock	&_acpi_gbl_hardware_lock
+ACPI_EXTERN acpi_spinlock acpi_gbl_gpe_lock;	/* For GPE data structs and registers */
+ACPI_EXTERN acpi_spinlock acpi_gbl_hardware_lock;	/* For ACPI H/W except GPE registers */
+ACPI_EXTERN acpi_spinlock acpi_ev_global_lock_pending_lock; /* For global lock */
+ACPI_EXTERN acpi_spinlock acpi_gbl_reference_count_lock;
 
 /*****************************************************************************
  *
@@ -257,6 +265,8 @@ ACPI_EXTERN u8 acpi_gbl_acpi_hardware_present;
 ACPI_EXTERN u8 acpi_gbl_events_initialized;
 ACPI_EXTERN u8 acpi_gbl_system_awake_and_running;
 ACPI_EXTERN u8 acpi_gbl_osi_data;
+ACPI_EXTERN struct acpi_address_range
+    *acpi_gbl_address_range_list[ACPI_ADDRESS_RANGE_MAX];
 
 #ifndef DEFINE_ACPI_GLOBALS
 

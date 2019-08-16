@@ -96,6 +96,9 @@ enum {
 #define TCP_QUICKACK		12	/* Block/reenable quick acks */
 #define TCP_CONGESTION		13	/* Congestion control algorithm */
 #define TCP_MD5SIG		14	/* TCP MD5 Signature (RFC2385) */
+#define TCP_THIN_LINEAR_TIMEOUTS 16      /* Use linear timeouts for thin streams*/
+#define TCP_THIN_DUPACK         17      /* Fast retrans. after 1 dupack */
+#define TCP_USER_TIMEOUT	18	/* How long for loss retry before timeout */
 
 #define TCPI_OPT_TIMESTAMPS	1
 #define TCPI_OPT_SACK		2
@@ -157,6 +160,17 @@ struct tcp_info
 	__u32	tcpi_rcv_space;
 
 	__u32	tcpi_total_retrans;
+
+	/* the following two fields are here just to keep uapi consistent
+	 * with upstream; they are left zeroed
+	 */
+	__u64	rh_reserved_tcpi_pacing_rate;
+	__u64	rh_reserved_tcpi_max_pacing_rate;
+
+	__u64	tcpi_bytes_acked; /* RFC4898 tcpEStatsAppHCThruOctetsAcked */
+	__u64	tcpi_bytes_received; /* RFC4898 tcpEStatsAppHCThruOctetsReceived */
+	__u32	tcpi_segs_out;	     /* RFC4898 tcpEStatsPerfSegsOut */
+	__u32	tcpi_segs_in;	     /* RFC4898 tcpEStatsPerfSegsIn */
 };
 
 /* for TCP_MD5SIG socket option */
@@ -174,6 +188,7 @@ struct tcp_md5sig {
 
 #include <linux/skbuff.h>
 #include <linux/dmaengine.h>
+#include <linux/u64_stats_sync.h>
 #include <net/sock.h>
 #include <net/inet_connection_sock.h>
 #include <net/inet_timewait_sock.h>
@@ -237,6 +252,8 @@ struct tcp_request_sock {
 #endif
 	u32			 	rcv_isn;
 	u32			 	snt_isn;
+	u32				snt_synack; /* synack sent time */
+	u32				last_oow_ack_time; /* last SYNACK */
 };
 
 static inline struct tcp_request_sock *tcp_rsk(const struct request_sock *req)
@@ -406,6 +423,42 @@ struct tcp_sock {
 /* TCP MD5 Signature Option information */
 	struct tcp_md5sig_info	*md5sig_info;
 #endif
+
+#ifndef __GENKSYMS__
+	u8	thin_lto    : 1,/* Use linear timeouts for thin streams */
+		thin_dupack : 1,/* Fast retransmit on first dupack      */
+		unused      : 6;
+
+	u32	prior_cwnd;	/* Congestion window at start of Recovery. */
+	u32	prr_delivered;	/* Number of newly delivered packets to
+				 * receiver in Recovery. */
+	u32	prr_out;	/* Total number of pkts sent during Recovery. */
+	struct list_head tsq_node; /* anchor in tsq_tasklet.head list */
+	unsigned long	tsq_flags;
+
+	struct u64_stats_sync syncp; /* protects 64bit vars (cf tcp_get_info()) */
+	u64	tcpi_acked;	/* RFC4898 tcpEStatsAppHCThruOctetsAcked
+				 * sum(delta(snd_una)), or how many bytes
+				 * were acked.
+				 */
+	u64	bytes_received;	/* RFC4898 tcpEStatsAppHCThruOctetsReceived
+				 * sum(delta(rcv_nxt)), or how many bytes
+				 * were acked.
+				 */
+	u32	segs_in;	/* RFC4898 tcpEStatsPerfSegsIn
+				 * total number of segments in.
+				 */
+	u32	segs_out;	/* RFC4898 tcpEStatsPerfSegsOut
+				 * The total number of segments sent.
+				 */
+	u32	last_oow_ack_time;  /* timestamp of last out-of-window ACK */
+#endif
+};
+
+enum tsq_flags {
+	TSQ_THROTTLED,
+	TSQ_QUEUED,
+	TSQ_OWNED, /* tcp_tasklet_func() found socket was locked */
 };
 
 static inline struct tcp_sock *tcp_sk(const struct sock *sk)
@@ -419,6 +472,10 @@ struct tcp_timewait_sock {
 	u32			  tw_snd_nxt;
 	u32			  tw_rcv_wnd;
 	u32			  tw_ts_recent;
+
+	/* The time we sent the last out-of-window ACK: */
+	u32			  tw_last_oow_ack_time;
+
 	long			  tw_ts_recent_stamp;
 #ifdef CONFIG_TCP_MD5SIG
 	u16			  tw_md5_keylen;

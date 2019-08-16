@@ -29,8 +29,8 @@
 #include "viosrp.h"
 
 #define IBMVFC_NAME	"ibmvfc"
-#define IBMVFC_DRIVER_VERSION		"1.0.6"
-#define IBMVFC_DRIVER_DATE		"(May 28, 2009)"
+#define IBMVFC_DRIVER_VERSION		"1.0.9"
+#define IBMVFC_DRIVER_DATE		"(August 5, 2010)"
 
 #define IBMVFC_DEFAULT_TIMEOUT	60
 #define IBMVFC_ADISC_CANCEL_TIMEOUT	45
@@ -38,6 +38,8 @@
 #define IBMVFC_ADISC_PLUS_CANCEL_TIMEOUT	\
 		(IBMVFC_ADISC_TIMEOUT + IBMVFC_ADISC_CANCEL_TIMEOUT)
 #define IBMVFC_INIT_TIMEOUT		120
+#define IBMVFC_ABORT_TIMEOUT		8
+#define IBMVFC_ABORT_WAIT_TIMEOUT	40
 #define IBMVFC_MAX_REQUESTS_DEFAULT	100
 
 #define IBMVFC_DEBUG			0
@@ -58,9 +60,10 @@
  * 1 for ERP
  * 1 for initialization
  * 1 for NPIV Logout
+ * 2 for BSG passthru
  * 2 for each discovery thread
  */
-#define IBMVFC_NUM_INTERNAL_REQ	(1 + 1 + 1 + (disc_threads * 2))
+#define IBMVFC_NUM_INTERNAL_REQ	(1 + 1 + 1 + 2 + (disc_threads * 2))
 
 #define IBMVFC_MAD_SUCCESS		0x00
 #define IBMVFC_MAD_NOT_SUPPORTED	0xF1
@@ -205,10 +208,10 @@ struct ibmvfc_npiv_login_resp {
 	u16 error;
 	u32 flags;
 #define IBMVFC_NATIVE_FC		0x01
-#define IBMVFC_CAN_FLUSH_ON_HALT	0x08
 	u32 reserved;
 	u64 capabilities;
 #define IBMVFC_CAN_FLUSH_ON_HALT	0x08
+#define IBMVFC_CAN_SUPPRESS_ABTS	0x10
 	u32 max_cmds;
 	u32 scsi_id_sz;
 	u64 max_dma_len;
@@ -348,6 +351,7 @@ struct ibmvfc_tmf {
 #define IBMVFC_TMF_LUN_RESET		0x10
 #define IBMVFC_TMF_TGT_RESET		0x20
 #define IBMVFC_TMF_LUA_VALID		0x40
+#define IBMVFC_TMF_SUPPRESS_ABTS	0x80
 	u32 cancel_key;
 	u32 my_cancel_key;
 	u32 pad;
@@ -466,7 +470,10 @@ struct ibmvfc_passthru_iu {
 	u16 error;
 	u32 flags;
 #define IBMVFC_FC_ELS		0x01
+#define IBMVFC_FC_CT_IU		0x02
 	u32 cancel_key;
+#define IBMVFC_PASSTHRU_CANCEL_KEY	0x80000000
+#define IBMVFC_INTERNAL_CANCEL_KEY	0x80000001
 	u32 reserved;
 	struct srp_direct_buf cmd;
 	struct srp_direct_buf rsp;
@@ -535,6 +542,12 @@ enum ibmvfc_async_event {
 	IBMVFC_AE_ADAPTER_FAILED	= 0x1000,
 };
 
+struct ibmvfc_async_desc {
+	const char *desc;
+	enum ibmvfc_async_event ae;
+	int log_level;
+};
+
 struct ibmvfc_crq {
 	volatile u8 valid;
 	volatile u8 format;
@@ -592,6 +605,7 @@ enum ibmvfc_target_action {
 	IBMVFC_TGT_ACTION_INIT,
 	IBMVFC_TGT_ACTION_INIT_WAIT,
 	IBMVFC_TGT_ACTION_DEL_RPORT,
+	IBMVFC_TGT_ACTION_DELETED_RPORT,
 };
 
 struct ibmvfc_target {
@@ -644,6 +658,8 @@ struct ibmvfc_event_pool {
 
 enum ibmvfc_host_action {
 	IBMVFC_HOST_ACTION_NONE = 0,
+	IBMVFC_HOST_ACTION_RESET,
+	IBMVFC_HOST_ACTION_REENABLE,
 	IBMVFC_HOST_ACTION_LOGO,
 	IBMVFC_HOST_ACTION_LOGO_WAIT,
 	IBMVFC_HOST_ACTION_INIT,
@@ -693,6 +709,7 @@ struct ibmvfc_host {
 	int disc_buf_sz;
 	int log_level;
 	struct ibmvfc_discover_targets_buf *disc_buf;
+	struct mutex passthru_mutex;
 	int task_set;
 	int init_retries;
 	int discovery_threads;
@@ -702,6 +719,7 @@ struct ibmvfc_host {
 	int delay_init;
 	int scan_complete;
 	int logged_in;
+	int aborting_passthru;
 	int events_to_log;
 #define IBMVFC_AE_LINKUP	0x0001
 #define IBMVFC_AE_LINKDOWN	0x0002

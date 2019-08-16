@@ -225,7 +225,7 @@ static void __init smp_read_mpc_oem(struct mpc_table *mpc)
 
 	mpc_record = 0;
 	printk(KERN_INFO
-		"Found an OEM MPC table at %8p - parsing it ... \n", oemtable);
+		"Found an OEM MPC table at %8p - parsing it...\n", oemtable);
 
 	if (memcmp(oemtable->signature, MPC_OEM_SIGNATURE, 4)) {
 		printk(KERN_WARNING
@@ -547,6 +547,7 @@ struct apic __refdata apic_numaq = {
 
 	.read				= native_apic_mem_read,
 	.write				= native_apic_mem_write,
+	.eoi_write			= native_apic_mem_write,
 	.icr_read			= native_apic_icr_read,
 	.icr_write			= native_apic_icr_write,
 	.wait_icr_idle			= native_apic_wait_icr_idle,

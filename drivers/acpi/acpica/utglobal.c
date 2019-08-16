@@ -744,6 +744,12 @@ acpi_status acpi_ut_init_globals(void)
 		return_ACPI_STATUS(status);
 	}
 
+	/* Address Range lists */
+
+	for (i = 0; i < ACPI_ADDRESS_RANGE_MAX; i++) {
+		acpi_gbl_address_range_list[i] = NULL;
+	}
+
 	/* Mutex locked flags */
 
 	for (i = 0; i < ACPI_NUM_MUTEX; i++) {
@@ -812,10 +818,10 @@ acpi_status acpi_ut_init_globals(void)
 	acpi_gbl_root_node_struct.name.integer = ACPI_ROOT_NAME;
 	acpi_gbl_root_node_struct.descriptor_type = ACPI_DESC_TYPE_NAMED;
 	acpi_gbl_root_node_struct.type = ACPI_TYPE_DEVICE;
+	acpi_gbl_root_node_struct.parent = NULL;
 	acpi_gbl_root_node_struct.child = NULL;
 	acpi_gbl_root_node_struct.peer = NULL;
 	acpi_gbl_root_node_struct.object = NULL;
-	acpi_gbl_root_node_struct.flags = ANOBJ_END_OF_PEER_LIST;
 
 #ifdef ACPI_DEBUG_OUTPUT
 	acpi_gbl_lowest_stack_pointer = ACPI_CAST_PTR(acpi_size, ACPI_SIZE_MAX);

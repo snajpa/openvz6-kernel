@@ -158,12 +158,16 @@ static int ipmi_release(struct inode *inode, struct file *file)
 {
 	struct ipmi_file_private *priv = file->private_data;
 	int                      rv;
+	struct  ipmi_recv_msg *msg, *next;
 
 	rv = ipmi_destroy_user(priv->user);
 	if (rv)
 		return rv;
 
-	/* FIXME - free the messages in the list. */
+	list_for_each_entry_safe(msg, next, &priv->recv_msgs, link)
+		ipmi_free_recv_msg(msg);
+
+
 	kfree(priv);
 
 	return 0;
@@ -899,7 +903,7 @@ static struct ipmi_smi_watcher smi_watcher =
 	.smi_gone = ipmi_smi_gone,
 };
 
-static __init int init_ipmi_devintf(void)
+static int __init init_ipmi_devintf(void)
 {
 	int rv;
 
@@ -937,7 +941,7 @@ static __init int init_ipmi_devintf(void)
 }
 module_init(init_ipmi_devintf);
 
-static __exit void cleanup_ipmi(void)
+static void __exit cleanup_ipmi(void)
 {
 	struct ipmi_reg_list *entry, *entry2;
 	mutex_lock(&reg_list_mutex);
@@ -956,4 +960,3 @@ module_exit(cleanup_ipmi);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Corey Minyard <minyard@mvista.com>");
 MODULE_DESCRIPTION("Linux device interface for the IPMI message handler.");
-MODULE_ALIAS("platform:ipmi_si");

@@ -19,6 +19,7 @@
 #include <asm/bootparam.h>
 #include <asm/elf.h>
 #include <asm/suspend.h>
+#include <asm/spec_ctrl.h>
 
 #include <xen/interface/xen.h>
 
@@ -93,9 +94,15 @@ void foo(void)
 	OFFSET(pbe_orig_address, pbe, orig_address);
 	OFFSET(pbe_next, pbe, next);
 
-	/* Offset from the sysenter stack to tss.sp0 */
-	DEFINE(TSS_sysenter_sp0, offsetof(struct tss_struct, x86_tss.sp0) -
-		 sizeof(struct tss_struct));
+	/* Offset from the sysenter stack to task stack (tss.sp1) */
+	DEFINE(TSS_entry_stack, offsetof(struct tss_struct, x86_tss.sp1) -
+	       offsetofend(struct tss_struct, stack));
+
+	/* Offsets for the tss_struct */
+	OFFSET(TSS_stack, tss_struct, stack);
+	OFFSET(TSS_kernel_stack, tss_struct, x86_tss.sp1);
+	DEFINE(TSS_stack_size, sizeof(((struct tss_struct *)0)->stack));
+	DEFINE(PTREGS_SIZE, sizeof(struct pt_regs));
 
 	DEFINE(PAGE_SIZE_asm, PAGE_SIZE);
 	DEFINE(PAGE_SHIFT_asm, PAGE_SHIFT);
@@ -148,4 +155,10 @@ void foo(void)
 	OFFSET(BP_hardware_subarch, boot_params, hdr.hardware_subarch);
 	OFFSET(BP_version, boot_params, hdr.version);
 	OFFSET(BP_kernel_alignment, boot_params, hdr.kernel_alignment);
+
+	/* Kernel IBRS speculation control structure */
+	OFFSET(KERNEL_IBRS_SPEC_CTRL_enabled, kernel_ibrs_spec_ctrl, enabled);
+	OFFSET(KERNEL_IBRS_SPEC_CTRL_entry, kernel_ibrs_spec_ctrl, entry);
+	OFFSET(KERNEL_IBRS_SPEC_CTRL_exit, kernel_ibrs_spec_ctrl, exit);
+	OFFSET(KERNEL_IBRS_SPEC_CTRL_hi32, kernel_ibrs_spec_ctrl, hi32);
 }

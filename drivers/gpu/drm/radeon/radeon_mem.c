@@ -27,11 +27,12 @@
  *
  * Authors:
  *    Keith Whitwell <keith@tungstengraphics.com>
+ *
+ * ------------------------ This file is DEPRECATED! -------------------------
  */
 
-#include "drmP.h"
-#include "drm.h"
-#include "radeon_drm.h"
+#include <drm/drmP.h>
+#include <drm/radeon_drm.h>
 #include "radeon_drv.h"
 
 /* Very simple allocator for GART memory, working on a static range
@@ -139,7 +140,7 @@ static int init_heap(struct mem_block **heap, int start, int size)
 	if (!blocks)
 		return -ENOMEM;
 
-	*heap = kmalloc(sizeof(**heap), GFP_KERNEL);
+	*heap = kzalloc(sizeof(**heap), GFP_KERNEL);
 	if (!*heap) {
 		kfree(blocks);
 		return -ENOMEM;
@@ -150,7 +151,6 @@ static int init_heap(struct mem_block **heap, int start, int size)
 	blocks->file_priv = NULL;
 	blocks->next = blocks->prev = *heap;
 
-	memset(*heap, 0, sizeof(**heap));
 	(*heap)->file_priv = (struct drm_file *) - 1;
 	(*heap)->next = (*heap)->prev = blocks;
 	return 0;
@@ -243,7 +243,7 @@ int radeon_mem_alloc(struct drm_device *dev, void *data, struct drm_file *file_p
 	if (!block)
 		return -ENOMEM;
 
-	if (DRM_COPY_TO_USER(alloc->region_offset, &block->start,
+	if (copy_to_user(alloc->region_offset, &block->start,
 			     sizeof(int))) {
 		DRM_ERROR("copy_to_user\n");
 		return -EFAULT;

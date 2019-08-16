@@ -5,7 +5,8 @@
  * based on the old aacraid driver that is..
  * Adaptec aacraid device driver for Linux.
  *
- * Copyright (c) 2000-2007 Adaptec, Inc. (aacraid@adaptec.com)
+ * Copyright (c) 2011 PMC-Sierra, Inc. (aacraid@pmc-sierra.com)
+ *		  2000-2010 Adaptec, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -130,9 +131,13 @@ struct inquiry_data {
  *              M O D U L E   G L O B A L S
  */
 
-static unsigned long aac_build_sg(struct scsi_cmnd* scsicmd, struct sgmap* sgmap);
-static unsigned long aac_build_sg64(struct scsi_cmnd* scsicmd, struct sgmap64* psg);
-static unsigned long aac_build_sgraw(struct scsi_cmnd* scsicmd, struct sgmapraw* psg);
+static long aac_build_sg(struct scsi_cmnd *scsicmd, struct sgmap *sgmap);
+static long aac_build_sg64(struct scsi_cmnd *scsicmd, struct sgmap64 *psg);
+static long aac_build_sgraw(struct scsi_cmnd *scsicmd, struct sgmapraw *psg);
+static long aac_build_sgraw2(struct scsi_cmnd *scsicmd,
+				struct aac_raw_io2 *rio2, int sg_max);
+static int aac_convert_sgraw2(struct aac_raw_io2 *rio2,
+				int pages, int nseg, int nseg_new);
 static int aac_send_srb_fib(struct scsi_cmnd* scsicmd);
 #ifdef AAC_DETAILED_STATUS_INFO
 static char *aac_get_status_string(u32 status);
@@ -149,7 +154,15 @@ int aac_msi;
 int aac_commit = -1;
 int startup_timeout = 180;
 int aif_timeout = 120;
+int aac_sync_mode;  /* Only Sync. transfer - disabled */
+int aac_convert_sgl = 1;	/* convert non-conformable s/g list - enabled */
 
+module_param(aac_sync_mode, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(aac_sync_mode, "Force sync. transfer mode"
+	" 0=off, 1=on");
+module_param(aac_convert_sgl, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(aac_convert_sgl, "Convert non-conformable s/g list"
+	" 0=off, 1=on");
 module_param(nondasd, int, S_IRUGO|S_IWUSR);
 MODULE_PARM_DESC(nondasd, "Control scanning of hba for nondasd devices."
 	" 0=off, 1=on");
@@ -293,7 +306,9 @@ int aac_get_config_status(struct aac_dev *dev, int commit_flag)
 			status = -EINVAL;
 		}
 	}
-	aac_fib_complete(fibptr);
+	/* Do not set XferState to zero unless receives a response from F/W */
+	if (status >= 0)
+		aac_fib_complete(fibptr);
 	/* Send a CT_COMMIT_CONFIG to enable discovery of devices */
 	if (status >= 0) {
 		if ((aac_commit == 1) || commit_flag) {
@@ -310,14 +325,29 @@ int aac_get_config_status(struct aac_dev *dev, int commit_flag)
 				    FsaNormal,
 				    1, 1,
 				    NULL, NULL);
-			aac_fib_complete(fibptr);
+			/* Do not set XferState to zero unless
+			 * receives a response from F/W */
+			if (status >= 0)
+				aac_fib_complete(fibptr);
 		} else if (aac_commit == 0) {
 			printk(KERN_WARNING
 			  "aac_get_config_status: Foreign device configurations are being ignored\n");
 		}
 	}
-	aac_fib_free(fibptr);
+	/* FIB should be freed only after getting the response from the F/W */
+	if (status != -ERESTARTSYS)
+		aac_fib_free(fibptr);
 	return status;
+}
+
+static void aac_expose_phy_device(struct scsi_cmnd *scsicmd)
+{
+	char inq_data;
+	scsi_sg_copy_to_buffer(scsicmd,  &inq_data, sizeof(inq_data));
+	if ((inq_data & 0x20) && (inq_data & 0x1f) == TYPE_DISK) {
+		inq_data &= 0xdf;
+		scsi_sg_copy_from_buffer(scsicmd, &inq_data, sizeof(inq_data));
+	}
 }
 
 /**
@@ -355,7 +385,9 @@ int aac_get_containers(struct aac_dev *dev)
 		maximum_num_containers = le32_to_cpu(dresp->ContainerSwitchEntries);
 		aac_fib_complete(fibptr);
 	}
-	aac_fib_free(fibptr);
+	/* FIB should be freed only after getting the response from the F/W */
+	if (status != -ERESTARTSYS)
+		aac_fib_free(fibptr);
 
 	if (maximum_num_containers < MAXIMUM_NUM_CONTAINERS)
 		maximum_num_containers = MAXIMUM_NUM_CONTAINERS;
@@ -937,25 +969,50 @@ static void io_callback(void *context, struct fib * fibptr);
 
 static int aac_read_raw_io(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, u32 count)
 {
-	u16 fibsize;
-	struct aac_raw_io *readcmd;
-	aac_fib_init(fib);
-	readcmd = (struct aac_raw_io *) fib_data(fib);
-	readcmd->block[0] = cpu_to_le32((u32)(lba&0xffffffff));
-	readcmd->block[1] = cpu_to_le32((u32)((lba&0xffffffff00000000LL)>>32));
-	readcmd->count = cpu_to_le32(count<<9);
-	readcmd->cid = cpu_to_le16(scmd_id(cmd));
-	readcmd->flags = cpu_to_le16(IO_TYPE_READ);
-	readcmd->bpTotal = 0;
-	readcmd->bpComplete = 0;
+	struct aac_dev *dev = fib->dev;
+	u16 fibsize, command;
+	long ret;
 
-	aac_build_sgraw(cmd, &readcmd->sg);
-	fibsize = sizeof(struct aac_raw_io) + ((le32_to_cpu(readcmd->sg.count) - 1) * sizeof (struct sgentryraw));
+	aac_fib_init(fib);
+	if (dev->comm_interface == AAC_COMM_MESSAGE_TYPE2 && !dev->sync_mode) {
+		struct aac_raw_io2 *readcmd2;
+		readcmd2 = (struct aac_raw_io2 *) fib_data(fib);
+		memset(readcmd2, 0, sizeof(struct aac_raw_io2));
+		readcmd2->blockLow = cpu_to_le32((u32)(lba&0xffffffff));
+		readcmd2->blockHigh = cpu_to_le32((u32)((lba&0xffffffff00000000LL)>>32));
+		readcmd2->byteCount = cpu_to_le32(count<<9);
+		readcmd2->cid = cpu_to_le16(scmd_id(cmd));
+		readcmd2->flags = cpu_to_le16(RIO2_IO_TYPE_READ);
+		ret = aac_build_sgraw2(cmd, readcmd2,
+				dev->scsi_host_ptr->sg_tablesize);
+		if (ret < 0)
+			return ret;
+		command = ContainerRawIo2;
+		fibsize = sizeof(struct aac_raw_io2) +
+			((le32_to_cpu(readcmd2->sgeCnt)-1) * sizeof(struct sge_ieee1212));
+	} else {
+		struct aac_raw_io *readcmd;
+		readcmd = (struct aac_raw_io *) fib_data(fib);
+		readcmd->block[0] = cpu_to_le32((u32)(lba&0xffffffff));
+		readcmd->block[1] = cpu_to_le32((u32)((lba&0xffffffff00000000LL)>>32));
+		readcmd->count = cpu_to_le32(count<<9);
+		readcmd->cid = cpu_to_le16(scmd_id(cmd));
+		readcmd->flags = cpu_to_le16(RIO_TYPE_READ);
+		readcmd->bpTotal = 0;
+		readcmd->bpComplete = 0;
+		ret = aac_build_sgraw(cmd, &readcmd->sg);
+		if (ret < 0)
+			return ret;
+		command = ContainerRawIo;
+		fibsize = sizeof(struct aac_raw_io) +
+			((le32_to_cpu(readcmd->sg.count)-1) * sizeof(struct sgentryraw));
+	}
+
 	BUG_ON(fibsize > (fib->dev->max_fib_size - sizeof(struct aac_fibhdr)));
 	/*
 	 *	Now send the Fib to the adapter
 	 */
-	return aac_fib_send(ContainerRawIo,
+	return aac_fib_send(command,
 			  fib,
 			  fibsize,
 			  FsaNormal,
@@ -968,6 +1025,8 @@ static int aac_read_block64(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, u
 {
 	u16 fibsize;
 	struct aac_read64 *readcmd;
+	long ret;
+
 	aac_fib_init(fib);
 	readcmd = (struct aac_read64 *) fib_data(fib);
 	readcmd->command = cpu_to_le32(VM_CtHostRead64);
@@ -977,7 +1036,9 @@ static int aac_read_block64(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, u
 	readcmd->pad   = 0;
 	readcmd->flags = 0;
 
-	aac_build_sg64(cmd, &readcmd->sg);
+	ret = aac_build_sg64(cmd, &readcmd->sg);
+	if (ret < 0)
+		return ret;
 	fibsize = sizeof(struct aac_read64) +
 		((le32_to_cpu(readcmd->sg.count) - 1) *
 		 sizeof (struct sgentry64));
@@ -999,6 +1060,8 @@ static int aac_read_block(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, u32
 {
 	u16 fibsize;
 	struct aac_read *readcmd;
+	long ret;
+
 	aac_fib_init(fib);
 	readcmd = (struct aac_read *) fib_data(fib);
 	readcmd->command = cpu_to_le32(VM_CtBlockRead);
@@ -1006,7 +1069,9 @@ static int aac_read_block(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, u32
 	readcmd->block = cpu_to_le32((u32)(lba&0xffffffff));
 	readcmd->count = cpu_to_le32(count * 512);
 
-	aac_build_sg(cmd, &readcmd->sg);
+	ret = aac_build_sg(cmd, &readcmd->sg);
+	if (ret < 0)
+		return ret;
 	fibsize = sizeof(struct aac_read) +
 			((le32_to_cpu(readcmd->sg.count) - 1) *
 			 sizeof (struct sgentry));
@@ -1026,28 +1091,56 @@ static int aac_read_block(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, u32
 
 static int aac_write_raw_io(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, u32 count, int fua)
 {
-	u16 fibsize;
-	struct aac_raw_io *writecmd;
-	aac_fib_init(fib);
-	writecmd = (struct aac_raw_io *) fib_data(fib);
-	writecmd->block[0] = cpu_to_le32((u32)(lba&0xffffffff));
-	writecmd->block[1] = cpu_to_le32((u32)((lba&0xffffffff00000000LL)>>32));
-	writecmd->count = cpu_to_le32(count<<9);
-	writecmd->cid = cpu_to_le16(scmd_id(cmd));
-	writecmd->flags = (fua && ((aac_cache & 5) != 1) &&
-	  (((aac_cache & 5) != 5) || !fib->dev->cache_protected)) ?
-		cpu_to_le16(IO_TYPE_WRITE|IO_SUREWRITE) :
-		cpu_to_le16(IO_TYPE_WRITE);
-	writecmd->bpTotal = 0;
-	writecmd->bpComplete = 0;
+	struct aac_dev *dev = fib->dev;
+	u16 fibsize, command;
+	long ret;
 
-	aac_build_sgraw(cmd, &writecmd->sg);
-	fibsize = sizeof(struct aac_raw_io) + ((le32_to_cpu(writecmd->sg.count) - 1) * sizeof (struct sgentryraw));
+	aac_fib_init(fib);
+	if (dev->comm_interface == AAC_COMM_MESSAGE_TYPE2 && !dev->sync_mode) {
+		struct aac_raw_io2 *writecmd2;
+		writecmd2 = (struct aac_raw_io2 *) fib_data(fib);
+		memset(writecmd2, 0, sizeof(struct aac_raw_io2));
+		writecmd2->blockLow = cpu_to_le32((u32)(lba&0xffffffff));
+		writecmd2->blockHigh = cpu_to_le32((u32)((lba&0xffffffff00000000LL)>>32));
+		writecmd2->byteCount = cpu_to_le32(count<<9);
+		writecmd2->cid = cpu_to_le16(scmd_id(cmd));
+		writecmd2->flags = (fua && ((aac_cache & 5) != 1) &&
+						   (((aac_cache & 5) != 5) || !fib->dev->cache_protected)) ?
+			cpu_to_le16(RIO2_IO_TYPE_WRITE|RIO2_IO_SUREWRITE) :
+			cpu_to_le16(RIO2_IO_TYPE_WRITE);
+		ret = aac_build_sgraw2(cmd, writecmd2,
+				dev->scsi_host_ptr->sg_tablesize);
+		if (ret < 0)
+			return ret;
+		command = ContainerRawIo2;
+		fibsize = sizeof(struct aac_raw_io2) +
+			((le32_to_cpu(writecmd2->sgeCnt)-1) * sizeof(struct sge_ieee1212));
+	} else {
+		struct aac_raw_io *writecmd;
+		writecmd = (struct aac_raw_io *) fib_data(fib);
+		writecmd->block[0] = cpu_to_le32((u32)(lba&0xffffffff));
+		writecmd->block[1] = cpu_to_le32((u32)((lba&0xffffffff00000000LL)>>32));
+		writecmd->count = cpu_to_le32(count<<9);
+		writecmd->cid = cpu_to_le16(scmd_id(cmd));
+		writecmd->flags = (fua && ((aac_cache & 5) != 1) &&
+						   (((aac_cache & 5) != 5) || !fib->dev->cache_protected)) ?
+			cpu_to_le16(RIO_TYPE_WRITE|RIO_SUREWRITE) :
+			cpu_to_le16(RIO_TYPE_WRITE);
+		writecmd->bpTotal = 0;
+		writecmd->bpComplete = 0;
+		ret = aac_build_sgraw(cmd, &writecmd->sg);
+		if (ret < 0)
+			return ret;
+		command = ContainerRawIo;
+		fibsize = sizeof(struct aac_raw_io) +
+			((le32_to_cpu(writecmd->sg.count)-1) * sizeof (struct sgentryraw));
+	}
+
 	BUG_ON(fibsize > (fib->dev->max_fib_size - sizeof(struct aac_fibhdr)));
 	/*
 	 *	Now send the Fib to the adapter
 	 */
-	return aac_fib_send(ContainerRawIo,
+	return aac_fib_send(command,
 			  fib,
 			  fibsize,
 			  FsaNormal,
@@ -1060,6 +1153,8 @@ static int aac_write_block64(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, 
 {
 	u16 fibsize;
 	struct aac_write64 *writecmd;
+	long ret;
+
 	aac_fib_init(fib);
 	writecmd = (struct aac_write64 *) fib_data(fib);
 	writecmd->command = cpu_to_le32(VM_CtHostWrite64);
@@ -1069,7 +1164,9 @@ static int aac_write_block64(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, 
 	writecmd->pad	= 0;
 	writecmd->flags	= 0;
 
-	aac_build_sg64(cmd, &writecmd->sg);
+	ret = aac_build_sg64(cmd, &writecmd->sg);
+	if (ret < 0)
+		return ret;
 	fibsize = sizeof(struct aac_write64) +
 		((le32_to_cpu(writecmd->sg.count) - 1) *
 		 sizeof (struct sgentry64));
@@ -1091,6 +1188,8 @@ static int aac_write_block(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, u3
 {
 	u16 fibsize;
 	struct aac_write *writecmd;
+	long ret;
+
 	aac_fib_init(fib);
 	writecmd = (struct aac_write *) fib_data(fib);
 	writecmd->command = cpu_to_le32(VM_CtBlockWrite);
@@ -1100,7 +1199,9 @@ static int aac_write_block(struct fib * fib, struct scsi_cmnd * cmd, u64 lba, u3
 	writecmd->sg.count = cpu_to_le32(1);
 	/* ->stable is not used - it did mean which type of write */
 
-	aac_build_sg(cmd, &writecmd->sg);
+	ret = aac_build_sg(cmd, &writecmd->sg);
+	if (ret < 0)
+		return ret;
 	fibsize = sizeof(struct aac_write) +
 		((le32_to_cpu(writecmd->sg.count) - 1) *
 		 sizeof (struct sgentry));
@@ -1162,8 +1263,11 @@ static int aac_scsi_64(struct fib * fib, struct scsi_cmnd * cmd)
 {
 	u16 fibsize;
 	struct aac_srb * srbcmd = aac_scsi_common(fib, cmd);
+	long ret;
 
-	aac_build_sg64(cmd, (struct sgmap64*) &srbcmd->sg);
+	ret = aac_build_sg64(cmd, (struct sgmap64 *) &srbcmd->sg);
+	if (ret < 0)
+		return ret;
 	srbcmd->count = cpu_to_le32(scsi_bufflen(cmd));
 
 	memset(srbcmd->cdb, 0, sizeof(srbcmd->cdb));
@@ -1190,8 +1294,11 @@ static int aac_scsi_32(struct fib * fib, struct scsi_cmnd * cmd)
 {
 	u16 fibsize;
 	struct aac_srb * srbcmd = aac_scsi_common(fib, cmd);
+	long ret;
 
-	aac_build_sg(cmd, (struct sgmap*)&srbcmd->sg);
+	ret = aac_build_sg(cmd, (struct sgmap *)&srbcmd->sg);
+	if (ret < 0)
+		return ret;
 	srbcmd->count = cpu_to_le32(scsi_bufflen(cmd));
 
 	memset(srbcmd->cdb, 0, sizeof(srbcmd->cdb));
@@ -1245,8 +1352,12 @@ int aac_get_adapter_info(struct aac_dev* dev)
 			 NULL);
 
 	if (rcode < 0) {
-		aac_fib_complete(fibptr);
-		aac_fib_free(fibptr);
+		/* FIB should be freed only after
+		 * getting the response from the F/W */
+		if (rcode != -ERESTARTSYS) {
+			aac_fib_complete(fibptr);
+			aac_fib_free(fibptr);
+		}
 		return rcode;
 	}
 	memcpy(&dev->adapter_info, info, sizeof(*info));
@@ -1270,6 +1381,11 @@ int aac_get_adapter_info(struct aac_dev* dev)
 
 		if (rcode >= 0)
 			memcpy(&dev->supplement_adapter_info, sinfo, sizeof(*sinfo));
+		if (rcode == -ERESTARTSYS) {
+			fibptr = aac_fib_alloc(dev);
+			if (!fibptr)
+				return -ENOMEM;
+		}
 	}
 
 
@@ -1456,7 +1572,7 @@ int aac_get_adapter_info(struct aac_dev* dev)
 			dev->a_ops.adapter_write = aac_write_block;
 		}
 		dev->scsi_host_ptr->max_sectors = AAC_MAX_32BIT_SGBCOUNT;
-		if(!(dev->adapter_info.options & AAC_OPT_NEW_COMM)) {
+		if (!(dev->adapter_info.options & AAC_OPT_NEW_COMM)) {
 			/*
 			 * Worst case size that could cause sg overflow when
 			 * we break up SG elements that are larger than 64KB.
@@ -1470,9 +1586,11 @@ int aac_get_adapter_info(struct aac_dev* dev)
 			  (dev->scsi_host_ptr->sg_tablesize * 8) + 112;
 		}
 	}
-
-	aac_fib_complete(fibptr);
-	aac_fib_free(fibptr);
+	/* FIB should be freed only after getting the response from the F/W */
+	if (rcode != -ERESTARTSYS) {
+		aac_fib_complete(fibptr);
+		aac_fib_free(fibptr);
+	}
 
 	return rcode;
 }
@@ -1576,6 +1694,7 @@ static int aac_read(struct scsi_cmnd * scsicmd)
 	int status;
 	struct aac_dev *dev;
 	struct fib * cmd_fibcontext;
+	int cid;
 
 	dev = (struct aac_dev *)scsicmd->device->host->hostdata;
 	/*
@@ -1625,6 +1744,22 @@ static int aac_read(struct scsi_cmnd * scsicmd)
 		count = (scsicmd->cmnd[7] << 8) | scsicmd->cmnd[8];
 		break;
 	}
+
+	if ((lba + count) > (dev->fsa_dev[scmd_id(scsicmd)].size)) {
+		cid = scmd_id(scsicmd);
+		dprintk((KERN_DEBUG "aacraid: Illegal lba\n"));
+		scsicmd->result = DID_OK << 16 | COMMAND_COMPLETE << 8 |
+			SAM_STAT_CHECK_CONDITION;
+		set_sense(&dev->fsa_dev[cid].sense_data,
+			  HARDWARE_ERROR, SENCODE_INTERNAL_TARGET_FAILURE,
+			  ASENCODE_INTERNAL_TARGET_FAILURE, 0, 0);
+		memcpy(scsicmd->sense_buffer, &dev->fsa_dev[cid].sense_data,
+		       min_t(size_t, sizeof(dev->fsa_dev[cid].sense_data),
+			     SCSI_SENSE_BUFFERSIZE));
+		scsicmd->scsi_done(scsicmd);
+		return 1;
+	}
+
 	dprintk((KERN_DEBUG "aac_read[cpu %d]: lba = %llu, t = %ld.\n",
 	  smp_processor_id(), (unsigned long long)lba, jiffies));
 	if (aac_adapter_bounds(dev,scsicmd,lba))
@@ -1633,6 +1768,7 @@ static int aac_read(struct scsi_cmnd * scsicmd)
 	 *	Alocate and initialize a Fib
 	 */
 	if (!(cmd_fibcontext = aac_fib_alloc(dev))) {
+		printk(KERN_WARNING "aac_read: fib allocation failed\n");
 		return -1;
 	}
 
@@ -1665,6 +1801,7 @@ static int aac_write(struct scsi_cmnd * scsicmd)
 	int status;
 	struct aac_dev *dev;
 	struct fib * cmd_fibcontext;
+	int cid;
 
 	dev = (struct aac_dev *)scsicmd->device->host->hostdata;
 	/*
@@ -1704,6 +1841,22 @@ static int aac_write(struct scsi_cmnd * scsicmd)
 		count = (scsicmd->cmnd[7] << 8) | scsicmd->cmnd[8];
 		fua = scsicmd->cmnd[1] & 0x8;
 	}
+
+	if ((lba + count) > (dev->fsa_dev[scmd_id(scsicmd)].size)) {
+		cid = scmd_id(scsicmd);
+		dprintk((KERN_DEBUG "aacraid: Illegal lba\n"));
+		scsicmd->result = DID_OK << 16 | COMMAND_COMPLETE << 8 |
+			SAM_STAT_CHECK_CONDITION;
+		set_sense(&dev->fsa_dev[cid].sense_data,
+			  HARDWARE_ERROR, SENCODE_INTERNAL_TARGET_FAILURE,
+			  ASENCODE_INTERNAL_TARGET_FAILURE, 0, 0);
+		memcpy(scsicmd->sense_buffer, &dev->fsa_dev[cid].sense_data,
+		       min_t(size_t, sizeof(dev->fsa_dev[cid].sense_data),
+			     SCSI_SENSE_BUFFERSIZE));
+		scsicmd->scsi_done(scsicmd);
+		return 1;
+	}
+
 	dprintk((KERN_DEBUG "aac_write[cpu %d]: lba = %llu, t = %ld.\n",
 	  smp_processor_id(), (unsigned long long)lba, jiffies));
 	if (aac_adapter_bounds(dev,scsicmd,lba))
@@ -1712,9 +1865,14 @@ static int aac_write(struct scsi_cmnd * scsicmd)
 	 *	Allocate and initialize a Fib then setup a BlockWrite command
 	 */
 	if (!(cmd_fibcontext = aac_fib_alloc(dev))) {
-		scsicmd->result = DID_ERROR << 16;
-		scsicmd->scsi_done(scsicmd);
-		return 0;
+		/* FIB temporarily unavailable,not catastrophic failure */
+
+		/* scsicmd->result = DID_ERROR << 16;
+		 * scsicmd->scsi_done(scsicmd);
+		 * return 0;
+		 */
+		printk(KERN_WARNING "aac_write: fib allocation failed\n");
+		return -1;
 	}
 
 	status = aac_adapter_write(cmd_fibcontext, scsicmd, lba, count, fua);
@@ -2536,14 +2694,25 @@ static void aac_srb_callback(void *context, struct fib * fibptr)
 	srbreply = (struct aac_srb_reply *) fib_data(fibptr);
 
 	scsicmd->sense_buffer[0] = '\0';  /* Initialize sense valid flag to false */
-	/*
-	 *	Calculate resid for sg
-	 */
 
-	scsi_set_resid(scsicmd, scsi_bufflen(scsicmd)
-		       - le32_to_cpu(srbreply->data_xfer_length));
+	if (fibptr->flags & FIB_CONTEXT_FLAG_FASTRESP) {
+		/* fast response */
+		srbreply->srb_status = cpu_to_le32(SRB_STATUS_SUCCESS);
+		srbreply->scsi_status = cpu_to_le32(SAM_STAT_GOOD);
+	} else {
+		/*
+		 *	Calculate resid for sg
+		 */
+		scsi_set_resid(scsicmd, scsi_bufflen(scsicmd)
+				   - le32_to_cpu(srbreply->data_xfer_length));
+	}
 
 	scsi_dma_unmap(scsicmd);
+
+	/* expose physical device if expose_physicald flag is on */
+	if (scsicmd->cmnd[0] == INQUIRY && !(scsicmd->cmnd[1] & 0x01)
+	  && expose_physicals > 0)
+		aac_expose_phy_device(scsicmd);
 
 	/*
 	 * First check the fib status
@@ -2650,8 +2819,22 @@ static void aac_srb_callback(void *context, struct fib * fibptr)
 			scsicmd->cmnd[0],
 			le32_to_cpu(srbreply->scsi_status));
 #endif
-		scsicmd->result = DID_ERROR << 16 | COMMAND_COMPLETE << 8;
-		break;
+		if ((scsicmd->cmnd[0] == ATA_12)
+		  || (scsicmd->cmnd[0] == ATA_16)) {
+			if (scsicmd->cmnd[2] & (0x01 << 5)) {
+				scsicmd->result = DID_OK << 16
+						| COMMAND_COMPLETE << 8;
+				break;
+			} else {
+				scsicmd->result = DID_ERROR << 16
+						| COMMAND_COMPLETE << 8;
+				break;
+			}
+		} else {
+			scsicmd->result = DID_ERROR << 16
+					| COMMAND_COMPLETE << 8;
+			break;
+		}
 	}
 	if (le32_to_cpu(srbreply->scsi_status) == SAM_STAT_CHECK_CONDITION) {
 		int len;
@@ -2720,7 +2903,7 @@ static int aac_send_srb_fib(struct scsi_cmnd* scsicmd)
 	return -1;
 }
 
-static unsigned long aac_build_sg(struct scsi_cmnd* scsicmd, struct sgmap* psg)
+static long aac_build_sg(struct scsi_cmnd *scsicmd, struct sgmap *psg)
 {
 	struct aac_dev *dev;
 	unsigned long byte_count = 0;
@@ -2733,7 +2916,8 @@ static unsigned long aac_build_sg(struct scsi_cmnd* scsicmd, struct sgmap* psg)
 	psg->sg[0].count = 0;
 
 	nseg = scsi_dma_map(scsicmd);
-	BUG_ON(nseg < 0);
+	if (nseg < 0)
+		return nseg;
 	if (nseg) {
 		struct scatterlist *sg;
 		int i;
@@ -2762,7 +2946,7 @@ static unsigned long aac_build_sg(struct scsi_cmnd* scsicmd, struct sgmap* psg)
 }
 
 
-static unsigned long aac_build_sg64(struct scsi_cmnd* scsicmd, struct sgmap64* psg)
+static long aac_build_sg64(struct scsi_cmnd *scsicmd, struct sgmap64 *psg)
 {
 	struct aac_dev *dev;
 	unsigned long byte_count = 0;
@@ -2777,7 +2961,8 @@ static unsigned long aac_build_sg64(struct scsi_cmnd* scsicmd, struct sgmap64* p
 	psg->sg[0].count = 0;
 
 	nseg = scsi_dma_map(scsicmd);
-	BUG_ON(nseg < 0);
+	if (nseg < 0)
+		return nseg;
 	if (nseg) {
 		struct scatterlist *sg;
 		int i;
@@ -2807,7 +2992,7 @@ static unsigned long aac_build_sg64(struct scsi_cmnd* scsicmd, struct sgmap64* p
 	return byte_count;
 }
 
-static unsigned long aac_build_sgraw(struct scsi_cmnd* scsicmd, struct sgmapraw* psg)
+static long aac_build_sgraw(struct scsi_cmnd *scsicmd, struct sgmapraw *psg)
 {
 	unsigned long byte_count = 0;
 	int nseg;
@@ -2822,7 +3007,8 @@ static unsigned long aac_build_sgraw(struct scsi_cmnd* scsicmd, struct sgmapraw*
 	psg->sg[0].flags = 0;
 
 	nseg = scsi_dma_map(scsicmd);
-	BUG_ON(nseg < 0);
+	if (nseg < 0)
+		return nseg;
 	if (nseg) {
 		struct scatterlist *sg;
 		int i;
@@ -2853,6 +3039,120 @@ static unsigned long aac_build_sgraw(struct scsi_cmnd* scsicmd, struct sgmapraw*
 		}
 	}
 	return byte_count;
+}
+
+static long aac_build_sgraw2(struct scsi_cmnd *scsicmd,
+				struct aac_raw_io2 *rio2, int sg_max)
+{
+	unsigned long byte_count = 0;
+	int nseg;
+
+	nseg = scsi_dma_map(scsicmd);
+	if (nseg < 0)
+		return nseg;
+	if (nseg) {
+		struct scatterlist *sg;
+		int i, conformable = 0;
+		u32 min_size = PAGE_SIZE, cur_size;
+
+		scsi_for_each_sg(scsicmd, sg, nseg, i) {
+			int count = sg_dma_len(sg);
+			u64 addr = sg_dma_address(sg);
+
+			BUG_ON(i >= sg_max);
+			rio2->sge[i].addrHigh = cpu_to_le32((u32)(addr>>32));
+			rio2->sge[i].addrLow = cpu_to_le32((u32)(addr & 0xffffffff));
+			cur_size = cpu_to_le32(count);
+			rio2->sge[i].length = cur_size;
+			rio2->sge[i].flags = 0;
+			if (i == 0) {
+				conformable = 1;
+				rio2->sgeFirstSize = cur_size;
+			} else if (i == 1) {
+				rio2->sgeNominalSize = cur_size;
+				min_size = cur_size;
+			} else if ((i+1) < nseg && cur_size != rio2->sgeNominalSize) {
+				conformable = 0;
+				if (cur_size < min_size)
+					min_size = cur_size;
+			}
+			byte_count += count;
+		}
+
+		/* hba wants the size to be exact */
+		if (byte_count > scsi_bufflen(scsicmd)) {
+			u32 temp = le32_to_cpu(rio2->sge[i-1].length) -
+				(byte_count - scsi_bufflen(scsicmd));
+			rio2->sge[i-1].length = cpu_to_le32(temp);
+			byte_count = scsi_bufflen(scsicmd);
+		}
+
+		rio2->sgeCnt = cpu_to_le32(nseg);
+		rio2->flags |= cpu_to_le16(RIO2_SG_FORMAT_IEEE1212);
+		/* not conformable: evaluate required sg elements */
+		if (!conformable) {
+			int j, nseg_new = nseg, err_found;
+			for (i = min_size / PAGE_SIZE; i >= 1; --i) {
+				err_found = 0;
+				nseg_new = 2;
+				for (j = 1; j < nseg - 1; ++j) {
+					if (rio2->sge[j].length % (i*PAGE_SIZE)) {
+						err_found = 1;
+						break;
+					}
+					nseg_new += (rio2->sge[j].length / (i*PAGE_SIZE));
+				}
+				if (!err_found)
+					break;
+			}
+			if (i > 0 && nseg_new <= sg_max)
+				aac_convert_sgraw2(rio2, i, nseg, nseg_new);
+		} else
+			rio2->flags |= cpu_to_le16(RIO2_SGL_CONFORMANT);
+
+		/* Check for command underflow */
+		if (scsicmd->underflow && (byte_count < scsicmd->underflow)) {
+			printk(KERN_WARNING"aacraid: cmd len %08lX cmd underflow %08X\n",
+					byte_count, scsicmd->underflow);
+		}
+	}
+
+	return byte_count;
+}
+
+static int aac_convert_sgraw2(struct aac_raw_io2 *rio2, int pages, int nseg, int nseg_new)
+{
+	struct sge_ieee1212 *sge;
+	int i, j, pos;
+	u32 addr_low;
+
+	if (aac_convert_sgl == 0)
+		return 0;
+
+	sge = kmalloc(nseg_new * sizeof(struct sge_ieee1212), GFP_ATOMIC);
+	if (sge == NULL)
+		return -1;
+
+	for (i = 1, pos = 1; i < nseg-1; ++i) {
+		for (j = 0; j < rio2->sge[i].length / (pages * PAGE_SIZE); ++j) {
+			addr_low = rio2->sge[i].addrLow + j * pages * PAGE_SIZE;
+			sge[pos].addrLow = addr_low;
+			sge[pos].addrHigh = rio2->sge[i].addrHigh;
+			if (addr_low < rio2->sge[i].addrLow)
+				sge[pos].addrHigh++;
+			sge[pos].length = pages * PAGE_SIZE;
+			sge[pos].flags = 0;
+			pos++;
+		}
+	}
+	sge[pos] = rio2->sge[nseg-1];
+	memcpy(&rio2->sge[1], &sge[1], (nseg_new-1)*sizeof(struct sge_ieee1212));
+
+	kfree(sge);
+	rio2->sgeCnt = cpu_to_le32(nseg_new);
+	rio2->flags |= cpu_to_le16(RIO2_SGL_CONFORMANT);
+	rio2->sgeNominalSize = pages * PAGE_SIZE;
+	return 0;
 }
 
 #ifdef AAC_DETAILED_STATUS_INFO

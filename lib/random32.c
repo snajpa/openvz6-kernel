@@ -39,13 +39,16 @@
 #include <linux/jiffies.h>
 #include <linux/random.h>
 
-struct rnd_state {
-	u32 s1, s2, s3;
-};
-
 static DEFINE_PER_CPU(struct rnd_state, net_rand_state);
 
-static u32 __random32(struct rnd_state *state)
+/**
+ *	prandom32 - seeded pseudo-random number generator.
+ *	@state: pointer to state structure holding seeded state.
+ *
+ *	This is used for pseudo-randomness with no outside seeding.
+ *	For more random results, use random32().
+ */
+u32 prandom32(struct rnd_state *state)
 {
 #define TAUSWORTHE(s,a,b,c,d) ((s&c)<<d) ^ (((s <<a) ^ s)>>b)
 
@@ -55,14 +58,7 @@ static u32 __random32(struct rnd_state *state)
 
 	return (state->s1 ^ state->s2 ^ state->s3);
 }
-
-/*
- * Handle minimum values for seeds
- */
-static inline u32 __seed(u32 x, u32 m)
-{
-	return (x < m) ? x + m : x;
-}
+EXPORT_SYMBOL(prandom32);
 
 /**
  *	random32 - pseudo random number generator
@@ -75,11 +71,60 @@ u32 random32(void)
 {
 	unsigned long r;
 	struct rnd_state *state = &get_cpu_var(net_rand_state);
-	r = __random32(state);
+	r = prandom32(state);
 	put_cpu_var(state);
 	return r;
 }
 EXPORT_SYMBOL(random32);
+
+/*
+ *	prandom_bytes_state - get the requested number of pseudo-random bytes
+ *
+ *	@state: pointer to state structure holding seeded state.
+ *	@buf: where to copy the pseudo-random bytes to
+ *	@bytes: the requested number of bytes
+ *
+ *	This is used for pseudo-randomness with no outside seeding.
+ *	For more random results, use prandom_bytes().
+ */
+void prandom_bytes_state(struct rnd_state *state, void *buf, int bytes)
+{
+	unsigned char *p = buf;
+	int i;
+
+	for (i = 0; i < round_down(bytes, sizeof(u32)); i += sizeof(u32)) {
+		u32 random = prandom32(state);
+		int j;
+
+		for (j = 0; j < sizeof(u32); j++) {
+			p[i + j] = random;
+			random >>= BITS_PER_BYTE;
+		}
+	}
+	if (i < bytes) {
+		u32 random = prandom32(state);
+
+		for (; i < bytes; i++) {
+			p[i] = random;
+			random >>= BITS_PER_BYTE;
+		}
+	}
+}
+EXPORT_SYMBOL(prandom_bytes_state);
+
+/**
+ *	prandom_bytes - get the requested number of pseudo-random bytes
+ *	@buf: where to copy the pseudo-random bytes to
+ *	@bytes: the requested number of bytes
+ */
+void prandom_bytes(void *buf, int bytes)
+{
+	struct rnd_state *state = &get_cpu_var(net_rand_state);
+
+	prandom_bytes_state(state, buf, bytes);
+	put_cpu_var(state);
+}
+EXPORT_SYMBOL(prandom_bytes);
 
 /**
  *	srandom32 - add entropy to pseudo random number generator
@@ -118,12 +163,12 @@ static int __init random32_init(void)
 		state->s3 = __seed(LCG(state->s2), 15);
 
 		/* "warm it up" */
-		__random32(state);
-		__random32(state);
-		__random32(state);
-		__random32(state);
-		__random32(state);
-		__random32(state);
+		prandom32(state);
+		prandom32(state);
+		prandom32(state);
+		prandom32(state);
+		prandom32(state);
+		prandom32(state);
 	}
 	return 0;
 }
@@ -147,7 +192,7 @@ static int __init random32_reseed(void)
 		state->s3 = __seed(seeds[2], 15);
 
 		/* mix it in */
-		__random32(state);
+		prandom32(state);
 	}
 	return 0;
 }

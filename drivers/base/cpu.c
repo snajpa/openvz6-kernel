@@ -35,6 +35,7 @@ static ssize_t __ref store_online(struct sys_device *dev, struct sysdev_attribut
 	struct cpu *cpu = container_of(dev, struct cpu, sysdev);
 	ssize_t ret;
 
+	cpu_hotplug_driver_lock();
 	switch (buf[0]) {
 	case '0':
 		ret = cpu_down(cpu->sysdev.id);
@@ -49,6 +50,7 @@ static ssize_t __ref store_online(struct sys_device *dev, struct sysdev_attribut
 	default:
 		ret = -EINVAL;
 	}
+	cpu_hotplug_driver_unlock();
 
 	if (ret >= 0)
 		ret = count;
@@ -72,6 +74,38 @@ void unregister_cpu(struct cpu *cpu)
 	per_cpu(cpu_sys_devices, logical_cpu) = NULL;
 	return;
 }
+
+#ifdef CONFIG_ARCH_CPU_PROBE_RELEASE
+static ssize_t cpu_probe_store(struct class *class, const char *buf,
+			       size_t count)
+{
+	return arch_cpu_probe(buf, count);
+}
+
+static ssize_t cpu_release_store(struct class *class, const char *buf,
+				 size_t count)
+{
+	return arch_cpu_release(buf, count);
+}
+
+static CLASS_ATTR(probe, S_IWUSR, NULL, cpu_probe_store);
+static CLASS_ATTR(release, S_IWUSR, NULL, cpu_release_store);
+
+int __init cpu_probe_release_init(void)
+{
+	int rc;
+
+	rc = sysfs_create_file(&cpu_sysdev_class.kset.kobj,
+			       &class_attr_probe.attr);
+	if (!rc)
+		rc = sysfs_create_file(&cpu_sysdev_class.kset.kobj,
+				       &class_attr_release.attr);
+
+	return rc;
+}
+device_initcall(cpu_probe_release_init);
+#endif /* CONFIG_ARCH_CPU_PROBE_RELEASE */
+
 #else /* ... !CONFIG_HOTPLUG_CPU */
 static inline void register_cpu_control(struct cpu *cpu)
 {
@@ -97,7 +131,7 @@ static ssize_t show_crash_notes(struct sys_device *dev, struct sysdev_attribute 
 	 * boot up and this data does not change there after. Hence this
 	 * operation should be safe. No locking required.
 	 */
-	addr = __pa(per_cpu_ptr(crash_notes, cpunum));
+	addr = per_cpu_ptr_to_phys(per_cpu_ptr(crash_notes, cpunum));
 	rc = sprintf(buf, "%Lx\n", addr);
 	return rc;
 }
@@ -208,7 +242,9 @@ int __cpuinit register_cpu(struct cpu *cpu, int num)
 	cpu->sysdev.id = num;
 	cpu->sysdev.cls = &cpu_sysdev_class;
 
-	error = sysdev_register(&cpu->sysdev);
+	sysdev_initialize(&cpu->sysdev);
+	cpu->sysdev.kobj.uevent_suppress = 1;
+	error = sysdev_add(&cpu->sysdev);
 
 	if (!error && cpu->hotpluggable)
 		register_cpu_control(cpu);
@@ -221,6 +257,11 @@ int __cpuinit register_cpu(struct cpu *cpu, int num)
 	if (!error)
 		error = sysdev_create_file(&cpu->sysdev, &attr_crash_notes);
 #endif
+
+	cpu->sysdev.kobj.uevent_suppress = 0;
+	if (!error)
+		kobject_uevent(&cpu->sysdev.kobj, KOBJ_ADD);
+
 	return error;
 }
 
@@ -232,6 +273,61 @@ struct sys_device *get_cpu_sysdev(unsigned cpu)
 		return NULL;
 }
 EXPORT_SYMBOL_GPL(get_cpu_sysdev);
+
+#ifdef CONFIG_GENERIC_CPU_VULNERABILITIES
+
+ssize_t __weak cpu_show_meltdown(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "Not affected\n");
+}
+
+ssize_t __weak cpu_show_spectre_v1(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "Not affected\n");
+}
+
+ssize_t __weak cpu_show_spectre_v2(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "Not affected\n");
+}
+
+ssize_t __weak cpu_show_spec_store_bypass(struct device *dev,
+					  struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "Not affected\n");
+}
+
+static DEVICE_ATTR(meltdown, 0400, cpu_show_meltdown, NULL);
+static DEVICE_ATTR(spectre_v1, 0400, cpu_show_spectre_v1, NULL);
+static DEVICE_ATTR(spectre_v2, 0400, cpu_show_spectre_v2, NULL);
+static DEVICE_ATTR(spec_store_bypass, 0400, cpu_show_spec_store_bypass, NULL);
+
+static struct attribute *cpu_root_vulnerabilities_attrs[] = {
+	&dev_attr_meltdown.attr,
+	&dev_attr_spectre_v1.attr,
+	&dev_attr_spectre_v2.attr,
+	&dev_attr_spec_store_bypass.attr,
+	NULL
+};
+
+static const struct attribute_group cpu_root_vulnerabilities_group = {
+	.name  = "vulnerabilities",
+	.attrs = cpu_root_vulnerabilities_attrs,
+};
+
+static void __init cpu_register_vulnerabilities(void)
+{
+	if (sysfs_create_group(&cpu_sysdev_class.kset.kobj,
+			       &cpu_root_vulnerabilities_group))
+		pr_err("Unable to register CPU vulnerabilities\n");
+}
+
+#else
+static inline void cpu_register_vulnerabilities(void) { }
+#endif
 
 int __init cpu_dev_init(void)
 {
@@ -245,6 +341,9 @@ int __init cpu_dev_init(void)
 	if (!err)
 		err = sched_create_sysfs_power_savings_entries(&cpu_sysdev_class);
 #endif
+
+	if (!err)
+		cpu_register_vulnerabilities();
 
 	return err;
 }

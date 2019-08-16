@@ -15,6 +15,7 @@
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/device.h>
+#include <linux/mutex.h>
 
 #include <asm/cio.h>
 #include <asm/chpid.h>
@@ -29,6 +30,8 @@
 #include "chsc.h"
 
 static void *sei_page;
+static DEFINE_SPINLOCK(siosl_lock);
+static DEFINE_SPINLOCK(sda_lock);
 
 /**
  * chsc_error_from_response() - convert a chsc response to an error
@@ -47,9 +50,15 @@ int chsc_error_from_response(int response)
 	case 0x0007:
 	case 0x0008:
 	case 0x000a:
+	case 0x0104:
 		return -EINVAL;
 	case 0x0004:
 		return -EOPNOTSUPP;
+	case 0x000b:
+		return -EBUSY;
+	case 0x0100:
+	case 0x0102:
+		return -ENOMEM;
 	default:
 		return -EIO;
 	}
@@ -156,8 +165,9 @@ out_unreg:
 
 void chsc_chp_offline(struct chp_id chpid)
 {
-	char dbf_txt[15];
+	struct channel_path *chp = chpid_to_chp(chpid);
 	struct chp_link link;
+	char dbf_txt[15];
 
 	sprintf(dbf_txt, "chpr%x.%02x", chpid.cssid, chpid.id);
 	CIO_TRACE_EVENT(2, dbf_txt);
@@ -168,27 +178,12 @@ void chsc_chp_offline(struct chp_id chpid)
 	link.chpid = chpid;
 	/* Wait until previous actions have settled. */
 	css_wait_for_slow_path();
+
+	mutex_lock(&chp->lock);
+	chp_update_desc(chp);
+	mutex_unlock(&chp->lock);
+
 	for_each_subchannel_staged(s390_subchannel_remove_chpid, NULL, &link);
-}
-
-static int s390_process_res_acc_new_sch(struct subchannel_id schid, void *data)
-{
-	struct schib schib;
-	/*
-	 * We don't know the device yet, but since a path
-	 * may be available now to the device we'll have
-	 * to do recognition again.
-	 * Since we don't have any idea about which chpid
-	 * that beast may be on we'll have to do a stsch
-	 * on all devices, grr...
-	 */
-	if (stsch_err(schid, &schib))
-		/* We're through */
-		return -ENXIO;
-
-	/* Put it on the slow path. */
-	css_schedule_eval(schid);
-	return 0;
 }
 
 static int __s390_process_res_acc(struct subchannel *sch, void *data)
@@ -221,8 +216,8 @@ static void s390_process_res_acc(struct chp_link *link)
 	 * The more information we have (info), the less scanning
 	 * will we have to do.
 	 */
-	for_each_subchannel_staged(__s390_process_res_acc,
-				   s390_process_res_acc_new_sch, link);
+	for_each_subchannel_staged(__s390_process_res_acc, NULL, link);
+	css_schedule_reprobe();
 }
 
 static int
@@ -325,6 +320,36 @@ static void chsc_process_sei_res_acc(struct chsc_sei_area *sei_area)
 	s390_process_res_acc(&link);
 }
 
+static void chsc_process_sei_chp_avail(struct chsc_sei_area *sei_area)
+{
+	struct channel_path *chp;
+	struct chp_id chpid;
+	u8 *data;
+	int num;
+
+	CIO_CRW_EVENT(4, "chsc: channel path availability information\n");
+	if (sei_area->rs != 0)
+		return;
+	data = sei_area->ccdf;
+	chp_id_init(&chpid);
+	for (num = 0; num <= __MAX_CHPID; num++) {
+		if (!chp_test_bit(data, num))
+			continue;
+		chpid.id = num;
+
+		CIO_CRW_EVENT(4, "Update information for channel path "
+			      "%x.%02x\n", chpid.cssid, chpid.id);
+		chp = chpid_to_chp(chpid);
+		if (!chp) {
+			chp_new(chpid);
+			continue;
+		}
+		mutex_lock(&chp->lock);
+		chp_update_desc(chp);
+		mutex_unlock(&chp->lock);
+	}
+}
+
 struct chp_config_data {
 	u8 map[32];
 	u8 op;
@@ -363,6 +388,34 @@ static void chsc_process_sei_chp_config(struct chsc_sei_area *sei_area)
 	}
 }
 
+static void chsc_process_sei_scm_change(struct chsc_sei_area *sei_area)
+{
+	int ret;
+
+	CIO_CRW_EVENT(4, "chsc: scm change notification\n");
+	if (sei_area->rs != 7)
+		return;
+
+	ret = scm_update_information();
+	if (ret)
+		CIO_CRW_EVENT(0, "chsc: updating change notification"
+			      " failed (rc=%d).\n", ret);
+}
+
+static void chsc_process_sei_scm_avail(struct chsc_sei_area *sei_area)
+{
+	int ret;
+
+	CIO_CRW_EVENT(4, "chsc: scm available information\n");
+	if (sei_area->rs != 7)
+		return;
+
+	ret = scm_process_availability_information();
+	if (ret)
+		CIO_CRW_EVENT(0, "chsc: process availability information"
+			      " failed (rc=%d).\n", ret);
+}
+
 static void chsc_process_sei(struct chsc_sei_area *sei_area)
 {
 	/* Check if we might have lost some information. */
@@ -375,11 +428,20 @@ static void chsc_process_sei(struct chsc_sei_area *sei_area)
 	case 1: /* link incident*/
 		chsc_process_sei_link_incident(sei_area);
 		break;
-	case 2: /* i/o resource accessibiliy */
+	case 2: /* i/o resource accessibility */
 		chsc_process_sei_res_acc(sei_area);
+		break;
+	case 7: /* channel-path-availability information */
+		chsc_process_sei_chp_avail(sei_area);
 		break;
 	case 8: /* channel-path-configuration notification */
 		chsc_process_sei_chp_config(sei_area);
+		break;
+	case 12: /* scm change notification */
+		chsc_process_sei_scm_change(sei_area);
+		break;
+	case 14: /* scm available notification */
+		chsc_process_sei_scm_avail(sei_area);
 		break;
 	default: /* other stuff */
 		CIO_CRW_EVENT(4, "chsc: unhandled sei content code %d\n",
@@ -427,8 +489,9 @@ static void chsc_process_crw(struct crw *crw0, struct crw *crw1, int overflow)
 
 void chsc_chp_online(struct chp_id chpid)
 {
-	char dbf_txt[15];
+	struct channel_path *chp = chpid_to_chp(chpid);
 	struct chp_link link;
+	char dbf_txt[15];
 
 	sprintf(dbf_txt, "cadd%x.%02x", chpid.cssid, chpid.id);
 	CIO_TRACE_EVENT(2, dbf_txt);
@@ -438,8 +501,14 @@ void chsc_chp_online(struct chp_id chpid)
 		link.chpid = chpid;
 		/* Wait until previous actions have settled. */
 		css_wait_for_slow_path();
+
+		mutex_lock(&chp->lock);
+		chp_update_desc(chp);
+		mutex_unlock(&chp->lock);
+
 		for_each_subchannel_staged(__s390_process_res_acc, NULL,
 					   &link);
+		css_schedule_reprobe();
 	}
 }
 
@@ -474,19 +543,6 @@ static int s390_subchannel_vary_chpid_on(struct subchannel *sch, void *data)
 	return 0;
 }
 
-static int
-__s390_vary_chpid_on(struct subchannel_id schid, void *data)
-{
-	struct schib schib;
-
-	if (stsch_err(schid, &schib))
-		/* We're through */
-		return -ENXIO;
-	/* Put it on the slow path. */
-	css_schedule_eval(schid);
-	return 0;
-}
-
 /**
  * chsc_chp_vary - propagate channel-path vary operation to subchannels
  * @chpid: channl-path ID
@@ -494,6 +550,7 @@ __s390_vary_chpid_on(struct subchannel_id schid, void *data)
  */
 int chsc_chp_vary(struct chp_id chpid, int on)
 {
+	struct channel_path *chp = chpid_to_chp(chpid);
 	struct chp_link link;
 
 	memset(&link, 0, sizeof(struct chp_link));
@@ -503,11 +560,13 @@ int chsc_chp_vary(struct chp_id chpid, int on)
 	/*
 	 * Redo PathVerification on the devices the chpid connects to
 	 */
-
-	if (on)
+	if (on) {
+		/* Try to update the channel path description. */
+		chp_update_desc(chp);
 		for_each_subchannel_staged(s390_subchannel_vary_chpid_on,
-					   __s390_vary_chpid_on, &link);
-	else
+					   NULL, &link);
+		css_schedule_reprobe();
+	} else
 		for_each_subchannel_staged(s390_subchannel_vary_chpid_off,
 					   NULL, &link);
 
@@ -712,7 +771,25 @@ int chsc_determine_base_channel_path_desc(struct chp_id chpid,
 	ret = chsc_determine_channel_path_desc(chpid, 0, 0, 0, 0, chsc_resp);
 	if (ret)
 		goto out_free;
-	memcpy(desc, &chsc_resp->data, chsc_resp->length);
+	memcpy(desc, &chsc_resp->data, sizeof(*desc));
+out_free:
+	kfree(chsc_resp);
+	return ret;
+}
+
+int chsc_determine_fmt1_channel_path_desc(struct chp_id chpid,
+					  struct channel_path_desc_fmt1 *desc)
+{
+	struct chsc_response_struct *chsc_resp;
+	int ret;
+
+	chsc_resp = kzalloc(sizeof(*chsc_resp), GFP_KERNEL);
+	if (!chsc_resp)
+		return -ENOMEM;
+	ret = chsc_determine_channel_path_desc(chpid, 0, 0, 1, 0, chsc_resp);
+	if (ret)
+		goto out_free;
+	memcpy(desc, &chsc_resp->data, sizeof(*desc));
 out_free:
 	kfree(chsc_resp);
 	return ret;
@@ -722,28 +799,14 @@ static void
 chsc_initialize_cmg_chars(struct channel_path *chp, u8 cmcv,
 			  struct cmg_chars *chars)
 {
-	switch (chp->cmg) {
-	case 2:
-	case 3:
-		chp->cmg_chars = kmalloc(sizeof(struct cmg_chars),
-					 GFP_KERNEL);
-		if (chp->cmg_chars) {
-			int i, mask;
-			struct cmg_chars *cmg_chars;
+	int i, mask;
 
-			cmg_chars = chp->cmg_chars;
-			for (i = 0; i < NR_MEASUREMENT_CHARS; i++) {
-				mask = 0x80 >> (i + 3);
-				if (cmcv & mask)
-					cmg_chars->values[i] = chars->values[i];
-				else
-					cmg_chars->values[i] = 0;
-			}
-		}
-		break;
-	default:
-		/* No cmg-dependent data. */
-		break;
+	for (i = 0; i < NR_MEASUREMENT_CHARS; i++) {
+		mask = 0x80 >> (i + 3);
+		if (cmcv & mask)
+			chp->cmg_chars.values[i] = chars->values[i];
+		else
+			chp->cmg_chars.values[i] = 0;
 	}
 }
 
@@ -772,6 +835,12 @@ int chsc_get_channel_measurement_chars(struct channel_path *chp)
 		u32 data[NR_MEASUREMENT_CHARS];
 	} __attribute__ ((packed)) *scmc_area;
 
+	chp->cmg = -1;
+	chp->shared = -1;
+
+	if (!css_chsc_characteristics.scmc || !css_chsc_characteristics.secm)
+		return 0;
+
 	scmc_area = (void *)get_zeroed_page(GFP_KERNEL | GFP_DMA);
 	if (!scmc_area)
 		return -ENOMEM;
@@ -791,16 +860,14 @@ int chsc_get_channel_measurement_chars(struct channel_path *chp)
 	ret = chsc_error_from_response(scmc_area->response.code);
 	if (ret == 0) {
 		/* Success. */
-		if (!scmc_area->not_valid) {
-			chp->cmg = scmc_area->cmg;
-			chp->shared = scmc_area->shared;
-			chsc_initialize_cmg_chars(chp, scmc_area->cmcv,
-						  (struct cmg_chars *)
-						  &scmc_area->data);
-		} else {
-			chp->cmg = -1;
-			chp->shared = -1;
-		}
+		if (scmc_area->not_valid)
+			goto out;
+
+		chp->cmg = scmc_area->cmg;
+		chp->shared = scmc_area->shared;
+		chsc_initialize_cmg_chars(chp, scmc_area->cmcv,
+					  (struct cmg_chars *)
+					  &scmc_area->data);
 	} else {
 		CIO_CRW_EVENT(2, "chsc: scmc failed (rc=%04x)\n",
 			      scmc_area->response.code);
@@ -832,11 +899,10 @@ void __init chsc_free_sei_area(void)
 	kfree(sei_page);
 }
 
-int __init
-chsc_enable_facility(int operation_code)
+int chsc_enable_facility(int operation_code)
 {
 	int ret;
-	struct {
+	static struct {
 		struct chsc_header request;
 		u8 reserved1:4;
 		u8 format:4;
@@ -849,33 +915,32 @@ chsc_enable_facility(int operation_code)
 		u32 reserved5:4;
 		u32 format2:4;
 		u32 reserved6:24;
-	} __attribute__ ((packed)) *sda_area;
+	} __attribute__ ((packed, aligned(4096))) sda_area;
 
-	sda_area = (void *)get_zeroed_page(GFP_KERNEL|GFP_DMA);
-	if (!sda_area)
-		return -ENOMEM;
-	sda_area->request.length = 0x0400;
-	sda_area->request.code = 0x0031;
-	sda_area->operation_code = operation_code;
+	spin_lock(&sda_lock);
+	memset(&sda_area, 0, sizeof(sda_area));
+	sda_area.request.length = 0x0400;
+	sda_area.request.code = 0x0031;
+	sda_area.operation_code = operation_code;
 
-	ret = chsc(sda_area);
+	ret = chsc(&sda_area);
 	if (ret > 0) {
 		ret = (ret == 3) ? -ENODEV : -EBUSY;
 		goto out;
 	}
 
-	switch (sda_area->response.code) {
+	switch (sda_area.response.code) {
 	case 0x0101:
 		ret = -EOPNOTSUPP;
 		break;
 	default:
-		ret = chsc_error_from_response(sda_area->response.code);
+		ret = chsc_error_from_response(sda_area.response.code);
 	}
 	if (ret != 0)
 		CIO_CRW_EVENT(2, "chsc: sda (oc=%x) failed (rc=%04x)\n",
-			      operation_code, sda_area->response.code);
+			      operation_code, sda_area.response.code);
  out:
-	free_page((unsigned long)sda_area);
+	spin_unlock(&sda_lock);
 	return ret;
 }
 
@@ -975,3 +1040,79 @@ int chsc_sstpi(void *page, void *result, size_t size)
 	return (rr->response.code == 0x0001) ? 0 : -EIO;
 }
 
+static struct {
+	struct chsc_header request;
+	u32 word1;
+	struct subchannel_id sid;
+	u32 word3;
+	struct chsc_header response;
+	u32 word[11];
+} __attribute__ ((packed)) siosl_area __attribute__ ((__aligned__(PAGE_SIZE)));
+
+int chsc_siosl(struct subchannel_id schid)
+{
+	unsigned long flags;
+	int ccode;
+	int rc;
+
+	spin_lock_irqsave(&siosl_lock, flags);
+	memset(&siosl_area, 0, sizeof(siosl_area));
+	siosl_area.request.length = 0x0010;
+	siosl_area.request.code = 0x0046;
+	siosl_area.word1 = 0x80000000;
+	siosl_area.sid = schid;
+
+	ccode = chsc(&siosl_area);
+	if (ccode > 0) {
+		if (ccode == 3)
+			rc = -ENODEV;
+		else
+			rc = -EBUSY;
+		CIO_MSG_EVENT(2, "chsc: chsc failed for 0.%x.%04x (ccode=%d)\n",
+			      schid.ssid, schid.sch_no, ccode);
+		goto out;
+	}
+	rc = chsc_error_from_response(siosl_area.response.code);
+	if (rc)
+		CIO_MSG_EVENT(2, "chsc: siosl failed for 0.%x.%04x (rc=%04x)\n",
+			      schid.ssid, schid.sch_no,
+			      siosl_area.response.code);
+	else
+		CIO_MSG_EVENT(4, "chsc: siosl succeeded for 0.%x.%04x\n",
+			      schid.ssid, schid.sch_no);
+out:
+	spin_unlock_irqrestore(&siosl_lock, flags);
+
+	return rc;
+}
+EXPORT_SYMBOL_GPL(chsc_siosl);
+
+/**
+ * chsc_scm_info() - store SCM information (SSI)
+ * @scm_area: request and response block for SSI
+ * @token: continuation token
+ *
+ * Returns 0 on success.
+ */
+int chsc_scm_info(struct chsc_scm_info *scm_area, u64 token)
+{
+	int ccode, ret;
+
+	memset(scm_area, 0, sizeof(*scm_area));
+	scm_area->request.length = 0x0020;
+	scm_area->request.code = 0x004C;
+	scm_area->reqtok = token;
+
+	ccode = chsc(scm_area);
+	if (ccode > 0) {
+		ret = (ccode == 3) ? -ENODEV : -EBUSY;
+		goto out;
+	}
+	ret = chsc_error_from_response(scm_area->response.code);
+	if (ret != 0)
+		CIO_MSG_EVENT(2, "chsc: scm info failed (rc=%04x)\n",
+			      scm_area->response.code);
+out:
+	return ret;
+}
+EXPORT_SYMBOL_GPL(chsc_scm_info);

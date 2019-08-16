@@ -456,14 +456,12 @@ static int mark_source_chains(struct xt_table_info *newinfo,
 	return 1;
 }
 
-static inline int check_entry(struct arpt_entry *e, const char *name)
+static inline int check_entry(struct arpt_entry *e)
 {
 	const struct arpt_entry_target *t;
 
-	if (!arp_checkentry(&e->arp)) {
-		duprintf("arp_tables: arp check failed %p %s.\n", e, name);
+	if (!arp_checkentry(&e->arp))
 		return -EINVAL;
-	}
 
 	if (e->target_offset + sizeof(struct arpt_entry_target) > e->next_offset)
 		return -EINVAL;
@@ -504,10 +502,6 @@ find_check_entry(struct arpt_entry *e, const char *name, unsigned int size,
 	struct arpt_entry_target *t;
 	struct xt_target *target;
 	int ret;
-
-	ret = check_entry(e, name);
-	if (ret)
-		return ret;
 
 	t = arpt_get_target(e);
 	target = try_then_request_module(xt_find_target(NFPROTO_ARP,
@@ -558,9 +552,11 @@ static inline int check_entry_size_and_hooks(struct arpt_entry *e,
 					     unsigned int *i)
 {
 	unsigned int h;
+	int err;
 
 	if ((unsigned long)e % __alignof__(struct arpt_entry) != 0
-	    || (unsigned char *)e + sizeof(struct arpt_entry) >= limit) {
+	    || (unsigned char *)e + sizeof(struct arpt_entry) >= limit
+	    || (unsigned char *)e + e->next_offset > limit) {
 		duprintf("Bad offset %p\n", e);
 		return -EINVAL;
 	}
@@ -571,6 +567,13 @@ static inline int check_entry_size_and_hooks(struct arpt_entry *e,
 			 e, e->next_offset);
 		return -EINVAL;
 	}
+
+	err = check_entry(e);
+	if (err)
+		return err;
+
+	if (e->target_offset < e->elems - (unsigned char *)e)
+		return -EINVAL;
 
 	/* Check hooks & underflows */
 	for (h = 0; h < NF_ARP_NUMHOOKS; h++) {
@@ -925,10 +928,10 @@ static int get_info(struct net *net, void __user *user, int *len, int compat)
 	if (t && !IS_ERR(t)) {
 		struct arpt_getinfo info;
 		const struct xt_table_info *private = t->private;
-
 #ifdef CONFIG_COMPAT
+		struct xt_table_info tmp;
+
 		if (compat) {
-			struct xt_table_info tmp;
 			ret = compat_table_info(private, &tmp);
 			xt_compat_flush_offsets(NFPROTO_ARP);
 			private = &tmp;
@@ -1086,6 +1089,7 @@ static int do_replace(struct net *net, void __user *user, unsigned int len)
 	/* overflow check */
 	if (tmp.num_counters >= INT_MAX / sizeof(struct xt_counters))
 		return -ENOMEM;
+	tmp.name[sizeof(tmp.name)-1] = 0;
 
 	newinfo = xt_alloc_table_info(tmp.size);
 	if (!newinfo)
@@ -1252,10 +1256,14 @@ check_compat_entry_size_and_hooks(struct compat_arpt_entry *e,
 
 	duprintf("check_compat_entry_size_and_hooks %p\n", e);
 	if ((unsigned long)e % __alignof__(struct compat_arpt_entry) != 0
-	    || (unsigned char *)e + sizeof(struct compat_arpt_entry) >= limit) {
+	    || (unsigned char *)e + sizeof(struct compat_arpt_entry) >= limit
+	    || (unsigned char *)e + e->next_offset > limit) {
 		duprintf("Bad offset %p, limit = %p\n", e, limit);
 		return -EINVAL;
 	}
+
+	if (e->target_offset < e->elems - (unsigned char *)e)
+		return -EINVAL;
 
 	if (e->next_offset < sizeof(struct compat_arpt_entry) +
 			     sizeof(struct compat_xt_entry_target)) {
@@ -1265,7 +1273,7 @@ check_compat_entry_size_and_hooks(struct compat_arpt_entry *e,
 	}
 
 	/* For purposes of check_entry casting the compat entry is fine */
-	ret = check_entry((struct arpt_entry *)e, name);
+	ret = check_entry((struct arpt_entry *)e);
 	if (ret)
 		return ret;
 
@@ -1508,6 +1516,7 @@ static int compat_do_replace(struct net *net, void __user *user,
 		return -ENOMEM;
 	if (tmp.num_counters >= INT_MAX / sizeof(struct xt_counters))
 		return -ENOMEM;
+	tmp.name[sizeof(tmp.name)-1] = 0;
 
 	newinfo = xt_alloc_table_info(tmp.size);
 	if (!newinfo)
@@ -1763,6 +1772,7 @@ static int do_arpt_get_ctl(struct sock *sk, int cmd, void __user *user, int *len
 			ret = -EFAULT;
 			break;
 		}
+		rev.name[sizeof(rev.name)-1] = 0;
 
 		try_then_request_module(xt_find_revision(NFPROTO_ARP, rev.name,
 							 rev.revision, 1, &ret),

@@ -18,11 +18,7 @@
 
 #include "internals.h"
 
-/**
- *	dynamic_irq_init - initialize a dynamically allocated irq
- *	@irq:	irq number to initialize
- */
-void dynamic_irq_init(unsigned int irq)
+static void dynamic_irq_init_x(unsigned int irq, bool keep_chip_data)
 {
 	struct irq_desc *desc;
 	unsigned long flags;
@@ -41,7 +37,8 @@ void dynamic_irq_init(unsigned int irq)
 	desc->depth = 1;
 	desc->msi_desc = NULL;
 	desc->handler_data = NULL;
-	desc->chip_data = NULL;
+	if (!keep_chip_data)
+		desc->chip_data = NULL;
 	desc->action = NULL;
 	desc->irq_count = 0;
 	desc->irqs_unhandled = 0;
@@ -55,10 +52,26 @@ void dynamic_irq_init(unsigned int irq)
 }
 
 /**
- *	dynamic_irq_cleanup - cleanup a dynamically allocated irq
+ *	dynamic_irq_init - initialize a dynamically allocated irq
  *	@irq:	irq number to initialize
  */
-void dynamic_irq_cleanup(unsigned int irq)
+void dynamic_irq_init(unsigned int irq)
+{
+	dynamic_irq_init_x(irq, false);
+}
+
+/**
+ *	dynamic_irq_init_keep_chip_data - initialize a dynamically allocated irq
+ *	@irq:	irq number to initialize
+ *
+ *	does not set irq_to_desc(irq)->chip_data to NULL
+ */
+void dynamic_irq_init_keep_chip_data(unsigned int irq)
+{
+	dynamic_irq_init_x(irq, true);
+}
+
+static void dynamic_irq_cleanup_x(unsigned int irq, bool keep_chip_data)
 {
 	struct irq_desc *desc = irq_to_desc(irq);
 	unsigned long flags;
@@ -77,12 +90,33 @@ void dynamic_irq_cleanup(unsigned int irq)
 	}
 	desc->msi_desc = NULL;
 	desc->handler_data = NULL;
-	desc->chip_data = NULL;
+	if (!keep_chip_data)
+		desc->chip_data = NULL;
 	desc->handle_irq = handle_bad_irq;
 	desc->chip = &no_irq_chip;
 	desc->name = NULL;
 	clear_kstat_irqs(desc);
 	spin_unlock_irqrestore(&desc->lock, flags);
+}
+
+/**
+ *	dynamic_irq_cleanup - cleanup a dynamically allocated irq
+ *	@irq:	irq number to initialize
+ */
+void dynamic_irq_cleanup(unsigned int irq)
+{
+	dynamic_irq_cleanup_x(irq, false);
+}
+
+/**
+ *	dynamic_irq_cleanup_keep_chip_data - cleanup a dynamically allocated irq
+ *	@irq:	irq number to initialize
+ *
+ *	does not set irq_to_desc(irq)->chip_data to NULL
+ */
+void dynamic_irq_cleanup_keep_chip_data(unsigned int irq)
+{
+	dynamic_irq_cleanup_x(irq, true);
 }
 
 
@@ -682,32 +716,21 @@ set_irq_chip_and_handler_name(unsigned int irq, struct irq_chip *chip,
 	__set_irq_handler(irq, handle, 0, name);
 }
 
-void __init set_irq_noprobe(unsigned int irq)
+void irq_modify_status(unsigned int irq, unsigned long clr, unsigned long set)
 {
 	struct irq_desc *desc = irq_to_desc(irq);
 	unsigned long flags;
 
-	if (!desc) {
-		printk(KERN_ERR "Trying to mark IRQ%d non-probeable\n", irq);
+	if (!desc)
 		return;
-	}
+
+	/* Sanitize flags */
+	set &= IRQF_MODIFY_MASK;
+	clr &= IRQF_MODIFY_MASK;
 
 	spin_lock_irqsave(&desc->lock, flags);
-	desc->status |= IRQ_NOPROBE;
+	desc->status &= ~clr;
+	desc->status |= set;
 	spin_unlock_irqrestore(&desc->lock, flags);
 }
-
-void __init set_irq_probe(unsigned int irq)
-{
-	struct irq_desc *desc = irq_to_desc(irq);
-	unsigned long flags;
-
-	if (!desc) {
-		printk(KERN_ERR "Trying to mark IRQ%d probeable\n", irq);
-		return;
-	}
-
-	spin_lock_irqsave(&desc->lock, flags);
-	desc->status &= ~IRQ_NOPROBE;
-	spin_unlock_irqrestore(&desc->lock, flags);
-}
+EXPORT_SYMBOL_GPL(irq_modify_status);

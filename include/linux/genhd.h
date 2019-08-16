@@ -91,6 +91,7 @@ struct hd_struct {
 	sector_t start_sect;
 	sector_t nr_sects;
 	sector_t alignment_offset;
+	unsigned int discard_alignment;
 	struct device __dev;
 	struct kobject *holder_dir;
 	int policy, partno;
@@ -98,14 +99,38 @@ struct hd_struct {
 	int make_it_fail;
 #endif
 	unsigned long stamp;
+#ifdef __GENKSYMS__
 	int in_flight[2];
+#else
+	atomic_t in_flight[2];
+#endif
 #ifdef	CONFIG_SMP
-	struct disk_stats *dkstats;
+	struct disk_stats __percpu *dkstats;
 #else
 	struct disk_stats dkstats;
 #endif
 	struct rcu_head rcu_head;
 };
+
+/*
+ * struct hd_struct are always allocated in add_partition or are directly
+ * included in struct gendisk (field part0). However, we don't need the
+ * reference for part0, so we can allocate hd_struct_aux at the same time
+ * as hd_struct, in add_partition.
+ */
+struct hd_struct_aux {
+	atomic_t ref;
+};
+
+struct hd_struct_with_aux {
+	struct hd_struct part;
+	struct hd_struct_aux aux;
+};
+
+static inline struct hd_struct_aux *hd_get_aux(struct hd_struct *p)
+{
+	return &container_of(p, struct hd_struct_with_aux, part)->aux;
+}
 
 #define GENHD_FL_REMOVABLE			1
 #define GENHD_FL_DRIVERFS			2
@@ -115,6 +140,7 @@ struct hd_struct {
 #define GENHD_FL_SUPPRESS_PARTITION_INFO	32
 #define GENHD_FL_EXT_DEVT			64 /* allow extended devt */
 #define GENHD_FL_NATIVE_CAPACITY		128
+#define GENHD_FL_INVALIDATED			256
 
 #define BLK_SCSI_MAX_CMDS	(256)
 #define BLK_SCSI_CMD_PER_LONG	(BLK_SCSI_MAX_CMDS / (sizeof(long) * 8))
@@ -324,21 +350,21 @@ static inline void free_part_stats(struct hd_struct *part)
 
 static inline void part_inc_in_flight(struct hd_struct *part, int rw)
 {
-	part->in_flight[rw]++;
+	atomic_inc(&part->in_flight[rw]);
 	if (part->partno)
-		part_to_disk(part)->part0.in_flight[rw]++;
+		atomic_inc(&part_to_disk(part)->part0.in_flight[rw]);
 }
 
 static inline void part_dec_in_flight(struct hd_struct *part, int rw)
 {
-	part->in_flight[rw]--;
+	atomic_dec(&part->in_flight[rw]);
 	if (part->partno)
-		part_to_disk(part)->part0.in_flight[rw]--;
+		atomic_dec(&part_to_disk(part)->part0.in_flight[rw]);
 }
 
 static inline int part_in_flight(struct hd_struct *part)
 {
-	return part->in_flight[0] + part->in_flight[1];
+	return atomic_read(&part->in_flight[0]) + atomic_read(&part->in_flight[1]);
 }
 
 /* block/blk-core.c */
@@ -533,6 +559,7 @@ extern int rescan_partitions(struct gendisk *disk, struct block_device *bdev);
 extern struct hd_struct * __must_check add_partition(struct gendisk *disk,
 						     int partno, sector_t start,
 						     sector_t len, int flags);
+extern void __delete_partition(struct hd_struct *);
 extern void delete_partition(struct gendisk *, int);
 extern void printk_all_partitions(void);
 
@@ -560,6 +587,44 @@ extern ssize_t part_fail_store(struct device *dev,
 			       struct device_attribute *attr,
 			       const char *buf, size_t count);
 #endif /* CONFIG_FAIL_MAKE_REQUEST */
+
+static inline atomic_t *hd_get_ref(struct hd_struct *p)
+{
+	if (p->partno)
+		return &hd_get_aux(p)->ref;
+	return NULL;
+}
+
+static inline void hd_ref_init(struct hd_struct *part)
+{
+	atomic_t *ref = hd_get_ref(part);
+	if (!ref)
+		return;
+	atomic_set(ref, 1);
+	smp_mb();
+}
+
+static inline void hd_struct_get(struct hd_struct *part)
+{
+	atomic_t *ref = hd_get_ref(part);
+	if (!ref)
+		return;
+	atomic_inc(ref);
+	smp_mb__after_atomic_inc();
+}
+
+static inline int hd_struct_try_get(struct hd_struct *part)
+{
+	atomic_t *ref = hd_get_ref(part);
+	return !ref || atomic_inc_not_zero(ref);
+}
+
+static inline void hd_struct_put(struct hd_struct *part)
+{
+	atomic_t *ref = hd_get_ref(part);
+	if (ref && atomic_dec_and_test(ref))
+		__delete_partition(part);
+}
 
 #else /* CONFIG_BLOCK */
 

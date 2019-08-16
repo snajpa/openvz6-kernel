@@ -22,6 +22,7 @@
 #include <asm/msr.h>
 #include <asm/apic.h>
 #include <linux/percpu.h>
+#include <linux/hardirq.h>
 
 #include <asm/x86_init.h>
 #include <asm/reboot.h>
@@ -29,6 +30,8 @@
 #define KVM_SCALE 22
 
 static int kvmclock = 1;
+static int msr_kvm_system_time = MSR_KVM_SYSTEM_TIME;
+static int msr_kvm_wall_clock = MSR_KVM_WALL_CLOCK;
 
 static int parse_no_kvmclock(char *arg)
 {
@@ -54,7 +57,8 @@ static unsigned long kvm_get_wallclock(void)
 
 	low = (int)__pa_symbol(&wall_clock);
 	high = ((u64)__pa_symbol(&wall_clock) >> 32);
-	native_write_msr(MSR_KVM_WALL_CLOCK, low, high);
+
+	native_write_msr(msr_kvm_wall_clock, low, high);
 
 	vcpu_time = &get_cpu_var(hv_clock);
 	pvclock_read_wallclock(&wall_clock, vcpu_time, &ts);
@@ -112,6 +116,20 @@ static void kvm_get_preset_lpj(void)
 	preset_lpj = lpj;
 }
 
+bool kvm_check_and_clear_guest_paused(void)
+{
+	bool ret = false;
+	struct pvclock_vcpu_time_info *src;
+
+	src = &__get_cpu_var(hv_clock);
+	if ((src->flags & PVCLOCK_GUEST_STOPPED) != 0) {
+		percpu_and(hv_clock.flags, ~PVCLOCK_GUEST_STOPPED);
+		ret = true;
+	}
+
+	return ret;
+}
+
 static struct clocksource kvm_clock = {
 	.name = "kvm-clock",
 	.read = kvm_clock_get_cycles,
@@ -122,7 +140,7 @@ static struct clocksource kvm_clock = {
 	.flags = CLOCK_SOURCE_IS_CONTINUOUS,
 };
 
-static int kvm_register_clock(char *txt)
+int kvm_register_clock(char *txt)
 {
 	int cpu = smp_processor_id();
 	int low, high;
@@ -130,7 +148,17 @@ static int kvm_register_clock(char *txt)
 	high = ((u64)__pa(&per_cpu(hv_clock, cpu)) >> 32);
 	printk(KERN_INFO "kvm-clock: cpu %d, msr %x:%x, %s\n",
 	       cpu, high, low, txt);
-	return native_write_msr_safe(MSR_KVM_SYSTEM_TIME, low, high);
+
+	return native_write_msr_safe(msr_kvm_system_time, low, high);
+}
+
+static void kvm_save_sched_clock_state(void)
+{
+}
+
+static void kvm_restore_sched_clock_state(void)
+{
+	kvm_register_clock("primary cpu clock, resume");
 }
 
 #ifdef CONFIG_X86_LOCAL_APIC
@@ -141,16 +169,6 @@ static void __cpuinit kvm_setup_secondary_clock(void)
 	 * we shouldn't fail.
 	 */
 	WARN_ON(kvm_register_clock("secondary cpu clock"));
-	/* ok, done with our trickery, call native */
-	setup_secondary_APIC_clock();
-}
-#endif
-
-#ifdef CONFIG_SMP
-static void __init kvm_smp_prepare_boot_cpu(void)
-{
-	WARN_ON(kvm_register_clock("primary cpu clock"));
-	native_smp_prepare_boot_cpu();
 }
 #endif
 
@@ -165,14 +183,16 @@ static void __init kvm_smp_prepare_boot_cpu(void)
 #ifdef CONFIG_KEXEC
 static void kvm_crash_shutdown(struct pt_regs *regs)
 {
-	native_write_msr_safe(MSR_KVM_SYSTEM_TIME, 0, 0);
+	native_write_msr(msr_kvm_system_time, 0, 0);
+	kvm_disable_steal_time();
 	native_machine_crash_shutdown(regs);
 }
 #endif
 
 static void kvm_shutdown(void)
 {
-	native_write_msr_safe(MSR_KVM_SYSTEM_TIME, 0, 0);
+	native_write_msr(msr_kvm_system_time, 0, 0);
+	kvm_disable_steal_time();
 	native_machine_shutdown();
 }
 
@@ -181,27 +201,35 @@ void __init kvmclock_init(void)
 	if (!kvm_para_available())
 		return;
 
-	if (kvmclock && kvm_para_has_feature(KVM_FEATURE_CLOCKSOURCE)) {
-		if (kvm_register_clock("boot clock"))
-			return;
-		pv_time_ops.sched_clock = kvm_clock_read;
-		x86_platform.calibrate_tsc = kvm_get_tsc_khz;
-		x86_platform.get_wallclock = kvm_get_wallclock;
-		x86_platform.set_wallclock = kvm_set_wallclock;
+	if (kvmclock && kvm_para_has_feature(KVM_FEATURE_CLOCKSOURCE2)) {
+		msr_kvm_system_time = MSR_KVM_SYSTEM_TIME_NEW;
+		msr_kvm_wall_clock = MSR_KVM_WALL_CLOCK_NEW;
+	} else if (!(kvmclock && kvm_para_has_feature(KVM_FEATURE_CLOCKSOURCE)))
+		return;
+
+	printk(KERN_INFO "kvm-clock: Using msrs %x and %x",
+		msr_kvm_system_time, msr_kvm_wall_clock);
+
+	if (kvm_register_clock("boot clock"))
+		return;
+	pv_time_ops.sched_clock = kvm_clock_read;
+	x86_platform.calibrate_tsc = kvm_get_tsc_khz;
+	x86_platform.get_wallclock = kvm_get_wallclock;
+	x86_platform.set_wallclock = kvm_set_wallclock;
 #ifdef CONFIG_X86_LOCAL_APIC
-		x86_cpuinit.setup_percpu_clockev =
-			kvm_setup_secondary_clock;
+	x86_cpuinit.early_percpu_clock_init =
+		kvm_setup_secondary_clock;
 #endif
-#ifdef CONFIG_SMP
-		smp_ops.smp_prepare_boot_cpu = kvm_smp_prepare_boot_cpu;
-#endif
-		machine_ops.shutdown  = kvm_shutdown;
+	x86_platform.save_sched_clock_state = kvm_save_sched_clock_state;
+	x86_platform.restore_sched_clock_state = kvm_restore_sched_clock_state;
+	machine_ops.shutdown  = kvm_shutdown;
 #ifdef CONFIG_KEXEC
-		machine_ops.crash_shutdown  = kvm_crash_shutdown;
+	machine_ops.crash_shutdown  = kvm_crash_shutdown;
 #endif
-		kvm_get_preset_lpj();
-		clocksource_register(&kvm_clock);
-		pv_info.paravirt_enabled = 1;
-		pv_info.name = "KVM";
-	}
+	kvm_get_preset_lpj();
+	clocksource_register(&kvm_clock);
+	pv_info.name = "KVM";
+
+	if (kvm_para_has_feature(KVM_FEATURE_CLOCKSOURCE_STABLE_BIT))
+		pvclock_set_flags(PVCLOCK_TSC_STABLE_BIT);
 }

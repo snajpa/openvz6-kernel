@@ -1,5 +1,5 @@
 /*
-	Copyright (C) 2004 - 2009 rt2x00 SourceForge Project
+	Copyright (C) 2004 - 2009 Ivo van Doorn <IvDoorn@gmail.com>
 	<http://rt2x00.serialmonkey.com>
 
 	This program is free software; you can redistribute it and/or modify
@@ -13,9 +13,7 @@
 	GNU General Public License for more details.
 
 	You should have received a copy of the GNU General Public License
-	along with this program; if not, write to the
-	Free Software Foundation, Inc.,
-	59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+	along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
 /*
@@ -46,7 +44,7 @@
 
 /*
  * Signal information.
- * Defaul offset is required for RSSI <-> dBm conversion.
+ * Default offset is required for RSSI <-> dBm conversion.
  */
 #define DEFAULT_RSSI_OFFSET		120
 
@@ -56,7 +54,7 @@
 #define CSR_REG_BASE			0x0400
 #define CSR_REG_SIZE			0x0100
 #define EEPROM_BASE			0x0000
-#define EEPROM_SIZE			0x006a
+#define EEPROM_SIZE			0x006e
 #define BBP_BASE			0x0000
 #define BBP_SIZE			0x0060
 #define RF_BASE				0x0004
@@ -187,16 +185,26 @@
 
 /*
  * MAC_CSR19: GPIO control register.
+ *	MAC_CSR19_VALx: GPIO value
+ *	MAC_CSR19_DIRx: GPIO direction: 0 = input; 1 = output
  */
 #define MAC_CSR19			0x0426
-#define MAC_CSR19_BIT0			FIELD32(0x0001)
-#define MAC_CSR19_BIT1			FIELD32(0x0002)
-#define MAC_CSR19_BIT2			FIELD32(0x0004)
-#define MAC_CSR19_BIT3			FIELD32(0x0008)
-#define MAC_CSR19_BIT4			FIELD32(0x0010)
-#define MAC_CSR19_BIT5			FIELD32(0x0020)
-#define MAC_CSR19_BIT6			FIELD32(0x0040)
-#define MAC_CSR19_BIT7			FIELD32(0x0080)
+#define MAC_CSR19_VAL0			FIELD16(0x0001)
+#define MAC_CSR19_VAL1			FIELD16(0x0002)
+#define MAC_CSR19_VAL2			FIELD16(0x0004)
+#define MAC_CSR19_VAL3			FIELD16(0x0008)
+#define MAC_CSR19_VAL4			FIELD16(0x0010)
+#define MAC_CSR19_VAL5			FIELD16(0x0020)
+#define MAC_CSR19_VAL6			FIELD16(0x0040)
+#define MAC_CSR19_VAL7			FIELD16(0x0080)
+#define MAC_CSR19_DIR0			FIELD16(0x0100)
+#define MAC_CSR19_DIR1			FIELD16(0x0200)
+#define MAC_CSR19_DIR2			FIELD16(0x0400)
+#define MAC_CSR19_DIR3			FIELD16(0x0800)
+#define MAC_CSR19_DIR4			FIELD16(0x1000)
+#define MAC_CSR19_DIR5			FIELD16(0x2000)
+#define MAC_CSR19_DIR6			FIELD16(0x4000)
+#define MAC_CSR19_DIR7			FIELD16(0x8000)
 
 /*
  * MAC_CSR20: LED control register.

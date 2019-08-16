@@ -6,6 +6,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/module.h>
+#include <linux/namei.h>
 #include <linux/sched.h>
 #include <linux/writeback.h>
 #include <linux/syscalls.h>
@@ -13,6 +14,7 @@
 #include <linux/pagemap.h>
 #include <linux/quotaops.h>
 #include <linux/buffer_head.h>
+#include <linux/kthread.h>
 #include "internal.h"
 
 #define VALID_FLAGS (SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE| \
@@ -108,8 +110,21 @@ restart:
 		spin_unlock(&sb_lock);
 
 		down_read(&sb->s_umount);
+		/*
+		 * If the file system is frozen we can't proceed because we
+		 * could potentially block on frozen file system. This would
+		 * lead to a deadlock, because we're holding s_umount which
+		 * has to be taken in order to  thaw the file system as well.
+		 * Frozen file system should be clean anyway so just skip it.
+		 */
+		if ((!sb_has_new_freeze(sb) && sb->s_frozen != SB_UNFROZEN) ||
+		    (sb->s_writers.frozen != SB_UNFROZEN))
+			goto skip;
+
 		if (!(sb->s_flags & MS_RDONLY) && sb->s_root && sb->s_bdi)
 			__sync_filesystem(sb, wait);
+
+skip:
 		up_read(&sb->s_umount);
 
 		/* restart only when sb is no longer on the list */
@@ -135,7 +150,7 @@ SYSCALL_DEFINE0(sync)
 	return 0;
 }
 
-static void do_sync_work(struct work_struct *work)
+static int __do_sync_work(void *dummy)
 {
 	/*
 	 * Sync twice to reduce the possibility we skipped some inodes / pages
@@ -144,6 +159,12 @@ static void do_sync_work(struct work_struct *work)
 	sync_filesystems(0);
 	sync_filesystems(0);
 	printk("Emergency Sync complete\n");
+	return 0;
+}
+
+static void do_sync_work(struct work_struct *work)
+{
+	kthread_run(__do_sync_work, NULL, "sync_work_thread");
 	kfree(work);
 }
 
@@ -184,6 +205,39 @@ int file_fsync(struct file *filp, struct dentry *dentry, int datasync)
 	return ret;
 }
 EXPORT_SYMBOL(file_fsync);
+
+/*
+ * sync a single super
+ */
+SYSCALL_DEFINE1(syncfs, int, fd)
+{
+	struct file *file;
+	struct super_block *sb;
+	int ret = 0;
+	int fput_needed;
+
+	file = fget_light(fd, &fput_needed);
+	if (!file)
+		return -EBADF;
+	sb = file->f_dentry->d_sb;
+
+	down_read(&sb->s_umount);
+	/*
+	 * If the file system is frozen we can't proceed because we
+	 * could potentially block on frozen file system. This would
+	 * lead to a deadlock, because we're holding s_umount which
+	 * has to be taken in order to  thaw the file system as well
+	 * Frozen file system should be clean anyway so just skip it.
+	 */
+	if ((sb_has_new_freeze(sb) && sb->s_writers.frozen == SB_UNFROZEN) ||
+	    (!sb_has_new_freeze(sb) && sb->s_frozen == SB_UNFROZEN))
+		ret = sync_filesystem(sb);
+
+	up_read(&sb->s_umount);
+
+	fput_light(file, fput_needed);
+	return ret;
+}
 
 /**
  * vfs_fsync_range - helper to sync a range of data & metadata to disk
@@ -234,7 +288,7 @@ int vfs_fsync_range(struct file *file, struct dentry *dentry, loff_t start,
 	 */
 	mutex_lock(&mapping->host->i_mutex);
 	err = fop->fsync(file, dentry, datasync);
-	if (!ret)
+	if (!ret || (err && ret == -EIO))
 		ret = err;
 	mutex_unlock(&mapping->host->i_mutex);
 

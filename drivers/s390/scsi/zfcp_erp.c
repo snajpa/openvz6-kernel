@@ -3,7 +3,7 @@
  *
  * Error Recovery Procedures (ERP).
  *
- * Copyright IBM Corporation 2002, 2009
+ * Copyright IBM Corp. 2002, 2016
  */
 
 #define KMSG_COMPONENT "zfcp"
@@ -134,8 +134,12 @@ static int zfcp_erp_required_act(int want, struct zfcp_adapter *adapter,
 		if (!(p_status & ZFCP_STATUS_COMMON_UNBLOCKED))
 			need = ZFCP_ERP_ACTION_REOPEN_PORT;
 		/* fall through */
-	case ZFCP_ERP_ACTION_REOPEN_PORT:
 	case ZFCP_ERP_ACTION_REOPEN_PORT_FORCED:
+		p_status = atomic_read(&port->status);
+		if (!(p_status & ZFCP_STATUS_COMMON_OPEN))
+			need = ZFCP_ERP_ACTION_REOPEN_PORT;
+		/* fall through */
+	case ZFCP_ERP_ACTION_REOPEN_PORT:
 		p_status = atomic_read(&port->status);
 		if (p_status & ZFCP_STATUS_COMMON_ERP_INUSE)
 			return 0;
@@ -199,10 +203,13 @@ static struct zfcp_erp_action *zfcp_erp_setup_act(int need,
 		return NULL;
 	}
 
-	memset(erp_action, 0, sizeof(struct zfcp_erp_action));
-	erp_action->adapter = adapter;
-	erp_action->port = port;
-	erp_action->unit = unit;
+	WARN_ON_ONCE(erp_action->adapter != adapter);
+	WARN_ON_ONCE(erp_action->port != port);
+	WARN_ON_ONCE(erp_action->unit != unit);
+	memset(&erp_action->list, 0, sizeof(erp_action->list));
+	memset(&erp_action->timer, 0, sizeof(erp_action->timer));
+	erp_action->step = ZFCP_ERP_STEP_UNINITIALIZED;
+	erp_action->fsf_req = NULL;
 	erp_action->action = need;
 	erp_action->status = status;
 
@@ -621,6 +628,7 @@ static void zfcp_erp_enqueue_ptp_port(struct zfcp_adapter *adapter)
 	if (IS_ERR(port)) /* error or port already attached */
 		return;
 	_zfcp_erp_port_reopen(port, 0, "ereptp1", NULL);
+	zfcp_port_put(port);
 }
 
 static int zfcp_erp_adapter_strat_fsf_xconf(struct zfcp_erp_action *erp_action)
@@ -874,8 +882,7 @@ static int zfcp_erp_port_strategy_open_common(struct zfcp_erp_action *act)
 		}
 		if (port->d_id && !(p_status & ZFCP_STATUS_COMMON_NOESC)) {
 			port->d_id = 0;
-			_zfcp_erp_port_reopen(port, 0, "erpsoc1", NULL);
-			return ZFCP_ERP_EXIT;
+			return ZFCP_ERP_FAILED;
 		}
 		/* fall through otherwise */
 	}
@@ -1161,6 +1168,58 @@ static void zfcp_erp_action_dequeue(struct zfcp_erp_action *erp_action)
 	}
 }
 
+/**
+ * zfcp_erp_try_rport_unblock - unblock rport if no more/new recovery
+ * @port: zfcp_port whose fc_rport we should try to unblock
+ */
+static void zfcp_erp_try_rport_unblock(struct zfcp_port *port)
+{
+	unsigned long flags;
+	struct zfcp_adapter *adapter = port->adapter;
+	int port_status;
+	struct zfcp_unit *unit;
+
+	write_lock_irqsave(&adapter->erp_lock, flags);
+	port_status = atomic_read(&port->status);
+	if ((port_status & ZFCP_STATUS_COMMON_UNBLOCKED)    == 0 ||
+	    (port_status & (ZFCP_STATUS_COMMON_ERP_INUSE |
+			    ZFCP_STATUS_COMMON_ERP_FAILED)) != 0) {
+		/* new ERP of severity >= port triggered elsewhere meanwhile or
+		 * local link down (adapter erp_failed but not clear unblock)
+		 */
+		zfcp_dbf_rec_action_lvl(6, "ertru_p", &port->erp_action);
+		write_unlock_irqrestore(&adapter->erp_lock, flags);
+		return;
+	}
+	read_lock(&zfcp_data.config_lock);
+	list_for_each_entry(unit, &port->unit_list_head, list) {
+		int lun_status;
+
+		lun_status = atomic_read(&unit->status);
+		if ((lun_status & ZFCP_STATUS_COMMON_ERP_FAILED) != 0)
+			continue; /* unblock rport despite failed LUNs */
+		/* LUN recovery not given up yet [maybe follow-up pending] */
+		if ((lun_status & ZFCP_STATUS_COMMON_UNBLOCKED) == 0 ||
+		    (lun_status & ZFCP_STATUS_COMMON_ERP_INUSE) != 0) {
+			/* LUN blocked:
+			 * not yet unblocked [LUN recovery pending]
+			 * or meanwhile blocked [new LUN recovery triggered]
+			 */
+			zfcp_dbf_rec_action_lvl(6, "ertru_l",
+						&unit->erp_action);
+			read_unlock(&zfcp_data.config_lock);
+			write_unlock_irqrestore(&adapter->erp_lock, flags);
+			return;
+		}
+	}
+	/* now port has no child or all children have completed recovery,
+	 * and no ERP of severity >= port was meanwhile triggered elsewhere
+	 */
+	zfcp_scsi_schedule_rport_register(port);
+	read_unlock(&zfcp_data.config_lock);
+	write_unlock_irqrestore(&adapter->erp_lock, flags);
+}
+
 static void zfcp_erp_action_cleanup(struct zfcp_erp_action *act, int result)
 {
 	struct zfcp_adapter *adapter = act->adapter;
@@ -1169,26 +1228,28 @@ static void zfcp_erp_action_cleanup(struct zfcp_erp_action *act, int result)
 
 	switch (act->action) {
 	case ZFCP_ERP_ACTION_REOPEN_UNIT:
-		if ((result == ZFCP_ERP_SUCCEEDED) && !unit->device) {
-			zfcp_unit_get(unit);
-			if (scsi_queue_work(unit->port->adapter->scsi_host,
-					    &unit->scsi_work) <= 0)
-				zfcp_unit_put(unit);
-		}
 		zfcp_unit_put(unit);
+		zfcp_erp_try_rport_unblock(port);
 		break;
 
-	case ZFCP_ERP_ACTION_REOPEN_PORT_FORCED:
 	case ZFCP_ERP_ACTION_REOPEN_PORT:
-		if (result == ZFCP_ERP_SUCCEEDED)
-			zfcp_scsi_schedule_rport_register(port);
+		/* This switch case might also happen after a forced reopen
+		 * was successfully done and thus overwritten with a new
+		 * non-forced reopen at `ersfs_2'. In this case, we must not
+		 * do the clean-up of the non-forced version.
+		 */
+		if (act->step != ZFCP_ERP_STEP_UNINITIALIZED)
+			if (result == ZFCP_ERP_SUCCEEDED)
+				zfcp_erp_try_rport_unblock(port);
+		/* fall through */
+	case ZFCP_ERP_ACTION_REOPEN_PORT_FORCED:
 		zfcp_port_put(port);
 		break;
 
 	case ZFCP_ERP_ACTION_REOPEN_ADAPTER:
 		if (result == ZFCP_ERP_SUCCEEDED) {
 			register_service_level(&adapter->service_level);
-			schedule_work(&adapter->scan_work);
+			zfcp_fc_conditional_port_scan(adapter);
 		} else
 			unregister_service_level(&adapter->service_level);
 		zfcp_adapter_put(adapter);
@@ -1228,6 +1289,11 @@ static int zfcp_erp_strategy(struct zfcp_erp_action *erp_action)
 		goto unlock;
 	}
 
+	if (erp_action->status & ZFCP_STATUS_ERP_TIMEDOUT) {
+		retval = ZFCP_ERP_FAILED;
+		goto check_target;
+	}
+
 	zfcp_erp_action_to_running(erp_action);
 
 	/* no lock to allow for blocking operations */
@@ -1262,6 +1328,7 @@ static int zfcp_erp_strategy(struct zfcp_erp_action *erp_action)
 		goto unlock;
 	}
 
+check_target:
 	retval = zfcp_erp_strategy_check_target(erp_action, retval);
 	zfcp_erp_action_dequeue(erp_action);
 	retval = zfcp_erp_strategy_statechange(erp_action, retval);

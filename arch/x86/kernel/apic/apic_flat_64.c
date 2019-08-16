@@ -164,9 +164,14 @@ static int flat_phys_pkg_id(int initial_apic_id, int index_msb)
 	return initial_apic_id >> index_msb;
 }
 
+static int flat_probe(void)
+{
+	return 1;
+}
+
 struct apic apic_flat =  {
 	.name				= "flat",
-	.probe				= NULL,
+	.probe				= flat_probe,
 	.acpi_madt_oem_check		= flat_acpi_madt_oem_check,
 	.apic_id_registered		= flat_apic_id_registered,
 
@@ -216,6 +221,7 @@ struct apic apic_flat =  {
 
 	.read				= native_apic_mem_read,
 	.write				= native_apic_mem_write,
+	.eoi_write			= native_apic_mem_write,
 	.icr_read			= native_apic_icr_read,
 	.icr_write			= native_apic_icr_write,
 	.wait_icr_idle			= native_apic_wait_icr_idle,
@@ -223,7 +229,7 @@ struct apic apic_flat =  {
 };
 
 /*
- * Physflat mode is used when there are more than 8 CPUs on a AMD system.
+ * Physflat mode is used when there are more than 8 CPUs on a system.
  * We cannot use logical delivery in this case because the mask
  * overflows, so use physical mode.
  */
@@ -238,6 +244,11 @@ static int physflat_acpi_madt_oem_check(char *oem_id, char *oem_table_id)
 	if (acpi_gbl_FADT.header.revision >= FADT2_REVISION_ID &&
 		(acpi_gbl_FADT.flags & ACPI_FADT_APIC_PHYSICAL)) {
 		printk(KERN_DEBUG "system APIC only can use physical flat");
+		return 1;
+	}
+
+	if (!strncmp(oem_id, "IBM", 3) && !strncmp(oem_table_id, "EXA", 3)) {
+		printk(KERN_DEBUG "IBM Summit detected, will use apic physical");
 		return 1;
 	}
 #endif
@@ -306,16 +317,21 @@ physflat_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
 		if (cpumask_test_cpu(cpu, cpu_online_mask))
 			break;
 	}
-	if (cpu < nr_cpu_ids)
-		return per_cpu(x86_cpu_to_apicid, cpu);
+	return per_cpu(x86_cpu_to_apicid, cpu);
+}
 
-	return BAD_APICID;
+static int physflat_probe(void)
+{
+	if (apic == &apic_physflat || num_possible_cpus() > 8)
+		return 1;
+
+	return 0;
 }
 
 struct apic apic_physflat =  {
 
 	.name				= "physical flat",
-	.probe				= NULL,
+	.probe				= physflat_probe,
 	.acpi_madt_oem_check		= physflat_acpi_madt_oem_check,
 	.apic_id_registered		= flat_apic_id_registered,
 
@@ -366,6 +382,7 @@ struct apic apic_physflat =  {
 
 	.read				= native_apic_mem_read,
 	.write				= native_apic_mem_write,
+	.eoi_write			= native_apic_mem_write,
 	.icr_read			= native_apic_icr_read,
 	.icr_write			= native_apic_icr_write,
 	.wait_icr_idle			= native_apic_wait_icr_idle,

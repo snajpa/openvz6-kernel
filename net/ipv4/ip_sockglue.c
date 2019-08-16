@@ -193,7 +193,7 @@ EXPORT_SYMBOL(ip_cmsg_recv);
 
 int ip_cmsg_send(struct net *net, struct msghdr *msg, struct ipcm_cookie *ipc)
 {
-	int err;
+	int err, val;
 	struct cmsghdr *cmsg;
 
 	for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
@@ -219,6 +219,24 @@ int ip_cmsg_send(struct net *net, struct msghdr *msg, struct ipcm_cookie *ipc)
 			ipc->addr = info->ipi_spec_dst.s_addr;
 			break;
 		}
+		case IP_TTL:
+			if (cmsg->cmsg_len != CMSG_LEN(sizeof(int)))
+				return -EINVAL;
+			val = *(int *)CMSG_DATA(cmsg);
+			if (val < 1 || val > 255)
+				return -EINVAL;
+			ipc->ttl = val;
+			break;
+		case IP_TOS:
+			if (cmsg->cmsg_len != CMSG_LEN(sizeof(int)))
+				return -EINVAL;
+			val = *(int *)CMSG_DATA(cmsg);
+			if (val < 0 || val > 255)
+				return -EINVAL;
+			ipc->tos = val;
+			ipc->priority = rt_tos2priority(ipc->tos);
+			break;
+
 		default:
 			return -EINVAL;
 		}
@@ -356,7 +374,7 @@ void ip_local_error(struct sock *sk, int err, __be32 daddr, __be16 port, u32 inf
 /*
  *	Handle MSG_ERRQUEUE
  */
-int ip_recv_error(struct sock *sk, struct msghdr *msg, int len)
+int ip_recv_error(struct sock *sk, struct msghdr *msg, int len, int *addr_len)
 {
 	struct sock_exterr_skb *serr;
 	struct sk_buff *skb, *skb2;
@@ -393,6 +411,7 @@ int ip_recv_error(struct sock *sk, struct msghdr *msg, int len)
 						   serr->addr_offset);
 		sin->sin_port = serr->port;
 		memset(&sin->sin_zero, 0, sizeof(sin->sin_zero));
+		*addr_len = sizeof(*sin);
 	}
 
 	memcpy(&errhdr.ee, &serr->ee, sizeof(struct sock_extended_err));
@@ -434,6 +453,11 @@ out:
 }
 
 
+static void opt_kfree_rcu(struct rcu_head *head)
+{
+	kfree(container_of(head, struct ip_options_rcu, rcu));
+}
+
 /*
  *	Socket option code for IP. This is the end of the line after any
  *	TCP,UDP etc options on an IP socket.
@@ -451,7 +475,8 @@ static int do_ip_setsockopt(struct sock *sk, int level,
 			     (1<<IP_TTL) | (1<<IP_HDRINCL) |
 			     (1<<IP_MTU_DISCOVER) | (1<<IP_RECVERR) |
 			     (1<<IP_ROUTER_ALERT) | (1<<IP_FREEBIND) |
-			     (1<<IP_PASSSEC) | (1<<IP_TRANSPARENT))) ||
+			     (1<<IP_PASSSEC) | (1<<IP_TRANSPARENT) |
+			     (1<<IP_MINTTL))) ||
 	    optname == IP_MULTICAST_TTL ||
 	    optname == IP_MULTICAST_ALL ||
 	    optname == IP_MULTICAST_LOOP ||
@@ -479,13 +504,15 @@ static int do_ip_setsockopt(struct sock *sk, int level,
 	switch (optname) {
 	case IP_OPTIONS:
 	{
-		struct ip_options *opt = NULL;
+		struct ip_options *old, *opt = NULL;
+
 		if (optlen > 40 || optlen < 0)
 			goto e_inval;
 		err = ip_options_get_from_user(sock_net(sk), &opt,
 					       optval, optlen);
 		if (err)
 			break;
+		old = rcu_dereference(inet->opt);
 		if (inet->is_icsk) {
 			struct inet_connection_sock *icsk = inet_csk(sk);
 #if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
@@ -494,8 +521,8 @@ static int do_ip_setsockopt(struct sock *sk, int level,
 			       (TCPF_LISTEN | TCPF_CLOSE)) &&
 			     inet->daddr != LOOPBACK4_IPV6)) {
 #endif
-				if (inet->opt)
-					icsk->icsk_ext_hdr_len -= inet->opt->optlen;
+				if (old)
+					icsk->icsk_ext_hdr_len -= old->optlen;
 				if (opt)
 					icsk->icsk_ext_hdr_len += opt->optlen;
 				icsk->icsk_sync_mss(sk, icsk->icsk_pmtu_cookie);
@@ -503,8 +530,9 @@ static int do_ip_setsockopt(struct sock *sk, int level,
 			}
 #endif
 		}
-		opt = xchg(&inet->opt, opt);
-		kfree(opt);
+		rcu_assign_pointer(inet->opt, opt);
+		if (old)
+			call_rcu(&get_ip_options_rcu(old)->rcu, opt_kfree_rcu);
 		break;
 	}
 	case IP_PKTINFO:
@@ -563,7 +591,7 @@ static int do_ip_setsockopt(struct sock *sk, int level,
 	case IP_TTL:
 		if (optlen < 1)
 			goto e_inval;
-		if (val != -1 && (val < 0 || val > 255))
+		if (val != -1 && (val < 1 || val > 255))
 			goto e_inval;
 		inet->uc_ttl = val;
 		break;
@@ -575,7 +603,7 @@ static int do_ip_setsockopt(struct sock *sk, int level,
 		inet->hdrincl = val ? 1 : 0;
 		break;
 	case IP_MTU_DISCOVER:
-		if (val < 0 || val > 3)
+		if (val < IP_PMTUDISC_DONT || val > IP_PMTUDISC_OMIT)
 			goto e_inval;
 		inet->pmtudisc = val;
 		break;
@@ -620,10 +648,15 @@ static int do_ip_setsockopt(struct sock *sk, int level,
 				break;
 		} else {
 			memset(&mreq, 0, sizeof(mreq));
-			if (optlen >= sizeof(struct in_addr) &&
-			    copy_from_user(&mreq.imr_address, optval,
-					   sizeof(struct in_addr)))
-				break;
+			if (optlen >= sizeof(struct ip_mreq)) {
+				if (copy_from_user(&mreq, optval,
+						   sizeof(struct ip_mreq)))
+					break;
+			} else if (optlen >= sizeof(struct in_addr)) {
+				if (copy_from_user(&mreq.imr_address, optval,
+						   sizeof(struct in_addr)))
+					break;
+			}
 		}
 
 		if (!mreq.imr_ifindex) {
@@ -936,6 +969,14 @@ mc_msf_out:
 		inet->transparent = !!val;
 		break;
 
+	case IP_MINTTL:
+		if (optlen < 1)
+			goto e_inval;
+		if (val < 0 || val > 255)
+			goto e_inval;
+		sk_set_min_ttl(sk, val);
+		break;
+
 	default:
 		err = -ENOPROTOOPT;
 		break;
@@ -1032,12 +1073,15 @@ static int do_ip_getsockopt(struct sock *sk, int level, int optname,
 	case IP_OPTIONS:
 	{
 		unsigned char optbuf[sizeof(struct ip_options)+40];
-		struct ip_options * opt = (struct ip_options *)optbuf;
+		struct ip_options *opt = (struct ip_options *)optbuf;
+		struct ip_options *inet_opt;
+
+		inet_opt = rcu_dereference(inet->opt);
 		opt->optlen = 0;
-		if (inet->opt)
-			memcpy(optbuf, inet->opt,
+		if (inet_opt)
+			memcpy(optbuf, inet_opt,
 			       sizeof(struct ip_options)+
-			       inet->opt->optlen);
+			       inet_opt->optlen);
 		release_sock(sk);
 
 		if (opt->optlen == 0)
@@ -1189,6 +1233,10 @@ static int do_ip_getsockopt(struct sock *sk, int level, int optname,
 			int hlim = inet->mc_ttl;
 			put_cmsg(&msg, SOL_IP, IP_TTL, sizeof(hlim), &hlim);
 		}
+		if (inet->cmsg_flags & IP_CMSG_TOS) {
+			int tos = sk_extended(sk)->rcv_tos;
+			put_cmsg(&msg, SOL_IP, IP_TOS, sizeof(tos), &tos);
+		}
 		len -= msg.msg_controllen;
 		return put_user(len, optlen);
 	}
@@ -1197,6 +1245,9 @@ static int do_ip_getsockopt(struct sock *sk, int level, int optname,
 		break;
 	case IP_TRANSPARENT:
 		val = inet->transparent;
+		break;
+	case IP_MINTTL:
+		val = sk_get_min_ttl(sk);
 		break;
 	default:
 		release_sock(sk);

@@ -236,14 +236,10 @@ typedef elf_vrregset_t elf_fpxregset_t;
 #ifdef __powerpc64__
 # define SET_PERSONALITY(ex)					\
 do {								\
-	unsigned long new_flags = 0;				\
 	if ((ex).e_ident[EI_CLASS] == ELFCLASS32)		\
-		new_flags = _TIF_32BIT;				\
-	if ((current_thread_info()->flags & _TIF_32BIT)		\
-	    != new_flags)					\
-		set_thread_flag(TIF_ABI_PENDING);		\
+		set_thread_flag(TIF_32BIT);			\
 	else							\
-		clear_thread_flag(TIF_ABI_PENDING);		\
+		clear_thread_flag(TIF_32BIT);			\
 	if (personality(current->personality) != PER_LINUX32)	\
 		set_personality(PER_LINUX |			\
 			(current->personality & (~PER_MASK)));	\
@@ -278,9 +274,6 @@ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
 #define STACK_RND_MASK (is_32bit_task() ? \
 	(0x7ff >> (PAGE_SHIFT - 12)) : \
 	(0x3ffff >> (PAGE_SHIFT - 12)))
-
-extern unsigned long arch_randomize_brk(struct mm_struct *mm);
-#define arch_randomize_brk arch_randomize_brk
 
 #endif /* __KERNEL__ */
 

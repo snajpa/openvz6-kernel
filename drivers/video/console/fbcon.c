@@ -283,7 +283,8 @@ static inline int fbcon_is_inactive(struct vc_data *vc, struct fb_info *info)
 	struct fbcon_ops *ops = info->fbcon_par;
 
 	return (info->state != FBINFO_STATE_RUNNING ||
-		vc->vc_mode != KD_TEXT || ops->graphics);
+		vc->vc_mode != KD_TEXT || ops->graphics) &&
+		!vt_force_oops_output(vc);
 }
 
 static inline int get_color(struct vc_data *vc, struct fb_info *info,
@@ -373,8 +374,11 @@ static void fb_flashcursor(struct work_struct *work)
 	struct vc_data *vc = NULL;
 	int c;
 	int mode;
+	int ret;
 
-	acquire_console_sem();
+	ret = try_acquire_console_sem();
+	if (ret < 0)
+		return;
 	if (ops && ops->currcon != -1)
 		vc = vc_cons[ops->currcon].d;
 
@@ -524,6 +528,33 @@ static int search_for_mapped_con(void)
 	return retval;
 }
 
+static int do_fbcon_takeover(int show_logo)
+{
+	int err, i;
+
+	if (!num_registered_fb)
+		return -ENODEV;
+
+	if (!show_logo)
+		logo_shown = FBCON_LOGO_DONTSHOW;
+
+	for (i = first_fb_vc; i <= last_fb_vc; i++)
+		con2fb_map[i] = info_idx;
+
+	err = do_take_over_console(&fb_con, first_fb_vc, last_fb_vc,
+				fbcon_is_default);
+
+	if (err) {
+		for (i = first_fb_vc; i <= last_fb_vc; i++)
+			con2fb_map[i] = -1;
+		info_idx = -1;
+	} else {
+		fbcon_has_console_bind = 1;
+	}
+
+	return err;
+}
+
 static int fbcon_takeover(int show_logo)
 {
 	int err, i;
@@ -634,13 +665,15 @@ static void fbcon_prepare_logo(struct vc_data *vc, struct fb_info *info,
 		kfree(save);
 	}
 
-	if (logo_lines > vc->vc_bottom) {
-		logo_shown = FBCON_LOGO_CANSHOW;
-		printk(KERN_INFO
-		       "fbcon_init: disable boot-logo (boot-logo bigger than screen).\n");
-	} else if (logo_shown != FBCON_LOGO_DONTSHOW) {
-		logo_shown = FBCON_LOGO_DRAW;
-		vc->vc_top = logo_lines;
+	if (logo_shown != FBCON_LOGO_DONTSHOW) {
+		if (logo_lines > vc->vc_bottom) {
+			logo_shown = FBCON_LOGO_CANSHOW;
+			printk(KERN_INFO
+			       "fbcon_init: disable boot-logo (boot-logo bigger than screen).\n");
+		} else {
+			logo_shown = FBCON_LOGO_DRAW;
+			vc->vc_top = logo_lines;
+		}
 	}
 }
 #endif /* MODULE */
@@ -810,6 +843,8 @@ static void con2fb_init_display(struct vc_data *vc, struct fb_info *info,
  *
  *	Maps a virtual console @unit to a frame buffer device
  *	@newidx.
+ *
+ *	This should be called with the console lock held.
  */
 static int set_con2fb_map(int unit, int newidx, int user)
 {
@@ -822,12 +857,12 @@ static int set_con2fb_map(int unit, int newidx, int user)
 	if (oldidx == newidx)
 		return 0;
 
-	if (!info || fbcon_has_exited)
+	if (!info)
 		return -EINVAL;
 
- 	if (!err && !search_for_mapped_con()) {
+	if (!search_for_mapped_con() || !con_is_bound(&fb_con)) {
 		info_idx = newidx;
-		return fbcon_takeover(0);
+		return do_fbcon_takeover(0);
 	}
 
 	if (oldidx != -1)
@@ -835,7 +870,6 @@ static int set_con2fb_map(int unit, int newidx, int user)
 
 	found = search_fb_in_map(newidx);
 
-	acquire_console_sem();
 	con2fb_map[unit] = newidx;
 	if (!err && !found)
  		err = con2fb_acquire_newinfo(vc, info, unit, oldidx);
@@ -862,7 +896,6 @@ static int set_con2fb_map(int unit, int newidx, int user)
 	if (!search_fb_in_map(info_idx))
 		info_idx = newidx;
 
-	release_console_sem();
  	return err;
 }
 
@@ -1073,6 +1106,7 @@ static void fbcon_init(struct vc_data *vc, int init)
 	if (p->userfont)
 		charcnt = FNTCHARCNT(p->fontdata);
 
+	vc->vc_panic_force_write = !!(info->flags & FBINFO_CAN_FORCE_OUTPUT);
 	vc->vc_can_do_color = (fb_get_color_depth(&info->var, &info->fix)!=1);
 	vc->vc_complement_mask = vc->vc_can_do_color ? 0x7700 : 0x0800;
 	if (charcnt == 256) {
@@ -2947,7 +2981,7 @@ static int fbcon_unbind(void)
 {
 	int ret;
 
-	ret = unbind_con_driver(&fb_con, first_fb_vc, last_fb_vc,
+	ret = do_unbind_con_driver(&fb_con, first_fb_vc, last_fb_vc,
 				fbcon_is_default);
 
 	if (!ret)
@@ -2962,6 +2996,7 @@ static inline int fbcon_unbind(void)
 }
 #endif /* CONFIG_VT_HW_CONSOLE_BINDING */
 
+/* called with console_lock held */
 static int fbcon_fb_unbind(int idx)
 {
 	int i, new_idx = -1, ret = 0;
@@ -2988,6 +3023,7 @@ static int fbcon_fb_unbind(int idx)
 	return ret;
 }
 
+/* called with console_lock held */
 static int fbcon_fb_unregistered(struct fb_info *info)
 {
 	int i, idx;
@@ -3020,9 +3056,24 @@ static int fbcon_fb_unregistered(struct fb_info *info)
 		primary_device = -1;
 
 	if (!num_registered_fb)
-		unregister_con_driver(&fb_con);
+		do_unregister_con_driver(&fb_con);
 
 	return 0;
+}
+
+/* called with console_lock held */
+static void fbcon_remap_all(int idx)
+{
+	int i;
+	for (i = first_fb_vc; i <= last_fb_vc; i++)
+		set_con2fb_map(i, idx, 0);
+
+	if (con_is_bound(&fb_con)) {
+		printk(KERN_INFO "fbcon: Remapping primary device, "
+		       "fb%i, to tty %i-%i\n", idx,
+		       first_fb_vc + 1, last_fb_vc + 1);
+		info_idx = idx;
+	}
 }
 
 #ifdef CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY
@@ -3055,6 +3106,7 @@ static inline void fbcon_select_primary(struct fb_info *info)
 }
 #endif /* CONFIG_FRAMEBUFFER_DETECT_PRIMARY */
 
+/* called with console_lock held */
 static int fbcon_fb_registered(struct fb_info *info)
 {
 	int ret = 0, i, idx;
@@ -3071,7 +3123,7 @@ static int fbcon_fb_registered(struct fb_info *info)
 		}
 
 		if (info_idx != -1)
-			ret = fbcon_takeover(1);
+			ret = do_fbcon_takeover(1);
 	} else {
 		for (i = first_fb_vc; i <= last_fb_vc; i++) {
 			if (con2fb_map_boot[i] == idx)
@@ -3207,6 +3259,7 @@ static int fbcon_event_notify(struct notifier_block *self,
 		ret = fbcon_fb_unregistered(info);
 		break;
 	case FB_EVENT_SET_CONSOLE_MAP:
+		/* called with console lock held */
 		con2fb = event->data;
 		ret = set_con2fb_map(con2fb->console - 1,
 				     con2fb->framebuffer, 1);
@@ -3224,6 +3277,10 @@ static int fbcon_event_notify(struct notifier_block *self,
 	case FB_EVENT_GET_REQ:
 		caps = event->data;
 		fbcon_get_requirement(info, caps);
+		break;
+	case FB_EVENT_REMAP_ALL_CONSOLE:
+		idx = info->node;
+		fbcon_remap_all(idx);
 		break;
 	}
 done:
@@ -3525,6 +3582,14 @@ static int __init fb_console_init(void)
 	fbcon_start();
 	return 0;
 }
+
+static int __init quiet_logo(char *str)
+{
+	logo_shown = FBCON_LOGO_DONTSHOW;
+	return 0;
+}
+
+early_param("quiet", quiet_logo);
 
 module_init(fb_console_init);
 

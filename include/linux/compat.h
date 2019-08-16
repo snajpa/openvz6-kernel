@@ -198,7 +198,7 @@ asmlinkage ssize_t compat_sys_pwritev(unsigned long fd,
 		const struct compat_iovec __user *vec,
 		unsigned long vlen, u32 pos_low, u32 pos_high);
 
-int compat_do_execve(char * filename, compat_uptr_t __user *argv,
+int compat_do_execve(const char * filename, compat_uptr_t __user *argv,
 	        compat_uptr_t __user *envp, struct pt_regs * regs);
 
 asmlinkage long compat_sys_select(int n, compat_ulong_t __user *inp,
@@ -309,5 +309,11 @@ asmlinkage long compat_sys_newfstatat(unsigned int dfd, char __user * filename,
 asmlinkage long compat_sys_openat(unsigned int dfd, const char __user *filename,
 				  int flags, int mode);
 
+extern void __user *compat_alloc_user_space(unsigned long len);
+
+extern ssize_t compat_rw_copy_check_uvector(int type,
+		const struct compat_iovec __user *uvector, unsigned long nr_segs,
+		unsigned long fast_segs, struct iovec *fast_pointer,
+		struct iovec **ret_pointer, int check_access);
 #endif /* CONFIG_COMPAT */
 #endif /* _LINUX_COMPAT_H */

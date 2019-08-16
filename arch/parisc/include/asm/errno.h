@@ -37,7 +37,7 @@
 #define	EBADMSG		67	/* Not a data message */
 #define	EUSERS		68	/* Too many users */
 #define	EDQUOT		69	/* Quota exceeded */
-#define	ESTALE		70	/* Stale NFS file handle */
+#define	ESTALE		70	/* Stale file handle */
 #define	EREMOTE		71	/* Object is remote */
 #define	EOVERFLOW	72	/* Value too large for defined data type */
 
@@ -121,5 +121,7 @@
 #define ENOTRECOVERABLE	255	/* State not recoverable */
 
 #define	ERFKILL		256	/* Operation not possible due to RF-kill */
+
+#define EHWPOISON	257	/* Memory page has hardware error */
 
 #endif

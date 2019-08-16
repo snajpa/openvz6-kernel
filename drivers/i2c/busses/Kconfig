@@ -77,7 +77,7 @@ config I2C_AMD8111
 	  will be called i2c-amd8111.
 
 config I2C_I801
-	tristate "Intel 82801 (ICH)"
+	tristate "Intel 82801 (ICH/PCH)"
 	depends on PCI
 	help
 	  If you say yes to this option, support will be included for the Intel
@@ -95,22 +95,45 @@ config I2C_I801
 	    ESB2
 	    ICH8
 	    ICH9
-	    Tolapai
+	    EP80579 (Tolapai)
 	    ICH10
-	    PCH
+	    5/3400 Series (PCH)
+	    Cougar Point (PCH)
+	    Patsburg (PCH)
+	    Panther Point (PCH)
+	    Lynx Point (PCH)
+	    Lynx Point-LP (PCH)
+	    Avoton (SOC)
+	    Wellsburg (PCH)
+	    Wildcat Point-LP (PCH)
+	    Coleto Creek (PCH)
+	    Sunrise Point-H (PCH)
+	    Sunrise Point-LP (PCH)
+	    Wildcat Point (PCH)
+	    Lewisburg (PCH)
 
 	  This driver can also be built as a module.  If so, the module
 	  will be called i2c-i801.
 
 config I2C_ISCH
 	tristate "Intel SCH SMBus 1.0"
-	depends on PCI
+	select LPC_SCH
 	help
 	  Say Y here if you want to use SMBus controller on the Intel SCH
 	  based systems.
 
 	  This driver can also be built as a module. If so, the module
 	  will be called i2c-isch.
+
+config I2C_ISMT
+	tristate "Intel iSMT SMBus Controller"
+	depends on PCI && X86
+	help
+	  If you say yes to this option, support will be included for the Intel
+	  iSMT SMBus host controller interface.
+
+	  This driver can also be built as a module.  If so, the module will be
+	  called i2c-ismt.
 
 config I2C_PIIX4
 	tristate "Intel PIIX4 and compatible (ATI/AMD/Serverworks/Broadcom/SMSC)"

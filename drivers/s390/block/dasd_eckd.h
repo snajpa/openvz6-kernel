@@ -27,6 +27,7 @@
 #define DASD_ECKD_CCW_WRITE_CKD		 0x1d
 #define DASD_ECKD_CCW_READ_CKD		 0x1e
 #define DASD_ECKD_CCW_PSF		 0x27
+#define DASD_ECKD_CCW_SNID		 0x34
 #define DASD_ECKD_CCW_RSSD		 0x3e
 #define DASD_ECKD_CCW_LOCATE_RECORD	 0x47
 #define DASD_ECKD_CCW_SNSS		 0x54
@@ -36,25 +37,60 @@
 #define DASD_ECKD_CCW_WRITE_KD_MT	 0x8d
 #define DASD_ECKD_CCW_READ_KD_MT	 0x8e
 #define DASD_ECKD_CCW_RELEASE		 0x94
+#define DASD_ECKD_CCW_WRITE_FULL_TRACK	 0x95
 #define DASD_ECKD_CCW_READ_CKD_MT	 0x9e
 #define DASD_ECKD_CCW_WRITE_CKD_MT	 0x9d
 #define DASD_ECKD_CCW_WRITE_TRACK_DATA	 0xA5
 #define DASD_ECKD_CCW_READ_TRACK_DATA	 0xA6
 #define DASD_ECKD_CCW_RESERVE		 0xB4
+#define DASD_ECKD_CCW_READ_TRACK	 0xDE
 #define DASD_ECKD_CCW_PFX		 0xE7
 #define DASD_ECKD_CCW_PFX_READ		 0xEA
 #define DASD_ECKD_CCW_RSCK		 0xF9
+#define DASD_ECKD_CCW_RCD		 0xFA
 
 /*
  * Perform Subsystem Function / Sub-Orders
  */
-#define PSF_ORDER_PRSSD 0x18
-#define PSF_ORDER_SSC	0x1D
+#define PSF_ORDER_PRSSD			 0x18
+#define PSF_ORDER_CUIR_RESPONSE		 0x1A
+#define PSF_ORDER_SSC			 0x1D
+
+/*
+ * CUIR response condition codes
+ */
+#define PSF_CUIR_INVALID		 0x00
+#define PSF_CUIR_COMPLETED		 0x01
+#define PSF_CUIR_NOT_SUPPORTED		 0x02
+#define PSF_CUIR_ERROR_IN_REQ		 0x03
+#define PSF_CUIR_DENIED			 0x04
+#define PSF_CUIR_LAST_PATH		 0x05
+#define PSF_CUIR_DEVICE_ONLINE		 0x06
+#define PSF_CUIR_VARY_FAILURE		 0x07
+#define PSF_CUIR_SOFTWARE_FAILURE	 0x08
+#define PSF_CUIR_NOT_RECOGNIZED		 0x09
+
+/*
+ * CUIR codes
+ */
+#define CUIR_QUIESCE			 0x01
+#define CUIR_RESUME			 0x02
+
+/*
+ * attention message definitions
+ */
+#define ATTENTION_LENGTH_CUIR		 0x0e
+#define ATTENTION_FORMAT_CUIR		 0x01
 
 /*
  * Size that is reportet for large volumes in the old 16-bit no_cyl field
  */
 #define LV_COMPAT_CYL 0xFFFE
+
+
+#define FCX_MAX_DATA_FACTOR 65536
+#define DASD_ECKD_RCD_DATA_SIZE 256
+
 
 /*****************************************************************************
  * SECTION: Type Definitions
@@ -320,21 +356,52 @@ struct dasd_gneq {
 		__u8 identifier:2;
 		__u8 reserved:6;
 	} __attribute__ ((packed)) flags;
-	__u8 reserved[7];
+	__u8 reserved[5];
+	struct {
+		__u8 value:2;
+		__u8 number:6;
+	} __attribute__ ((packed)) timeout;
+	__u8 reserved3;
 	__u16 subsystemID;
 	__u8 reserved2[22];
 } __attribute__ ((packed));
-
-struct dasd_eckd_path {
-	__u8 opm;
-	__u8 ppm;
-	__u8 npm;
-};
 
 struct dasd_rssd_features {
 	char feature[256];
 } __attribute__((packed));
 
+struct dasd_rssd_messages {
+	__u16 length;
+	__u8 format;
+	__u8 code;
+	__u32 message_id;
+	__u8 flags;
+	char messages[4087];
+} __packed;
+
+struct dasd_cuir_message {
+	__u16 length;
+	__u8 format;
+	__u8 code;
+	__u32 message_id;
+	__u8 flags;
+	__u8 neq_map[3];
+	__u8 ned_map;
+	__u8 record_selector;
+} __packed;
+
+struct dasd_psf_cuir_response {
+	__u8 order;
+	__u8 flags;
+	__u8 cc;
+	__u8 chpid;
+	__u16 device_nr;
+	__u16 reserved;
+	__u32 message_id;
+	__u64 system_id;
+	__u8 cssid;
+	__u8 ssid;
+} __packed;
 
 /*
  * Perform Subsystem Function - Prepare for Read Subsystem Data
@@ -414,6 +481,7 @@ struct alias_lcu {
 	struct summary_unit_check_work_data suc_data;
 	struct read_uac_work_data ruac_data;
 	struct dasd_ccw_req *rsu_cqr;
+	struct completion lcu_setup;
 };
 
 struct alias_pav_group {
@@ -425,7 +493,6 @@ struct alias_pav_group {
 	struct dasd_device *next;
 };
 
-
 struct dasd_eckd_private {
 	struct dasd_eckd_characteristics rdc_data;
 	u8 *conf_data;
@@ -436,7 +503,6 @@ struct dasd_eckd_private {
 	struct vd_sneq *vdsneq;
 	struct dasd_gneq *gneq;
 
-	struct dasd_eckd_path path_data;
 	struct eckd_count count_area[5];
 	int init_cqr_status;
 	int uses_cdl;
@@ -449,6 +515,8 @@ struct dasd_eckd_private {
 	struct alias_pav_group *pavgroup;
 	struct alias_lcu *lcu;
 	int count;
+
+	u32 fcx_max_data;
 };
 
 
@@ -460,5 +528,7 @@ int dasd_alias_remove_device(struct dasd_device *);
 struct dasd_device *dasd_alias_get_start_dev(struct dasd_device *);
 void dasd_alias_handle_summary_unit_check(struct dasd_device *, struct irb *);
 void dasd_eckd_reset_ccw_to_base_io(struct dasd_ccw_req *);
-
+void dasd_alias_lcu_setup_complete(struct dasd_device *);
+void dasd_alias_wait_for_lcu_setup(struct dasd_device *);
+int dasd_alias_update_add_device(struct dasd_device *);
 #endif				/* DASD_ECKD_H */

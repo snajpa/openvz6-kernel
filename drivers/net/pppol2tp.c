@@ -756,6 +756,7 @@ static int pppol2tp_recv_core(struct sock *sock, struct sk_buff *skb)
 
 	/* Try to dequeue as many skbs from reorder_q as we can. */
 	pppol2tp_recv_dequeue(session);
+	sock_put(sock);
 
 	return 0;
 
@@ -772,6 +773,7 @@ discard_bad_csum:
 	UDP_INC_STATS_USER(&init_net, UDP_MIB_INERRORS, 0);
 	tunnel->stats.rx_errors++;
 	kfree_skb(skb);
+	sock_put(sock);
 
 	return 0;
 
@@ -1178,7 +1180,8 @@ static int pppol2tp_xmit(struct ppp_channel *chan, struct sk_buff *skb)
 	/* Calculate UDP checksum if configured to do so */
 	if (sk_tun->sk_no_check == UDP_CSUM_NOXMIT)
 		skb->ip_summed = CHECKSUM_NONE;
-	else if (!(skb_dst(skb)->dev->features & NETIF_F_V4_CSUM)) {
+	else if ((skb_dst(skb) && skb_dst(skb)->dev) &&
+		 (!(skb_dst(skb)->dev->features & NETIF_F_V4_CSUM))) {
 		skb->ip_summed = CHECKSUM_COMPLETE;
 		csum = skb_checksum(skb, 0, udp_len, 0);
 		uh->check = csum_tcpudp_magic(inet->saddr, inet->daddr,
@@ -1657,6 +1660,7 @@ static int pppol2tp_connect(struct socket *sock, struct sockaddr *uservaddr,
 		if (tunnel_sock == NULL)
 			goto end;
 
+		sock_hold(tunnel_sock);
 		tunnel = tunnel_sock->sk_user_data;
 	} else {
 		tunnel = pppol2tp_tunnel_find(sock_net(sk), sp->pppol2tp.s_tunnel);
@@ -2188,7 +2192,7 @@ static int pppol2tp_setsockopt(struct socket *sock, int level, int optname,
 	int err;
 
 	if (level != SOL_PPPOL2TP)
-		return udp_prot.setsockopt(sk, level, optname, optval, optlen);
+		return -EINVAL;
 
 	if (optlen < sizeof(int))
 		return -EINVAL;
@@ -2312,7 +2316,7 @@ static int pppol2tp_getsockopt(struct socket *sock, int level,
 	int err;
 
 	if (level != SOL_PPPOL2TP)
-		return udp_prot.getsockopt(sk, level, optname, optval, optlen);
+		return -EINVAL;
 
 	if (get_user(len, (int __user *) optlen))
 		return -EFAULT;
@@ -2654,34 +2658,35 @@ static int __init pppol2tp_init(void)
 {
 	int err;
 
-	err = proto_register(&pppol2tp_sk_proto, 0);
+	err = register_pernet_gen_device(&pppol2tp_net_id, &pppol2tp_net_ops);
 	if (err)
 		goto out;
+
+	err = proto_register(&pppol2tp_sk_proto, 0);
+	if (err)
+		goto out_unregister_pernet_dev;
+
 	err = register_pppox_proto(PX_PROTO_OL2TP, &pppol2tp_proto);
 	if (err)
 		goto out_unregister_pppol2tp_proto;
-
-	err = register_pernet_gen_device(&pppol2tp_net_id, &pppol2tp_net_ops);
-	if (err)
-		goto out_unregister_pppox_proto;
 
 	printk(KERN_INFO "PPPoL2TP kernel driver, %s\n",
 	       PPPOL2TP_DRV_VERSION);
 
 out:
 	return err;
-out_unregister_pppox_proto:
-	unregister_pppox_proto(PX_PROTO_OL2TP);
 out_unregister_pppol2tp_proto:
 	proto_unregister(&pppol2tp_sk_proto);
+out_unregister_pernet_dev:
+	unregister_pernet_gen_device(pppol2tp_net_id, &pppol2tp_net_ops);
 	goto out;
 }
 
 static void __exit pppol2tp_exit(void)
 {
 	unregister_pppox_proto(PX_PROTO_OL2TP);
-	unregister_pernet_gen_device(pppol2tp_net_id, &pppol2tp_net_ops);
 	proto_unregister(&pppol2tp_sk_proto);
+	unregister_pernet_gen_device(pppol2tp_net_id, &pppol2tp_net_ops);
 }
 
 module_init(pppol2tp_init);

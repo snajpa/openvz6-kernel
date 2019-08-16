@@ -13,12 +13,40 @@ ip_forward - BOOLEAN
 ip_default_ttl - INTEGER
 	default 64
 
-ip_no_pmtu_disc - BOOLEAN
-	Disable Path MTU Discovery.
-	default FALSE
+ip_no_pmtu_disc - INTEGER
+	Disable Path MTU Discovery. If enabled in mode 1 and a
+	fragmentation-required ICMP is received, the PMTU to this
+	destination will be set to min_pmtu (see below). You will need
+	to raise min_pmtu to the smallest interface MTU on your system
+	manually if you want to avoid locally generated fragments.
+
+	In mode 2 incoming Path MTU Discovery messages will be
+	discarded. Outgoing frames are handled the same as in mode 1,
+	implicitly setting IP_PMTUDISC_DONT on every created socket.
+
+	Possible values: 0-2
+	Default: FALSE
 
 min_pmtu - INTEGER
 	default 562 - minimum discovered Path MTU
+
+ip_forward_use_pmtu - BOOLEAN
+	By default we don't trust protocol path MTUs while forwarding
+	because they could be easily forged and can lead to unwanted
+	fragmentation by the router.
+	You only need to enable this if you have user-space software
+	which tries to discover path mtus by itself and depends on the
+	kernel honoring this information. This is normally not the
+	case.
+	Default: 0 (disabled)
+	Possible values:
+	0 - disabled
+	1 - enabled
+
+neigh/default/gc_thresh1 - INTEGER
+	Minimum number of entries to keep.  Garbage collector will not
+	purge entries if there are fewer than this number.
+	Default: 256
 
 mtu_expires - INTEGER
 	Time, in seconds, that cached PMTU information is kept.
@@ -226,6 +254,28 @@ tcp_frto_response - INTEGER
 		  to the values prior timeout
 	Default: 0 (rate halving based)
 
+tcp_invalid_ratelimit - INTEGER
+	Limit the maximal rate for sending duplicate acknowledgments
+	in response to incoming TCP packets that are for an existing
+	connection but that are invalid due to any of these reasons:
+
+	  (a) out-of-window sequence number,
+	  (b) out-of-window acknowledgment number, or
+	  (c) PAWS (Protection Against Wrapped Sequence numbers) check failure
+
+	This can help mitigate simple "ack loop" DoS attacks, wherein
+	a buggy or malicious middlebox or man-in-the-middle can
+	rewrite TCP header fields in manner that causes each endpoint
+	to think that the other is sending invalid TCP segments, thus
+	causing each side to send an unterminating stream of duplicate
+	acknowledgments for invalid segments.
+
+	Using 0 disables rate-limiting of dupacks in response to
+	invalid segments; otherwise this value specifies the minimal
+	space between sending such dupacks, in milliseconds.
+
+	Default: 500 (milliseconds).
+
 tcp_keepalive_time - INTEGER
 	How often TCP sends out keepalive messages when keepalive is enabled.
 	Default: 2hours.
@@ -261,11 +311,11 @@ tcp_max_orphans - INTEGER
 	up to ~64K of unswappable memory.
 
 tcp_max_syn_backlog - INTEGER
-	Maximal number of remembered connection requests, which are
-	still did not receive an acknowledgment from connecting client.
-	Default value is 1024 for systems with more than 128Mb of memory,
-	and 128 for low memory machines. If server suffers of overload,
-	try to increase this number.
+	Maximal number of remembered connection requests, which have not
+	received an acknowledgment from connecting client.
+	The minimal value is 128 for low memory machines, and it will
+	increase in proportion to the memory of machine.
+	If server suffers from overload, try increasing this number.
 
 tcp_max_tw_buckets - INTEGER
 	Maximal number of timewait sockets held by system simultaneously.
@@ -428,6 +478,15 @@ tcp_syn_retries - INTEGER
 tcp_timestamps - BOOLEAN
 	Enable timestamps as defined in RFC1323.
 
+tcp_min_tso_segs - INTEGER
+	Minimal number of segments per TSO frame.
+	Since linux-3.12, TCP does an automatic sizing of TSO frames,
+	depending on flow rate, instead of filling 64Kbytes packets.
+	For specific usages, it's possible to force TCP to build big
+	TSO frames. Note that TCP stack might split too big TSO packets
+	if available window is too small.
+	Default: 2
+
 tcp_tso_win_divisor - INTEGER
 	This allows control over what percentage of the congestion window
 	can be consumed by a single TSO frame.
@@ -478,6 +537,46 @@ tcp_dma_copybreak - INTEGER
 	offloaded to a DMA copy engine, if one is present in the system
 	and CONFIG_NET_DMA is enabled.
 	Default: 4096
+
+tcp_thin_linear_timeouts - BOOLEAN
+	Enable dynamic triggering of linear timeouts for thin streams.
+	If set, a check is performed upon retransmission by timeout to
+	determine if the stream is thin (less than 4 packets in flight).
+	As long as the stream is found to be thin, up to 6 linear
+	timeouts may be performed before exponential backoff mode is
+	initiated. This improves retransmission latency for
+	non-aggressive thin streams, often found to be time-dependent.
+	For more information on thin streams, see
+	Documentation/networking/tcp-thin.txt
+	Default: 0
+
+tcp_thin_dupack - BOOLEAN
+	Enable dynamic triggering of retransmissions after one dupACK
+	for thin streams. If set, a check is performed upon reception
+	of a dupACK to determine if the stream is thin (less than 4
+	packets in flight). As long as the stream is found to be thin,
+	data is retransmitted on the first received dupACK. This
+	improves retransmission latency for non-aggressive thin
+	streams, often found to be time-dependent.
+	For more information on thin streams, see
+	Documentation/networking/tcp-thin.txt
+	Default: 0
+
+tcp_limit_output_bytes - INTEGER
+	Controls TCP Small Queue limit per tcp socket.
+	TCP bulk sender tends to increase packets in flight until it
+	gets losses notifications. With SNDBUF autotuning, this can
+	result in a large amount of packets queued in qdisc/device
+	on the local machine, hurting latency of other flows, for
+	typical pfifo_fast qdiscs.
+	tcp_limit_output_bytes limits the number of bytes on qdisc
+	or device to reduce artificial RTT/cwnd and reduce bufferbloat.
+	Default: 131072
+
+tcp_challenge_ack_limit - INTEGER
+	Limits number of Challenge ACK sent per second, as recommended
+	in RFC 5961 (Improving TCP's Robustness to Blind In-Window Attacks)
+	Default: 100
 
 UDP variables:
 
@@ -546,15 +645,41 @@ IP Variables:
 ip_local_port_range - 2 INTEGERS
 	Defines the local port range that is used by TCP and UDP to
 	choose the local port. The first number is the first, the
-	second the last local port number. Default value depends on
-	amount of memory available on the system:
-	> 128Mb 32768-61000
-	< 128Mb 1024-4999 or even less.
-	This number defines number of active connections, which this
-	system can issue simultaneously to systems not supporting
-	TCP extensions (timestamps). With tcp_tw_recycle enabled
-	(i.e. by default) range 1024-4999 is enough to issue up to
-	2000 connections per second to systems supporting timestamps.
+	second the last local port number.
+	If possible, it is better these numbers have different parity.
+	(one even and one odd values)
+	The default values are 32768 and 60999 respectively.
+
+ip_local_reserved_ports - list of comma separated ranges
+	Specify the ports which are reserved for known third-party
+	applications. These ports will not be used by automatic port
+	assignments (e.g. when calling connect() or bind() with port
+	number 0). Explicit port allocation behavior is unchanged.
+
+	The format used for both input and output is a comma separated
+	list of ranges (e.g. "1,2-4,10-10" for ports 1, 2, 3, 4 and
+	10). Writing to the file will clear all previously reserved
+	ports and update the current list with the one given in the
+	input.
+
+	Note that ip_local_port_range and ip_local_reserved_ports
+	settings are independent and both are considered by the kernel
+	when determining which ports are available for automatic port
+	assignments.
+
+	You can reserve ports which are not in the current
+	ip_local_port_range, e.g.:
+
+	$ cat /proc/sys/net/ipv4/ip_local_port_range
+	32000	60999
+	$ cat /proc/sys/net/ipv4/ip_local_reserved_ports
+	8080,9148
+
+	although this is redundant. However such a setting is useful
+	if later the port range is changed to a value that will
+	include the reserved ports.
+
+	Default: Empty
 
 ip_nonlocal_bind - BOOLEAN
 	If set, allows processes to bind() to non-local IP addresses,
@@ -635,10 +760,28 @@ igmp_max_memberships - INTEGER
 	Change the maximum number of multicast groups we can subscribe to.
 	Default: 20
 
-conf/interface/*  changes special settings per interface (where "interface" is
-		  the name of your network interface)
-conf/all/*	  is special, changes the settings for all interfaces
+	Theoretical maximum value is bounded by having to send a membership
+	report in a single datagram (i.e. the report can't span multiple
+	datagrams, or risk confusing the switch and leaving groups you don't
+	intend to).
 
+	The number of supported groups 'M' is bounded by the number of group
+	report entries you can fit into a single datagram of 65535 bytes.
+
+	M = 65536-sizeof (ip header)/(sizeof(Group record))
+
+	Group records are variable length, with a minimum of 12 bytes.
+	So net.ipv4.igmp_max_memberships should not be set higher than:
+
+	(65536-24) / 12 = 5459
+
+	The value 5459 assumes no IP header options, so in practice
+	this number may be lower.
+
+	conf/interface/*  changes special settings per interface (where
+	"interface" is the name of your network interface)
+
+	conf/all/*	  is special, changes the settings for all interfaces
 
 log_martians - BOOLEAN
 	Log packets with impossible addresses to kernel log.
@@ -684,6 +827,25 @@ proxy_arp - BOOLEAN
 	conf/{all,interface}/proxy_arp is set to TRUE,
 	it will be disabled otherwise
 
+proxy_arp_pvlan - BOOLEAN
+	Private VLAN proxy arp.
+	Basically allow proxy arp replies back to the same interface
+	(from which the ARP request/solicitation was received).
+
+	This is done to support (ethernet) switch features, like RFC
+	3069, where the individual ports are NOT allowed to
+	communicate with each other, but they are allowed to talk to
+	the upstream router.  As described in RFC 3069, it is possible
+	to allow these hosts to communicate through the upstream
+	router by proxy_arp'ing. Don't need to be used together with
+	proxy_arp.
+
+	This technology is known by different names:
+	  In RFC 3069 it is called VLAN Aggregation.
+	  Cisco and Allied Telesyn call it Private VLAN.
+	  Hewlett-Packard call it Source-Port filtering or port-isolation.
+	  Ericsson call it MAC-Forced Forwarding (RFC Draft).
+
 shared_media - BOOLEAN
 	Send(router) or accept(host) RFC1620 shared media redirects.
 	Overrides ip_secure_redirects.
@@ -723,6 +885,17 @@ accept_source_route - BOOLEAN
 	default TRUE (router)
 		FALSE (host)
 
+accept_local - BOOLEAN
+	Accept packets with local source addresses. In combination with
+	suitable routing, this can be used to direct packets between two
+	local interfaces over the wire and have them accepted properly.
+	default FALSE
+
+route_localnet - BOOLEAN
+	Do not consider loopback addresses as martian source or destination
+	while routing. This enables the use of 127/8 for local routing purposes.
+	default FALSE
+
 rp_filter - INTEGER
 	0 - No source validation.
 	1 - Strict mode as defined in RFC3704 Strict Reverse Path
@@ -738,8 +911,8 @@ rp_filter - INTEGER
 	to prevent IP spoofing from DDos attacks. If using asymmetric routing
 	or other complicated routing, then loose mode is recommended.
 
-	conf/all/rp_filter must also be set to non-zero to do source validation
-	on the interface
+	The max value from conf/{all,interface}/rp_filter is used
+	when doing source validation on the {interface}.
 
 	Default value is 0. Note that some distributions enable it
 	in startup scripts.
@@ -815,7 +988,7 @@ arp_ignore - INTEGER
 arp_notify - BOOLEAN
 	Define mode for notification of address and device changes.
 	0 - (default): do nothing
-	1 - Generate gratuitous arp replies when device is brought up
+	1 - Generate gratuitous arp requests when device is brought up
 	    or hardware address changes.
 
 arp_accept - BOOLEAN
@@ -839,6 +1012,11 @@ disable_xfrm - BOOLEAN
 tag - INTEGER
 	Allows you to write a number, which can be used as required.
 	Default value is 0.
+
+xfrm4_gc_thresh - INTEGER
+	The threshold at which we will start garbage collecting for IPv4
+	destination cache entries.  At twice this value the system will
+	refuse new allocations.
 
 Alexey Kuznetsov.
 kuznet@ms2.inr.ac.ru
@@ -917,6 +1095,17 @@ conf/interface/*:
 accept_ra - BOOLEAN
 	Accept Router Advertisements; autoconfigure using them.
 
+	It also determines whether or not to transmit Router
+	Solicitations. If and only if the functional setting is to
+	accept Router Advertisements, Router Solicitations will be
+	transmitted.
+
+	Possible values are:
+		0 Do not accept Router Advertisements.
+		1 Accept Router Advertisements if forwarding is disabled.
+		2 Overrule forwarding behaviour. Accept Router Advertisements
+		  even if forwarding is enabled.
+
 	Functional default: enabled if local forwarding is disabled.
 			    disabled if local forwarding is enabled.
 
@@ -978,28 +1167,33 @@ forwarding - BOOLEAN
 	Note: It is recommended to have the same setting on all
 	interfaces; mixed router/host scenarios are rather uncommon.
 
-	FALSE:
+	Possible values are:
+		0 Forwarding disabled
+		1 Forwarding enabled
+
+	FALSE (0):
 
 	By default, Host behaviour is assumed.  This means:
 
 	1. IsRouter flag is not set in Neighbour Advertisements.
-	2. Router Solicitations are being sent when necessary.
+	2. If accept_ra is TRUE (default), transmit Router
+	   Solicitations.
 	3. If accept_ra is TRUE (default), accept Router
 	   Advertisements (and do autoconfiguration).
 	4. If accept_redirects is TRUE (default), accept Redirects.
 
-	TRUE:
+	TRUE (1):
 
 	If local forwarding is enabled, Router behaviour is assumed.
 	This means exactly the reverse from the above:
 
 	1. IsRouter flag is set in Neighbour Advertisements.
-	2. Router Solicitations are not sent.
-	3. Router Advertisements are ignored.
+	2. Router Solicitations are not sent unless accept_ra is 2.
+	3. Router Advertisements are ignored unless accept_ra is 2.
 	4. Redirects are ignored.
 
-	Default: FALSE if global forwarding is disabled (default),
-		 otherwise TRUE.
+	Default: 0 (disabled) if global forwarding is disabled (default),
+		 otherwise 1 (enabled).
 
 hop_limit - INTEGER
 	Default Hop Limit to set.
@@ -1086,12 +1280,22 @@ accept_dad - INTEGER
 	2: Enable DAD, and disable IPv6 operation if MAC-based duplicate
 	   link-local address has been found.
 
+force_mld_version - INTEGER
+	0 - (default) No enforcement of a MLD version, MLDv1 fallback allowed
+	1 - Enforce to use MLD version 1
+	2 - Enforce to use MLD version 2
+
 icmp/*:
 ratelimit - INTEGER
 	Limit the maximal rates for sending ICMPv6 packets.
 	0 to disable any limiting,
 	otherwise the minimal space between responses in milliseconds.
 	Default: 1000
+
+xfrm6_gc_thresh - INTEGER
+	The threshold at which we will start garbage collecting for IPv6
+	destination cache entries.  At twice this value the system will
+	refuse new allocations.
 
 
 IPv6 Update by:
@@ -1207,6 +1411,20 @@ path_max_retrans - INTEGER
 
 	Default: 5
 
+pf_retrans - INTEGER
+	The number of retransmissions that will be attempted on a given path
+	before traffic is redirected to an alternate transport (should one
+	exist).  Note this is distinct from path_max_retrans, as a path that
+	passes the pf_retrans threshold can still be used.  Its only
+	deprioritized when a transmission path is selected by the stack.  This
+	setting is primarily used to enable fast failover mechanisms without
+	having to reduce path_max_retrans to a very low value.  See:
+	http://www.ietf.org/id/draft-nishida-tsvwg-sctp-failover-05.txt
+	for details.  Note also that a value of pf_retrans > path_max_retrans
+	disables this feature
+
+	Default: INT_MAX
+
 rto_initial - INTEGER
 	The initial round trip timeout value in milliseconds that will be used
 	in calculating round trip times.  This is the initial time interval
@@ -1253,6 +1471,20 @@ cookie_preserve_enable - BOOLEAN
 	0: Disable
 
 	Default: 1
+
+cookie_hmac_alg - STRING
+	Select the hmac algorithm used when generating the cookie value sent by
+	a listening sctp socket to a connecting client in the INIT-ACK chunk.
+	Valid values are:
+	* md5
+	* sha1
+	* none
+	Ability to assign md5 or sha1 as the selected alg is predicated on the
+	configuarion of those algorithms at build time (CONFIG_CRYPTO_MD5 and
+	CONFIG_CRYPTO_SHA1).
+
+	Default: Dependent on configuration.  MD5 if available, else SHA1 if
+	available, else none.
 
 rcvbuf_policy - INTEGER
 	Determines if the receive buffer is attributed to the socket or to

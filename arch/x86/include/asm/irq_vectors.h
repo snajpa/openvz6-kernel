@@ -106,19 +106,23 @@
 /*
  * Generic system vector for platform specific use
  */
-#define GENERIC_INTERRUPT_VECTOR	0xed
+#define X86_PLATFORM_IPI_VECTOR		0xed
 
 /*
- * Performance monitoring pending work vector:
+ * IRQ work vector:
  */
-#define LOCAL_PENDING_VECTOR		0xec
+#define IRQ_WORK_VECTOR			0xec
 
-#define UV_BAU_MESSAGE			0xec
+#define UV_BAU_MESSAGE			0xea
 
 /*
  * Self IPI vector for machine checks
  */
 #define MCE_SELF_VECTOR			0xeb
+
+
+/* Vector on which hypervisor callbacks will be delivered */
+#define HYPERVISOR_CALLBACK_VECTOR	0xe9
 
 /*
  * First APIC vector available to drivers: (vectors 0x30-0xee) we

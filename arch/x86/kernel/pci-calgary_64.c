@@ -46,6 +46,7 @@
 #include <asm/dma.h>
 #include <asm/rio.h>
 #include <asm/bios_ebda.h>
+#include <asm/x86_init.h>
 
 #ifdef CONFIG_CALGARY_IOMMU_ENABLED_BY_DEFAULT
 int use_calgary __read_mostly = 1;
@@ -102,11 +103,16 @@ int use_calgary __read_mostly = 0;
 #define PMR_SOFTSTOPFAULT	0x40000000
 #define PMR_HARDSTOP		0x20000000
 
-#define MAX_NUM_OF_PHBS		8 /* how many PHBs in total? */
-#define MAX_NUM_CHASSIS		8 /* max number of chassis */
-/* MAX_PHB_BUS_NUM is the maximal possible dev->bus->number */
-#define MAX_PHB_BUS_NUM		(MAX_NUM_OF_PHBS * MAX_NUM_CHASSIS * 2)
-#define PHBS_PER_CALGARY	4
+/*
+ * The maximum PHB bus number.
+ * x3950M2 (rare): 8 chassis, 48 PHBs per chassis = 384
+ * x3950M2: 4 chassis, 48 PHBs per chassis        = 192
+ * x3950 (PCIE): 8 chassis, 32 PHBs per chassis   = 256
+ * x3950 (PCIX): 8 chassis, 16 PHBs per chassis   = 128
+ */
+#define MAX_PHB_BUS_NUM		256
+
+#define PHBS_PER_CALGARY	  4
 
 /* register offsets in Calgary's internal register space */
 static const unsigned long tar_offsets[] = {
@@ -318,13 +324,15 @@ static inline struct iommu_table *find_iommu_table(struct device *dev)
 
 	pdev = to_pci_dev(dev);
 
+	/* search up the device tree for an iommu */
 	pbus = pdev->bus;
-
-	/* is the device behind a bridge? Look for the root bus */
-	while (pbus->parent)
+	do {
+		tbl = pci_iommu(pbus);
+		if (tbl && tbl->it_busno == pbus->number)
+			break;
+		tbl = NULL;
 		pbus = pbus->parent;
-
-	tbl = pci_iommu(pbus);
+	} while (pbus);
 
 	BUG_ON(tbl && (tbl->it_busno != pbus->number));
 
@@ -1051,8 +1059,6 @@ static int __init calgary_init_one(struct pci_dev *dev)
 	struct iommu_table *tbl;
 	int ret;
 
-	BUG_ON(dev->bus->number >= MAX_PHB_BUS_NUM);
-
 	bbar = busno_to_bbar(dev->bus->number);
 	ret = calgary_setup_tar(dev, bbar);
 	if (ret)
@@ -1344,6 +1350,25 @@ static void __init get_tce_space_from_tar(void)
 	return;
 }
 
+static int __init calgary_iommu_init(void)
+{
+	int ret;
+
+	/* ok, we're trying to use Calgary - let's roll */
+	printk(KERN_INFO "PCI-DMA: Using Calgary IOMMU\n");
+
+	ret = calgary_init();
+	if (ret) {
+		printk(KERN_ERR "PCI-DMA: Calgary init failed %d, "
+		       "falling back to no_iommu\n", ret);
+		return ret;
+	}
+
+	bad_dma_address = 0x0;
+
+	return 0;
+}
+
 void __init detect_calgary(void)
 {
 	int bus;
@@ -1357,7 +1382,7 @@ void __init detect_calgary(void)
 	 * if the user specified iommu=off or iommu=soft or we found
 	 * another HW IOMMU already, bail out.
 	 */
-	if (swiotlb || no_iommu || iommu_detected)
+	if (no_iommu || iommu_detected)
 		return;
 
 	if (!use_calgary)
@@ -1442,9 +1467,7 @@ void __init detect_calgary(void)
 		printk(KERN_INFO "PCI-DMA: Calgary TCE table spec is %d\n",
 		       specified_table_size);
 
-		/* swiotlb for devices that aren't behind the Calgary. */
-		if (max_pfn > MAX_DMA32_PFN)
-			swiotlb = 1;
+		x86_init.iommu.iommu_init = calgary_iommu_init;
 	}
 	return;
 
@@ -1455,35 +1478,6 @@ cleanup:
 		if (info->tce_space)
 			free_tce_table(info->tce_space);
 	}
-}
-
-int __init calgary_iommu_init(void)
-{
-	int ret;
-
-	if (no_iommu || (swiotlb && !calgary_detected))
-		return -ENODEV;
-
-	if (!calgary_detected)
-		return -ENODEV;
-
-	/* ok, we're trying to use Calgary - let's roll */
-	printk(KERN_INFO "PCI-DMA: Using Calgary IOMMU\n");
-
-	ret = calgary_init();
-	if (ret) {
-		printk(KERN_ERR "PCI-DMA: Calgary init failed %d, "
-		       "falling back to no_iommu\n", ret);
-		return ret;
-	}
-
-	force_iommu = 1;
-	bad_dma_address = 0x0;
-	/* dma_ops is set to swiotlb or nommu */
-	if (!dma_ops)
-		dma_ops = &nommu_dma_ops;
-
-	return 0;
 }
 
 static int __init calgary_parse_options(char *p)

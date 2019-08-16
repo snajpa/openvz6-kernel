@@ -596,8 +596,7 @@ static void ipath_ht_handle_hwerrors(struct ipath_devdata *dd, char *msg,
 
 	ipath_format_hwerrors(hwerrs,
 			      ipath_6110_hwerror_msgs,
-			      sizeof(ipath_6110_hwerror_msgs) /
-			      sizeof(ipath_6110_hwerror_msgs[0]),
+			      ARRAY_SIZE(ipath_6110_hwerror_msgs),
 			      msg, msgl);
 
 	if (hwerrs & (_IPATH_HTLINK0_CRCBITS | _IPATH_HTLINK1_CRCBITS))
@@ -1474,7 +1473,7 @@ static void ipath_ht_quiet_serdes(struct ipath_devdata *dd)
 /**
  * ipath_pe_put_tid - write a TID in chip
  * @dd: the infinipath device
- * @tidptr: pointer to the expected TID (in chip) to udpate
+ * @tidptr: pointer to the expected TID (in chip) to update
  * @tidtype: RCVHQ_RCV_TYPE_EAGER (1) for eager, RCVHQ_RCV_TYPE_EXPECTED (0) for expected
  * @pa: physical address of in memory buffer; ipath_tidinvalid if freeing
  *

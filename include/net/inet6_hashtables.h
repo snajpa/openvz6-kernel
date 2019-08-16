@@ -53,7 +53,7 @@ static inline int inet6_sk_ehashfn(const struct sock *sk)
 	return inet6_ehashfn(net, laddr, lport, faddr, fport);
 }
 
-extern void __inet6_hash(struct sock *sk);
+extern int __inet6_hash(struct sock *sk, struct inet_timewait_sock *twp);
 
 /*
  * Sockets in TCP_CLOSE state are _always_ taken out of the hash, so
@@ -71,6 +71,8 @@ extern struct sock *__inet6_lookup_established(struct net *net,
 
 extern struct sock *inet6_lookup_listener(struct net *net,
 					  struct inet_hashinfo *hashinfo,
+					  const struct in6_addr *saddr,
+					  const __be16 sport,
 					  const struct in6_addr *daddr,
 					  const unsigned short hnum,
 					  const int dif);
@@ -88,7 +90,8 @@ static inline struct sock *__inet6_lookup(struct net *net,
 	if (sk)
 		return sk;
 
-	return inet6_lookup_listener(net, hashinfo, daddr, hnum, dif);
+	return inet6_lookup_listener(net, hashinfo, saddr, sport,
+				     daddr, hnum, dif);
 }
 
 static inline struct sock *__inet6_lookup_skb(struct inet_hashinfo *hashinfo,

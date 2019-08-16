@@ -23,6 +23,8 @@ static int zfcp_ccw_suspend(struct ccw_device *cdev)
 
 	mutex_lock(&zfcp_data.config_mutex);
 
+	zfcp_erp_modify_adapter_status(adapter, "ccsusp2", NULL,
+				       ZFCP_STATUS_ADAPTER_SUSPENDED, ZFCP_SET);
 	zfcp_erp_adapter_shutdown(adapter, 0, "ccsusp1", NULL);
 	zfcp_erp_wait(adapter);
 
@@ -31,20 +33,39 @@ static int zfcp_ccw_suspend(struct ccw_device *cdev)
 	return 0;
 }
 
-static int zfcp_ccw_activate(struct ccw_device *cdev)
-
+/**
+ * zfcp_ccw_activate - activate adapter and wait for it to finish
+ * @cdev: pointer to belonging ccw device
+ * @clear: Status flags to clear.
+ * @tag: s390dbf trace record tag
+ */
+static int zfcp_ccw_activate(struct ccw_device *cdev, int clear, char *tag)
 {
 	struct zfcp_adapter *adapter = dev_get_drvdata(&cdev->dev);
 
 	if (!adapter)
 		return 0;
 
-	zfcp_erp_modify_adapter_status(adapter, "ccresu1", NULL,
+	zfcp_erp_modify_adapter_status(adapter, tag, NULL, clear, ZFCP_CLEAR);
+	zfcp_erp_modify_adapter_status(adapter, tag, NULL,
 				       ZFCP_STATUS_COMMON_RUNNING, ZFCP_SET);
 	zfcp_erp_adapter_reopen(adapter, ZFCP_STATUS_COMMON_ERP_FAILED,
-				"ccresu2", NULL);
+				tag, NULL);
+	/*
+	 * We want to scan ports here, with some random backoff and without
+	 * rate limit. Recovery has already scheduled a port scan for us,
+	 * but with both random delay and rate limit. Nevertheless we get
+	 * what we want here by flushing the scheduled work after sleeping
+	 * an equivalent random time.
+	 * Let the port scan random delay elapse first. If recovery finishes
+	 * up to that point in time, that would be perfect for both recovery
+	 * and port scan. If not, i.e. recovery takes ages, there was no
+	 * point in waiting a random delay on top of the time consumed by
+	 * recovery.
+	 */
+	msleep(zfcp_fc_port_scan_backoff());
 	zfcp_erp_wait(adapter);
-	flush_work(&adapter->scan_work);
+	flush_delayed_work(&adapter->scan_work);
 
 	return 0;
 }
@@ -100,16 +121,21 @@ static void zfcp_ccw_remove(struct ccw_device *ccw_device)
 
 	mutex_lock(&zfcp_data.config_mutex);
 	adapter = dev_get_drvdata(&ccw_device->dev);
-	if (!adapter)
-		goto out;
+	dev_set_drvdata(&ccw_device->dev, NULL);
 	mutex_unlock(&zfcp_data.config_mutex);
 
-	cancel_work_sync(&adapter->scan_work);
+	if (!adapter)
+		return;
+
+	zfcp_adapter_scsi_unregister(adapter);
+
+	cancel_delayed_work_sync(&adapter->scan_work);
+	cancel_work_sync(&adapter->stat_work);
+	zfcp_fc_wka_ports_force_offline(adapter->gs);
+	zfcp_fc_gs_destroy(adapter);
 
 	mutex_lock(&zfcp_data.config_mutex);
-
-	/* this also removes the scsi devices, so call it first */
-	zfcp_adapter_scsi_unregister(adapter);
+	atomic_set_mask(ZFCP_STATUS_COMMON_REMOVE, &adapter->status);
 
 	write_lock_irq(&zfcp_data.config_lock);
 	list_for_each_entry_safe(port, p, &adapter->port_list_head, list) {
@@ -121,19 +147,18 @@ static void zfcp_ccw_remove(struct ccw_device *ccw_device)
 		list_move(&port->list, &port_remove_lh);
 		atomic_set_mask(ZFCP_STATUS_COMMON_REMOVE, &port->status);
 	}
-	atomic_set_mask(ZFCP_STATUS_COMMON_REMOVE, &adapter->status);
 	write_unlock_irq(&zfcp_data.config_lock);
+	mutex_unlock(&zfcp_data.config_mutex);
 
-	list_for_each_entry_safe(port, p, &port_remove_lh, list) {
-		list_for_each_entry_safe(unit, u, &unit_remove_lh, list)
-			zfcp_unit_dequeue(unit);
+	list_for_each_entry_safe(unit, u, &unit_remove_lh, list)
+		zfcp_unit_dequeue(unit);
+
+	list_for_each_entry_safe(port, p, &port_remove_lh, list)
 		zfcp_port_dequeue(port);
-	}
+
+	zfcp_destroy_adapter_work_queue(adapter);
 	wait_event(adapter->remove_wq, atomic_read(&adapter->refcount) == 0);
 	zfcp_adapter_dequeue(adapter);
-
-out:
-	mutex_unlock(&zfcp_data.config_mutex);
 }
 
 /**
@@ -176,11 +201,28 @@ static int zfcp_ccw_set_online(struct ccw_device *ccw_device)
 				       ZFCP_STATUS_COMMON_RUNNING, ZFCP_SET);
 	zfcp_erp_adapter_reopen(adapter, ZFCP_STATUS_COMMON_ERP_FAILED,
 				"ccsonl2", NULL);
+	/*
+	 * We want to scan ports here, always, with some random delay and
+	 * without rate limit - basically what zfcp_erp_adapter_reopen()
+	 * has achieved for us. Not quite! That port scan depended on
+	 * !no_auto_port_rescan. So let's cover the no_auto_port_rescan
+	 * case here to make sure a port scan is done unconditionally.
+	 * Scheduled port scans use a rate limit. Nevertheless we get
+	 * what we want here by flushing the scheduled work after sleeping
+	 * a random time equivalent to the desired backoff.
+	 * Let the port scan random delay elapse first. If recovery finishes
+	 * up to that point in time, that would be perfect for both recovery
+	 * and port scan. If not, i.e. recovery takes ages, there was no
+	 * point in waiting a random delay on top of the time consumed by
+	 * recovery.
+	 */
+	msleep(zfcp_fc_port_scan_backoff());
 	zfcp_erp_wait(adapter);
+	zfcp_fc_inverse_conditional_port_scan(adapter);
 out:
 	mutex_unlock(&zfcp_data.config_mutex);
 	if (!ret)
-		flush_work(&adapter->scan_work);
+		flush_delayed_work(&adapter->scan_work);
 	return ret;
 }
 
@@ -217,6 +259,11 @@ static int zfcp_ccw_notify(struct ccw_device *ccw_device, int event)
 
 	switch (event) {
 	case CIO_GONE:
+		if (atomic_read(&adapter->status) &
+		    ZFCP_STATUS_ADAPTER_SUSPENDED) { /* notification ignore */
+			zfcp_dbf_hba_base(adapter->dbf, "nigo");
+			break;
+		}
 		dev_warn(&adapter->ccw_device->dev,
 			 "The FCP device has been detached\n");
 		zfcp_erp_adapter_shutdown(adapter, 0, "ccnoti1", NULL);
@@ -227,6 +274,11 @@ static int zfcp_ccw_notify(struct ccw_device *ccw_device, int event)
 		zfcp_erp_adapter_shutdown(adapter, 0, "ccnoti2", NULL);
 		break;
 	case CIO_OPER:
+		if (atomic_read(&adapter->status) &
+		    ZFCP_STATUS_ADAPTER_SUSPENDED) { /* notification ignore */
+			zfcp_dbf_hba_base(adapter->dbf, "niop");
+			break;
+		}
 		dev_info(&adapter->ccw_device->dev,
 			 "The FCP device is operational again\n");
 		zfcp_erp_modify_adapter_status(adapter, "ccnoti3", NULL,
@@ -264,6 +316,22 @@ out:
 	mutex_unlock(&zfcp_data.config_mutex);
 }
 
+static int zfcp_ccw_thaw(struct ccw_device *cdev)
+{
+	/* trace records for thaw and final shutdown during suspend
+	   can only be found in system dump until the end of suspend
+	   but not after resume because it's based on the memory image
+	   right after the very first suspend (freeze) callback */
+	zfcp_ccw_activate(cdev, 0, "ccthaw1");
+	return 0;
+}
+
+static int zfcp_ccw_resume(struct ccw_device *cdev)
+{
+	zfcp_ccw_activate(cdev, ZFCP_STATUS_ADAPTER_SUSPENDED, "ccresu1");
+	return 0;
+}
+
 struct ccw_driver zfcp_ccw_driver = {
 	.owner       = THIS_MODULE,
 	.name        = "zfcp",
@@ -275,8 +343,8 @@ struct ccw_driver zfcp_ccw_driver = {
 	.notify      = zfcp_ccw_notify,
 	.shutdown    = zfcp_ccw_shutdown,
 	.freeze      = zfcp_ccw_suspend,
-	.thaw	     = zfcp_ccw_activate,
-	.restore     = zfcp_ccw_activate,
+	.thaw	     = zfcp_ccw_thaw,
+	.restore     = zfcp_ccw_resume,
 };
 
 /**

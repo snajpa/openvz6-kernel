@@ -66,6 +66,7 @@ struct input_absinfo {
 #define EVIOCGNAME(len)		_IOC(_IOC_READ, 'E', 0x06, len)		/* get device name */
 #define EVIOCGPHYS(len)		_IOC(_IOC_READ, 'E', 0x07, len)		/* get physical location */
 #define EVIOCGUNIQ(len)		_IOC(_IOC_READ, 'E', 0x08, len)		/* get unique identifier */
+#define EVIOCGPROP(len)		_IOC(_IOC_READ, 'E', 0x09, len)		/* get device properties */
 
 #define EVIOCGKEY(len)		_IOC(_IOC_READ, 'E', 0x18, len)		/* get global keystate */
 #define EVIOCGLED(len)		_IOC(_IOC_READ, 'E', 0x19, len)		/* get all LEDs */
@@ -81,6 +82,20 @@ struct input_absinfo {
 #define EVIOCGEFFECTS		_IOR('E', 0x84, int)			/* Report number of effects playable at the same time */
 
 #define EVIOCGRAB		_IOW('E', 0x90, int)			/* Grab/Release device */
+
+/*
+ * Device properties and quirks
+ */
+
+#define INPUT_PROP_POINTER		0x00	/* needs a pointer */
+#define INPUT_PROP_DIRECT		0x01	/* direct input devices */
+#define INPUT_PROP_BUTTONPAD		0x02	/* has button(s) under pad */
+#define INPUT_PROP_SEMI_MT		0x03	/* touch rectangle only */
+#define INPUT_PROP_TOPBUTTONPAD		0x04	/* softbuttons at top of pad */
+#define INPUT_PROP_ACCELEROMETER	0x06	/* has accelerometer */
+
+#define INPUT_PROP_MAX			0x1f
+#define INPUT_PROP_CNT			(INPUT_PROP_MAX + 1)
 
 /*
  * Event types
@@ -377,7 +392,9 @@ struct input_absinfo {
 
 #define KEY_WIMAX		246
 
-/* Range 248 - 255 is reserved for special needs of AT keyboard driver */
+#define KEY_MICMUTE		248	/* Mute / unmute the microphone */
+
+/* Code 255 is reserved for special needs of AT keyboard driver */
 
 #define BTN_MISC		0x100
 #define BTN_0			0x100
@@ -442,6 +459,7 @@ struct input_absinfo {
 #define BTN_TOOL_FINGER		0x145
 #define BTN_TOOL_MOUSE		0x146
 #define BTN_TOOL_LENS		0x147
+#define BTN_TOOL_QUINTTAP	0x148	/* Five fingers on trackpad */
 #define BTN_TOUCH		0x14a
 #define BTN_STYLUS		0x14b
 #define BTN_STYLUS2		0x14c
@@ -543,6 +561,8 @@ struct input_absinfo {
 #define KEY_FRAMEFORWARD	0x1b5
 #define KEY_CONTEXT_MENU	0x1b6	/* GenDesc - system context menu */
 #define KEY_MEDIA_REPEAT	0x1b7	/* Consumer - transport control */
+#define KEY_10CHANNELSUP        0x1b8   /* 10 channels up (10+) */
+#define KEY_10CHANNELSDOWN      0x1b9   /* 10 channels up (10-) */
 
 #define KEY_DEL_EOL		0x1c0
 #define KEY_DEL_EOS		0x1c1
@@ -595,6 +615,13 @@ struct input_absinfo {
 #define KEY_NUMERIC_STAR	0x20a
 #define KEY_NUMERIC_POUND	0x20b
 
+#define KEY_RFKILL		0x20c /* Key that controls all radios */
+
+#define KEY_WPS_BUTTON		0x211	/* WiFi Protected Setup key */
+#define KEY_TOUCHPAD_TOGGLE	0x212	/* Request switch touchpad on or off */
+#define KEY_TOUCHPAD_ON		0x213
+#define KEY_TOUCHPAD_OFF	0x214
+
 /* We avoid low common keys in module aliases so they don't get huge. */
 #define KEY_MIN_INTERESTING	KEY_MUTE
 #define KEY_MAX			0x2ff
@@ -645,19 +672,32 @@ struct input_absinfo {
 #define ABS_TILT_X		0x1a
 #define ABS_TILT_Y		0x1b
 #define ABS_TOOL_WIDTH		0x1c
+
 #define ABS_VOLUME		0x20
+
 #define ABS_MISC		0x28
 
+#define ABS_MT_SLOT		0x2f	/* MT slot being modified */
 #define ABS_MT_TOUCH_MAJOR	0x30	/* Major axis of touching ellipse */
 #define ABS_MT_TOUCH_MINOR	0x31	/* Minor axis (omit if circular) */
 #define ABS_MT_WIDTH_MAJOR	0x32	/* Major axis of approaching ellipse */
 #define ABS_MT_WIDTH_MINOR	0x33	/* Minor axis (omit if circular) */
 #define ABS_MT_ORIENTATION	0x34	/* Ellipse orientation */
-#define ABS_MT_POSITION_X	0x35	/* Center X ellipse position */
-#define ABS_MT_POSITION_Y	0x36	/* Center Y ellipse position */
+#define ABS_MT_POSITION_X	0x35	/* Center X touch position */
+#define ABS_MT_POSITION_Y	0x36	/* Center Y touch position */
 #define ABS_MT_TOOL_TYPE	0x37	/* Type of touching device */
 #define ABS_MT_BLOB_ID		0x38	/* Group a set of packets as a blob */
 #define ABS_MT_TRACKING_ID	0x39	/* Unique ID of initiated contact */
+#define ABS_MT_PRESSURE		0x3a	/* Pressure on contact area */
+#define ABS_MT_DISTANCE		0x3b	/* Contact hover distance */
+#define ABS_MT_TOOL_X		0x3c	/* Center X tool position */
+#define ABS_MT_TOOL_Y		0x3d	/* Center Y tool position */
+
+#ifdef __KERNEL__
+/* Implementation details, userspace should not care about these */
+#define ABS_MT_FIRST		ABS_MT_TOUCH_MAJOR
+#define ABS_MT_LAST		ABS_MT_TOOL_Y
+#endif
 
 #define ABS_MAX			0x3f
 #define ABS_CNT			(ABS_MAX+1)
@@ -677,6 +717,7 @@ struct input_absinfo {
 #define SW_LINEOUT_INSERT	0x06  /* set = inserted */
 #define SW_JACK_PHYSICAL_INSERT 0x07  /* set = mechanical switch set */
 #define SW_VIDEOOUT_INSERT	0x08  /* set = inserted */
+#define SW_LINEIN_INSERT	0x0d  /* set = inserted */
 #define SW_MAX			0x0f
 #define SW_CNT			(SW_MAX+1)
 
@@ -762,6 +803,7 @@ struct input_absinfo {
  */
 #define MT_TOOL_FINGER		0
 #define MT_TOOL_PEN		1
+#define MT_TOOL_MAX		1
 
 /*
  * Values describing the status of a force-feedback effect
@@ -1002,6 +1044,7 @@ struct ff_effect {
  * @phys: physical path to the device in the system hierarchy
  * @uniq: unique identification code for the device (if device has it)
  * @id: id of the device (struct input_id)
+ * @propbit: bitmap of device properties and quirks
  * @evbit: bitmap of types of events supported by the device (EV_KEY,
  *	EV_REL, etc.)
  * @keybit: bitmap of keys/buttons this device has
@@ -1012,6 +1055,10 @@ struct ff_effect {
  * @sndbit: bitmap of sound effects supported by the device
  * @ffbit: bitmap of force feedback effects supported by the device
  * @swbit: bitmap of switches present on the device
+ * @hint_events_per_packet: average number of events generated by the
+ *	device in a packet (between EV_SYN/SYN_REPORT events). Used by
+ *	event handlers to estimate size of the buffer needed to hold
+ *	events.
  * @keycodemax: size of keycode table
  * @keycodesize: size of elements in keycode table
  * @keycode: map of scancodes to keycodes for this device
@@ -1027,6 +1074,7 @@ struct ff_effect {
  * @sync: set to 1 when there were no new events since last EV_SYNC
  * @abs: current values for reports from absolute axes
  * @rep: current values for autorepeat parameters (delay, rate)
+ * @mt: pointer to multitouch state
  * @key: reflects current state of device's keys/buttons
  * @led: reflects current state of device's LEDs
  * @snd: reflects current state of sound effects
@@ -1129,6 +1177,13 @@ struct input_dev {
 
 	struct list_head	h_list;
 	struct list_head	node;
+
+#ifndef __GENKSYMS__
+	/* Currently used only by the synaptics driver */
+	unsigned long propbit[BITS_TO_LONGS(INPUT_PROP_CNT)];
+	unsigned int hint_events_per_packet;
+	struct input_mt *mt;
+#endif
 };
 #define to_input_dev(d) container_of(d, struct input_dev, dev)
 
@@ -1340,6 +1395,21 @@ static inline void input_mt_sync(struct input_dev *dev)
 
 void input_set_capability(struct input_dev *dev, unsigned int type, unsigned int code);
 
+/**
+ * input_set_events_per_packet - tell handlers about the driver event rate
+ * @dev: the input device used by the driver
+ * @n_events: the average number of events between calls to input_sync()
+ *
+ * If the event rate sent from a device is unusually large, use this
+ * function to set the expected event rate. This will allow handlers
+ * to set up an appropriate buffer size for the event stream, in order
+ * to minimize information loss.
+ */
+static inline void input_set_events_per_packet(struct input_dev *dev, int n_events)
+{
+	dev->hint_events_per_packet = n_events;
+}
+
 static inline void input_set_abs_params(struct input_dev *dev, int axis, int min, int max, int fuzz, int flat)
 {
 	dev->absmin[axis] = min;
@@ -1348,6 +1418,36 @@ static inline void input_set_abs_params(struct input_dev *dev, int axis, int min
 	dev->absflat[axis] = flat;
 
 	dev->absbit[BIT_WORD(axis)] |= BIT_MASK(axis);
+}
+
+#define INPUT_GENERATE_ABS_ACCESSORS(_suffix, _item)			\
+static inline int input_abs_get_##_suffix(struct input_dev *dev,	\
+					  unsigned int axis)		\
+{									\
+	return dev->abs##_item[axis];					\
+}									\
+									\
+static inline void input_abs_set_##_suffix(struct input_dev *dev,	\
+					   unsigned int axis, int val)	\
+{									\
+	dev->abs##_item[axis] = val;					\
+}
+
+INPUT_GENERATE_ABS_ACCESSORS(min, min)
+INPUT_GENERATE_ABS_ACCESSORS(max, max)
+INPUT_GENERATE_ABS_ACCESSORS(fuzz, fuzz)
+INPUT_GENERATE_ABS_ACCESSORS(flat, flat)
+INPUT_GENERATE_ABS_ACCESSORS(res, res)
+
+static inline int input_abs_get_val(struct input_dev *dev, unsigned int axis)
+{
+	return dev->abs[axis];
+}
+
+static inline void input_abs_set_val(struct input_dev *dev,
+				     unsigned int axis, int val)
+{
+	dev->abs[axis] = val;
 }
 
 int input_get_keycode(struct input_dev *dev, int scancode, int *keycode);
@@ -1414,6 +1514,9 @@ int input_ff_erase(struct input_dev *dev, int effect_id, struct file *file);
 
 int input_ff_create_memless(struct input_dev *dev, void *data,
 		int (*play_effect)(struct input_dev *, void *, struct ff_effect *));
+
+int input_mt_create_slots(struct input_dev *dev, unsigned int num_slots);
+void input_mt_destroy_slots(struct input_dev *dev);
 
 #endif
 #endif

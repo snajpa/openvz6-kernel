@@ -17,6 +17,7 @@
 #include <linux/fadvise.h>
 #include <linux/writeback.h>
 #include <linux/syscalls.h>
+#include <linux/swap.h>
 
 #include <asm/unistd.h>
 
@@ -77,12 +78,20 @@ SYSCALL_DEFINE(fadvise64_64)(int fd, loff_t offset, loff_t len, int advice)
 	switch (advice) {
 	case POSIX_FADV_NORMAL:
 		file->f_ra.ra_pages = bdi->ra_pages;
+		spin_lock(&file->f_lock);
+		file->f_mode &= ~FMODE_RANDOM;
+		spin_unlock(&file->f_lock);
 		break;
 	case POSIX_FADV_RANDOM:
-		file->f_ra.ra_pages = 0;
+		spin_lock(&file->f_lock);
+		file->f_mode |= FMODE_RANDOM;
+		spin_unlock(&file->f_lock);
 		break;
 	case POSIX_FADV_SEQUENTIAL:
 		file->f_ra.ra_pages = bdi->ra_pages * 2;
+		spin_lock(&file->f_lock);
+		file->f_mode &= ~FMODE_RANDOM;
+		spin_unlock(&file->f_lock);
 		break;
 	case POSIX_FADV_WILLNEED:
 		if (!mapping->a_ops->readpage) {
@@ -115,9 +124,22 @@ SYSCALL_DEFINE(fadvise64_64)(int fd, loff_t offset, loff_t len, int advice)
 		start_index = (offset+(PAGE_CACHE_SIZE-1)) >> PAGE_CACHE_SHIFT;
 		end_index = (endbyte >> PAGE_CACHE_SHIFT);
 
-		if (end_index >= start_index)
-			invalidate_mapping_pages(mapping, start_index,
+		if (end_index >= start_index) {
+			unsigned long count = invalidate_mapping_pages(mapping,
+						start_index, end_index);
+
+			/*
+			 * If fewer pages were invalidated than expected then
+			 * it is possible that some of the pages were on
+			 * a per-cpu pagevec for a remote CPU. Drain all
+			 * pagevecs and try again.
+			 */
+			if (count < (end_index - start_index + 1)) {
+				lru_add_drain_all();
+				invalidate_mapping_pages(mapping, start_index,
 						end_index);
+			}
+		}
 		break;
 	default:
 		ret = -EINVAL;

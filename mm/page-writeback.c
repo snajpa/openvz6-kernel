@@ -34,6 +34,8 @@
 #include <linux/syscalls.h>
 #include <linux/buffer_head.h>
 #include <linux/pagevec.h>
+#include <trace/events/kmem.h>
+#include <trace/events/writeback.h>
 
 /*
  * After a CPU has dirtied this many pages, balance_dirty_pages_ratelimited
@@ -144,6 +146,25 @@ static int calc_period_shift(void)
 	else
 		dirty_total = (vm_dirty_ratio * determine_dirtyable_memory()) /
 				100;
+	/*
+	 * RHEL6: When an user sets vm.dirty_ratio=0 we trigger havoc that
+	 * creates the barbed wire which leads to the kernel panic described
+	 * at  BZ#871599.
+	 *
+	 * As dirty_total is from unsigned long type, doing dirty total - 1
+	 * means we're calling for ilog2(ULONG_MAX), thus calc_periodic_shift()
+	 * will return 66.
+	 * Also, if we are unlucky enough to get dirty_total becoming 1, we
+	 * can potentially trigger unexpected behavior, as  ilog2(0) == NaN.
+	 *
+	 * That's why we need to certify the lower limit of dirty_total never
+	 * gets smaller than 2, as ilog2(1) == 0, and for such cases
+	 * calc_periodic_shift() will always return the smaller period shift
+	 * expected (2).
+	 */
+	if (dirty_total < 2)
+		dirty_total = 2;
+
 	return 2 + ilog2(dirty_total - 1);
 }
 
@@ -495,7 +516,6 @@ static void balance_dirty_pages(struct address_space *mapping,
 
 	for (;;) {
 		struct writeback_control wbc = {
-			.bdi		= bdi,
 			.sync_mode	= WB_SYNC_NONE,
 			.older_than_this = NULL,
 			.nr_to_write	= write_chunk,
@@ -536,9 +556,11 @@ static void balance_dirty_pages(struct address_space *mapping,
 		 * threshold otherwise wait until the disk writes catch
 		 * up.
 		 */
+		trace_wbc_balance_dirty_start(&wbc, bdi);
 		if (bdi_nr_reclaimable > bdi_thresh) {
-			writeback_inodes_wbc(&wbc);
+			writeback_inodes_wb(&bdi->wb, &wbc);
 			pages_written += write_chunk - wbc.nr_to_write;
+			trace_wbc_balance_dirty_written(&wbc, bdi);
 			get_dirty_limits(&background_thresh, &dirty_thresh,
 				       &bdi_thresh, bdi);
 		}
@@ -566,7 +588,8 @@ static void balance_dirty_pages(struct address_space *mapping,
 		if (pages_written >= write_chunk)
 			break;		/* We've done our duty */
 
-		__set_current_state(TASK_INTERRUPTIBLE);
+		trace_wbc_balance_dirty_wait(&wbc, bdi);
+		__set_current_state(TASK_KILLABLE);
 		io_schedule_timeout(pause);
 
 		/*
@@ -576,8 +599,12 @@ static void balance_dirty_pages(struct address_space *mapping,
 		pause <<= 1;
 		if (pause > HZ / 10)
 			pause = HZ / 10;
+
+		if (fatal_signal_pending(current))
+			break;
 	}
 
+	if(pages_written) trace_mm_balancedirty_writeout(pages_written);
 	if (bdi_nr_reclaimable + bdi_nr_writeback < bdi_thresh &&
 			bdi->dirty_exceeded)
 		bdi->dirty_exceeded = 0;
@@ -597,7 +624,7 @@ static void balance_dirty_pages(struct address_space *mapping,
 	    (!laptop_mode && ((global_page_state(NR_FILE_DIRTY)
 			       + global_page_state(NR_UNSTABLE_NFS))
 					  > background_thresh)))
-		bdi_start_writeback(bdi, NULL, 0);
+		bdi_start_background_writeback(bdi);
 }
 
 void set_page_dirty_balance(struct page *page, int page_mkwrite)
@@ -694,6 +721,7 @@ int dirty_writeback_centisecs_handler(ctl_table *table, int write,
 	void __user *buffer, size_t *length, loff_t *ppos)
 {
 	proc_dointvec(table, write, buffer, length, ppos);
+	bdi_arm_supers_timer();
 	return 0;
 }
 
@@ -803,6 +831,42 @@ void __init page_writeback_init(void)
 }
 
 /**
+ * tag_pages_for_writeback - tag pages to be written by write_cache_pages
+ * @mapping: address space structure to write
+ * @start: starting page index
+ * @end: ending page index (inclusive)
+ *
+ * This function scans the page range from @start to @end (inclusive) and tags
+ * all pages that have DIRTY tag set with a special TOWRITE tag. The idea is
+ * that write_cache_pages (or whoever calls this function) will then use
+ * TOWRITE tag to identify pages eligible for writeback.  This mechanism is
+ * used to avoid livelocking of writeback by a process steadily creating new
+ * dirty pages in the file (thus it is important for this function to be quick
+ * so that it can tag pages faster than a dirtying process can create them).
+ */
+/*
+ * We tag pages in batches of WRITEBACK_TAG_BATCH to reduce tree_lock latency.
+ */
+void tag_pages_for_writeback(struct address_space *mapping,
+			     pgoff_t start, pgoff_t end)
+{
+#define WRITEBACK_TAG_BATCH 4096
+	unsigned long tagged;
+
+	do {
+		spin_lock_irq(&mapping->tree_lock);
+		tagged = radix_tree_range_tag_if_tagged(&mapping->page_tree,
+				&start, end, WRITEBACK_TAG_BATCH,
+				PAGECACHE_TAG_DIRTY, PAGECACHE_TAG_TOWRITE);
+		spin_unlock_irq(&mapping->tree_lock);
+		WARN_ON_ONCE(tagged > WRITEBACK_TAG_BATCH);
+		cond_resched();
+		/* We check 'start' to handle wrapping when end == ~0UL */
+	} while (tagged >= WRITEBACK_TAG_BATCH && start);
+}
+EXPORT_SYMBOL(tag_pages_for_writeback);
+
+/**
  * write_cache_pages - walk the list of dirty pages of the given address space and write all of them.
  * @mapping: address space structure to write
  * @wbc: subtract the number of written pages from *@wbc->nr_to_write
@@ -816,12 +880,18 @@ void __init page_writeback_init(void)
  * the call was made get new I/O started against them.  If wbc->sync_mode is
  * WB_SYNC_ALL then we were called for data integrity and we must wait for
  * existing IO to complete.
+ *
+ * To avoid livelocks (when other process dirties new pages), we first tag
+ * pages which should be written back with TOWRITE tag and only then start
+ * writing them. For data-integrity sync we have to be careful so that we do
+ * not miss some pages (e.g., because some other process has cleared TOWRITE
+ * tag we set). The rule we follow is that TOWRITE tag can be cleared only
+ * by the process clearing the DIRTY tag (and submitting the page for IO).
  */
 int write_cache_pages(struct address_space *mapping,
 		      struct writeback_control *wbc, writepage_t writepage,
 		      void *data)
 {
-	struct backing_dev_info *bdi = mapping->backing_dev_info;
 	int ret = 0;
 	int done = 0;
 	struct pagevec pvec;
@@ -832,12 +902,7 @@ int write_cache_pages(struct address_space *mapping,
 	pgoff_t done_index;
 	int cycled;
 	int range_whole = 0;
-	long nr_to_write = wbc->nr_to_write;
-
-	if (wbc->nonblocking && bdi_write_congested(bdi)) {
-		wbc->encountered_congestion = 1;
-		return 0;
-	}
+	int tag;
 
 	pagevec_init(&pvec, 0);
 	if (wbc->range_cyclic) {
@@ -855,13 +920,18 @@ int write_cache_pages(struct address_space *mapping,
 			range_whole = 1;
 		cycled = 1; /* ignore range_cyclic tests */
 	}
+	if (wbc->sync_mode == WB_SYNC_ALL)
+		tag = PAGECACHE_TAG_TOWRITE;
+	else
+		tag = PAGECACHE_TAG_DIRTY;
 retry:
+	if (wbc->sync_mode == WB_SYNC_ALL)
+		tag_pages_for_writeback(mapping, index, end);
 	done_index = index;
 	while (!done && (index <= end)) {
 		int i;
 
-		nr_pages = pagevec_lookup_tag(&pvec, mapping, &index,
-			      PAGECACHE_TAG_DIRTY,
+		nr_pages = pagevec_lookup_tag(&pvec, mapping, &index, tag,
 			      min(end - index, (pgoff_t)PAGEVEC_SIZE-1) + 1);
 		if (nr_pages == 0)
 			break;
@@ -885,7 +955,7 @@ retry:
 				break;
 			}
 
-			done_index = page->index + 1;
+			done_index = page->index;
 
 			lock_page(page);
 
@@ -919,6 +989,7 @@ continue_unlock:
 			if (!clear_page_dirty_for_io(page))
 				goto continue_unlock;
 
+			trace_wbc_writepage(wbc, mapping->backing_dev_info);
 			ret = (*writepage)(page, wbc, data);
 			if (unlikely(ret)) {
 				if (ret == AOP_WRITEPAGE_ACTIVATE) {
@@ -934,32 +1005,20 @@ continue_unlock:
 					 * not be suitable for data integrity
 					 * writeout).
 					 */
-					done = 1;
-					break;
-				}
- 			}
-
-			if (nr_to_write > 0) {
-				nr_to_write--;
-				if (nr_to_write == 0 &&
-				    wbc->sync_mode == WB_SYNC_NONE) {
-					/*
-					 * We stop writing back only if we are
-					 * not doing integrity sync. In case of
-					 * integrity sync we have to keep going
-					 * because someone may be concurrently
-					 * dirtying pages, and we might have
-					 * synced a lot of newly appeared dirty
-					 * pages, but have not synced all of the
-					 * old dirty pages.
-					 */
+					done_index = page->index + 1;
 					done = 1;
 					break;
 				}
 			}
 
-			if (wbc->nonblocking && bdi_write_congested(bdi)) {
-				wbc->encountered_congestion = 1;
+			/*
+			 * We stop writing back only if we are not doing
+			 * integrity sync. In case of integrity sync we have to
+			 * keep going until we have written all the pages
+			 * we tagged for writeback prior to entering this loop.
+			 */
+			if (--wbc->nr_to_write <= 0 &&
+			    wbc->sync_mode == WB_SYNC_NONE) {
 				done = 1;
 				break;
 			}
@@ -978,11 +1037,8 @@ continue_unlock:
 		end = writeback_index - 1;
 		goto retry;
 	}
-	if (!wbc->no_nrwrite_index_update) {
-		if (wbc->range_cyclic || (range_whole && nr_to_write > 0))
-			mapping->writeback_index = done_index;
-		wbc->nr_to_write = nr_to_write;
-	}
+	if (wbc->range_cyclic || (range_whole && wbc->nr_to_write > 0))
+		mapping->writeback_index = done_index;
 
 	return ret;
 }
@@ -1170,6 +1226,17 @@ int set_page_dirty(struct page *page)
 
 	if (likely(mapping)) {
 		int (*spd)(struct page *) = mapping->a_ops->set_page_dirty;
+		/*
+		 * readahead/lru_deactivate_page could remain
+		 * PG_readahead/PG_reclaim due to race with end_page_writeback
+		 * About readahead, if the page is written, the flags would be
+		 * reset. So no problem.
+		 * About lru_deactivate_page, if the page is redirty, the flag
+		 * will be reset. So no problem. but if the page is used by readahead
+		 * it will confuse readahead and make it restart the size rampup
+		 * process. But it's a trivial problem.
+		 */
+		ClearPageReclaim(page);
 #ifdef CONFIG_BLOCK
 		if (!spd)
 			spd = __set_page_dirty_buffers;
@@ -1225,7 +1292,6 @@ int clear_page_dirty_for_io(struct page *page)
 
 	BUG_ON(!PageLocked(page));
 
-	ClearPageReclaim(page);
 	if (mapping && mapping_cap_account_dirty(mapping)) {
 		/*
 		 * Yes, Virginia, this is indeed insane.
@@ -1305,7 +1371,7 @@ int test_clear_page_writeback(struct page *page)
 	return ret;
 }
 
-int test_set_page_writeback(struct page *page)
+int __test_set_page_writeback(struct page *page, bool keep_write)
 {
 	struct address_space *mapping = page_mapping(page);
 	int ret;
@@ -1327,6 +1393,10 @@ int test_set_page_writeback(struct page *page)
 			radix_tree_tag_clear(&mapping->page_tree,
 						page_index(page),
 						PAGECACHE_TAG_DIRTY);
+		if (!keep_write)
+			radix_tree_tag_clear(&mapping->page_tree,
+						page_index(page),
+						PAGECACHE_TAG_TOWRITE);
 		spin_unlock_irqrestore(&mapping->tree_lock, flags);
 	} else {
 		ret = TestSetPageWriteback(page);
@@ -1335,6 +1405,12 @@ int test_set_page_writeback(struct page *page)
 		inc_zone_page_state(page, NR_WRITEBACK);
 	return ret;
 
+}
+EXPORT_SYMBOL(__test_set_page_writeback);
+
+int test_set_page_writeback(struct page *page)
+{
+	return __test_set_page_writeback(page, false);
 }
 EXPORT_SYMBOL(test_set_page_writeback);
 
@@ -1351,3 +1427,27 @@ int mapping_tagged(struct address_space *mapping, int tag)
 	return ret;
 }
 EXPORT_SYMBOL(mapping_tagged);
+
+/**
+ * wait_for_stable_page() - wait for writeback to finish, if necessary.
+ * @page:	The page to wait on.
+ *
+ * This function determines if the given page is related to a backing device
+ * that requires page contents to be held stable during writeback.  If so, then
+ * it will wait for any pending writeback to complete.
+ */
+void wait_for_stable_page(struct page *page)
+{
+	struct address_space *mapping = page_mapping(page);
+	struct backing_dev_info *bdi = mapping->backing_dev_info;
+
+	if (!bdi_cap_stable_pages_required(bdi))
+		return;
+#ifdef CONFIG_NEED_BOUNCE_POOL
+	if (mapping->host->i_sb->s_flags & MS_SNAP_STABLE)
+		return;
+#endif /* CONFIG_NEED_BOUNCE_POOL */
+
+	wait_on_page_writeback(page);
+}
+EXPORT_SYMBOL_GPL(wait_for_stable_page);

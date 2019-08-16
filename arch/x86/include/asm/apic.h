@@ -14,6 +14,7 @@
 #include <asm/mpspec.h>
 #include <asm/system.h>
 #include <asm/msr.h>
+#include <asm/idle.h>
 
 #define ARCH_APICTIMER_STOPS_ON_C3	1
 
@@ -50,6 +51,7 @@ extern unsigned int apic_verbosity;
 extern int local_apic_timer_c2_ok;
 
 extern int disable_apic;
+extern unsigned int lapic_timer_frequency;
 
 #ifdef CONFIG_SMP
 extern void __inquire_remote_apic(int apicid);
@@ -137,6 +139,11 @@ static inline void native_apic_msr_write(u32 reg, u32 v)
 		return;
 
 	wrmsr(APIC_BASE_MSR + (reg >> 4), v, 0);
+}
+
+static inline void native_apic_msr_eoi_write(u32 reg, u32 v)
+{
+	wrmsr(APIC_BASE_MSR + (APIC_EOI >> 4), APIC_EOI_ACK, 0);
 }
 
 static inline u32 native_apic_msr_read(u32 reg)
@@ -252,9 +259,7 @@ static inline int apic_is_clustered_box(void)
 }
 #endif
 
-extern u8 setup_APIC_eilvt_mce(u8 vector, u8 msg_type, u8 mask);
-extern u8 setup_APIC_eilvt_ibs(u8 vector, u8 msg_type, u8 mask);
-
+extern int setup_APIC_eilvt(u8 lvt_off, u8 vector, u8 msg_type, u8 mask);
 
 #else /* !CONFIG_X86_LOCAL_APIC */
 static inline void lapic_shutdown(void) { }
@@ -356,6 +361,16 @@ struct apic {
 	void (*icr_write)(u32 low, u32 high);
 	void (*wait_icr_idle)(void);
 	u32 (*safe_wait_icr_idle)(void);
+#ifndef __GENKSYMS__
+	/*
+	 * ->eoi_write() has the same signature as ->write().
+	 *
+	 * Drivers can support both ->eoi_write() and ->write() by passing the same
+	 * callback value. Kernel can override ->eoi_write() and fall back
+	 * on write for EOI.
+	 */
+	void (*eoi_write)(u32 reg, u32 v);
+#endif
 };
 
 /*
@@ -383,6 +398,11 @@ static inline void apic_write(u32 reg, u32 val)
 	apic->write(reg, val);
 }
 
+static inline void apic_eoi(void)
+{
+	apic->eoi_write(APIC_EOI, APIC_EOI_ACK);
+}
+
 static inline u64 apic_icr_read(void)
 {
 	return apic->icr_read();
@@ -403,6 +423,12 @@ static inline u32 safe_apic_wait_icr_idle(void)
 	return apic->safe_wait_icr_idle();
 }
 
+#ifdef CONFIG_X86_LOCAL_APIC
+extern struct apic *apic_probe[];
+extern void __init apic_set_eoi_write(void (*eoi_write)(u32 reg, u32 v));
+#else
+static inline void apic_set_eoi_write(void (*eoi_write)(u32 reg, u32 v)) {}
+#endif
 
 static inline void ack_APIC_irq(void)
 {
@@ -411,9 +437,7 @@ static inline void ack_APIC_irq(void)
 	 * ack_APIC_irq() actually gets compiled as a single instruction
 	 * ... yummie.
 	 */
-
-	/* Docs say use 0 for future compatibility */
-	apic_write(APIC_EOI, 0);
+	apic_eoi();
 #endif
 }
 
@@ -589,6 +613,32 @@ static inline physid_mask_t default_apicid_to_cpu_present(int phys_apicid)
 }
 
 #endif /* CONFIG_X86_LOCAL_APIC */
+extern void irq_enter(void);
+extern void irq_exit(void);
+
+static inline void entering_irq(void)
+{
+	exit_idle();
+	irq_enter();
+}
+
+static inline void entering_ack_irq(void)
+{
+	ack_APIC_irq();
+	entering_irq();
+}
+
+static inline void exiting_irq(void)
+{
+	irq_exit();
+}
+
+static inline void exiting_ack_irq(void)
+{
+	irq_exit();
+	/* Ack only at the end to avoid potential reentry */
+	ack_APIC_irq();
+}
 
 #ifdef CONFIG_X86_32
 extern u8 cpu_2_logical_apicid[NR_CPUS];

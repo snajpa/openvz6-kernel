@@ -19,6 +19,13 @@ struct bio;
 #define SWAP_FLAG_PREFER	0x8000	/* set if swap priority specified */
 #define SWAP_FLAG_PRIO_MASK	0x7fff
 #define SWAP_FLAG_PRIO_SHIFT	0
+#define SWAP_FLAG_DISCARD	0x10000 /* enable discard for swap */
+#define SWAP_FLAG_DISCARD_ONCE	0x20000 /* discard swap area at swapon-time */
+#define SWAP_FLAG_DISCARD_PAGES 0x40000 /* discard page-clusters after use */
+
+#define SWAP_FLAGS_VALID	(SWAP_FLAG_PRIO_MASK | SWAP_FLAG_PREFER | \
+				 SWAP_FLAG_DISCARD | SWAP_FLAG_DISCARD_ONCE | \
+				 SWAP_FLAG_DISCARD_PAGES)
 
 static inline int current_is_kswapd(void)
 {
@@ -142,31 +149,55 @@ struct swap_extent {
 enum {
 	SWP_USED	= (1 << 0),	/* is slot in swap_info[] used? */
 	SWP_WRITEOK	= (1 << 1),	/* ok to write to this swap?	*/
-	SWP_DISCARDABLE = (1 << 2),	/* blkdev supports discard */
+	SWP_DISCARDABLE = (1 << 2),	/* swapon+blkdev support discard */
 	SWP_DISCARDING	= (1 << 3),	/* now discarding a free cluster */
 	SWP_SOLIDSTATE	= (1 << 4),	/* blkdev seeks are cheap */
+	SWP_CONTINUED	= (1 << 5),	/* swap_map has count continuation */
+	SWP_BLKDEV	= (1 << 6),	/* its a block device */
+	/*
+	 * RHEL6: we acutally don't have swap-over-NFS feature backported
+	 * but lets let SWP_FILE slot reserved, if that upstream changeset
+	 * eventually finds it's way into el6 kernel.
+	 */
+	SWP_AREA_DISCARD = (1 << 8),    /* single-time swap area discards */
+	SWP_PAGE_DISCARD = (1 << 9),    /* freed swap page-cluster discards */
 					/* add others here before... */
-	SWP_SCANNING	= (1 << 8),	/* refcount in scan_swap_map */
+	SWP_SCANNING	= (1 << 10),	/* refcount in scan_swap_map */
 };
 
 #define SWAP_CLUSTER_MAX 32
+#define COMPACT_CLUSTER_MAX SWAP_CLUSTER_MAX
 
-#define SWAP_MAP_MAX	0x7ffe
-#define SWAP_MAP_BAD	0x7fff
-#define SWAP_HAS_CACHE  0x8000		/* There is a swap cache of entry. */
-#define SWAP_COUNT_MASK (~SWAP_HAS_CACHE)
+/*
+ * Ratio between the present memory in the zone and the "gap" that
+ * we're allowing kswapd to shrink in addition to the per-zone high
+ * wmark, even for zones that already have the high wmark satisfied,
+ * in order to provide better per-zone lru behavior. We are ok to
+ * spend not more than 1% of the memory for this zone balancing "gap".
+ */
+#define KSWAPD_ZONE_BALANCE_GAP_RATIO 100
+
+#define SWAP_MAP_MAX	0x3e	/* Max duplication count, in first swap_map */
+#define SWAP_MAP_BAD	0x3f	/* Note pageblock is bad, in first swap_map */
+#define SWAP_HAS_CACHE	0x40	/* Flag page is cached, in first swap_map */
+#define SWAP_CONT_MAX	0x7f	/* Max count, in each swap_map continuation */
+#define COUNT_CONTINUED	0x80	/* See swap_map continuation for full count */
+#define SWAP_MAP_SHMEM	0xbf	/* Owned by shmem/tmpfs, in first swap_map */
+
 /*
  * The in-memory structure used to track swap areas.
  */
 struct swap_info_struct {
-	unsigned long flags;
-	int prio;			/* swap priority */
-	int next;			/* next entry on swap list */
+	unsigned long	flags;		/* SWP_USED etc: see above */
+	signed short	prio;		/* swap priority of this type */
+	struct plist_node list;		/* entry in swap_active_head */
+	struct plist_node avail_list;	/* entry in swap_avail_head */
+	signed char	type;		/* strange name for an index */
 	struct file *swap_file;
 	struct block_device *bdev;
-	struct list_head extent_list;
+	struct swap_extent first_swap_extent;
 	struct swap_extent *curr_swap_extent;
-	unsigned short *swap_map;
+	unsigned char *swap_map;
 	unsigned int lowest_bit;
 	unsigned int highest_bit;
 	unsigned int lowest_alloc;	/* while preparing discard cluster */
@@ -179,19 +210,13 @@ struct swap_info_struct {
 	unsigned int old_block_size;
 };
 
-struct swap_list_t {
-	int head;	/* head of priority-ordered swapfile list */
-	int next;	/* swapfile to be used next */
-};
-
-/* Swap 50% full? Release swapcache more aggressively.. */
-#define vm_swap_full() (nr_swap_pages*2 < total_swap_pages)
-
 /* linux/mm/page_alloc.c */
 extern unsigned long totalram_pages;
 extern unsigned long totalreserve_pages;
-extern unsigned int nr_free_buffer_pages(void);
-extern unsigned int nr_free_pagecache_pages(void);
+extern int min_free_kbytes;
+extern int extra_free_kbytes;
+extern unsigned long nr_free_buffer_pages(void);
+extern unsigned long nr_free_pagecache_pages(void);
 
 /* Definition of global_page_state not available yet */
 #define nr_free_pages() global_page_state(NR_FREE_PAGES)
@@ -200,11 +225,15 @@ extern unsigned int nr_free_pagecache_pages(void);
 /* linux/mm/swap.c */
 extern void __lru_cache_add(struct page *, enum lru_list lru);
 extern void lru_cache_add_lru(struct page *, enum lru_list lru);
+extern void lru_add_page_tail(struct zone* zone,
+			      struct page *page, struct page *page_tail);
 extern void activate_page(struct page *);
 extern void mark_page_accessed(struct page *);
 extern void lru_add_drain(void);
-extern int lru_add_drain_all(void);
+extern void lru_add_drain_cpu(int cpu);
+extern void lru_add_drain_all(void);
 extern void rotate_reclaimable_page(struct page *page);
+extern void deactivate_page(struct page *page);
 extern void swap_setup(void);
 
 extern void add_page_to_unevictable_list(struct page *page);
@@ -244,20 +273,24 @@ extern unsigned long mem_cgroup_shrink_node_zone(struct mem_cgroup *mem,
 						unsigned int swappiness,
 						struct zone *zone,
 						int nid);
-extern int __isolate_lru_page(struct page *page, int mode, int file);
+extern int __isolate_lru_page(struct page *page, isolate_mode_t mode, int file);
 extern unsigned long shrink_all_memory(unsigned long nr_pages);
 extern int vm_swappiness;
 extern int remove_mapping(struct address_space *mapping, struct page *page);
-extern long vm_total_pages;
+extern unsigned long vm_total_pages;
 
 #ifdef CONFIG_NUMA
 extern int zone_reclaim_mode;
 extern int sysctl_min_unmapped_ratio;
 extern int sysctl_min_slab_ratio;
-extern int zone_reclaim(struct zone *, gfp_t, unsigned int);
+extern int zone_reclaim(struct zone *, struct zone *, gfp_t, unsigned int,
+			unsigned long, int, int);
 #else
 #define zone_reclaim_mode 0
-static inline int zone_reclaim(struct zone *z, gfp_t mask, unsigned int order)
+static inline int zone_reclaim(struct zone *preferred_zone, struct zone *zone,
+			       gfp_t mask, unsigned int order,
+			       unsigned long mark, int classzone_idx,
+			       int alloc_flags)
 {
 	return 0;
 }
@@ -273,11 +306,6 @@ extern int scan_unevictable_register_node(struct node *node);
 extern void scan_unevictable_unregister_node(struct node *node);
 
 extern int kswapd_run(int nid);
-
-#ifdef CONFIG_MMU
-/* linux/mm/shmem.c */
-extern int shmem_unuse(swp_entry_t entry, struct page *page);
-#endif /* CONFIG_MMU */
 
 extern void swap_unplug_io_fn(struct backing_dev_info *, struct page *);
 
@@ -304,22 +332,36 @@ extern struct page *swapin_readahead(swp_entry_t, gfp_t,
 			struct vm_area_struct *vma, unsigned long addr);
 
 /* linux/mm/swapfile.c */
-extern long nr_swap_pages;
+extern atomic_long_t nr_swap_pages;
 extern long total_swap_pages;
+
+/* Swap 50% full? Release swapcache more aggressively.. */
+static inline bool vm_swap_full(void)
+{
+       return atomic_long_read(&nr_swap_pages) * 2 < total_swap_pages;
+}
+
+static inline long get_nr_swap_pages(void)
+{
+       return atomic_long_read(&nr_swap_pages);
+}
+
 extern void si_swapinfo(struct sysinfo *);
 extern swp_entry_t get_swap_page(void);
 extern swp_entry_t get_swap_page_of_type(int);
-extern void swap_duplicate(swp_entry_t);
-extern int swapcache_prepare(swp_entry_t);
 extern int valid_swaphandles(swp_entry_t, unsigned long *);
+extern int add_swap_count_continuation(swp_entry_t, gfp_t);
+extern void swap_shmem_alloc(swp_entry_t);
+extern int swap_duplicate(swp_entry_t);
+extern int swapcache_prepare(swp_entry_t);
 extern void swap_free(swp_entry_t);
 extern void swapcache_free(swp_entry_t, struct page *page);
 extern int free_swap_and_cache(swp_entry_t);
 extern int swap_type_of(dev_t, sector_t, struct block_device **);
 extern unsigned int count_swap_pages(int, int);
-extern sector_t map_swap_page(struct swap_info_struct *, pgoff_t);
+extern sector_t map_swap_page(swp_entry_t, struct block_device **);
 extern sector_t swapdev_block(int, pgoff_t);
-extern struct swap_info_struct *get_swap_info_struct(unsigned);
+extern int page_swapcount(struct page *);
 extern int reuse_swap_page(struct page *);
 extern int try_to_free_swap(struct page *);
 struct backing_dev_info;
@@ -348,6 +390,7 @@ static inline void disable_swap_token(void)
 #ifdef CONFIG_CGROUP_MEM_RES_CTLR
 extern void
 mem_cgroup_uncharge_swapcache(struct page *page, swp_entry_t ent, bool swapout);
+extern int mem_cgroup_count_swap_user(swp_entry_t ent, struct page **pagep);
 #else
 static inline void
 mem_cgroup_uncharge_swapcache(struct page *page, swp_entry_t ent, bool swapout)
@@ -364,9 +407,10 @@ static inline void mem_cgroup_uncharge_swap(swp_entry_t ent)
 
 #else /* CONFIG_SWAP */
 
-#define nr_swap_pages				0L
+#define get_nr_swap_pages()			0L
 #define total_swap_pages			0L
 #define total_swapcache_pages			0UL
+#define vm_swap_full()				0
 
 #define si_swapinfo(val) \
 	do { (val)->freeswap = (val)->totalswap = 0; } while (0)
@@ -384,8 +428,18 @@ static inline void show_swap_cache_info(void)
 #define free_swap_and_cache(swp)	is_migration_entry(swp)
 #define swapcache_prepare(swp)		is_migration_entry(swp)
 
-static inline void swap_duplicate(swp_entry_t swp)
+static inline int add_swap_count_continuation(swp_entry_t swp, gfp_t gfp_mask)
 {
+	return 0;
+}
+
+static inline void swap_shmem_alloc(swp_entry_t swp)
+{
+}
+
+static inline int swap_duplicate(swp_entry_t swp)
+{
+	return 0;
 }
 
 static inline void swap_free(swp_entry_t swp)
@@ -431,6 +485,11 @@ static inline void delete_from_swap_cache(struct page *page)
 {
 }
 
+static inline int page_swapcount(struct page *page)
+{
+	return 0;
+}
+
 #define reuse_swap_page(page)	(page_mapcount(page) == 1)
 
 static inline int try_to_free_swap(struct page *page)
@@ -467,6 +526,14 @@ static inline void
 mem_cgroup_uncharge_swapcache(struct page *page, swp_entry_t ent)
 {
 }
+
+#ifdef CONFIG_CGROUP_MEM_RES_CTLR
+static inline int
+mem_cgroup_count_swap_user(swp_entry_t ent, struct page **pagep)
+{
+	return 0;
+}
+#endif
 
 #endif /* CONFIG_SWAP */
 #endif /* __KERNEL__*/

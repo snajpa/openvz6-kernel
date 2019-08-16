@@ -308,6 +308,10 @@ enum { SCTP_MAX_GABS = 16 };
 
 #define SCTP_DEFAULT_MINWINDOW	1500	/* default minimum rwnd size */
 #define SCTP_DEFAULT_MAXWINDOW	65535	/* default rwnd size */
+#define SCTP_DEFAULT_RWND_SHIFT  4	/* by default, update on 1/16 of
+					 * rcvbuf, which is 1/8 of initial
+					 * window
+					 */
 #define SCTP_DEFAULT_MAXSEGMENT 1500	/* MTU size, this is the limit
                                          * to which we will raise the P-MTU.
 					 */
@@ -324,14 +328,6 @@ enum { SCTP_MAX_GABS = 16 };
 				 * functions simpler to write.
 				 */
 
-#if defined (CONFIG_SCTP_HMAC_MD5)
-#define SCTP_COOKIE_HMAC_ALG "hmac(md5)"
-#elif defined (CONFIG_SCTP_HMAC_SHA1)
-#define SCTP_COOKIE_HMAC_ALG "hmac(sha1)"
-#else
-#define SCTP_COOKIE_HMAC_ALG NULL
-#endif
-
 /* These return values describe the success or failure of a number of
  * routines which form the lower interface to SCTP_outqueue.
  */
@@ -346,6 +342,7 @@ typedef enum {
 typedef enum {
 	SCTP_TRANSPORT_UP,
 	SCTP_TRANSPORT_DOWN,
+	SCTP_TRANSPORT_PF,
 } sctp_transport_cmd_t;
 
 /* These are the address scopes defined mainly for IPv4 addresses

@@ -78,10 +78,12 @@ static int scm_fp_copy(struct cmsghdr *cmsg, struct scm_fp_list **fplp)
 			return -ENOMEM;
 		*fplp = fpl;
 		fpl->count = 0;
+		fpl->max = SCM_MAX_FD;
+		fpl->user = NULL;
 	}
 	fpp = &fpl->fp[fpl->count];
 
-	if (fpl->count + num > SCM_MAX_FD)
+	if (fpl->count + num > fpl->max)
 		return -EINVAL;
 
 	/*
@@ -98,6 +100,10 @@ static int scm_fp_copy(struct cmsghdr *cmsg, struct scm_fp_list **fplp)
 		*fpp++ = file;
 		fpl->count++;
 	}
+
+	if (!fpl->user)
+		fpl->user = get_uid(current_user());
+
 	return num;
 }
 
@@ -122,6 +128,7 @@ void __scm_destroy(struct scm_cookie *scm)
 				list_del(&fpl->list);
 				for (i=fpl->count-1; i>=0; i--)
 					fput(fpl->fp[i]);
+				free_uid(fpl->user);
 				kfree(fpl);
 			}
 
@@ -156,6 +163,8 @@ int __scm_send(struct socket *sock, struct msghdr *msg, struct scm_cookie *p)
 		switch (cmsg->cmsg_type)
 		{
 		case SCM_RIGHTS:
+			if (!sock->ops || sock->ops->family != PF_UNIX)
+				goto error;
 			err=scm_fp_copy(cmsg, &p->fp);
 			if (err<0)
 				goto error;
@@ -167,6 +176,32 @@ int __scm_send(struct socket *sock, struct msghdr *msg, struct scm_cookie *p)
 			err = scm_check_creds(&p->creds);
 			if (err)
 				goto error;
+
+			if (!p->pid || pid_vnr(p->pid) != p->creds.pid) {
+				struct pid *pid;
+				err = -ESRCH;
+				pid = find_get_pid(p->creds.pid);
+				if (!pid)
+					goto error;
+				put_pid(p->pid);
+				p->pid = pid;
+			}
+
+			if (!p->cred ||
+			    (p->cred->euid != p->creds.uid) ||
+			    (p->cred->egid != p->creds.gid)) {
+				struct cred *cred;
+				err = -ENOMEM;
+				cred = prepare_creds();
+				if (!cred)
+					goto error;
+
+				cred->uid = cred->euid = p->creds.uid;
+				cred->gid = cred->egid = p->creds.gid;
+				if (p->cred)
+					put_cred(p->cred);
+				p->cred = cred;
+			}
 			break;
 		default:
 			goto error;
@@ -300,11 +335,13 @@ struct scm_fp_list *scm_fp_dup(struct scm_fp_list *fpl)
 	if (!fpl)
 		return NULL;
 
-	new_fpl = kmalloc(sizeof(*fpl), GFP_KERNEL);
+	new_fpl = kmemdup(fpl, offsetof(struct scm_fp_list, fp[fpl->count]),
+			  GFP_KERNEL);
 	if (new_fpl) {
-		for (i=fpl->count-1; i>=0; i--)
+		for (i = 0; i < fpl->count; i++)
 			get_file(fpl->fp[i]);
-		memcpy(new_fpl, fpl, sizeof(*fpl));
+		new_fpl->max = new_fpl->count;
+		new_fpl->user = get_uid(fpl->user);
 	}
 	return new_fpl;
 }

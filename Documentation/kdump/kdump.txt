@@ -17,8 +17,8 @@ You can use common commands, such as cp and scp, to copy the
 memory image to a dump file on the local disk, or across the network to
 a remote system.
 
-Kdump and kexec are currently supported on the x86, x86_64, ppc64 and ia64
-architectures.
+Kdump and kexec are currently supported on the x86, x86_64, ppc64, ia64,
+and s390x architectures.
 
 When the system kernel boots, it reserves a small section of memory for
 the dump-capture kernel. This ensures that ongoing Direct Memory Access
@@ -34,11 +34,18 @@ Similarly on PPC64 machines first 32KB of physical memory is needed for
 booting regardless of where the kernel is loaded and to support 64K page
 size kexec backs up the first 64KB memory.
 
+For s390x, when kdump is triggered, the crashkernel region is exchanged
+with the region [0, crashkernel region size] and then the kdump kernel
+runs in [0, crashkernel region size]. Therefore no relocatable kernel is
+needed for s390x.
+
 All of the necessary information about the system kernel's core image is
 encoded in the ELF format, and stored in a reserved area of memory
 before a crash. The physical address of the start of the ELF header is
 passed to the dump-capture kernel through the elfcorehdr= boot
-parameter.
+parameter. Optionally the size of the ELF header can also be passed
+when using the elfcorehdr=[size[KMG]@]offset[KMG] syntax.
+
 
 With the dump-capture kernel, you can access the memory image, or "old
 memory," in two ways:
@@ -146,6 +153,15 @@ System kernel config options
    This causes the kernel to be built with debug symbols. The dump
    analysis tools require a vmlinux with debug symbols in order to read
    and analyze a dump file.
+
+4) Enable "automatically reserve memory for kexec kernel" in
+   "Processor type and features."
+
+   CONFIG_KEXEC_AUTO_RESERVE=y
+
+   This will let you to use "crashkernel=auto", instead of specifying
+   numbers for "crashkernel=". Note, you need to have enough memory.
+   The threshold and reserved memory size are arch-dependent.
 
 Dump-capture kernel config options (Arch Independent)
 -----------------------------------------------------
@@ -266,6 +282,42 @@ This would mean:
     2) if the RAM size is between 512M and 2G (exclusive), then reserve 64M
     3) if the RAM size is larger than 2G, then reserve 128M
 
+Or you can use:
+
+    crashkernel=auto
+
+if you have enough memory. The threshold is 2G on ia64 and x86, for powerpc
+if PAGESIZE is 4k the threshold is 2G or the threshold is 8G, below which
+this won't work. For s390x, crashkernel=auto can be used for all
+memory sizes > 256M.
+
+The automatically reserved memory size varies based on architecture. For i386
+and x86_64, base memory reserved is 128M and this memory is scaled based on
+physical memory present in the system. Currently dump filtering utility
+(makedumpfile) requires 2bits per 4K page of memory in its user space. So
+memory reserved is scaled accordingly. That means on top of 128MB, we reserve
+additional 2bit per 4K page of physical memory in the system. But when system
+has large memory crashkernel=auto could try to reserve very large contiguous
+memory, possibly exceed 896M. While kernel only supports reserving memory
+below 896M for kexec/kdump kernel. So the reservation size need be scaled
+down in step size of 64M until a final size is found or failed if the reserved
+size is smaller than 256M since kdump probably won't work with <256M with very
+large memory. This is fine since makedumpfile use cyclic buffer mode by default
+which need far less memory than bitmap mode.
+
+It will be 128M or 256M on ppc, 128M on s390x, 1/32 of your physical memory
+size on ppc64 (but it will not grow if you have more than 128G memory). IA64
+has its own policy, shown below:
+
+	Memory size	Reserved memory
+	===========	===============
+	[4G, 12G)	256M
+	[12G, 128G)	512M
+	[128G, 256G)	768M
+	[256G, 378G)	1024M
+	[378G, 512G)	1536M
+	[512G, 768G)	2048M
+	[768G, )	3072M
 
 
 Boot into System Kernel
@@ -288,6 +340,10 @@ Boot into System Kernel
    The region may be automatically placed on ia64, see the
    dump-capture kernel config option notes above.
 
+   On s390x, typically use "crashkernel=xxM". The value of xx is dependent
+   on the memory consumption of the kdump system. In general this is not
+   dependent on the memory size of the production system.
+
 Load the Dump-capture Kernel
 ============================
 
@@ -305,6 +361,8 @@ For ppc64:
 	- Use vmlinux
 For ia64:
 	- Use vmlinux or vmlinuz.gz
+For s390x:
+	- Use image
 
 
 If you are using a uncompressed vmlinux image then use following command
@@ -334,6 +392,9 @@ For i386, x86_64 and ia64:
 For ppc64:
 	"1 maxcpus=1 noirqdistrib reset_devices"
 
+For s390x:
+	"1 maxcpus=1 cgroup_disable=memory"
+
 
 Notes on loading the dump-capture kernel:
 
@@ -358,6 +419,20 @@ Notes on loading the dump-capture kernel:
 * We generally don' have to bring up a SMP kernel just to capture the
   dump. Hence generally it is useful either to build a UP dump-capture
   kernel or specify maxcpus=1 option while loading dump-capture kernel.
+
+* For s390x there are two kdump modes: If a ELF header is specified with
+  the elfcorehdr= kernel parameter, it is used by the kdump kernel as it
+  is done on all other architectures. If no elfcorehdr= kernel parameter is
+  specified, the s390x kdump kernel dynamically creates the header. The
+  second mode has the advantage that for CPU and memory hotplug, kdump has
+  not to be reloaded with kexec_load().
+
+* For s390x systems with many attached devices the "cio_ignore" kernel
+  parameter should be used for the kdump kernel in order to prevent allocation
+  of kernel memory for devices that are not relevant for kdump. The same
+  applies to systems that use SCSI/FCP devices. In that case the
+  "allow_lun_scan" zfcp module parameter should be set to zero before
+  setting FCP devices online.
 
 Kernel Panic
 ============
@@ -402,6 +477,14 @@ To see the entire memory, use the following command:
 
    dd if=/dev/oldmem of=oldmem.001
 
+Trigger Kdump on WARN()
+=======================
+
+It is an X86 only option. Powerpc and S390 do not expect panic on warn.
+The kernel parameter, panic_on_warn, calls panic() in all WARN() paths.  This
+will cause a kdump to occur at the panic() call.  In cases where a user wants
+to specify this during runtime, /proc/sys/kernel/panic_on_warn can be set to 1
+to achieve the same behaviour.
 
 Analysis
 ========

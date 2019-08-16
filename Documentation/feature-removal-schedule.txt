@@ -2,7 +2,14 @@ The following is a list of files and features that are going to be
 removed in the kernel source tree.  Every entry should contain what
 exactly is going away, why it is happening, and who is going to be doing
 the work.  When the feature is removed from the kernel, it should also
-be removed from this file.
+be removed from this file.  The suggested deprecation period is 3 releases.
+
+---------------------------
+
+What:	ddebug_query="query" boot cmdline param
+When:	v3.8
+Why:	obsoleted by dyndbg="query" and module.dyndbg="query"
+Who:	Jim Cromie <jim.cromie@gmail.com>, Jason Baron <jbaron@redhat.com>
 
 ---------------------------
 
@@ -32,6 +39,17 @@ Why:	prism54 FullMAC PCI / Cardbus devices used to be supported only by the
 	http://wireless.kernel.org/en/users/Drivers/p54
 
 Who:	Luis R. Rodriguez <lrodriguez@atheros.com>
+
+---------------------------
+
+What:	AR9170USB
+When:	2.6.40
+
+Why:	This driver is deprecated and the firmware is no longer
+	maintained. The replacement driver "carl9170" has been
+	around for a while, so the devices are still supported.
+
+Who:	Christian Lamparter <chunkeey@googlemail.com>
 
 ---------------------------
 
@@ -345,15 +363,6 @@ Who:	Johannes Berg <johannes@sipsolutions.net>
 
 ---------------------------
 
-What: CONFIG_NF_CT_ACCT
-When: 2.6.29
-Why:  Accounting can now be enabled/disabled without kernel recompilation.
-      Currently used only to set a default value for a feature that is also
-      controlled by a kernel/module/sysfs/sysctl parameter.
-Who:  Krzysztof Piotr Oledzki <ole@ans.pl>
-
----------------------------
-
 What:	sysfs ui for changing p4-clockmod parameters
 When:	September 2009
 Why:	See commits 129f8ae9b1b5be94517da76009ea956e89104ce8 and
@@ -489,3 +498,23 @@ Why:	With the recent innovations in CPU hardware acceleration technologies
 Who:	Alok N Kataria <akataria@vmware.com>
 
 ----------------------------
+
+What:   access to nfsd auth cache through sys_nfsservctl or '.' files
+        in the 'nfsd' filesystem.
+When:   2.6.40
+Why:    This is a legacy interface which have been replaced by a more
+        dynamic cache.  Continuing to maintain this interface is an
+        unnecessary burden.
+Who:    NeilBrown <neilb@suse.de>
+
+----------------------------
+
+What:	pci_scan_bus_parented()
+When:	3.5
+Why:	The pci_scan_bus_parented() interface creates a new root bus.  The
+	bus is created with default resources (ioport_resource and
+	iomem_resource) that are always wrong, so we rely on arch code to
+	correct them later.  Callers of pci_scan_bus_parented() should
+	convert to using pci_scan_root_bus() so they can supply a list of
+	bus resources when the bus is created.
+Who:	Bjorn Helgaas <bhelgaas@google.com>

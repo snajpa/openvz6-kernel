@@ -56,13 +56,31 @@
 #define VALIDATE_READY	       -1001 /* Firmware image ready for validation */
 #define VALIDATE_PARAM_ERR     -3    /* RTAS Parameter Error */
 #define VALIDATE_HW_ERR        -1    /* RTAS Hardware Error */
-#define VALIDATE_TMP_UPDATE    0     /* Validate Return Status */
-#define VALIDATE_FLASH_AUTH    1     /* Validate Return Status */
-#define VALIDATE_INVALID_IMG   2     /* Validate Return Status */
-#define VALIDATE_CUR_UNKNOWN   3     /* Validate Return Status */
-#define VALIDATE_TMP_COMMIT_DL 4     /* Validate Return Status */
-#define VALIDATE_TMP_COMMIT    5     /* Validate Return Status */
-#define VALIDATE_TMP_UPDATE_DL 6     /* Validate Return Status */
+
+/* ibm,validate-flash-image update result tokens */
+#define VALIDATE_TMP_UPDATE    0     /* T side will be updated */
+#define VALIDATE_FLASH_AUTH    1     /* Partition does not have authority */
+#define VALIDATE_INVALID_IMG   2     /* Candidate image is not valid */
+#define VALIDATE_CUR_UNKNOWN   3     /* Current fixpack level is unknown */
+/*
+ * Current T side will be committed to P side before being replace with new
+ * image, and the new image is downlevel from current image
+ */
+#define VALIDATE_TMP_COMMIT_DL 4
+/*
+ * Current T side will be committed to P side before being replaced with new
+ * image
+ */
+#define VALIDATE_TMP_COMMIT    5
+/*
+ * T side will be updated with a downlevel image
+ */
+#define VALIDATE_TMP_UPDATE_DL 6
+/*
+ * The candidate image's release date is later than the system's firmware
+ * service entitlement date - service warranty period has expired
+ */
+#define VALIDATE_OUT_OF_WRNTY  7
 
 /* ibm,manage-flash-image operation tokens */
 #define RTAS_REJECT_TMP_IMG   0
@@ -70,6 +88,7 @@
 
 /* Array sizes */
 #define VALIDATE_BUF_SIZE 4096    
+#define VALIDATE_MSG_LEN  256
 #define RTAS_MSG_MAXLEN   64
 
 /* Quirk - RTAS requires 4k list length and block size */
@@ -93,12 +112,8 @@ struct flash_block_list {
 	struct flash_block_list *next;
 	struct flash_block blocks[FLASH_BLOCKS_PER_NODE];
 };
-struct flash_block_list_header { /* just the header of flash_block_list */
-	unsigned long num_blocks;
-	struct flash_block_list *next;
-};
 
-static struct flash_block_list_header rtas_firmware_flash_list = {0, NULL};
+static struct flash_block_list *rtas_firmware_flash_list;
 
 /* Use slab cache to guarantee 4k alignment */
 static struct kmem_cache *flash_block_cache = NULL;
@@ -107,13 +122,14 @@ static struct kmem_cache *flash_block_cache = NULL;
 
 /* Local copy of the flash block list.
  * We only allow one open of the flash proc file and create this
- * list as we go.  This list will be put in the
- * rtas_firmware_flash_list var once it is fully read.
+ * list as we go.  The rtas_firmware_flash_list varable will be
+ * set once the data is fully read.
  *
  * For convenience as we build the list we use virtual addrs,
  * we do not fill in the version number, and the length field
  * is treated as the number of entries currently in the block
- * (i.e. not a byte count).  This is all fixed on release.
+ * (i.e. not a byte count).  This is all fixed when calling
+ * the flash routine.
  */
 
 /* Status int must be first member of struct */
@@ -200,16 +216,16 @@ static int rtas_flash_release(struct inode *inode, struct file *file)
 	if (uf->flist) {    
 		/* File was opened in write mode for a new flash attempt */
 		/* Clear saved list */
-		if (rtas_firmware_flash_list.next) {
-			free_flash_list(rtas_firmware_flash_list.next);
-			rtas_firmware_flash_list.next = NULL;
+		if (rtas_firmware_flash_list) {
+			free_flash_list(rtas_firmware_flash_list);
+			rtas_firmware_flash_list = NULL;
 		}
 
 		if (uf->status != FLASH_AUTH)  
 			uf->status = flash_list_valid(uf->flist);
 
 		if (uf->status == FLASH_IMG_READY) 
-			rtas_firmware_flash_list.next = uf->flist;
+			rtas_firmware_flash_list = uf->flist;
 		else
 			free_flash_list(uf->flist);
 
@@ -285,12 +301,6 @@ static ssize_t rtas_flash_read(struct file *file, char __user *buf,
 	return msglen;
 }
 
-/* constructor for flash_block_cache */
-void rtas_block_ctor(void *ptr)
-{
-	memset(ptr, 0, RTAS_BLK_SIZE);
-}
-
 /* We could be much more efficient here.  But to keep this function
  * simple we allocate a page to the block list no matter how small the
  * count is.  If the system is low on memory it will be just as well
@@ -315,7 +325,7 @@ static ssize_t rtas_flash_write(struct file *file, const char __user *buffer,
 	 * proc file
 	 */
 	if (uf->flist == NULL) {
-		uf->flist = kmem_cache_alloc(flash_block_cache, GFP_KERNEL);
+		uf->flist = kmem_cache_zalloc(flash_block_cache, GFP_KERNEL);
 		if (!uf->flist)
 			return -ENOMEM;
 	}
@@ -326,7 +336,7 @@ static ssize_t rtas_flash_write(struct file *file, const char __user *buffer,
 	next_free = fl->num_blocks;
 	if (next_free == FLASH_BLOCKS_PER_NODE) {
 		/* Need to allocate another block_list */
-		fl->next = kmem_cache_alloc(flash_block_cache, GFP_KERNEL);
+		fl->next = kmem_cache_zalloc(flash_block_cache, GFP_KERNEL);
 		if (!fl->next)
 			return -ENOMEM;
 		fl = fl->next;
@@ -335,7 +345,7 @@ static ssize_t rtas_flash_write(struct file *file, const char __user *buffer,
 
 	if (count > RTAS_BLK_SIZE)
 		count = RTAS_BLK_SIZE;
-	p = kmem_cache_alloc(flash_block_cache, GFP_KERNEL);
+	p = kmem_cache_zalloc(flash_block_cache, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
 	
@@ -474,7 +484,7 @@ static void validate_flash(struct rtas_validate_flash_t *args_buf)
 }
 
 static int get_validate_flash_msg(struct rtas_validate_flash_t *args_buf, 
-		                   char *msg)
+		                   char *msg, int msglen)
 {
 	int n;
 
@@ -482,7 +492,8 @@ static int get_validate_flash_msg(struct rtas_validate_flash_t *args_buf,
 		n = sprintf(msg, "%d\n", args_buf->update_results);
 		if ((args_buf->update_results >= VALIDATE_CUR_UNKNOWN) ||
 		    (args_buf->update_results == VALIDATE_TMP_UPDATE))
-			n += sprintf(msg + n, "%s\n", args_buf->buf);
+			n += snprintf(msg + n, msglen - n, "%s\n",
+					args_buf->buf);
 	} else {
 		n = sprintf(msg, "%d\n", args_buf->status);
 	}
@@ -494,7 +505,7 @@ static ssize_t validate_flash_read(struct file *file, char __user *buf,
 {
 	struct proc_dir_entry *dp = PDE(file->f_path.dentry->d_inode);
 	struct rtas_validate_flash_t *args_buf;
-	char msg[RTAS_MSG_MAXLEN];
+	char msg[VALIDATE_MSG_LEN];
 	int msglen;
 
 	args_buf = (struct rtas_validate_flash_t *) dp->data;
@@ -502,7 +513,7 @@ static ssize_t validate_flash_read(struct file *file, char __user *buf,
 	if (ppos && *ppos != 0)
 		return 0;	/* be cheap */
 	
-	msglen = get_validate_flash_msg(args_buf, msg);
+	msglen = get_validate_flash_msg(args_buf, msg, VALIDATE_MSG_LEN);
 	if (msglen > count)
 		msglen = count;
 
@@ -592,7 +603,7 @@ static void rtas_flash_firmware(int reboot_type)
 	unsigned long rtas_block_list;
 	int i, status, update_token;
 
-	if (rtas_firmware_flash_list.next == NULL)
+	if (rtas_firmware_flash_list == NULL)
 		return;		/* nothing to do */
 
 	if (reboot_type != SYS_RESTART) {
@@ -609,20 +620,31 @@ static void rtas_flash_firmware(int reboot_type)
 		return;
 	}
 
-	/* NOTE: the "first" block list is a global var with no data
-	 * blocks in the kernel data segment.  We do this because
-	 * we want to ensure this block_list addr is under 4GB.
+	/*
+	 * Just before starting the firmware flash, cancel the event scan work
+	 * to avoid any soft lockup issues.
 	 */
-	rtas_firmware_flash_list.num_blocks = 0;
-	flist = (struct flash_block_list *)&rtas_firmware_flash_list;
+	rtas_cancel_event_scan();
+
+	/*
+	 * NOTE: the "first" block must be under 4GB, so we create
+	 * an entry with no data blocks in the reserved buffer in
+	 * the kernel data segment.
+	 */
+	spin_lock(&rtas_data_buf_lock);
+	flist = (struct flash_block_list *)&rtas_data_buf[0];
+	flist->num_blocks = 0;
+	flist->next = rtas_firmware_flash_list;
 	rtas_block_list = virt_to_abs(flist);
 	if (rtas_block_list >= 4UL*1024*1024*1024) {
 		printk(KERN_ALERT "FLASH: kernel bug...flash list header addr above 4GB\n");
+		spin_unlock(&rtas_data_buf_lock);
 		return;
 	}
 
 	printk(KERN_ALERT "FLASH: preparing saved firmware image for flash\n");
 	/* Update the block_list in place. */
+	rtas_firmware_flash_list = NULL; /* too hard to backout on error */
 	image_size = 0;
 	for (f = flist; f; f = next) {
 		/* Translate data addrs to absolute */
@@ -663,6 +685,7 @@ static void rtas_flash_firmware(int reboot_type)
 		printk(KERN_ALERT "FLASH: unknown flash return code %d\n", status);
 		break;
 	}
+	spin_unlock(&rtas_data_buf_lock);
 }
 
 static void remove_flash_pde(struct proc_dir_entry *dp)
@@ -798,7 +821,7 @@ static int __init rtas_flash_init(void)
 
 	flash_block_cache = kmem_cache_create("rtas_flash_cache",
 				RTAS_BLK_SIZE, RTAS_BLK_SIZE, 0,
-				rtas_block_ctor);
+				NULL);
 	if (!flash_block_cache) {
 		printk(KERN_ERR "%s: failed to create block cache\n",
 				__func__);
@@ -819,6 +842,11 @@ cleanup:
 static void __exit rtas_flash_cleanup(void)
 {
 	rtas_flash_term_hook = NULL;
+
+	if (rtas_firmware_flash_list) {
+		free_flash_list(rtas_firmware_flash_list);
+		rtas_firmware_flash_list = NULL;
+	}
 
 	if (flash_block_cache)
 		kmem_cache_destroy(flash_block_cache);

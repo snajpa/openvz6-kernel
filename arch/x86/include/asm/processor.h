@@ -21,7 +21,6 @@ struct mm_struct;
 #include <asm/msr.h>
 #include <asm/desc_defs.h>
 #include <asm/nops.h>
-#include <asm/ds.h>
 
 #include <linux/personality.h>
 #include <linux/cpumask.h>
@@ -29,6 +28,8 @@ struct mm_struct;
 #include <linux/threads.h>
 #include <linux/math64.h>
 #include <linux/init.h>
+#include <linux/err.h>
+#include <linux/magic.h>
 
 /*
  * Default implementation of macro that returns current
@@ -112,8 +113,39 @@ struct cpuinfo_x86 {
 	/* Index into per_cpu list: */
 	u16			cpu_index;
 #endif
+	/* RHEL6: deprecated and should use x86_hyper instead */
 	unsigned int		x86_hyper_vendor;
+#ifndef __GENKSYMS__
+	/* RHEL6:
+	   There are only 4 bytes of space before the end of this struct. */
+#ifdef CONFIG_SMP
+	/* Compute unit id */
+	u8			compute_unit_id;
+#endif /* CONFIG_SMP */
+	u32			microcode;
+#endif /* !__GENKSYMS__ */
 } __attribute__((__aligned__(SMP_CACHE_BYTES)));
+
+/* This struct never should be on a kabi whitelist. */
+struct cpuinfo_x86_rh {
+	__u32			x86_capability[RH_EXT_NCAPINTS];
+
+	/* Cache QoS architectural values: */
+	int			x86_cache_max_rmid;	/* max index */
+	int			x86_cache_occ_scale;	/* scale to bytes */
+} __attribute__((__aligned__(SMP_CACHE_BYTES)));
+
+
+struct cpuid_regs {
+	u32 eax, ebx, ecx, edx;
+};
+
+enum cpuid_regs_idx {
+	CPUID_EAX = 0,
+	CPUID_EBX,
+	CPUID_ECX,
+	CPUID_EDX,
+};
 
 #define X86_VENDOR_INTEL	0
 #define X86_VENDOR_CYRIX	1
@@ -126,23 +158,32 @@ struct cpuinfo_x86 {
 
 #define X86_VENDOR_UNKNOWN	0xff
 
-#define X86_HYPER_VENDOR_NONE  0
-#define X86_HYPER_VENDOR_VMWARE 1
-
 /*
  * capabilities of CPUs
  */
 extern struct cpuinfo_x86	boot_cpu_data;
+extern struct cpuinfo_x86_rh	boot_cpu_data_rh;
 extern struct cpuinfo_x86	new_cpu_data;
+extern struct cpuinfo_x86_rh	new_cpu_data_rh;
 
 extern struct tss_struct	doublefault_tss;
-extern __u32			cpu_caps_cleared[NCAPINTS];
-extern __u32			cpu_caps_set[NCAPINTS];
+extern __u32			cpu_caps_cleared[RHNCAPINTS];
+extern __u32			cpu_caps_set[RHNCAPINTS];
 
 #ifdef CONFIG_SMP
 DECLARE_PER_CPU_SHARED_ALIGNED(struct cpuinfo_x86, cpu_info);
+DECLARE_PER_CPU_SHARED_ALIGNED(struct cpuinfo_x86_rh, cpu_info_rh);
 #define cpu_data(cpu)		per_cpu(cpu_info, cpu)
 #define current_cpu_data	__get_cpu_var(cpu_info)
+#define cpu_data_rh(cpu)	per_cpu(cpu_info_rh, cpu)
+#define current_cpu_data_rh	__get_cpu_var(cpu_info_rh)
+static inline struct cpuinfo_x86_rh *get_cpuinfo_x86_rh(struct cpuinfo_x86 *c)
+{
+	if (c == &boot_cpu_data)
+		return &boot_cpu_data_rh;
+	else
+		return &cpu_data_rh(c->cpu_index);
+}
 #else
 #define cpu_data(cpu)		boot_cpu_data
 #define current_cpu_data	boot_cpu_data
@@ -161,6 +202,9 @@ static inline int hlt_works(int cpu)
 
 #define cache_line_size()	(boot_cpu_data.x86_cache_alignment)
 
+#define __HAVE_ARCH_ALIGN_STACK
+extern unsigned long arch_align_stack(unsigned long sp);
+
 extern void cpu_detect(struct cpuinfo_x86 *c);
 
 extern struct pt_regs *idle_regs(struct pt_regs *);
@@ -170,8 +214,11 @@ extern void identify_boot_cpu(void);
 extern void identify_secondary_cpu(struct cpuinfo_x86 *);
 extern void print_cpu_info(struct cpuinfo_x86 *);
 extern void init_scattered_cpuid_features(struct cpuinfo_x86 *c);
+extern u32 get_scattered_cpuid_leaf(unsigned int level,
+				    unsigned int sub_leaf,
+				    enum cpuid_regs_idx reg);
 extern unsigned int init_intel_cacheinfo(struct cpuinfo_x86 *c);
-extern unsigned short num_cache_leaves;
+extern void init_amd_cacheinfo(struct cpuinfo_x86 *c);
 
 extern void detect_extended_topology(struct cpuinfo_x86 *c);
 extern void detect_ht(struct cpuinfo_x86 *c);
@@ -180,17 +227,13 @@ static inline void native_cpuid(unsigned int *eax, unsigned int *ebx,
 				unsigned int *ecx, unsigned int *edx)
 {
 	/* ecx is often an input as well as an output. */
-	asm("cpuid"
+	asm volatile("cpuid"
 	    : "=a" (*eax),
 	      "=b" (*ebx),
 	      "=c" (*ecx),
 	      "=d" (*edx)
-	    : "0" (*eax), "2" (*ecx));
-}
-
-static inline void load_cr3(pgd_t *pgdir)
-{
-	write_cr3(__pa(pgdir));
+	    : "0" (*eax), "2" (*ecx)
+	    : "memory");
 }
 
 #ifdef CONFIG_X86_32
@@ -268,11 +311,34 @@ struct tss_struct {
 	/*
 	 * .. and then another 0x100 bytes for the emergency kernel stack:
 	 */
+#ifndef __GENKSYMS__
+	unsigned long		stack_canary;
+	unsigned long		stack[256];
+#else
 	unsigned long		stack[64];
+#endif
 
-} ____cacheline_aligned;
+	/*
+	 *
+	 * The Intel SDM says (Volume 3, 7.2.1):
+	 *
+	 *  Avoid placing a page boundary in the part of the TSS that the
+	 *  processor reads during a task switch (the first 104 bytes). The
+	 *  processor may not correctly perform address translations if a
+	 *  boundary occurs in this area. During a task switch, the processor
+	 *  reads and writes into the first 104 bytes of each TSS (using
+	 *  contiguous physical addresses beginning with the physical address
+	 *  of the first byte of the TSS). So, after TSS access begins, if
+	 *  part of the 104 bytes is not physically contiguous, the processor
+	 *  will access incorrect information without generating a page-fault
+	 *  exception.
+	 *
+	 * There are also a lot of errata involving the TSS spanning a page
+	 * boundary.  Assert that we're not doing that.
+	 */
+} __attribute__((__aligned__(PAGE_SIZE)));
 
-DECLARE_PER_CPU_SHARED_ALIGNED(struct tss_struct, init_tss);
+DECLARE_PER_CPU_PAGE_ALIGNED_USER_MAPPED(struct tss_struct, init_tss);
 
 /*
  * Save the original ist values for checking stack pointers during debugging
@@ -379,6 +445,10 @@ union thread_xstate {
 	struct xsave_struct		xsave;
 };
 
+struct fpu {
+       union thread_xstate *state;
+};
+
 #ifdef CONFIG_X86_64
 DECLARE_PER_CPU(struct orig_ist, orig_ist);
 
@@ -471,10 +541,6 @@ struct thread_struct {
 	unsigned long		iopl;
 	/* Max allowed port in the bitmap, in bytes: */
 	unsigned		io_bitmap_max;
-/* MSR_IA32_DEBUGCTLMSR value to switch in if TIF_DEBUGCTLMSR is set.  */
-	unsigned long	debugctlmsr;
-	/* Debug Store context; see asm/ds.h */
-	struct ds_context	*ds_ctx;
 };
 
 static inline unsigned long native_get_debugreg(int regno)
@@ -733,7 +799,7 @@ static inline void sync_core(void)
 			     : "ebx", "ecx", "edx", "memory");
 }
 
-static inline void __monitor(const void *eax, unsigned long ecx,
+static __always_inline void __monitor(const void *eax, unsigned long ecx,
 			     unsigned long edx)
 {
 	/* "monitor %eax, %ecx, %edx;" */
@@ -741,7 +807,7 @@ static inline void __monitor(const void *eax, unsigned long ecx,
 		     :: "a" (eax), "c" (ecx), "d"(edx));
 }
 
-static inline void __mwait(unsigned long eax, unsigned long ecx)
+static __always_inline void __mwait(unsigned long eax, unsigned long ecx)
 {
 	/* "mwait %eax, %ecx;" */
 	asm volatile(".byte 0x0f, 0x01, 0xc9;"
@@ -765,29 +831,6 @@ extern unsigned long		boot_option_idle_override;
 extern unsigned long		idle_halt;
 extern unsigned long		idle_nomwait;
 
-/*
- * on systems with caches, caches must be flashed as the absolute
- * last instruction before going into a suspended halt.  Otherwise,
- * dirty data can linger in the cache and become stale on resume,
- * leading to strange errors.
- *
- * perform a variety of operations to guarantee that the compiler
- * will not reorder instructions.  wbinvd itself is serializing
- * so the processor will not reorder.
- *
- * Systems without cache can just go into halt.
- */
-static inline void wbinvd_halt(void)
-{
-	mb();
-	/* check for clflush to determine if wbinvd is legal */
-	if (cpu_has_clflush)
-		asm volatile("cli; wbinvd; 1: hlt; jmp 1b" : : : "memory");
-	else
-		while (1)
-			halt();
-}
-
 extern void enable_sep_cpu(void);
 extern int sysenter_setup(void);
 
@@ -801,28 +844,13 @@ extern void cpu_init(void);
 
 static inline unsigned long get_debugctlmsr(void)
 {
-    unsigned long debugctlmsr = 0;
+	unsigned long debugctlmsr = 0;
 
 #ifndef CONFIG_X86_DEBUGCTLMSR
 	if (boot_cpu_data.x86 < 6)
 		return 0;
 #endif
 	rdmsrl(MSR_IA32_DEBUGCTLMSR, debugctlmsr);
-
-    return debugctlmsr;
-}
-
-static inline unsigned long get_debugctlmsr_on_cpu(int cpu)
-{
-	u64 debugctlmsr = 0;
-	u32 val1, val2;
-
-#ifndef CONFIG_X86_DEBUGCTLMSR
-	if (boot_cpu_data.x86 < 6)
-		return 0;
-#endif
-	rdmsr_on_cpu(cpu, MSR_IA32_DEBUGCTLMSR, &val1, &val2);
-	debugctlmsr = val1 | ((u64)val2 << 32);
 
 	return debugctlmsr;
 }
@@ -834,18 +862,6 @@ static inline void update_debugctlmsr(unsigned long debugctlmsr)
 		return;
 #endif
 	wrmsrl(MSR_IA32_DEBUGCTLMSR, debugctlmsr);
-}
-
-static inline void update_debugctlmsr_on_cpu(int cpu,
-					     unsigned long debugctlmsr)
-{
-#ifndef CONFIG_X86_DEBUGCTLMSR
-	if (boot_cpu_data.x86 < 6)
-		return;
-#endif
-	wrmsr_on_cpu(cpu, MSR_IA32_DEBUGCTLMSR,
-		     (u32)((u64)debugctlmsr),
-		     (u32)((u64)debugctlmsr >> 32));
 }
 
 /*
@@ -930,10 +946,12 @@ static inline void spin_lock_prefetch(const void *x)
 #define INIT_TSS  {							  \
 	.x86_tss = {							  \
 		.sp0		= sizeof(init_stack) + (long)&init_stack, \
+		.sp1		= sizeof(init_stack) + (long)&init_stack, \
 		.ss0		= __KERNEL_DS,				  \
 		.ss1		= __KERNEL_CS,				  \
 		.io_bitmap_base	= INVALID_IO_BITMAP_OFFSET,		  \
 	 },								  \
+	.stack_canary		= STACK_END_MAGIC,			  \
 	.io_bitmap		= { [0 ... IO_BITMAP_LONGS] = ~0 },	  \
 }
 
@@ -990,7 +1008,8 @@ extern unsigned long thread_saved_pc(struct task_struct *tsk);
 }
 
 #define INIT_TSS  { \
-	.x86_tss.sp0 = (unsigned long)&init_stack + sizeof(init_stack) \
+	.x86_tss.sp0 = (unsigned long)&init_stack + sizeof(init_stack), \
+	.stack_canary		= STACK_END_MAGIC, \
 }
 
 /*
@@ -1050,6 +1069,21 @@ unsigned long calc_aperfmperf_ratio(struct aperfmperf *old,
 		ratio = div64_u64(aperf, mperf);
 
 	return ratio;
+}
+
+static inline uint32_t hypervisor_cpuid_base(const char *sig, uint32_t leaves)
+{
+	uint32_t base, eax, signature[3];
+
+	for (base = 0x40000000; base < 0x40010000; base += 0x100) {
+		cpuid(base, &eax, &signature[0], &signature[1], &signature[2]);
+
+		if (!memcmp(sig, signature, 12) &&
+		    (leaves == 0 || ((eax - base) >= leaves)))
+			return base;
+	}
+
+	return 0;
 }
 
 #endif /* _ASM_X86_PROCESSOR_H */

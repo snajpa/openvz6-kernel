@@ -38,7 +38,9 @@
 #define mb()   __asm__ __volatile__ ("sync" : : : "memory")
 #define rmb()  __asm__ __volatile__ ("sync" : : : "memory")
 #define wmb()  __asm__ __volatile__ ("sync" : : : "memory")
+#define gmb()  __asm__ __volatile__ ("ori 31,31,0": : : "memory")
 #define read_barrier_depends()  do { } while(0)
+
 
 #define set_mb(var, value)	do { var = value; mb(); } while (0)
 
@@ -212,7 +214,7 @@ extern struct task_struct *_switch(struct thread_struct *prev,
 extern unsigned int rtas_data;
 extern int mem_init_done;	/* set on boot once kmalloc can be called */
 extern int init_bootmem_done;	/* set once bootmem is available */
-extern phys_addr_t memory_limit;
+extern unsigned long long memory_limit;
 extern unsigned long klimit;
 
 extern void *alloc_maybe_bootmem(size_t size, gfp_t mask);

@@ -31,20 +31,29 @@
 #include <asm/div64.h>
 #include <asm/sections.h>	/* for dereference_function_descriptor() */
 
-/* Works only for digits and letters, but small and fast */
-#define TOLOWER(x) ((x) | 0x20)
+#include "kstrtox.h"
 
-static unsigned int simple_guess_base(const char *cp)
+/**
+ * simple_strtoull - convert a string to an unsigned long long
+ * @cp: The start of the string
+ * @endp: A pointer to the end of the parsed string will be placed here
+ * @base: The number base to use
+ */
+unsigned long long simple_strtoull(const char *cp, char **endp, unsigned int base)
 {
-	if (cp[0] == '0') {
-		if (TOLOWER(cp[1]) == 'x' && isxdigit(cp[2]))
-			return 16;
-		else
-			return 8;
-	} else {
-		return 10;
-	}
+	unsigned long long result;
+	unsigned int rv;
+
+	cp = _parse_integer_fixup_radix(cp, &base);
+	rv = _parse_integer(cp, base, &result);
+	/* FIXME */
+	cp += (rv & ~KSTRTOX_OVERFLOW);
+
+	if (endp)
+		*endp = (char *)cp;
+	return result;
 }
+EXPORT_SYMBOL(simple_strtoull);
 
 /**
  * simple_strtoul - convert a string to an unsigned long
@@ -54,27 +63,7 @@ static unsigned int simple_guess_base(const char *cp)
  */
 unsigned long simple_strtoul(const char *cp, char **endp, unsigned int base)
 {
-	unsigned long result = 0;
-
-	if (!base)
-		base = simple_guess_base(cp);
-
-	if (base == 16 && cp[0] == '0' && TOLOWER(cp[1]) == 'x')
-		cp += 2;
-
-	while (isxdigit(*cp)) {
-		unsigned int value;
-
-		value = isdigit(*cp) ? *cp - '0' : TOLOWER(*cp) - 'a' + 10;
-		if (value >= base)
-			break;
-		result = result * base + value;
-		cp++;
-	}
-
-	if (endp)
-		*endp = (char *)cp;
-	return result;
+	return simple_strtoull(cp, endp, base);
 }
 EXPORT_SYMBOL(simple_strtoul);
 
@@ -86,43 +75,12 @@ EXPORT_SYMBOL(simple_strtoul);
  */
 long simple_strtol(const char *cp, char **endp, unsigned int base)
 {
-	if(*cp == '-')
+	if (*cp == '-')
 		return -simple_strtoul(cp + 1, endp, base);
+
 	return simple_strtoul(cp, endp, base);
 }
 EXPORT_SYMBOL(simple_strtol);
-
-/**
- * simple_strtoull - convert a string to an unsigned long long
- * @cp: The start of the string
- * @endp: A pointer to the end of the parsed string will be placed here
- * @base: The number base to use
- */
-unsigned long long simple_strtoull(const char *cp, char **endp, unsigned int base)
-{
-	unsigned long long result = 0;
-
-	if (!base)
-		base = simple_guess_base(cp);
-
-	if (base == 16 && cp[0] == '0' && TOLOWER(cp[1]) == 'x')
-		cp += 2;
-
-	while (isxdigit(*cp)) {
-		unsigned int value;
-
-		value = isdigit(*cp) ? *cp - '0' : TOLOWER(*cp) - 'a' + 10;
-		if (value >= base)
-			break;
-		result = result * base + value;
-		cp++;
-	}
-
-	if (endp)
-		*endp = (char *)cp;
-	return result;
-}
-EXPORT_SYMBOL(simple_strtoull);
 
 /**
  * simple_strtoll - convert a string to a signed long long
@@ -394,8 +352,8 @@ static noinline char* put_dec(char *buf, unsigned long long num)
 #define PLUS	4		/* show plus */
 #define SPACE	8		/* space if plus */
 #define LEFT	16		/* left justified */
-#define SMALL	32		/* Must be 32 == 0x20 */
-#define SPECIAL	64		/* 0x */
+#define SMALL	32		/* use lowercase in hex (must be 32 == 0x20) */
+#define SPECIAL	64		/* prefix hex with "0x", octal with "0" */
 
 enum format_type {
 	FORMAT_TYPE_NONE, /* Just a string part */
@@ -546,12 +504,12 @@ static char *number(char *buf, char *end, unsigned long long num,
 	return buf;
 }
 
-static char *string(char *buf, char *end, char *s, struct printf_spec spec)
+static char *string(char *buf, char *end, const char *s, struct printf_spec spec)
 {
 	int len, i;
 
 	if ((unsigned long)s < PAGE_SIZE)
-		s = "<NULL>";
+		s = "(null)";
 
 	len = strnlen(s, spec.precision);
 
@@ -595,39 +553,154 @@ static char *symbol_string(char *buf, char *end, void *ptr,
 }
 
 static char *resource_string(char *buf, char *end, struct resource *res,
-				struct printf_spec spec)
+				struct printf_spec spec, const char *fmt)
 {
 #ifndef IO_RSRC_PRINTK_SIZE
-#define IO_RSRC_PRINTK_SIZE	4
+#define IO_RSRC_PRINTK_SIZE	6
 #endif
 
 #ifndef MEM_RSRC_PRINTK_SIZE
-#define MEM_RSRC_PRINTK_SIZE	8
+#define MEM_RSRC_PRINTK_SIZE	10
 #endif
-	struct printf_spec num_spec = {
+	static const struct printf_spec io_spec = {
 		.base = 16,
+		.field_width = IO_RSRC_PRINTK_SIZE,
 		.precision = -1,
 		.flags = SPECIAL | SMALL | ZEROPAD,
 	};
-	/* room for the actual numbers, the two "0x", -, [, ] and the final zero */
-	char sym[4*sizeof(resource_size_t) + 8];
-	char *p = sym, *pend = sym + sizeof(sym);
-	int size = -1;
+	static const struct printf_spec mem_spec = {
+		.base = 16,
+		.field_width = MEM_RSRC_PRINTK_SIZE,
+		.precision = -1,
+		.flags = SPECIAL | SMALL | ZEROPAD,
+	};
+	static const struct printf_spec bus_spec = {
+		.base = 16,
+		.field_width = 2,
+		.precision = -1,
+		.flags = SMALL | ZEROPAD,
+	};
+	static const struct printf_spec dec_spec = {
+		.base = 10,
+		.precision = -1,
+		.flags = 0,
+	};
+	static const struct printf_spec str_spec = {
+		.field_width = -1,
+		.precision = 10,
+		.flags = LEFT,
+	};
+	static const struct printf_spec flag_spec = {
+		.base = 16,
+		.precision = -1,
+		.flags = SPECIAL | SMALL,
+	};
 
-	if (res->flags & IORESOURCE_IO)
-		size = IO_RSRC_PRINTK_SIZE;
-	else if (res->flags & IORESOURCE_MEM)
-		size = MEM_RSRC_PRINTK_SIZE;
+	/* 32-bit res (sizeof==4): 10 chars in dec, 10 in hex ("0x" + 8)
+	 * 64-bit res (sizeof==8): 20 chars in dec, 18 in hex ("0x" + 16) */
+#define RSRC_BUF_SIZE		((2 * sizeof(resource_size_t)) + 4)
+#define FLAG_BUF_SIZE		(2 * sizeof(res->flags))
+#define DECODED_BUF_SIZE	sizeof("[mem - 64bit pref window disabled]")
+#define RAW_BUF_SIZE		sizeof("[mem - flags 0x]")
+	char sym[max(2*RSRC_BUF_SIZE + DECODED_BUF_SIZE,
+		     2*RSRC_BUF_SIZE + FLAG_BUF_SIZE + RAW_BUF_SIZE)];
+
+	char *p = sym, *pend = sym + sizeof(sym);
+	int decode = (fmt[0] == 'R') ? 1 : 0;
+	const struct printf_spec *specp;
 
 	*p++ = '[';
-	num_spec.field_width = size;
-	p = number(p, pend, res->start, num_spec);
-	*p++ = '-';
-	p = number(p, pend, res->end, num_spec);
+	if (res->flags & IORESOURCE_IO) {
+		p = string(p, pend, "io  ", str_spec);
+		specp = &io_spec;
+	} else if (res->flags & IORESOURCE_MEM) {
+		p = string(p, pend, "mem ", str_spec);
+		specp = &mem_spec;
+	} else if (res->flags & IORESOURCE_IRQ) {
+		p = string(p, pend, "irq ", str_spec);
+		specp = &dec_spec;
+	} else if (res->flags & IORESOURCE_DMA) {
+		p = string(p, pend, "dma ", str_spec);
+		specp = &dec_spec;
+	} else if (res->flags & IORESOURCE_BUS) {
+		p = string(p, pend, "bus ", str_spec);
+		specp = &bus_spec;
+	} else {
+		p = string(p, pend, "??? ", str_spec);
+		specp = &mem_spec;
+		decode = 0;
+	}
+	if (decode && res->flags & IORESOURCE_UNSET) {
+		p = string(p, pend, "size ", str_spec);
+		p = number(p, pend, resource_size(res), *specp);
+	} else {
+		p = number(p, pend, res->start, *specp);
+		if (res->start != res->end) {
+			*p++ = '-';
+			p = number(p, pend, res->end, *specp);
+		}
+	}
+	if (decode) {
+		if (res->flags & IORESOURCE_MEM_64)
+			p = string(p, pend, " 64bit", str_spec);
+		if (res->flags & IORESOURCE_PREFETCH)
+			p = string(p, pend, " pref", str_spec);
+		if (res->flags & IORESOURCE_WINDOW)
+			p = string(p, pend, " window", str_spec);
+		if (res->flags & IORESOURCE_DISABLED)
+			p = string(p, pend, " disabled", str_spec);
+	} else {
+		p = string(p, pend, " flags ", str_spec);
+		p = number(p, pend, res->flags, flag_spec);
+	}
 	*p++ = ']';
-	*p = 0;
+	*p = '\0';
 
 	return string(buf, end, sym, spec);
+}
+
+static noinline_for_stack
+char *hex_string(char *buf, char *end, u8 *addr, struct printf_spec spec,
+		 const char *fmt)
+{
+	int i, len = 1;		/* if we pass '%ph[CDN]', field witdh remains
+				   negative value, fallback to the default */
+	char separator;
+
+	if (spec.field_width == 0)
+		/* nothing to print */
+		return buf;
+
+	if (ZERO_OR_NULL_PTR(addr))
+		/* NULL pointer */
+		return string(buf, end, NULL, spec);
+
+	switch (fmt[1]) {
+	case 'C':
+		separator = ':';
+		break;
+	case 'D':
+		separator = '-';
+		break;
+	case 'N':
+		separator = 0;
+		break;
+	default:
+		separator = ' ';
+		break;
+	}
+
+	if (spec.field_width > 0)
+		len = min_t(int, spec.field_width, 64);
+
+	for (i = 0; i < len && buf < end - 1; i++) {
+		buf = pack_hex_byte(buf, addr[i]);
+
+		if (buf < end && separator && i != len - 1)
+			*buf++ = separator;
+	}
+
+	return buf;
 }
 
 static char *mac_address_string(char *buf, char *end, u8 *addr,
@@ -647,13 +720,37 @@ static char *mac_address_string(char *buf, char *end, u8 *addr,
 	return string(buf, end, mac_addr, spec);
 }
 
-static char *ip4_string(char *p, const u8 *addr, bool leading_zeros)
+static char *ip4_string(char *p, const u8 *addr, const char *fmt)
 {
 	int i;
+	bool leading_zeros = (fmt[0] == 'i');
+	int index;
+	int step;
 
+	switch (fmt[2]) {
+	case 'h':
+#ifdef __BIG_ENDIAN
+		index = 0;
+		step = 1;
+#else
+		index = 3;
+		step = -1;
+#endif
+		break;
+	case 'l':
+		index = 3;
+		step = -1;
+		break;
+	case 'n':
+	case 'b':
+	default:
+		index = 0;
+		step = 1;
+		break;
+	}
 	for (i = 0; i < 4; i++) {
 		char temp[3];	/* hold each IP quad in reverse order */
-		int digits = put_dec_trunc(temp, addr[i]) - temp;
+		int digits = put_dec_trunc(temp, addr[index]) - temp;
 		if (leading_zeros) {
 			if (digits < 3)
 				*p++ = '0';
@@ -665,6 +762,7 @@ static char *ip4_string(char *p, const u8 *addr, bool leading_zeros)
 			*p++ = temp[digits];
 		if (i < 3)
 			*p++ = '.';
+		index += step;
 	}
 
 	*p = '\0';
@@ -711,6 +809,8 @@ static char *ip6_compressed_string(char *p, const char *addr)
 			colonpos = i;
 		}
 	}
+	if (longest == 1)		/* don't compress a single 0 */
+		colonpos = -1;
 
 	/* emit address */
 	for (i = 0; i < range; i++) {
@@ -746,7 +846,7 @@ static char *ip6_compressed_string(char *p, const char *addr)
 	if (useIPv4) {
 		if (needcolon)
 			*p++ = ':';
-		p = ip4_string(p, &in6.s6_addr[12], false);
+		p = ip4_string(p, &in6.s6_addr[12], "I4");
 	}
 
 	*p = '\0';
@@ -785,9 +885,154 @@ static char *ip4_addr_string(char *buf, char *end, const u8 *addr,
 {
 	char ip4_addr[sizeof("255.255.255.255")];
 
-	ip4_string(ip4_addr, addr, fmt[0] == 'i');
+	ip4_string(ip4_addr, addr, fmt);
 
 	return string(buf, end, ip4_addr, spec);
+}
+
+static noinline_for_stack
+char *ip6_addr_string_sa(char *buf, char *end, const struct sockaddr_in6 *sa,
+			 struct printf_spec spec, const char *fmt)
+{
+	bool have_p = false, have_s = false, have_f = false, have_c = false;
+	char ip6_addr[sizeof("[xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:255.255.255.255]") +
+		      sizeof(":12345") + sizeof("/123456789") +
+		      sizeof("%1234567890")];
+	char *p = ip6_addr, *pend = ip6_addr + sizeof(ip6_addr);
+	const u8 *addr = (const u8 *) &sa->sin6_addr;
+	char fmt6[2] = { fmt[0], '6' };
+	u8 off = 0;
+
+	fmt++;
+	while (isalpha(*++fmt)) {
+		switch (*fmt) {
+		case 'p':
+			have_p = true;
+			break;
+		case 'f':
+			have_f = true;
+			break;
+		case 's':
+			have_s = true;
+			break;
+		case 'c':
+			have_c = true;
+			break;
+		}
+	}
+
+	if (have_p || have_s || have_f) {
+		*p = '[';
+		off = 1;
+	}
+
+	if (fmt6[0] == 'I' && have_c)
+		p = ip6_compressed_string(ip6_addr + off, addr);
+	else
+		p = ip6_string(ip6_addr + off, addr, fmt6);
+
+	if (have_p || have_s || have_f)
+		*p++ = ']';
+
+	if (have_p) {
+		*p++ = ':';
+		p = number(p, pend, ntohs(sa->sin6_port), spec);
+	}
+	if (have_f) {
+		*p++ = '/';
+		p = number(p, pend, ntohl(sa->sin6_flowinfo &
+					  IPV6_FLOWINFO_MASK), spec);
+	}
+	if (have_s) {
+		*p++ = '%';
+		p = number(p, pend, sa->sin6_scope_id, spec);
+	}
+	*p = '\0';
+
+	return string(buf, end, ip6_addr, spec);
+}
+
+static noinline_for_stack
+char *ip4_addr_string_sa(char *buf, char *end, const struct sockaddr_in *sa,
+			 struct printf_spec spec, const char *fmt)
+{
+	bool have_p = false;
+	char *p, ip4_addr[sizeof("255.255.255.255") + sizeof(":12345")];
+	char *pend = ip4_addr + sizeof(ip4_addr);
+	const u8 *addr = (const u8 *) &sa->sin_addr.s_addr;
+	char fmt4[3] = { fmt[0], '4', 0 };
+
+	fmt++;
+	while (isalpha(*++fmt)) {
+		switch (*fmt) {
+		case 'p':
+			have_p = true;
+			break;
+		case 'h':
+		case 'l':
+		case 'n':
+		case 'b':
+			fmt4[2] = *fmt;
+			break;
+		}
+	}
+
+	p = ip4_string(ip4_addr, addr, fmt4);
+	if (have_p) {
+		*p++ = ':';
+		p = number(p, pend, ntohs(sa->sin_port), spec);
+	}
+	*p = '\0';
+
+	return string(buf, end, ip4_addr, spec);
+}
+
+int kptr_restrict = 1;
+
+static char *uuid_string(char *buf, char *end, const u8 *addr,
+			 struct printf_spec spec, const char *fmt)
+{
+	char uuid[sizeof("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")];
+	char *p = uuid;
+	int i;
+	static const u8 be[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+	static const u8 le[16] = {3,2,1,0,5,4,7,6,8,9,10,11,12,13,14,15};
+	const u8 *index = be;
+	bool uc = false;
+
+	switch (*(++fmt)) {
+	case 'L':
+		uc = true;		/* fall-through */
+	case 'l':
+		index = le;
+		break;
+	case 'B':
+		uc = true;
+		break;
+	}
+
+	for (i = 0; i < 16; i++) {
+		p = pack_hex_byte(p, addr[index[i]]);
+		switch (i) {
+		case 3:
+		case 5:
+		case 7:
+		case 9:
+			*p++ = '-';
+			break;
+		}
+	}
+
+	*p = 0;
+
+	if (uc) {
+		p = uuid;
+		do {
+			*p = toupper(*p);
+		} while (*(++p));
+	}
+
+	return string(buf, end, uuid, spec);
 }
 
 /*
@@ -801,19 +1046,51 @@ static char *ip4_addr_string(char *buf, char *end, const u8 *addr,
  * - 'f' For simple symbolic function names without offset
  * - 'S' For symbolic direct pointers with offset
  * - 's' For symbolic direct pointers without offset
- * - 'R' For a struct resource pointer, it prints the range of
- *       addresses (not the name nor the flags)
+ * - 'R' For decoded struct resource, e.g., [mem 0x0-0x1f 64bit pref]
+ * - 'r' For raw struct resource, e.g., [mem 0x0-0x1f flags 0x201]
  * - 'M' For a 6-byte MAC address, it prints the address in the
  *       usual colon-separated hex notation
  * - 'm' For a 6-byte MAC address, it prints the hex address without colons
  * - 'I' [46] for IPv4/IPv6 addresses printed in the usual way
  *       IPv4 uses dot-separated decimal without leading 0's (1.2.3.4)
  *       IPv6 uses colon separated network-order 16 bit hex with leading 0's
+ *       [S][pfs]
+ *       Generic IPv4/IPv6 address (struct sockaddr *) that falls back to
+ *       [4] or [6] and is able to print port [p], flowinfo [f], scope [s]
  * - 'i' [46] for 'raw' IPv4/IPv6 addresses
  *       IPv6 omits the colons (01020304...0f)
  *       IPv4 uses dot-separated decimal with leading 0's (010.123.045.006)
- * - 'I6c' for IPv6 addresses printed as specified by
- *       http://www.ietf.org/id/draft-kawamura-ipv6-text-representation-03.txt
+ *       [S][pfs]
+ *       Generic IPv4/IPv6 address (struct sockaddr *) that falls back to
+ *       [4] or [6] and is able to print port [p], flowinfo [f], scope [s]
+ * - '[Ii][4S][hnbl]' IPv4 addresses in host, network, big or little endian order
+ * - 'I[6S]c' for IPv6 addresses printed as specified by
+ *       http://tools.ietf.org/html/rfc5952
+ * - 'V' For a struct va_format which contains a format string * and va_list *,
+ *       call vsnprintf(->format, *->va_list).
+ *       Implements a "recursive vsnprintf".
+ *       Do not use this feature without some mechanism to verify the
+ *       correctness of the format string and va_list arguments.
+ * - 'K' For a kernel pointer that should be hidden from unprivileged users
+ * - 'U' For a 16 byte UUID/GUID, it prints the UUID/GUID in the form
+ *       "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+ *       Options for %pU are:
+ *         b big endian lower case hex (default)
+ *         B big endian UPPER case hex
+ *         l little endian lower case hex
+ *         L little endian UPPER case hex
+ *           big endian output byte order is:
+ *             [0][1][2][3]-[4][5]-[6][7]-[8][9]-[10][11][12][13][14][15]
+ *           little endian output byte order is:
+ *             [3][2][1][0]-[5][4]-[7][6]-[8][9]-[10][11][12][13][14][15]
+ * - 'h[CDN]' For a variable-length buffer, it prints it as a hex string with
+ *            a certain separator (' ' by default):
+ *              C colon
+ *              D dash
+ *              N no separator
+ *            The maximum supported length is 64 bytes of the input. Consider
+ *            to use print_hex_dump() for the larger input.
+ *
  * Note: The difference between 'S' and 'F' is that on ia64 and ppc64
  * function pointers are really function descriptors, which contain a
  * pointer to the real address.
@@ -821,19 +1098,22 @@ static char *ip4_addr_string(char *buf, char *end, const u8 *addr,
 static char *pointer(const char *fmt, char *buf, char *end, void *ptr,
 			struct printf_spec spec)
 {
-	if (!ptr)
+	if (!ptr && *fmt != 'K')
 		return string(buf, end, "(null)", spec);
 
 	switch (*fmt) {
 	case 'F':
 	case 'f':
 		ptr = dereference_function_descriptor(ptr);
-	case 's':
 		/* Fallthrough */
 	case 'S':
+	case 's':
 		return symbol_string(buf, end, ptr, spec, *fmt);
 	case 'R':
-		return resource_string(buf, end, ptr, spec);
+	case 'r':
+		return resource_string(buf, end, ptr, spec, fmt);
+	case 'h':
+		return hex_string(buf, end, ptr, spec, fmt);
 	case 'M':			/* Colon separated: 00:01:02:03:04:05 */
 	case 'm':			/* Contiguous: 000102030405 */
 		return mac_address_string(buf, end, ptr, spec, fmt);
@@ -851,8 +1131,48 @@ static char *pointer(const char *fmt, char *buf, char *end, void *ptr,
 			return ip6_addr_string(buf, end, ptr, spec, fmt);
 		case '4':
 			return ip4_addr_string(buf, end, ptr, spec, fmt);
+		case 'S': {
+			const union {
+				struct sockaddr		raw;
+				struct sockaddr_in	v4;
+				struct sockaddr_in6	v6;
+			} *sa = ptr;
+
+			switch (sa->raw.sa_family) {
+			case AF_INET:
+				return ip4_addr_string_sa(buf, end, &sa->v4, spec, fmt);
+			case AF_INET6:
+				return ip6_addr_string_sa(buf, end, &sa->v6, spec, fmt);
+			default:
+				return string(buf, end, "(invalid address)", spec);
+			}}
 		}
 		break;
+	case 'K':
+		/*
+		 * %pK cannot be used in IRQ context because its test
+		 * for CAP_SYS_ADMIN would be meaningless.
+		 */
+		if (in_irq() || in_softirq() || in_nmi()) {
+			if (spec.field_width == -1)
+				spec.field_width = 2 * sizeof(void *);
+			return string(buf, end, "pK-error", spec);
+		} else if ((kptr_restrict == 0) ||
+			 (kptr_restrict == 1 &&
+			  has_capability_noaudit(current, CAP_SYS_ADMIN)))
+			break;
+
+		if (spec.field_width == -1) {
+			spec.field_width = 2 * sizeof(void *);
+			spec.flags |= ZEROPAD;
+		}
+		return number(buf, end, 0, spec);
+	case 'U':
+		return uuid_string(buf, end, ptr, spec, fmt);
+	case 'V':
+		return buf + vsnprintf(buf, end - buf,
+				       ((struct va_format *)ptr)->fmt,
+				       *(((struct va_format *)ptr)->va));
 	}
 	spec.flags |= SMALL;
 	if (spec.field_width == -1) {
@@ -970,8 +1290,8 @@ precision:
 qualifier:
 	/* get the conversion qualifier */
 	spec->qualifier = -1;
-	if (*fmt == 'h' || *fmt == 'l' || *fmt == 'L' ||
-	    *fmt == 'Z' || *fmt == 'z' || *fmt == 't') {
+	if (*fmt == 'h' || _tolower(*fmt) == 'l' ||
+	    _tolower(*fmt) == 'z' || *fmt == 't') {
 		spec->qualifier = *fmt++;
 		if (unlikely(spec->qualifier == *fmt)) {
 			if (spec->qualifier == 'l') {
@@ -1038,7 +1358,7 @@ qualifier:
 			spec->type = FORMAT_TYPE_LONG;
 		else
 			spec->type = FORMAT_TYPE_ULONG;
-	} else if (spec->qualifier == 'Z' || spec->qualifier == 'z') {
+	} else if (_tolower(spec->qualifier) == 'z') {
 		spec->type = FORMAT_TYPE_SIZE_T;
 	} else if (spec->qualifier == 't') {
 		spec->type = FORMAT_TYPE_PTRDIFF;
@@ -1075,6 +1395,10 @@ qualifier:
  * %pF output the name of a function pointer with its offset
  * %pf output the name of a function pointer without its offset
  * %pR output the address range in a struct resource
+ * %pIS depending on sa_family of 'struct sockaddr *' print IPv4/IPv6 address
+ * %piS depending on sa_family of 'struct sockaddr *' print IPv4/IPv6 address
+ * %*ph[CDN] a variable-length hex string with a separator (supports up to 64
+ *           bytes of the input)
  * %n is ignored
  *
  * The return value is the number of characters which would
@@ -1185,8 +1509,7 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
 			if (qualifier == 'l') {
 				long *ip = va_arg(args, long *);
 				*ip = (str - buf);
-			} else if (qualifier == 'Z' ||
-					qualifier == 'z') {
+			} else if (_tolower(qualifier) == 'z') {
 				size_t *ip = va_arg(args, size_t *);
 				*ip = (str - buf);
 			} else {
@@ -1257,7 +1580,7 @@ EXPORT_SYMBOL(vsnprintf);
  * @args: Arguments for the format string
  *
  * The return value is the number of characters which have been written into
- * the @buf not including the trailing '\0'. If @size is <= 0 the function
+ * the @buf not including the trailing '\0'. If @size is == 0 the function
  * returns 0.
  *
  * Call this function if you are already dealing with a va_list.
@@ -1270,7 +1593,12 @@ int vscnprintf(char *buf, size_t size, const char *fmt, va_list args)
 	int i;
 
 	i=vsnprintf(buf,size,fmt,args);
-	return (i >= size) ? (size - 1) : i;
+
+	if (likely(i < size))
+		return i;
+	if (size != 0)
+		return size - 1;
+	return 0;
 }
 EXPORT_SYMBOL(vscnprintf);
 
@@ -1308,7 +1636,7 @@ EXPORT_SYMBOL(snprintf);
  * @...: Arguments for the format string
  *
  * The return value is the number of characters written into @buf not including
- * the trailing '\0'. If @size is <= 0 the function returns 0.
+ * the trailing '\0'. If @size is == 0 the function returns 0.
  */
 
 int scnprintf(char * buf, size_t size, const char *fmt, ...)
@@ -1317,9 +1645,9 @@ int scnprintf(char * buf, size_t size, const char *fmt, ...)
 	int i;
 
 	va_start(args, fmt);
-	i = vsnprintf(buf, size, fmt, args);
+	i = vscnprintf(buf, size, fmt, args);
 	va_end(args);
-	return (i >= size) ? (size - 1) : i;
+	return i;
 }
 EXPORT_SYMBOL(scnprintf);
 
@@ -1445,7 +1773,7 @@ do {									\
 			size_t len;
 			if ((unsigned long)save_str > (unsigned long)-PAGE_SIZE
 					|| (unsigned long)save_str < PAGE_SIZE)
-				save_str = "<NULL>";
+				save_str = "(null)";
 			len = strlen(save_str);
 			if (str + len + 1 < end)
 				memcpy(str, save_str, len + 1);
@@ -1472,7 +1800,7 @@ do {									\
 			void *skip_arg;
 			if (qualifier == 'l')
 				skip_arg = va_arg(args, long *);
-			else if (qualifier == 'Z' || qualifier == 'z')
+			else if (_tolower(qualifier) == 'z')
 				skip_arg = va_arg(args, size_t *);
 			else
 				skip_arg = va_arg(args, int *);
@@ -1750,10 +2078,8 @@ int vsscanf(const char * buf, const char * fmt, va_list args)
 		 * white space, including none, in the input.
 		 */
 		if (isspace(*fmt)) {
-			while (isspace(*fmt))
-				++fmt;
-			while (isspace(*str))
-				++str;
+			fmt = skip_spaces(++fmt);
+			str = skip_spaces(str);
 		}
 
 		/* anything that is not a conversion must match exactly */
@@ -1785,8 +2111,8 @@ int vsscanf(const char * buf, const char * fmt, va_list args)
 
 		/* get conversion qualifier */
 		qualifier = -1;
-		if (*fmt == 'h' || *fmt == 'l' || *fmt == 'L' ||
-		    *fmt == 'Z' || *fmt == 'z') {
+		if (*fmt == 'h' || _tolower(*fmt) == 'l' ||
+		    _tolower(*fmt) == 'z') {
 			qualifier = *fmt++;
 			if (unlikely(qualifier == *fmt)) {
 				if (qualifier == 'h') {
@@ -1822,8 +2148,7 @@ int vsscanf(const char * buf, const char * fmt, va_list args)
 			if(field_width == -1)
 				field_width = INT_MAX;
 			/* first, skip leading white space in buffer */
-			while (isspace(*str))
-				str++;
+			str = skip_spaces(str);
 
 			/* now copy until next white space */
 			while (*str && !isspace(*str) && field_width--) {
@@ -1866,8 +2191,7 @@ int vsscanf(const char * buf, const char * fmt, va_list args)
 		/* have some sort of integer conversion.
 		 * first, skip white space in buffer.
 		 */
-		while (isspace(*str))
-			str++;
+		str = skip_spaces(str);
 
 		digit = *str;
 		if (is_sign && digit == '-')

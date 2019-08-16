@@ -32,7 +32,7 @@ extern struct apic apic_x2apic_cluster;
 struct apic __read_mostly *apic = &apic_flat;
 EXPORT_SYMBOL_GPL(apic);
 
-static struct apic *apic_probe[] __initdata = {
+struct apic *apic_probe[] __initdata = {
 #ifdef CONFIG_X86_UV
 	&apic_x2apic_uv_x,
 #endif
@@ -41,6 +41,7 @@ static struct apic *apic_probe[] __initdata = {
 	&apic_x2apic_cluster,
 #endif
 	&apic_physflat,
+	&apic_flat,	/* must be last */
 	NULL,
 };
 
@@ -54,44 +55,23 @@ static int apicid_phys_pkg_id(int initial_apic_id, int index_msb)
  */
 void __init default_setup_apic_routing(void)
 {
-#ifdef CONFIG_X86_X2APIC
-	if (x2apic_mode
-#ifdef CONFIG_X86_UV
-		       && apic != &apic_x2apic_uv_x
-#endif
-		       ) {
-		if (x2apic_phys)
-			apic = &apic_x2apic_phys;
-		else
-			apic = &apic_x2apic_cluster;
-	}
-#endif
+	int i;
 
-	if (apic == &apic_flat) {
-		switch (boot_cpu_data.x86_vendor) {
-		case X86_VENDOR_INTEL:
-			if (num_processors > 8)
-				apic = &apic_physflat;
+	enable_IR_x2apic();
+
+	for (i = 0; apic_probe[i]; ++i) {
+		if (apic_probe[i]->probe()) {
+			apic = apic_probe[i];
 			break;
-		case X86_VENDOR_AMD:
-			if (max_physical_apicid >= 8)
-				apic = &apic_physflat;
 		}
 	}
 
-	printk(KERN_INFO "Setting APIC routing to %s\n", apic->name);
+	printk(KERN_INFO "APIC routing finalized to %s.\n", apic->name);
 
 	if (is_vsmp_box()) {
 		/* need to update phys_pkg_id */
 		apic->phys_pkg_id = apicid_phys_pkg_id;
 	}
-
-	/*
-	 * Now that apic routing model is selected, configure the
-	 * fault handling for intr remapping.
-	 */
-	if (intr_remapping_enabled)
-		enable_drhd_fault_handling();
 }
 
 /* Same for both flat and physical. */

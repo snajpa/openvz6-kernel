@@ -21,6 +21,7 @@
 #include <linux/mount.h>
 #include <linux/statfs.h>
 #include <linux/ctype.h>
+#include <linux/string.h>
 #include <linux/fs_struct.h>
 #include "internal.h"
 
@@ -160,6 +161,8 @@ static ssize_t cachefiles_daemon_read(struct file *file, char __user *_buffer,
 				      size_t buflen, loff_t *pos)
 {
 	struct cachefiles_cache *cache = file->private_data;
+	unsigned long long b_released;
+	unsigned f_released;
 	char buffer[256];
 	int n;
 
@@ -172,6 +175,8 @@ static ssize_t cachefiles_daemon_read(struct file *file, char __user *_buffer,
 	cachefiles_has_space(cache, 0, 0);
 
 	/* summarise */
+	f_released = atomic_xchg(&cache->f_released, 0);
+	b_released = atomic_long_xchg(&cache->b_released, 0);
 	clear_bit(CACHEFILES_STATE_CHANGED, &cache->flags);
 
 	n = snprintf(buffer, sizeof(buffer),
@@ -181,15 +186,18 @@ static ssize_t cachefiles_daemon_read(struct file *file, char __user *_buffer,
 		     " fstop=%llx"
 		     " brun=%llx"
 		     " bcull=%llx"
-		     " bstop=%llx",
+		     " bstop=%llx"
+		     " freleased=%x"
+		     " breleased=%llx",
 		     test_bit(CACHEFILES_CULLING, &cache->flags) ? '1' : '0',
 		     (unsigned long long) cache->frun,
 		     (unsigned long long) cache->fcull,
 		     (unsigned long long) cache->fstop,
 		     (unsigned long long) cache->brun,
 		     (unsigned long long) cache->bcull,
-		     (unsigned long long) cache->bstop
-		     );
+		     (unsigned long long) cache->bstop,
+		     f_released,
+		     b_released);
 
 	if (n > buflen)
 		return -EMSGSIZE;
@@ -257,8 +265,7 @@ static ssize_t cachefiles_daemon_write(struct file *file,
 		if (args == data)
 			goto error;
 		*args = '\0';
-		for (args++; isspace(*args); args++)
-			continue;
+		args = skip_spaces(++args);
 	}
 
 	/* run the appropriate command handler */
@@ -314,8 +321,7 @@ static unsigned int cachefiles_daemon_poll(struct file *file,
 static int cachefiles_daemon_range_error(struct cachefiles_cache *cache,
 					 char *args)
 {
-	kerror("Free space limits must be in range"
-	       " 0%%<=stop<cull<run<100%%");
+	pr_err("Free space limits must be in range 0%%<=stop<cull<run<100%%\n");
 
 	return -EINVAL;
 }
@@ -475,12 +481,12 @@ static int cachefiles_daemon_dir(struct cachefiles_cache *cache, char *args)
 	_enter(",%s", args);
 
 	if (!*args) {
-		kerror("Empty directory specified");
+		pr_err("Empty directory specified\n");
 		return -EINVAL;
 	}
 
 	if (cache->rootdirname) {
-		kerror("Second cache directory specified");
+		pr_err("Second cache directory specified\n");
 		return -EEXIST;
 	}
 
@@ -503,12 +509,12 @@ static int cachefiles_daemon_secctx(struct cachefiles_cache *cache, char *args)
 	_enter(",%s", args);
 
 	if (!*args) {
-		kerror("Empty security context specified");
+		pr_err("Empty security context specified\n");
 		return -EINVAL;
 	}
 
 	if (cache->secctx) {
-		kerror("Second security context specified");
+		pr_err("Second security context specified\n");
 		return -EINVAL;
 	}
 
@@ -531,7 +537,7 @@ static int cachefiles_daemon_tag(struct cachefiles_cache *cache, char *args)
 	_enter(",%s", args);
 
 	if (!*args) {
-		kerror("Empty tag specified");
+		pr_err("Empty tag specified\n");
 		return -EINVAL;
 	}
 
@@ -563,12 +569,12 @@ static int cachefiles_daemon_cull(struct cachefiles_cache *cache, char *args)
 		goto inval;
 
 	if (!test_bit(CACHEFILES_READY, &cache->flags)) {
-		kerror("cull applied to unready cache");
+		pr_err("cull applied to unready cache\n");
 		return -EIO;
 	}
 
 	if (test_bit(CACHEFILES_DEAD, &cache->flags)) {
-		kerror("cull applied to dead cache");
+		pr_err("cull applied to dead cache\n");
 		return -EIO;
 	}
 
@@ -591,11 +597,11 @@ static int cachefiles_daemon_cull(struct cachefiles_cache *cache, char *args)
 
 notdir:
 	dput(dir);
-	kerror("cull command requires dirfd to be a directory");
+	pr_err("cull command requires dirfd to be a directory\n");
 	return -ENOTDIR;
 
 inval:
-	kerror("cull command requires dirfd and filename");
+	pr_err("cull command requires dirfd and filename\n");
 	return -EINVAL;
 }
 
@@ -618,7 +624,7 @@ static int cachefiles_daemon_debug(struct cachefiles_cache *cache, char *args)
 	return 0;
 
 inval:
-	kerror("debug command requires mask");
+	pr_err("debug command requires mask\n");
 	return -EINVAL;
 }
 
@@ -639,12 +645,12 @@ static int cachefiles_daemon_inuse(struct cachefiles_cache *cache, char *args)
 		goto inval;
 
 	if (!test_bit(CACHEFILES_READY, &cache->flags)) {
-		kerror("inuse applied to unready cache");
+		pr_err("inuse applied to unready cache\n");
 		return -EIO;
 	}
 
 	if (test_bit(CACHEFILES_DEAD, &cache->flags)) {
-		kerror("inuse applied to dead cache");
+		pr_err("inuse applied to dead cache\n");
 		return -EIO;
 	}
 
@@ -667,11 +673,11 @@ static int cachefiles_daemon_inuse(struct cachefiles_cache *cache, char *args)
 
 notdir:
 	dput(dir);
-	kerror("inuse command requires dirfd to be a directory");
+	pr_err("inuse command requires dirfd to be a directory\n");
 	return -ENOTDIR;
 
 inval:
-	kerror("inuse command requires dirfd and filename");
+	pr_err("inuse command requires dirfd and filename\n");
 	return -EINVAL;
 }
 
@@ -683,6 +689,10 @@ int cachefiles_has_space(struct cachefiles_cache *cache,
 			 unsigned fnr, unsigned bnr)
 {
 	struct kstatfs stats;
+	struct path path = {
+		.mnt	= cache->mnt,
+		.dentry	= cache->mnt->mnt_root,
+	};
 	int ret;
 
 	//_enter("{%llu,%llu,%llu,%llu,%llu,%llu},%u,%u",
@@ -697,7 +707,7 @@ int cachefiles_has_space(struct cachefiles_cache *cache,
 	/* find out how many pages of blockdev are available */
 	memset(&stats, 0, sizeof(stats));
 
-	ret = vfs_statfs(cache->mnt->mnt_root, &stats);
+	ret = vfs_statfs(&path, &stats);
 	if (ret < 0) {
 		if (ret == -EIO)
 			cachefiles_io_error(cache, "statfs failed");

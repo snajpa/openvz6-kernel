@@ -39,17 +39,17 @@
 #include <asm/timer.h>
 
 /* nop stub */
-void _paravirt_nop(void)
+void notrace _paravirt_nop(void)
 {
 }
 
 /* identity function, which can be inlined */
-u32 _paravirt_ident_32(u32 x)
+u32 notrace _paravirt_ident_32(u32 x)
 {
 	return x;
 }
 
-u64 _paravirt_ident_64(u64 x)
+u64 notrace _paravirt_ident_64(u64 x)
 {
 	return x;
 }
@@ -202,6 +202,13 @@ static void native_flush_tlb_single(unsigned long addr)
 	__native_flush_tlb_single(addr);
 }
 
+bool paravirt_steal_enabled;
+
+static u64 native_steal_clock(int cpu)
+{
+	return 0;
+}
+
 /* These are in entry.S */
 extern void native_iret(void);
 extern void native_irq_enable_sysexit(void);
@@ -231,6 +238,9 @@ static DEFINE_PER_CPU(enum paravirt_lazy_mode, paravirt_lazy_mode) = PARAVIRT_LA
 
 static inline void enter_lazy(enum paravirt_lazy_mode mode)
 {
+	if (in_interrupt())
+		return;
+
 	BUG_ON(percpu_read(paravirt_lazy_mode) != PARAVIRT_LAZY_NONE);
 
 	percpu_write(paravirt_lazy_mode, mode);
@@ -238,6 +248,9 @@ static inline void enter_lazy(enum paravirt_lazy_mode mode)
 
 static void leave_lazy(enum paravirt_lazy_mode mode)
 {
+	if (in_interrupt())
+		return;
+
 	BUG_ON(percpu_read(paravirt_lazy_mode) != mode);
 
 	percpu_write(paravirt_lazy_mode, PARAVIRT_LAZY_NONE);
@@ -307,6 +320,7 @@ struct pv_init_ops pv_init_ops = {
 
 struct pv_time_ops pv_time_ops = {
 	.sched_clock = native_sched_clock,
+	.steal_clock = native_steal_clock,
 };
 
 struct pv_irq_ops pv_irq_ops = {
@@ -345,6 +359,9 @@ struct pv_cpu_ops pv_cpu_ops = {
 	.read_tscp = native_read_tscp,
 	.load_tr_desc = native_load_tr_desc,
 	.set_ldt = native_set_ldt,
+#ifdef CONFIG_X86_32
+	.load_user_cs_desc = native_load_user_cs_desc,
+#endif /*CONFIG_X86_32*/
 	.load_gdt = native_load_gdt,
 	.load_idt = native_load_idt,
 	.store_gdt = native_store_gdt,
@@ -422,15 +439,14 @@ struct pv_mmu_ops pv_mmu_ops = {
 	.set_pte = native_set_pte,
 	.set_pte_at = native_set_pte_at,
 	.set_pmd = native_set_pmd,
+	.set_pmd_at = native_set_pmd_at,
 	.pte_update = paravirt_nop,
 	.pte_update_defer = paravirt_nop,
+	.pmd_update = paravirt_nop,
+	.pmd_update_defer = paravirt_nop,
 
 	.ptep_modify_prot_start = __ptep_modify_prot_start,
 	.ptep_modify_prot_commit = __ptep_modify_prot_commit,
-
-#ifdef CONFIG_HIGHPTE
-	.kmap_atomic_pte = kmap_atomic,
-#endif
 
 #if PAGETABLE_LEVELS >= 3
 #ifdef CONFIG_X86_PAE

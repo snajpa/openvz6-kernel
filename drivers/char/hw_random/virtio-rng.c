@@ -38,7 +38,7 @@ static void random_recv_done(struct virtqueue *vq)
 	unsigned int len;
 
 	/* We can get spurious callbacks, e.g. shared IRQs + virtio_pci. */
-	if (!vq->vq_ops->get_buf(vq, &len))
+	if (!virtqueue_get_buf(vq, &len))
 		return;
 
 	data_left += len;
@@ -51,14 +51,17 @@ static void register_buffer(void)
 
 	sg_init_one(&sg, random_data+data_left, RANDOM_DATA_SIZE-data_left);
 	/* There should always be room for one buffer. */
-	if (vq->vq_ops->add_buf(vq, &sg, 0, 1, random_data) < 0)
+	if (virtqueue_add_buf(vq, &sg, 0, 1, random_data) < 0)
 		BUG();
-	vq->vq_ops->kick(vq);
+
+	virtqueue_kick(vq);
 }
 
 /* At least we don't udelay() in a loop like some other drivers. */
 static int virtio_data_present(struct hwrng *rng, int wait)
 {
+	int ret;
+
 	if (data_left >= sizeof(u32))
 		return 1;
 
@@ -66,7 +69,9 @@ again:
 	if (!wait)
 		return 0;
 
-	wait_for_completion(&have_data);
+	ret = wait_for_completion_killable(&have_data);
+	if (ret < 0)
+		return ret;
 
 	/* Not enough?  Re-register. */
 	if (unlikely(data_left < sizeof(u32))) {
@@ -97,43 +102,80 @@ static struct hwrng virtio_hwrng = {
 	.data_read = virtio_data_read,
 };
 
-static int virtrng_probe(struct virtio_device *vdev)
+static int probe_common(struct virtio_device *vdev)
 {
 	int err;
 
+	if (vq) {
+		/* We only support one device for now */
+		return -EBUSY;
+	}
 	/* We expect a single virtqueue. */
 	vq = virtio_find_single_vq(vdev, random_recv_done, "input");
-	if (IS_ERR(vq))
-		return PTR_ERR(vq);
+	if (IS_ERR(vq)) {
+		err = PTR_ERR(vq);
+		vq = NULL;
+		return err;
+	}
 
 	err = hwrng_register(&virtio_hwrng);
 	if (err) {
 		vdev->config->del_vqs(vdev);
+		vq = NULL;
 		return err;
 	}
 
-	register_buffer();
+	if (data_left < sizeof(u32))
+		register_buffer();
 	return 0;
 }
 
-static void __devexit virtrng_remove(struct virtio_device *vdev)
+static void remove_common(struct virtio_device *vdev)
 {
 	vdev->config->reset(vdev);
 	hwrng_unregister(&virtio_hwrng);
 	vdev->config->del_vqs(vdev);
+	vq = NULL;
 }
+
+static int virtrng_probe(struct virtio_device *vdev)
+{
+	return probe_common(vdev);
+}
+
+static void __devexit virtrng_remove(struct virtio_device *vdev)
+{
+	remove_common(vdev);
+}
+
+#ifdef CONFIG_PM
+static int virtrng_freeze(struct virtio_device *vdev)
+{
+	remove_common(vdev);
+	return 0;
+}
+
+static int virtrng_restore(struct virtio_device *vdev)
+{
+	return probe_common(vdev);
+}
+#endif
 
 static struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_RNG, VIRTIO_DEV_ANY_ID },
 	{ 0 },
 };
 
-static struct virtio_driver virtio_rng = {
+static struct virtio_driver virtio_rng_driver = {
 	.driver.name =	KBUILD_MODNAME,
 	.driver.owner =	THIS_MODULE,
 	.id_table =	id_table,
 	.probe =	virtrng_probe,
 	.remove =	__devexit_p(virtrng_remove),
+#ifdef CONFIG_PM
+	.freeze =	virtrng_freeze,
+	.restore =	virtrng_restore,
+#endif
 };
 
 static int __init init(void)
@@ -144,7 +186,7 @@ static int __init init(void)
 	if (!random_data)
 		return -ENOMEM;
 
-	err = register_virtio_driver(&virtio_rng);
+	err = register_virtio_driver(&virtio_rng_driver);
 	if (err)
 		kfree(random_data);
 	return err;
@@ -153,7 +195,7 @@ static int __init init(void)
 static void __exit fini(void)
 {
 	kfree(random_data);
-	unregister_virtio_driver(&virtio_rng);
+	unregister_virtio_driver(&virtio_rng_driver);
 }
 module_init(init);
 module_exit(fini);

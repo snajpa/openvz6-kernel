@@ -1,7 +1,7 @@
 /****************************************************************************
- * Driver for Solarflare Solarstorm network controllers and boards
+ * Driver for Solarflare network controllers and boards
  * Copyright 2005-2006 Fen Systems Ltd.
- * Copyright 2006-2008 Solarflare Communications Inc.
+ * Copyright 2006-2012 Solarflare Communications Inc.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 as published
@@ -18,17 +18,22 @@
 #include <linux/in.h>
 #include <linux/udp.h>
 #include <linux/rtnetlink.h>
-#include <asm/io.h>
+#include <linux/slab.h>
 #include "net_driver.h"
-#include "ethtool.h"
 #include "efx.h"
-#include "falcon.h"
+#include "nic.h"
 #include "selftest.h"
-#include "boards.h"
 #include "workarounds.h"
-#include "spi.h"
-#include "falcon_io.h"
-#include "mdio_10g.h"
+
+/* IRQ latency can be enormous because:
+ * - All IRQs may be disabled on a CPU for a *long* time by e.g. a
+ *   slow serial console or an old IDE driver doing error recovery
+ * - The PREEMPT_RT patches mostly deal with this, but also allow a
+ *   tasklet or normal task to be given higher priority than our IRQ
+ *   threads
+ * Try to avoid blaming the hardware for this.
+ */
+#define IRQ_TIMEOUT HZ
 
 /*
  * Loopback test packet structure
@@ -41,22 +46,33 @@ struct efx_loopback_payload {
 	struct iphdr ip;
 	struct udphdr udp;
 	__be16 iteration;
-	const char msg[64];
-} __attribute__ ((packed));
+	char msg[64];
+} __packed;
 
 /* Loopback test source MAC address */
-static const unsigned char payload_source[ETH_ALEN] = {
+static const u8 payload_source[ETH_ALEN] __aligned(2) = {
 	0x00, 0x0f, 0x53, 0x1b, 0x1b, 0x1b,
 };
 
-static const char *payload_msg =
+static const char payload_msg[] =
 	"Hello world! This is an Efx loopback test in progress!";
+
+/* Interrupt mode names */
+static const unsigned int efx_interrupt_mode_max = EFX_INT_MODE_MAX;
+static const char *const efx_interrupt_mode_names[] = {
+	[EFX_INT_MODE_MSIX]   = "MSI-X",
+	[EFX_INT_MODE_MSI]    = "MSI",
+	[EFX_INT_MODE_LEGACY] = "legacy",
+};
+#define INT_MODE(efx) \
+	STRING_TABLE_LOOKUP(efx->interrupt_mode, efx_interrupt_mode)
 
 /**
  * efx_loopback_state - persistent state during a loopback selftest
  * @flush:		Drop all packets in efx_loopback_rx_packet
  * @packet_count:	Number of packets being used in this test
  * @skbs:		An array of skbs transmitted
+ * @offload_csum:	Checksums are being offloaded
  * @rx_good:		RX good packet count
  * @rx_bad:		RX bad packet count
  * @payload:		Payload used in tests
@@ -65,14 +81,14 @@ struct efx_loopback_state {
 	bool flush;
 	int packet_count;
 	struct sk_buff **skbs;
-
-	/* Checksums are being offloaded */
 	bool offload_csum;
-
 	atomic_t rx_good;
 	atomic_t rx_bad;
 	struct efx_loopback_payload payload;
 };
+
+/* How long to wait for all the packets to arrive (in ms) */
+#define LOOPBACK_TIMEOUT_MS 1000
 
 /**************************************************************************
  *
@@ -80,60 +96,30 @@ struct efx_loopback_state {
  *
  **************************************************************************/
 
-static int efx_test_mdio(struct efx_nic *efx, struct efx_self_tests *tests)
+static int efx_test_phy_alive(struct efx_nic *efx, struct efx_self_tests *tests)
 {
 	int rc = 0;
-	int devad = __ffs(efx->mdio.mmds);
-	u16 physid1, physid2;
 
-	if (efx->phy_type == PHY_TYPE_NONE)
-		return 0;
-
-	mutex_lock(&efx->mac_lock);
-	tests->mdio = -1;
-
-	physid1 = efx_mdio_read(efx, devad, MDIO_DEVID1);
-	physid2 = efx_mdio_read(efx, devad, MDIO_DEVID2);
-
-	if ((physid1 == 0x0000) || (physid1 == 0xffff) ||
-	    (physid2 == 0x0000) || (physid2 == 0xffff)) {
-		EFX_ERR(efx, "no MDIO PHY present with ID %d\n",
-			efx->mdio.prtad);
-		rc = -EINVAL;
-		goto out;
+	if (efx->phy_op->test_alive) {
+		rc = efx->phy_op->test_alive(efx);
+		tests->phy_alive = rc ? -1 : 1;
 	}
 
-	if (EFX_IS10G(efx)) {
-		rc = efx_mdio_check_mmds(efx, efx->phy_op->mmds, 0);
-		if (rc)
-			goto out;
-	}
-
-out:
-	mutex_unlock(&efx->mac_lock);
-	tests->mdio = rc ? -1 : 1;
 	return rc;
 }
 
 static int efx_test_nvram(struct efx_nic *efx, struct efx_self_tests *tests)
 {
-	int rc;
+	int rc = 0;
 
-	rc = falcon_read_nvram(efx, NULL);
-	tests->nvram = rc ? -1 : 1;
-	return rc;
-}
+	if (efx->type->test_nvram) {
+		rc = efx->type->test_nvram(efx);
+		if (rc == -EPERM)
+			rc = 0;
+		else
+			tests->nvram = rc ? -1 : 1;
+	}
 
-static int efx_test_chip(struct efx_nic *efx, struct efx_self_tests *tests)
-{
-	int rc;
-
-	/* Not supported on A-series silicon */
-	if (falcon_rev(efx) < FALCON_REV_B0)
-		return 0;
-
-	rc = falcon_test_registers(efx);
-	tests->registers = rc ? -1 : 1;
 	return rc;
 }
 
@@ -147,103 +133,124 @@ static int efx_test_chip(struct efx_nic *efx, struct efx_self_tests *tests)
 static int efx_test_interrupts(struct efx_nic *efx,
 			       struct efx_self_tests *tests)
 {
-	struct efx_channel *channel;
+	unsigned long timeout, wait;
+	int cpu;
+	int rc;
 
-	EFX_LOG(efx, "testing interrupts\n");
+	netif_dbg(efx, drv, efx->net_dev, "testing interrupts\n");
 	tests->interrupt = -1;
 
-	/* Reset interrupt flag */
-	efx->last_irq_cpu = -1;
-	smp_wmb();
-
-	/* ACK each interrupting event queue. Receiving an interrupt due to
-	 * traffic before a test event is raised is considered a pass */
-	efx_for_each_channel(channel, efx) {
-		if (channel->work_pending)
-			efx_process_channel_now(channel);
-		if (efx->last_irq_cpu >= 0)
-			goto success;
+	rc = efx_nic_irq_test_start(efx);
+	if (rc == -ENOTSUPP) {
+		netif_dbg(efx, drv, efx->net_dev,
+			  "direct interrupt testing not supported\n");
+		tests->interrupt = 0;
+		return 0;
 	}
 
-	falcon_generate_interrupt(efx);
+	timeout = jiffies + IRQ_TIMEOUT;
+	wait = 1;
 
 	/* Wait for arrival of test interrupt. */
-	EFX_LOG(efx, "waiting for test interrupt\n");
-	schedule_timeout_uninterruptible(HZ / 10);
-	if (efx->last_irq_cpu >= 0)
-		goto success;
+	netif_dbg(efx, drv, efx->net_dev, "waiting for test interrupt\n");
+	do {
+		schedule_timeout_uninterruptible(wait);
+		cpu = efx_nic_irq_test_irq_cpu(efx);
+		if (cpu >= 0)
+			goto success;
+		wait *= 2;
+	} while (time_before(jiffies, timeout));
 
-	EFX_ERR(efx, "timed out waiting for interrupt\n");
+	netif_err(efx, drv, efx->net_dev, "timed out waiting for interrupt\n");
 	return -ETIMEDOUT;
 
  success:
-	EFX_LOG(efx, "test interrupt (mode %d) seen on CPU%d\n",
-		efx->interrupt_mode, efx->last_irq_cpu);
+	netif_dbg(efx, drv, efx->net_dev, "%s test interrupt seen on CPU%d\n",
+		  INT_MODE(efx), cpu);
 	tests->interrupt = 1;
 	return 0;
 }
 
 /* Test generation and receipt of interrupting events */
-static int efx_test_eventq_irq(struct efx_channel *channel,
+static int efx_test_eventq_irq(struct efx_nic *efx,
 			       struct efx_self_tests *tests)
 {
-	unsigned int magic, count;
+	struct efx_channel *channel;
+	unsigned int read_ptr[EFX_MAX_CHANNELS];
+	unsigned long napi_ran = 0, dma_pend = 0, int_pend = 0;
+	unsigned long timeout, wait;
 
-	/* Channel specific code, limited to 20 bits */
-	magic = (0x00010150 + channel->channel);
-	EFX_LOG(channel->efx, "channel %d testing event queue with code %x\n",
-		channel->channel, magic);
+	BUILD_BUG_ON(EFX_MAX_CHANNELS > BITS_PER_LONG);
 
-	tests->eventq_dma[channel->channel] = -1;
-	tests->eventq_int[channel->channel] = -1;
-	tests->eventq_poll[channel->channel] = -1;
+	efx_for_each_channel(channel, efx) {
+		read_ptr[channel->channel] = channel->eventq_read_ptr;
+		set_bit(channel->channel, &dma_pend);
+		set_bit(channel->channel, &int_pend);
+		efx_nic_event_test_start(channel);
+	}
 
-	/* Reset flag and zero magic word */
-	channel->efx->last_irq_cpu = -1;
-	channel->eventq_magic = 0;
-	smp_wmb();
+	timeout = jiffies + IRQ_TIMEOUT;
+	wait = 1;
 
-	falcon_generate_test_event(channel, magic);
-
-	/* Wait for arrival of interrupt */
-	count = 0;
+	/* Wait for arrival of interrupts.  NAPI processing may or may
+	 * not complete in time, but we can cope in any case.
+	 */
 	do {
-		schedule_timeout_uninterruptible(HZ / 100);
+		schedule_timeout_uninterruptible(wait);
 
-		if (channel->work_pending)
-			efx_process_channel_now(channel);
+		efx_for_each_channel(channel, efx) {
+			efx_stop_eventq(channel);
+			if (channel->eventq_read_ptr !=
+			    read_ptr[channel->channel]) {
+				set_bit(channel->channel, &napi_ran);
+				clear_bit(channel->channel, &dma_pend);
+				clear_bit(channel->channel, &int_pend);
+			} else {
+				if (efx_nic_event_present(channel))
+					clear_bit(channel->channel, &dma_pend);
+				if (efx_nic_event_test_irq_cpu(channel) >= 0)
+					clear_bit(channel->channel, &int_pend);
+			}
+			efx_start_eventq(channel);
+		}
 
-		if (channel->eventq_magic == magic)
-			goto eventq_ok;
-	} while (++count < 2);
+		wait *= 2;
+	} while ((dma_pend || int_pend) && time_before(jiffies, timeout));
 
-	EFX_ERR(channel->efx, "channel %d timed out waiting for event queue\n",
-		channel->channel);
+	efx_for_each_channel(channel, efx) {
+		bool dma_seen = !test_bit(channel->channel, &dma_pend);
+		bool int_seen = !test_bit(channel->channel, &int_pend);
 
-	/* See if interrupt arrived */
-	if (channel->efx->last_irq_cpu >= 0) {
-		EFX_ERR(channel->efx, "channel %d saw interrupt on CPU%d "
-			"during event queue test\n", channel->channel,
-			raw_smp_processor_id());
-		tests->eventq_int[channel->channel] = 1;
+		tests->eventq_dma[channel->channel] = dma_seen ? 1 : -1;
+		tests->eventq_int[channel->channel] = int_seen ? 1 : -1;
+
+		if (dma_seen && int_seen) {
+			netif_dbg(efx, drv, efx->net_dev,
+				  "channel %d event queue passed (with%s NAPI)\n",
+				  channel->channel,
+				  test_bit(channel->channel, &napi_ran) ?
+				  "" : "out");
+		} else {
+			/* Report failure and whether either interrupt or DMA
+			 * worked
+			 */
+			netif_err(efx, drv, efx->net_dev,
+				  "channel %d timed out waiting for event queue\n",
+				  channel->channel);
+			if (int_seen)
+				netif_err(efx, drv, efx->net_dev,
+					  "channel %d saw interrupt "
+					  "during event queue test\n",
+					  channel->channel);
+			if (dma_seen)
+				netif_err(efx, drv, efx->net_dev,
+					  "channel %d event was generated, but "
+					  "failed to trigger an interrupt\n",
+					  channel->channel);
+		}
 	}
 
-	/* Check to see if event was received even if interrupt wasn't */
-	efx_process_channel_now(channel);
-	if (channel->eventq_magic == magic) {
-		EFX_ERR(channel->efx, "channel %d event was generated, but "
-			"failed to trigger an interrupt\n", channel->channel);
-		tests->eventq_dma[channel->channel] = 1;
-	}
-
-	return -ETIMEDOUT;
- eventq_ok:
-	EFX_LOG(channel->efx, "channel %d event queue passed\n",
-		channel->channel);
-	tests->eventq_dma[channel->channel] = 1;
-	tests->eventq_int[channel->channel] = 1;
-	tests->eventq_poll[channel->channel] = 1;
-	return 0;
+	return (dma_pend || int_pend) ? -ETIMEDOUT : 0;
 }
 
 static int efx_test_phy(struct efx_nic *efx, struct efx_self_tests *tests,
@@ -254,12 +261,15 @@ static int efx_test_phy(struct efx_nic *efx, struct efx_self_tests *tests,
 	if (!efx->phy_op->run_tests)
 		return 0;
 
-	EFX_BUG_ON_PARANOID(efx->phy_op->num_tests == 0 ||
-			    efx->phy_op->num_tests > EFX_MAX_PHY_TESTS);
-
 	mutex_lock(&efx->mac_lock);
-	rc = efx->phy_op->run_tests(efx, tests->phy, flags);
+	rc = efx->phy_op->run_tests(efx, tests->phy_ext, flags);
 	mutex_unlock(&efx->mac_lock);
+	if (rc == -EPERM)
+		rc = 0;
+	else
+		netif_info(efx, drv, efx->net_dev,
+			   "%s phy selftest\n", rc ? "Failed" : "Passed");
+
 	return rc;
 }
 
@@ -295,62 +305,68 @@ void efx_loopback_rx_packet(struct efx_nic *efx,
 
 	/* Check that header exists */
 	if (pkt_len < sizeof(received->header)) {
-		EFX_ERR(efx, "saw runt RX packet (length %d) in %s loopback "
-			"test\n", pkt_len, LOOPBACK_MODE(efx));
+		netif_err(efx, drv, efx->net_dev,
+			  "saw runt RX packet (length %d) in %s loopback "
+			  "test\n", pkt_len, LOOPBACK_MODE(efx));
 		goto err;
 	}
 
 	/* Check that the ethernet header exists */
 	if (memcmp(&received->header, &payload->header, ETH_HLEN) != 0) {
-		EFX_ERR(efx, "saw non-loopback RX packet in %s loopback test\n",
-			LOOPBACK_MODE(efx));
+		netif_err(efx, drv, efx->net_dev,
+			  "saw non-loopback RX packet in %s loopback test\n",
+			  LOOPBACK_MODE(efx));
 		goto err;
 	}
 
 	/* Check packet length */
 	if (pkt_len != sizeof(*payload)) {
-		EFX_ERR(efx, "saw incorrect RX packet length %d (wanted %d) in "
-			"%s loopback test\n", pkt_len, (int)sizeof(*payload),
-			LOOPBACK_MODE(efx));
+		netif_err(efx, drv, efx->net_dev,
+			  "saw incorrect RX packet length %d (wanted %d) in "
+			  "%s loopback test\n", pkt_len, (int)sizeof(*payload),
+			  LOOPBACK_MODE(efx));
 		goto err;
 	}
 
 	/* Check that IP header matches */
 	if (memcmp(&received->ip, &payload->ip, sizeof(payload->ip)) != 0) {
-		EFX_ERR(efx, "saw corrupted IP header in %s loopback test\n",
-			LOOPBACK_MODE(efx));
+		netif_err(efx, drv, efx->net_dev,
+			  "saw corrupted IP header in %s loopback test\n",
+			  LOOPBACK_MODE(efx));
 		goto err;
 	}
 
 	/* Check that msg and padding matches */
 	if (memcmp(&received->msg, &payload->msg, sizeof(received->msg)) != 0) {
-		EFX_ERR(efx, "saw corrupted RX packet in %s loopback test\n",
-			LOOPBACK_MODE(efx));
+		netif_err(efx, drv, efx->net_dev,
+			  "saw corrupted RX packet in %s loopback test\n",
+			  LOOPBACK_MODE(efx));
 		goto err;
 	}
 
 	/* Check that iteration matches */
 	if (received->iteration != payload->iteration) {
-		EFX_ERR(efx, "saw RX packet from iteration %d (wanted %d) in "
-			"%s loopback test\n", ntohs(received->iteration),
-			ntohs(payload->iteration), LOOPBACK_MODE(efx));
+		netif_err(efx, drv, efx->net_dev,
+			  "saw RX packet from iteration %d (wanted %d) in "
+			  "%s loopback test\n", ntohs(received->iteration),
+			  ntohs(payload->iteration), LOOPBACK_MODE(efx));
 		goto err;
 	}
 
 	/* Increase correct RX count */
-	EFX_TRACE(efx, "got loopback RX in %s loopback test\n",
-		  LOOPBACK_MODE(efx));
+	netif_vdbg(efx, drv, efx->net_dev,
+		   "got loopback RX in %s loopback test\n", LOOPBACK_MODE(efx));
 
 	atomic_inc(&state->rx_good);
 	return;
 
  err:
-#ifdef EFX_ENABLE_DEBUG
+#ifdef DEBUG
 	if (atomic_read(&state->rx_bad) == 0) {
-		EFX_ERR(efx, "received packet:\n");
+		netif_err(efx, drv, efx->net_dev, "received packet:\n");
 		print_hex_dump(KERN_ERR, "", DUMP_PREFIX_OFFSET, 0x10, 1,
 			       buf_ptr, pkt_len, 0);
-		EFX_ERR(efx, "expected packet:\n");
+		netif_err(efx, drv, efx->net_dev, "expected packet:\n");
 		print_hex_dump(KERN_ERR, "", DUMP_PREFIX_OFFSET, 0x10, 1,
 			       &state->payload, sizeof(state->payload), 0);
 	}
@@ -366,14 +382,14 @@ static void efx_iterate_state(struct efx_nic *efx)
 	struct efx_loopback_payload *payload = &state->payload;
 
 	/* Initialise the layerII header */
-	memcpy(&payload->header.h_dest, net_dev->dev_addr, ETH_ALEN);
-	memcpy(&payload->header.h_source, &payload_source, ETH_ALEN);
+	ether_addr_copy((u8 *)&payload->header.h_dest, net_dev->dev_addr);
+	ether_addr_copy((u8 *)&payload->header.h_source, payload_source);
 	payload->header.h_proto = htons(ETH_P_IP);
 
 	/* saddr set later and used as incrementing count */
 	payload->ip.daddr = htonl(INADDR_LOOPBACK);
 	payload->ip.ihl = 5;
-	payload->ip.check = htons(0xdead);
+	payload->ip.check = (__force __sum16) htons(0xdead);
 	payload->ip.tot_len = htons(sizeof(*payload) - sizeof(struct ethhdr));
 	payload->ip.version = IPVERSION;
 	payload->ip.protocol = IPPROTO_UDP;
@@ -424,22 +440,21 @@ static int efx_begin_loopback(struct efx_tx_queue *tx_queue)
 		 * interrupt handler. */
 		smp_wmb();
 
-		if (efx_dev_registered(efx))
-			netif_tx_lock_bh(efx->net_dev);
-		rc = efx_xmit(efx, tx_queue, skb);
-		if (efx_dev_registered(efx))
-			netif_tx_unlock_bh(efx->net_dev);
+		netif_tx_lock_bh(efx->net_dev);
+		rc = efx_enqueue_skb(tx_queue, skb);
+		netif_tx_unlock_bh(efx->net_dev);
 
 		if (rc != NETDEV_TX_OK) {
-			EFX_ERR(efx, "TX queue %d could not transmit packet %d "
-				"of %d in %s loopback test\n", tx_queue->queue,
-				i + 1, state->packet_count, LOOPBACK_MODE(efx));
+			netif_err(efx, drv, efx->net_dev,
+				  "TX queue %d could not transmit packet %d of "
+				  "%d in %s loopback test\n", tx_queue->queue,
+				  i + 1, state->packet_count,
+				  LOOPBACK_MODE(efx));
 
 			/* Defer cleaning up the other skbs for the caller */
 			kfree_skb(skb);
 			return -EPIPE;
 		}
-		efx->net_dev->trans_start = jiffies;
 	}
 
 	return 0;
@@ -448,14 +463,7 @@ static int efx_begin_loopback(struct efx_tx_queue *tx_queue)
 static int efx_poll_loopback(struct efx_nic *efx)
 {
 	struct efx_loopback_state *state = efx->loopback_selftest;
-	struct efx_channel *channel;
 
-	/* NAPI polling is not enabled, so process channels
-	 * synchronously */
-	efx_for_each_channel(channel, efx) {
-		if (channel->work_pending)
-			efx_process_channel_now(channel);
-	}
 	return atomic_read(&state->rx_good) == state->packet_count;
 }
 
@@ -468,20 +476,18 @@ static int efx_end_loopback(struct efx_tx_queue *tx_queue,
 	int tx_done = 0, rx_good, rx_bad;
 	int i, rc = 0;
 
-	if (efx_dev_registered(efx))
-		netif_tx_lock_bh(efx->net_dev);
+	netif_tx_lock_bh(efx->net_dev);
 
 	/* Count the number of tx completions, and decrement the refcnt. Any
 	 * skbs not already completed will be free'd when the queue is flushed */
-	for (i=0; i < state->packet_count; i++) {
+	for (i = 0; i < state->packet_count; i++) {
 		skb = state->skbs[i];
 		if (skb && !skb_shared(skb))
 			++tx_done;
-		dev_kfree_skb_any(skb);
+		dev_kfree_skb(skb);
 	}
 
-	if (efx_dev_registered(efx))
-		netif_tx_unlock_bh(efx->net_dev);
+	netif_tx_unlock_bh(efx->net_dev);
 
 	/* Check TX completion and received packet counts */
 	rx_good = atomic_read(&state->rx_good);
@@ -490,20 +496,22 @@ static int efx_end_loopback(struct efx_tx_queue *tx_queue,
 		/* Don't free the skbs; they will be picked up on TX
 		 * overflow or channel teardown.
 		 */
-		EFX_ERR(efx, "TX queue %d saw only %d out of an expected %d "
-			"TX completion events in %s loopback test\n",
-			tx_queue->queue, tx_done, state->packet_count,
-			LOOPBACK_MODE(efx));
+		netif_err(efx, drv, efx->net_dev,
+			  "TX queue %d saw only %d out of an expected %d "
+			  "TX completion events in %s loopback test\n",
+			  tx_queue->queue, tx_done, state->packet_count,
+			  LOOPBACK_MODE(efx));
 		rc = -ETIMEDOUT;
 		/* Allow to fall through so we see the RX errors as well */
 	}
 
 	/* We may always be up to a flush away from our desired packet total */
 	if (rx_good != state->packet_count) {
-		EFX_LOG(efx, "TX queue %d saw only %d out of an expected %d "
-			"received packets in %s loopback test\n",
-			tx_queue->queue, rx_good, state->packet_count,
-			LOOPBACK_MODE(efx));
+		netif_dbg(efx, drv, efx->net_dev,
+			  "TX queue %d saw only %d out of an expected %d "
+			  "received packets in %s loopback test\n",
+			  tx_queue->queue, rx_good, state->packet_count,
+			  LOOPBACK_MODE(efx));
 		rc = -ETIMEDOUT;
 		/* Fall through */
 	}
@@ -527,26 +535,27 @@ efx_test_loopback(struct efx_tx_queue *tx_queue,
 
 	for (i = 0; i < 3; i++) {
 		/* Determine how many packets to send */
-		state->packet_count = (efx->type->txd_ring_mask + 1) / 3;
+		state->packet_count = efx->txq_entries / 3;
 		state->packet_count = min(1 << (i << 2), state->packet_count);
-		state->skbs = kzalloc(sizeof(state->skbs[0]) *
-				      state->packet_count, GFP_KERNEL);
+		state->skbs = kcalloc(state->packet_count,
+				      sizeof(state->skbs[0]), GFP_KERNEL);
 		if (!state->skbs)
 			return -ENOMEM;
 		state->flush = false;
 
-		EFX_LOG(efx, "TX queue %d testing %s loopback with %d "
-			"packets\n", tx_queue->queue, LOOPBACK_MODE(efx),
-			state->packet_count);
+		netif_dbg(efx, drv, efx->net_dev,
+			  "TX queue %d testing %s loopback with %d packets\n",
+			  tx_queue->queue, LOOPBACK_MODE(efx),
+			  state->packet_count);
 
 		efx_iterate_state(efx);
 		begin_rc = efx_begin_loopback(tx_queue);
 
 		/* This will normally complete very quickly, but be
-		 * prepared to wait up to 100 ms. */
+		 * prepared to wait much longer. */
 		msleep(1);
 		if (!efx_poll_loopback(efx)) {
-			msleep(100);
+			msleep(LOOPBACK_TIMEOUT_MS);
 			efx_poll_loopback(efx);
 		}
 
@@ -561,11 +570,48 @@ efx_test_loopback(struct efx_tx_queue *tx_queue,
 		}
 	}
 
-	EFX_LOG(efx, "TX queue %d passed %s loopback test with a burst length "
-		"of %d packets\n", tx_queue->queue, LOOPBACK_MODE(efx),
-		state->packet_count);
+	netif_dbg(efx, drv, efx->net_dev,
+		  "TX queue %d passed %s loopback test with a burst length "
+		  "of %d packets\n", tx_queue->queue, LOOPBACK_MODE(efx),
+		  state->packet_count);
 
 	return 0;
+}
+
+/* Wait for link up. On Falcon, we would prefer to rely on efx_monitor, but
+ * any contention on the mac lock (via e.g. efx_mac_mcast_work) causes it
+ * to delay and retry. Therefore, it's safer to just poll directly. Wait
+ * for link up and any faults to dissipate. */
+static int efx_wait_for_link(struct efx_nic *efx)
+{
+	struct efx_link_state *link_state = &efx->link_state;
+	int count, link_up_count = 0;
+	bool link_up;
+
+	for (count = 0; count < 40; count++) {
+		schedule_timeout_uninterruptible(HZ / 10);
+
+		if (efx->type->monitor != NULL) {
+			mutex_lock(&efx->mac_lock);
+			efx->type->monitor(efx);
+			mutex_unlock(&efx->mac_lock);
+		}
+
+		mutex_lock(&efx->mac_lock);
+		link_up = link_state->up;
+		if (link_up)
+			link_up = !efx->type->check_mac_fault(efx);
+		mutex_unlock(&efx->mac_lock);
+
+		if (link_up) {
+			if (++link_up_count == 2)
+				return 0;
+		} else {
+			link_up_count = 0;
+		}
+	}
+
+	return -ETIMEDOUT;
 }
 
 static int efx_test_loopbacks(struct efx_nic *efx, struct efx_self_tests *tests,
@@ -573,9 +619,10 @@ static int efx_test_loopbacks(struct efx_nic *efx, struct efx_self_tests *tests,
 {
 	enum efx_loopback_mode mode;
 	struct efx_loopback_state *state;
+	struct efx_channel *channel =
+		efx_get_channel(efx, efx->tx_channel_offset);
 	struct efx_tx_queue *tx_queue;
-	bool link_up;
-	int count, rc = 0;
+	int rc = 0;
 
 	/* Set the port loopback_selftest member. From this point on
 	 * all received packets will be dropped. Mark the state as
@@ -594,50 +641,29 @@ static int efx_test_loopbacks(struct efx_nic *efx, struct efx_self_tests *tests,
 
 		/* Move the port into the specified loopback mode. */
 		state->flush = true;
+		mutex_lock(&efx->mac_lock);
 		efx->loopback_mode = mode;
-		efx_reconfigure_port(efx);
-
-		/* Wait for the PHY to signal the link is up. Interrupts
-		 * are enabled for PHY's using LASI, otherwise we poll()
-		 * quickly */
-		count = 0;
-		do {
-			struct efx_channel *channel = &efx->channel[0];
-
-			efx->phy_op->poll(efx);
-			schedule_timeout_uninterruptible(HZ / 10);
-			if (channel->work_pending)
-				efx_process_channel_now(channel);
-			/* Wait for PHY events to be processed */
-			flush_workqueue(efx->workqueue);
-			rmb();
-
-			/* We need both the phy and xaui links to be ok.
-			 * rather than relying on the falcon_xmac irq/poll
-			 * regime, just poll xaui directly */
-			link_up = efx->link_up;
-			if (link_up && EFX_IS10G(efx) &&
-			    !falcon_xaui_link_ok(efx))
-				link_up = false;
-
-		} while ((++count < 20) && !link_up);
-
-		/* The link should now be up. If it isn't, there is no point
-		 * in attempting a loopback test */
-		if (!link_up) {
-			EFX_ERR(efx, "loopback %s never came up\n",
-				LOOPBACK_MODE(efx));
-			rc = -EIO;
+		rc = __efx_reconfigure_port(efx);
+		mutex_unlock(&efx->mac_lock);
+		if (rc) {
+			netif_err(efx, drv, efx->net_dev,
+				  "unable to move into %s loopback\n",
+				  LOOPBACK_MODE(efx));
 			goto out;
 		}
 
-		EFX_LOG(efx, "link came up in %s loopback in %d iterations\n",
-			LOOPBACK_MODE(efx), count);
+		rc = efx_wait_for_link(efx);
+		if (rc) {
+			netif_err(efx, drv, efx->net_dev,
+				  "loopback %s never came up\n",
+				  LOOPBACK_MODE(efx));
+			goto out;
+		}
 
-		/* Test every TX queue */
-		efx_for_each_tx_queue(tx_queue, efx) {
-			state->offload_csum = (tx_queue->queue ==
-					       EFX_TX_QUEUE_OFFLOAD_CSUM);
+		/* Test all enabled types of TX queue */
+		efx_for_each_channel_tx_queue(tx_queue, channel) {
+			state->offload_csum = (tx_queue->queue &
+					       EFX_TXQ_TYPE_OFFLOAD);
 			rc = efx_test_loopback(tx_queue,
 					       &tests->loopback[mode]);
 			if (rc)
@@ -651,6 +677,9 @@ static int efx_test_loopbacks(struct efx_nic *efx, struct efx_self_tests *tests,
 	efx->loopback_selftest = NULL;
 	wmb();
 	kfree(state);
+
+	if (rc == -EPERM)
+		rc = 0;
 
 	return rc;
 }
@@ -666,15 +695,14 @@ int efx_selftest(struct efx_nic *efx, struct efx_self_tests *tests,
 {
 	enum efx_loopback_mode loopback_mode = efx->loopback_mode;
 	int phy_mode = efx->phy_mode;
-	enum reset_type reset_method = RESET_TYPE_INVISIBLE;
-	struct ethtool_cmd ecmd;
-	struct efx_channel *channel;
-	int rc_test = 0, rc_reset = 0, rc;
+	int rc_test = 0, rc_reset, rc;
+
+	efx_selftest_async_cancel(efx);
 
 	/* Online (i.e. non-disruptive) testing
 	 * This checks interrupt generation, event delivery and PHY presence. */
 
-	rc = efx_test_mdio(efx, tests);
+	rc = efx_test_phy_alive(efx, tests);
 	if (rc && !rc_test)
 		rc_test = rc;
 
@@ -686,11 +714,9 @@ int efx_selftest(struct efx_nic *efx, struct efx_self_tests *tests,
 	if (rc && !rc_test)
 		rc_test = rc;
 
-	efx_for_each_channel(channel, efx) {
-		rc = efx_test_eventq_irq(channel, tests);
-		if (rc && !rc_test)
-			rc_test = rc;
-	}
+	rc = efx_test_eventq_irq(efx, tests);
+	if (rc && !rc_test)
+		rc_test = rc;
 
 	if (rc_test)
 		return rc_test;
@@ -701,48 +727,31 @@ int efx_selftest(struct efx_nic *efx, struct efx_self_tests *tests,
 	/* Offline (i.e. disruptive) testing
 	 * This checks MAC and PHY loopback on the specified port. */
 
-	/* force the carrier state off so the kernel doesn't transmit during
-	 * the loopback test, and the watchdog timeout doesn't fire. Also put
-	 * falcon into loopback for the register test.
+	/* Detach the device so the kernel doesn't transmit during the
+	 * loopback test and the watchdog timeout doesn't fire.
 	 */
-	mutex_lock(&efx->mac_lock);
-	efx->port_inhibited = true;
-	if (efx->loopback_modes) {
-		/* We need the 312 clock from the PHY to test the XMAC
-		 * registers, so move into XGMII loopback if available */
-		if (efx->loopback_modes & (1 << LOOPBACK_XGMII))
-			efx->loopback_mode = LOOPBACK_XGMII;
-		else
-			efx->loopback_mode = __ffs(efx->loopback_modes);
+	efx_device_detach_sync(efx);
+
+	if (efx->type->test_chip) {
+		rc_reset = efx->type->test_chip(efx, tests);
+		if (rc_reset) {
+			netif_err(efx, hw, efx->net_dev,
+				  "Unable to recover from chip test\n");
+			efx_schedule_reset(efx, RESET_TYPE_DISABLE);
+			return rc_reset;
+		}
+
+		if ((tests->memory < 0 || tests->registers < 0) && !rc_test)
+			rc_test = -EIO;
 	}
-
-	__efx_reconfigure_port(efx);
-	mutex_unlock(&efx->mac_lock);
-
-	/* free up all consumers of SRAM (including all the queues) */
-	efx_reset_down(efx, reset_method, &ecmd);
-
-	rc = efx_test_chip(efx, tests);
-	if (rc && !rc_test)
-		rc_test = rc;
-
-	/* reset the chip to recover from the register test */
-	rc_reset = falcon_reset_hw(efx, reset_method);
 
 	/* Ensure that the phy is powered and out of loopback
 	 * for the bist and loopback tests */
+	mutex_lock(&efx->mac_lock);
 	efx->phy_mode &= ~PHY_MODE_LOW_POWER;
 	efx->loopback_mode = LOOPBACK_NONE;
-
-	rc = efx_reset_up(efx, reset_method, &ecmd, rc_reset == 0);
-	if (rc && !rc_reset)
-		rc_reset = rc;
-
-	if (rc_reset) {
-		EFX_ERR(efx, "Unable to recover from chip test\n");
-		efx_schedule_reset(efx, RESET_TYPE_DISABLE);
-		return rc_reset;
-	}
+	__efx_reconfigure_port(efx);
+	mutex_unlock(&efx->mac_lock);
 
 	rc = efx_test_phy(efx, tests, flags);
 	if (rc && !rc_test)
@@ -753,11 +762,47 @@ int efx_selftest(struct efx_nic *efx, struct efx_self_tests *tests,
 		rc_test = rc;
 
 	/* restore the PHY to the previous state */
-	efx->loopback_mode = loopback_mode;
+	mutex_lock(&efx->mac_lock);
 	efx->phy_mode = phy_mode;
-	efx->port_inhibited = false;
-	efx_ethtool_set_settings(efx->net_dev, &ecmd);
+	efx->loopback_mode = loopback_mode;
+	__efx_reconfigure_port(efx);
+	mutex_unlock(&efx->mac_lock);
+
+	netif_device_attach(efx->net_dev);
 
 	return rc_test;
 }
 
+void efx_selftest_async_start(struct efx_nic *efx)
+{
+	struct efx_channel *channel;
+
+	efx_for_each_channel(channel, efx)
+		efx_nic_event_test_start(channel);
+	schedule_delayed_work(&efx->selftest_work, IRQ_TIMEOUT);
+}
+
+void efx_selftest_async_cancel(struct efx_nic *efx)
+{
+	cancel_delayed_work_sync(&efx->selftest_work);
+}
+
+void efx_selftest_async_work(struct work_struct *data)
+{
+	struct efx_nic *efx = container_of(data, struct efx_nic,
+					   selftest_work.work);
+	struct efx_channel *channel;
+	int cpu;
+
+	efx_for_each_channel(channel, efx) {
+		cpu = efx_nic_event_test_irq_cpu(channel);
+		if (cpu < 0)
+			netif_err(efx, ifup, efx->net_dev,
+				  "channel %d failed to trigger an interrupt\n",
+				  channel->channel);
+		else
+			netif_dbg(efx, ifup, efx->net_dev,
+				  "channel %d triggered interrupt on CPU %d\n",
+				  channel->channel, cpu);
+	}
+}

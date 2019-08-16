@@ -172,6 +172,7 @@ static inline void __iomem *ioremap(resource_size_t offset, unsigned long size)
 
 extern void iounmap(volatile void __iomem *addr);
 
+extern void set_iounmap_nonlazy(void);
 
 #ifdef CONFIG_X86_32
 # include "io_32.h"
@@ -200,5 +201,12 @@ extern void __iomem *early_memremap(resource_size_t phys_addr,
 extern void early_iounmap(void __iomem *addr, unsigned long size);
 
 #define IO_SPACE_LIMIT 0xffff
+
+#ifdef CONFIG_MTRR
+extern int __must_check arch_phys_wc_add(unsigned long base,
+					 unsigned long size);
+extern void arch_phys_wc_del(int handle);
+#define arch_phys_wc_add arch_phys_wc_add
+#endif
 
 #endif /* _ASM_X86_IO_H */

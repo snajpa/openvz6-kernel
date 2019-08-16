@@ -72,10 +72,7 @@ static void sym_printl_hex(u_char *p, int n)
 
 static void sym_print_msg(struct sym_ccb *cp, char *label, u_char *msg)
 {
-	if (label)
-		sym_print_addr(cp->cmd, "%s: ", label);
-	else
-		sym_print_addr(cp->cmd, "");
+	sym_print_addr(cp->cmd, "%s: ", label);
 
 	spi_print_msg(msg);
 	printf("\n");
@@ -3003,7 +3000,11 @@ sym_dequeue_from_squeue(struct sym_hcb *np, int i, int target, int lun, int task
 		if ((target == -1 || cp->target == target) &&
 		    (lun    == -1 || cp->lun    == lun)    &&
 		    (task   == -1 || cp->tag    == task)) {
+#ifdef SYM_OPT_HANDLE_DEVICE_QUEUEING
 			sym_set_cam_status(cp->cmd, DID_SOFT_ERROR);
+#else
+			sym_set_cam_status(cp->cmd, DID_REQUEUE);
+#endif
 			sym_remque(&cp->link_ccbq);
 			sym_insque_tail(&cp->link_ccbq, &np->comp_ccbq);
 		}
@@ -4558,7 +4559,8 @@ static void sym_int_sir(struct sym_hcb *np)
 			switch (np->msgin [2]) {
 			case M_X_MODIFY_DP:
 				if (DEBUG_FLAGS & DEBUG_POINTER)
-					sym_print_msg(cp, NULL, np->msgin);
+					sym_print_msg(cp, "extended msg ",
+						      np->msgin);
 				tmp = (np->msgin[3]<<24) + (np->msgin[4]<<16) + 
 				      (np->msgin[5]<<8)  + (np->msgin[6]);
 				sym_modify_dp(np, tp, cp, tmp);
@@ -4585,7 +4587,7 @@ static void sym_int_sir(struct sym_hcb *np)
 		 */
 		case M_IGN_RESIDUE:
 			if (DEBUG_FLAGS & DEBUG_POINTER)
-				sym_print_msg(cp, NULL, np->msgin);
+				sym_print_msg(cp, "1 or 2 byte ", np->msgin);
 			if (cp->host_flags & HF_SENSE)
 				OUTL_DSP(np, SCRIPTA_BA(np, clrack));
 			else

@@ -1,6 +1,4 @@
 /*
- *  fs/nfs4acl/acl.c
- *
  *  Common NFSv4 ACL handling code.
  *
  *  Copyright (c) 2002, 2003 The Regents of the University of Michigan.
@@ -36,15 +34,7 @@
  *  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <linux/string.h>
-#include <linux/slab.h>
-#include <linux/list.h>
-#include <linux/types.h>
-#include <linux/fs.h>
-#include <linux/module.h>
 #include <linux/nfs_fs.h>
-#include <linux/posix_acl.h>
-#include <linux/nfs4.h>
 #include <linux/nfs4_acl.h>
 
 
@@ -389,7 +379,7 @@ sort_pacl(struct posix_acl *pacl)
 	sort_pacl_range(pacl, 1, i-1);
 
 	BUG_ON(pacl->a_entries[i].e_tag != ACL_GROUP_OBJ);
-	j = i++;
+	j = ++i;
 	while (pacl->a_entries[j].e_tag == ACL_GROUP)
 		j++;
 	sort_pacl_range(pacl, i, j-1);
@@ -518,7 +508,10 @@ posix_state_to_acl(struct posix_acl_state *state, unsigned int flags)
 	 * up setting a 3-element effective posix ACL with all
 	 * permissions zero.
 	 */
-	nace = 4 + state->users->n + state->groups->n;
+	if (!state->users->n && !state->groups->n)
+		nace = 3;
+	else /* Note we also include a MASK ACE in this case: */
+		nace = 4 + state->users->n + state->groups->n;
 	pacl = posix_acl_alloc(nace, GFP_KERNEL);
 	if (!pacl)
 		return ERR_PTR(-ENOMEM);
@@ -564,10 +557,12 @@ posix_state_to_acl(struct posix_acl_state *state, unsigned int flags)
 		add_to_mask(state, &state->groups->aces[i].perms);
 	}
 
-	pace++;
-	pace->e_tag = ACL_MASK;
-	low_mode_from_nfs4(state->mask.allow, &pace->e_perm, flags);
-	pace->e_id = ACL_UNDEFINED_ID;
+	if (state->users->n || state->groups->n) {
+		pace++;
+		pace->e_tag = ACL_MASK;
+		low_mode_from_nfs4(state->mask.allow, &pace->e_perm, flags);
+		pace->e_id = ACL_UNDEFINED_ID;
+	}
 
 	pace++;
 	pace->e_tag = ACL_OTHER;

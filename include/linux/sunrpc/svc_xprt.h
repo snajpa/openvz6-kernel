@@ -12,6 +12,7 @@
 
 struct svc_xprt_ops {
 	struct svc_xprt	*(*xpo_create)(struct svc_serv *,
+				       struct net *net,
 				       struct sockaddr *, int,
 				       int);
 	struct svc_xprt	*(*xpo_accept)(struct svc_xprt *);
@@ -22,6 +23,7 @@ struct svc_xprt_ops {
 	void		(*xpo_release_rqst)(struct svc_rqst *);
 	void		(*xpo_detach)(struct svc_xprt *);
 	void		(*xpo_free)(struct svc_xprt *);
+	int		(*xpo_secure_port)(struct svc_rqst *);
 };
 
 struct svc_xprt_class {
@@ -30,6 +32,16 @@ struct svc_xprt_class {
 	struct svc_xprt_ops	*xcl_ops;
 	struct list_head	xcl_list;
 	u32			xcl_max_payload;
+};
+
+/*
+ * This is embedded in an object that wants a callback before deleting
+ * an xprt; intended for use by NFSv4.1, which needs to know when a
+ * client's tcp connection (and hence possibly a backchannel) goes away.
+ */
+struct svc_xpt_user {
+	struct list_head list;
+	void (*callback)(struct svc_xpt_user *);
 };
 
 struct svc_xprt {
@@ -52,7 +64,6 @@ struct svc_xprt {
 #define XPT_LISTENER	11		/* listening endpoint */
 #define XPT_CACHE_AUTH	12		/* cache auth info */
 
-	struct svc_pool		*xpt_pool;	/* current pool iff queued */
 	struct svc_serv		*xpt_server;	/* service for transport */
 	atomic_t    	    	xpt_reserved;	/* space on outq that is rsvd */
 	struct mutex		xpt_mutex;	/* to serialize sending data */
@@ -66,14 +77,42 @@ struct svc_xprt {
 	struct sockaddr_storage	xpt_remote;	/* remote peer's address */
 	size_t			xpt_remotelen;	/* length of address */
 	struct rpc_wait_queue	xpt_bc_pending;	/* backchannel wait queue */
+	struct list_head	xpt_users;	/* callbacks on free */
+
+	struct net		*xpt_net;
+	struct rpc_xprt		*xpt_bc_xprt;	/* NFSv4.1 backchannel */
 };
+
+static inline void unregister_xpt_user(struct svc_xprt *xpt, struct svc_xpt_user *u)
+{
+	spin_lock(&xpt->xpt_lock);
+	list_del_init(&u->list);
+	spin_unlock(&xpt->xpt_lock);
+}
+
+static inline int register_xpt_user(struct svc_xprt *xpt, struct svc_xpt_user *u)
+{
+	spin_lock(&xpt->xpt_lock);
+	if (test_bit(XPT_CLOSE, &xpt->xpt_flags)) {
+		/*
+		 * The connection is about to be deleted soon (or,
+		 * worse, may already be deleted--in which case we've
+		 * already notified the xpt_users).
+		 */
+		spin_unlock(&xpt->xpt_lock);
+		return -ENOTCONN;
+	}
+	list_add(&u->list, &xpt->xpt_users);
+	spin_unlock(&xpt->xpt_lock);
+	return 0;
+}
 
 int	svc_reg_xprt_class(struct svc_xprt_class *);
 void	svc_unreg_xprt_class(struct svc_xprt_class *);
-void	svc_xprt_init(struct svc_xprt_class *, struct svc_xprt *,
+void	svc_xprt_init(struct net *, struct svc_xprt_class *, struct svc_xprt *,
 		      struct svc_serv *);
-int	svc_create_xprt(struct svc_serv *, const char *, const int,
-			const unsigned short, int);
+int	svc_create_xprt(struct svc_serv *, const char *, struct net *,
+			const int, const unsigned short, int);
 void	svc_xprt_enqueue(struct svc_xprt *xprt);
 void	svc_xprt_received(struct svc_xprt *);
 void	svc_xprt_put(struct svc_xprt *xprt);
@@ -85,6 +124,7 @@ int	svc_print_xprts(char *buf, int maxlen);
 struct	svc_xprt *svc_find_xprt(struct svc_serv *serv, const char *xcl_name,
 			const sa_family_t af, const unsigned short port);
 int	svc_xprt_names(struct svc_serv *serv, char *buf, const int buflen);
+void	svc_age_temp_xprts_now(struct svc_serv *, struct sockaddr *);
 
 static inline void svc_xprt_get(struct svc_xprt *xprt)
 {
@@ -127,8 +167,7 @@ static inline size_t svc_addr_len(const struct sockaddr *sa)
 	case AF_INET6:
 		return sizeof(struct sockaddr_in6);
 	}
-
-	return 0;
+	BUG();
 }
 
 static inline unsigned short svc_xprt_local_port(const struct svc_xprt *xprt)

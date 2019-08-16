@@ -46,10 +46,14 @@ cond_syscall(sys_getsockopt);
 cond_syscall(compat_sys_getsockopt);
 cond_syscall(sys_shutdown);
 cond_syscall(sys_sendmsg);
+cond_syscall(sys_sendmmsg);
 cond_syscall(compat_sys_sendmsg);
+cond_syscall(compat_sys_sendmmsg);
 cond_syscall(sys_recvmsg);
+cond_syscall(sys_recvmmsg);
 cond_syscall(compat_sys_recvmsg);
 cond_syscall(compat_sys_recvfrom);
+cond_syscall(compat_sys_recvmmsg);
 cond_syscall(sys_socketcall);
 cond_syscall(sys_futex);
 cond_syscall(compat_sys_futex);
@@ -133,6 +137,10 @@ cond_syscall(sys_io_submit);
 cond_syscall(sys_io_cancel);
 cond_syscall(sys_io_getevents);
 cond_syscall(sys_syslog);
+cond_syscall(sys_process_vm_readv);
+cond_syscall(sys_process_vm_writev);
+cond_syscall(compat_sys_process_vm_readv);
+cond_syscall(compat_sys_process_vm_writev);
 
 /* arch-specific weak syscall entries */
 cond_syscall(sys_pciconfig_read);

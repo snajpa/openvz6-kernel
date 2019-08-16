@@ -2,7 +2,7 @@
  * Sonics Silicon Backplane
  * Common SPROM support routines
  *
- * Copyright (C) 2005-2008 Michael Buesch <mb@bu3sch.de>
+ * Copyright (C) 2005-2008 Michael Buesch <m@bues.ch>
  * Copyright (C) 2005 Martin Langer <martin-langer@gmx.de>
  * Copyright (C) 2005 Stefano Brivio <st3@riseup.net>
  * Copyright (C) 2005 Danny van Dyk <kugelfang@gentoo.org>
@@ -13,8 +13,11 @@
 
 #include "ssb_private.h"
 
+#include <linux/ctype.h>
+#include <linux/slab.h>
 
-static const struct ssb_sprom *fallback_sprom;
+
+static int(*get_fallback_sprom)(struct ssb_bus *dev, struct ssb_sprom *out);
 
 
 static int sprom2hex(const u16 *sprom, char *buf, size_t buf_len,
@@ -33,17 +36,27 @@ static int sprom2hex(const u16 *sprom, char *buf, size_t buf_len,
 static int hex2sprom(u16 *sprom, const char *dump, size_t len,
 		     size_t sprom_size_words)
 {
-	char tmp[5] = { 0 };
-	int cnt = 0;
+	char c, tmp[5] = { 0 };
+	int err, cnt = 0;
 	unsigned long parsed;
 
-	if (len < sprom_size_words * 2)
+	/* Strip whitespace at the end. */
+	while (len) {
+		c = dump[len - 1];
+		if (!isspace(c) && c != '\0')
+			break;
+		len--;
+	}
+	/* Length must match exactly. */
+	if (len != sprom_size_words * 4)
 		return -EINVAL;
 
 	while (cnt < sprom_size_words) {
 		memcpy(tmp, dump, 4);
 		dump += 4;
-		parsed = simple_strtoul(tmp, NULL, 16);
+		err = kstrtoul(tmp, 16, &parsed);
+		if (err)
+			return err;
 		sprom[cnt++] = swab16((u16)parsed);
 	}
 
@@ -90,6 +103,7 @@ ssize_t ssb_attr_sprom_store(struct ssb_bus *bus,
 	u16 *sprom;
 	int res = 0, err = -ENOMEM;
 	size_t sprom_size_words = bus->sprom_size;
+	struct ssb_freeze_context freeze;
 
 	sprom = kcalloc(bus->sprom_size, sizeof(u16), GFP_KERNEL);
 	if (!sprom)
@@ -111,20 +125,15 @@ ssize_t ssb_attr_sprom_store(struct ssb_bus *bus,
 	err = -ERESTARTSYS;
 	if (mutex_lock_interruptible(&bus->sprom_mutex))
 		goto out_kfree;
-	err = ssb_devices_freeze(bus);
-	if (err == -EOPNOTSUPP) {
-		ssb_printk(KERN_ERR PFX "SPROM write: Could not freeze devices. "
-			   "No suspend support. Is CONFIG_PM enabled?\n");
-		goto out_unlock;
-	}
+	err = ssb_devices_freeze(bus, &freeze);
 	if (err) {
-		ssb_printk(KERN_ERR PFX "SPROM write: Could not freeze all devices\n");
+		ssb_err("SPROM write: Could not freeze all devices\n");
 		goto out_unlock;
 	}
 	res = sprom_write(bus, sprom);
-	err = ssb_devices_thaw(bus);
+	err = ssb_devices_thaw(&freeze);
 	if (err)
-		ssb_printk(KERN_ERR PFX "SPROM write: Could not thaw all devices\n");
+		ssb_err("SPROM write: Could not thaw all devices\n");
 out_unlock:
 	mutex_unlock(&bus->sprom_mutex);
 out_kfree:
@@ -136,34 +145,56 @@ out:
 }
 
 /**
- * ssb_arch_set_fallback_sprom - Set a fallback SPROM for use if no SPROM is found.
+ * ssb_arch_register_fallback_sprom - Registers a method providing a
+ * fallback SPROM if no SPROM is found.
  *
- * @sprom: The SPROM data structure to register.
+ * @sprom_callback: The callback function.
  *
- * With this function the architecture implementation may register a fallback
- * SPROM data structure. The fallback is only used for PCI based SSB devices,
- * where no valid SPROM can be found in the shadow registers.
+ * With this function the architecture implementation may register a
+ * callback handler which fills the SPROM data structure. The fallback is
+ * only used for PCI based SSB devices, where no valid SPROM can be found
+ * in the shadow registers.
  *
- * This function is useful for weird architectures that have a half-assed SSB device
- * hardwired to their PCI bus.
+ * This function is useful for weird architectures that have a half-assed
+ * SSB device hardwired to their PCI bus.
  *
- * Note that it does only work with PCI attached SSB devices. PCMCIA devices currently
- * don't use this fallback.
- * Architectures must provide the SPROM for native SSB devices anyway,
- * so the fallback also isn't used for native devices.
+ * Note that it does only work with PCI attached SSB devices. PCMCIA
+ * devices currently don't use this fallback.
+ * Architectures must provide the SPROM for native SSB devices anyway, so
+ * the fallback also isn't used for native devices.
  *
- * This function is available for architecture code, only. So it is not exported.
+ * This function is available for architecture code, only. So it is not
+ * exported.
  */
-int ssb_arch_set_fallback_sprom(const struct ssb_sprom *sprom)
+int ssb_arch_register_fallback_sprom(int (*sprom_callback)(struct ssb_bus *bus,
+				     struct ssb_sprom *out))
 {
-	if (fallback_sprom)
+	if (get_fallback_sprom)
 		return -EEXIST;
-	fallback_sprom = sprom;
+	get_fallback_sprom = sprom_callback;
 
 	return 0;
 }
 
-const struct ssb_sprom *ssb_get_fallback_sprom(void)
+int ssb_fill_sprom_with_fallback(struct ssb_bus *bus, struct ssb_sprom *out)
 {
-	return fallback_sprom;
+	if (!get_fallback_sprom)
+		return -ENOENT;
+
+	return get_fallback_sprom(bus, out);
+}
+
+/* http://bcm-v4.sipsolutions.net/802.11/IsSpromAvailable */
+bool ssb_is_sprom_available(struct ssb_bus *bus)
+{
+	/* status register only exists on chipcomon rev >= 11 and we need check
+	   for >= 31 only */
+	/* this routine differs from specs as we do not access SPROM directly
+	   on PCMCIA */
+	if (bus->bustype == SSB_BUSTYPE_PCI &&
+	    bus->chipco.dev &&	/* can be unavailable! */
+	    bus->chipco.dev->id.revision >= 31)
+		return bus->chipco.capabilities & SSB_CHIPCO_CAP_SPROM;
+
+	return true;
 }

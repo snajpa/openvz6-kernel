@@ -5,7 +5,8 @@
  * based on the old aacraid driver that is..
  * Adaptec aacraid device driver for Linux.
  *
- * Copyright (c) 2000-2007 Adaptec, Inc. (aacraid@adaptec.com)
+ * Copyright (c) 2011 PMC-Sierra, Inc. (aacraid@pmc-sierra.com)
+ *		  2000-2010 Adaptec, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -78,7 +79,7 @@ static int aac_rkt_ioremap(struct aac_dev * dev, u32 size)
 		iounmap(dev->regs.rkt);
 		return 0;
 	}
-	dev->base = dev->regs.rkt = ioremap(dev->scsi_host_ptr->base, size);
+	dev->base = dev->regs.rkt = ioremap(dev->base_start, size);
 	if (dev->base == NULL)
 		return -1;
 	dev->IndexRegs = &dev->regs.rkt->IndexRegs;

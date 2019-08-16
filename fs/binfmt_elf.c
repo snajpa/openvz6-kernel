@@ -30,7 +30,9 @@
 #include <linux/security.h>
 #include <linux/random.h>
 #include <linux/elf.h>
+#include <linux/elf-randomize.h>
 #include <linux/utsname.h>
+#include <linux/coredump.h>
 #include <asm/uaccess.h>
 #include <asm/param.h>
 #include <asm/page.h>
@@ -45,7 +47,7 @@ static unsigned long elf_map(struct file *, unsigned long, struct elf_phdr *,
  * don't even try.
  */
 #if defined(USE_ELF_CORE_DUMP) && defined(CONFIG_ELF_CORE)
-static int elf_core_dump(long signr, struct pt_regs *regs, struct file *file, unsigned long limit);
+static int elf_core_dump(struct coredump_params *cprm);
 #else
 #define elf_core_dump	NULL
 #endif
@@ -73,7 +75,7 @@ static struct linux_binfmt elf_format = {
 		.hasvdso	= 1
 };
 
-#define BAD_ADDR(x) ((unsigned long)(x) >= TASK_SIZE)
+#define BAD_ADDR(x) IS_ERR_VALUE(x)
 
 static int set_brk(unsigned long start, unsigned long end)
 {
@@ -546,11 +548,12 @@ out:
 
 static unsigned long randomize_stack_top(unsigned long stack_top)
 {
-	unsigned int random_variable = 0;
+	unsigned long random_variable = 0;
 
 	if ((current->flags & PF_RANDOMIZE) &&
 		!(current->personality & ADDR_NO_RANDOMIZE)) {
-		random_variable = get_random_int() & STACK_RND_MASK;
+		random_variable = (unsigned long) get_random_int();
+		random_variable &= STACK_RND_MASK;
 		random_variable <<= PAGE_SHIFT;
 	}
 #ifdef CONFIG_STACK_GROWSUP
@@ -662,27 +665,6 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 			if (elf_interpreter[elf_ppnt->p_filesz - 1] != '\0')
 				goto out_free_interp;
 
-			/*
-			 * The early SET_PERSONALITY here is so that the lookup
-			 * for the interpreter happens in the namespace of the 
-			 * to-be-execed image.  SET_PERSONALITY can select an
-			 * alternate root.
-			 *
-			 * However, SET_PERSONALITY is NOT allowed to switch
-			 * this task into the new images's memory mapping
-			 * policy - that is, TASK_SIZE must still evaluate to
-			 * that which is appropriate to the execing application.
-			 * This is because exit_mmap() needs to have TASK_SIZE
-			 * evaluate to the size of the old image.
-			 *
-			 * So if (say) a 64-bit application is execing a 32-bit
-			 * application it is the architecture's responsibility
-			 * to defer changing the value of TASK_SIZE until the
-			 * switch really is going to happen - do this in
-			 * flush_thread().	- akpm
-			 */
-			SET_PERSONALITY(loc->elf_ex);
-
 			interpreter = open_exec(elf_interpreter);
 			retval = PTR_ERR(interpreter);
 			if (IS_ERR(interpreter))
@@ -721,6 +703,11 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 			break;
 		}
 
+	if (current->personality == PER_LINUX && (exec_shield & 2)) {
+		executable_stack = EXSTACK_DISABLE_X;
+		current->flags |= PF_RANDOMIZE;
+	}
+
 	/* Some simple consistency checks for the interpreter */
 	if (elf_interpreter) {
 		retval = -ELIBBAD;
@@ -730,15 +717,21 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 		/* Verify the interpreter has a valid arch */
 		if (!elf_check_arch(&loc->interp_elf_ex))
 			goto out_free_dentry;
-	} else {
-		/* Executables without an interpreter also need a personality  */
-		SET_PERSONALITY(loc->elf_ex);
 	}
 
 	/* Flush all traces of the currently running executable */
 	retval = flush_old_exec(bprm);
 	if (retval)
 		goto out_free_dentry;
+
+#ifdef CONFIG_X86_32
+	/*
+	 * Turn off the CS limit completely if exec-shield disabled or
+	 * NX active:
+	 */
+	if (!exec_shield || executable_stack != EXSTACK_DISABLE_X || nx_enabled)
+		arch_add_exec_range(current->mm, -1);
+#endif
 
 	/* OK, This is the point of no return */
 	current->flags &= ~PF_FORKNOEXEC;
@@ -747,12 +740,14 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 	/* Do this immediately, since STACK_TOP as used in setup_arg_pages
 	   may depend on the personality.  */
 	SET_PERSONALITY(loc->elf_ex);
-	if (elf_read_implies_exec(loc->elf_ex, executable_stack))
+	if (!(exec_shield & 2) &&
+			elf_read_implies_exec(loc->elf_ex, executable_stack))
 		current->personality |= READ_IMPLIES_EXEC;
 
 	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
 		current->flags |= PF_RANDOMIZE;
-	arch_pick_mmap_layout(current->mm);
+
+	setup_new_exec(bprm);
 
 	/* Do this so that we can load the interpreter, if need be.  We will
 	   change some of these later */
@@ -773,6 +768,7 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 	    i < loc->elf_ex.e_phnum; i++, elf_ppnt++) {
 		int elf_prot = 0, elf_flags;
 		unsigned long k, vaddr;
+		unsigned long total_size = 0;
 
 		if (elf_ppnt->p_type != PT_LOAD)
 			continue;
@@ -822,15 +818,20 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 			 * default mmap base, as well as whatever program they
 			 * might try to exec.  This is because the brk will
 			 * follow the loader, and is not movable.  */
-#ifdef CONFIG_X86
-			load_bias = 0;
-#else
-			load_bias = ELF_PAGESTART(ELF_ET_DYN_BASE - vaddr);
-#endif
+			load_bias = ELF_ET_DYN_BASE - vaddr;
+			if (current->flags & PF_RANDOMIZE)
+				load_bias += arch_mmap_rnd();
+			load_bias = ELF_PAGESTART(load_bias);
+			total_size = total_mapping_size(elf_phdata,
+							loc->elf_ex.e_phnum);
+			if (!total_size) {
+				retval = -EINVAL;
+				goto out_free_dentry;
+			}
 		}
 
 		error = elf_map(bprm->file, load_bias + vaddr, elf_ppnt,
-				elf_prot, elf_flags, 0);
+				elf_prot, elf_flags, total_size);
 		if (BAD_ADDR(error)) {
 			send_sig(SIGKILL, current, 0);
 			retval = IS_ERR((void *)error) ?
@@ -912,7 +913,7 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 					    interpreter,
 					    &interp_map_addr,
 					    load_bias);
-		if (!IS_ERR((void *)elf_entry)) {
+		if (!BAD_ADDR(elf_entry)) {
 			/*
 			 * load_elf_interp() returns relocation
 			 * adjustment
@@ -967,11 +968,13 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 	current->mm->end_data = end_data;
 	current->mm->start_stack = bprm->p;
 
-#ifdef arch_randomize_brk
-	if ((current->flags & PF_RANDOMIZE) && (randomize_va_space > 1))
+	if ((current->flags & PF_RANDOMIZE) && (randomize_va_space > 1)) {
 		current->mm->brk = current->mm->start_brk =
 			arch_randomize_brk(current->mm);
+#ifdef compat_brk_randomized
+		current->brk_randomized = 1;
 #endif
+	}
 
 	if (current->personality & MMAP_PAGE_ZERO) {
 		/* Why this, you ask???  Well SVr4 maps page 0 as read-only,
@@ -1113,35 +1116,28 @@ out:
  * Modelled on fs/exec.c:aout_core_dump()
  * Jeremy Fitzhardinge <jeremy@sw.oz.au>
  */
-/*
- * These are the only things you should do on a core-file: use only these
- * functions to write out all the necessary info.
- */
-static int dump_write(struct file *file, const void *addr, int nr)
-{
-	return file->f_op->write(file, addr, nr, &file->f_pos) == nr;
-}
 
-static int dump_seek(struct file *file, loff_t off)
+/*
+ * The purpose of always_dump_vma() is to make sure that special kernel mappings
+ * that are useful for post-mortem analysis are included in every core dump.
+ * In that way we ensure that the core dump is fully interpretable later
+ * without matching up the same kernel and hardware config to see what PC values
+ * meant. These special mappings include - vDSO, vsyscall, and other
+ * architecture specific mappings
+ */
+static bool always_dump_vma(struct vm_area_struct *vma)
 {
-	if (file->f_op->llseek && file->f_op->llseek != no_llseek) {
-		if (file->f_op->llseek(file, off, SEEK_CUR) < 0)
-			return 0;
-	} else {
-		char *buf = (char *)get_zeroed_page(GFP_KERNEL);
-		if (!buf)
-			return 0;
-		while (off > 0) {
-			unsigned long n = off;
-			if (n > PAGE_SIZE)
-				n = PAGE_SIZE;
-			if (!dump_write(file, buf, n))
-				return 0;
-			off -= n;
-		}
-		free_page((unsigned long)buf);
-	}
-	return 1;
+	/* Any vsyscall mappings? */
+	if (vma == get_gate_vma(vma->vm_mm))
+		return true;
+	/*
+	 * arch_vma_name() returns non-NULL for special architecture mappings,
+	 * such as vDSO sections.
+	 */
+	if (arch_vma_name(vma))
+		return true;
+
+	return false;
 }
 
 /*
@@ -1152,9 +1148,12 @@ static unsigned long vma_dump_size(struct vm_area_struct *vma,
 {
 #define FILTER(type)	(mm_flags & (1UL << MMF_DUMP_##type))
 
-	/* The vma can be set up to tell us the answer directly.  */
-	if (vma->vm_flags & VM_ALWAYSDUMP)
+	/* always dump the vdso and vsyscall sections */
+	if (always_dump_vma(vma))
 		goto whole;
+
+	if (vma->vm_flags & VM_NODUMP)
+		return 0;
 
 	/* Hugetlb memory check */
 	if (vma->vm_flags & VM_HUGETLB) {
@@ -1162,6 +1161,7 @@ static unsigned long vma_dump_size(struct vm_area_struct *vma,
 			goto whole;
 		if (!(vma->vm_flags & VM_SHARED) && FILTER(HUGETLB_PRIVATE))
 			goto whole;
+		return 0;
 	}
 
 	/* Do not dump I/O mapped devices or special mappings */
@@ -1276,10 +1276,6 @@ static int writenote(struct memelfnote *men, struct file *file,
 	return 1;
 }
 #undef DUMP_WRITE
-
-#define DUMP_WRITE(addr, nr)	\
-	if ((size += (nr)) > limit || !dump_write(file, (addr), (nr))) \
-		goto end_coredump;
 
 static void fill_elf_header(struct elfhdr *elf, int segs,
 			    u16 machine, u32 flags, u8 osabi)
@@ -1475,7 +1471,7 @@ static int fill_thread_core_info(struct elf_thread_core_info *t,
 	for (i = 1; i < view->n; ++i) {
 		const struct user_regset *regset = &view->regsets[i];
 		do_thread_regset_writeback(t->task, regset);
-		if (regset->core_note_type &&
+		if (regset->core_note_type && regset->get &&
 		    (!regset->active || regset->active(t->task, regset))) {
 			int ret;
 			size_t size = regset->n * regset->size;
@@ -1899,6 +1895,34 @@ static struct vm_area_struct *next_vma(struct vm_area_struct *this_vma,
 	return gate_vma;
 }
 
+static void fill_extnum_info(struct elfhdr *elf, struct elf_shdr *shdr4extnum,
+			     elf_addr_t e_shoff, int segs)
+{
+	elf->e_shoff = e_shoff;
+	elf->e_shentsize = sizeof(*shdr4extnum);
+	elf->e_shnum = 1;
+	elf->e_shstrndx = SHN_UNDEF;
+
+	memset(shdr4extnum, 0, sizeof(*shdr4extnum));
+
+	shdr4extnum->sh_type = SHT_NULL;
+	shdr4extnum->sh_size = elf->e_shnum;
+	shdr4extnum->sh_link = elf->e_shstrndx;
+	shdr4extnum->sh_info = segs;
+}
+
+static size_t elf_core_vma_data_size(struct vm_area_struct *gate_vma,
+				     unsigned long mm_flags)
+{
+	struct vm_area_struct *vma;
+	size_t size = 0;
+
+	for (vma = first_vma(current, gate_vma); vma != NULL;
+	     vma = next_vma(vma, gate_vma))
+		size += vma_dump_size(vma, mm_flags);
+	return size;
+}
+
 /*
  * Actual dumper
  *
@@ -1906,7 +1930,7 @@ static struct vm_area_struct *next_vma(struct vm_area_struct *this_vma,
  * and then they are actually written out.  If we run out of core limit
  * we just truncate.
  */
-static int elf_core_dump(long signr, struct pt_regs *regs, struct file *file, unsigned long limit)
+static int elf_core_dump(struct coredump_params *cprm)
 {
 	int has_dumped = 0;
 	mm_segment_t fs;
@@ -1917,6 +1941,10 @@ static int elf_core_dump(long signr, struct pt_regs *regs, struct file *file, un
 	loff_t offset = 0, dataoff, foffset;
 	unsigned long mm_flags;
 	struct elf_note_info info;
+	struct elf_phdr *phdr4note = NULL;
+	struct elf_shdr *shdr4extnum = NULL;
+	Elf_Half e_phnum;
+	elf_addr_t e_shoff;
 
 	/*
 	 * We no longer stop all VM operations.
@@ -1939,20 +1967,25 @@ static int elf_core_dump(long signr, struct pt_regs *regs, struct file *file, un
 	 * Please check DEFAULT_MAX_MAP_COUNT definition when you modify here.
 	 */
 	segs = current->mm->map_count;
-#ifdef ELF_CORE_EXTRA_PHDRS
-	segs += ELF_CORE_EXTRA_PHDRS;
-#endif
+	segs += elf_core_extra_phdrs();
 
-	gate_vma = get_gate_vma(current);
+	gate_vma = get_gate_vma(current->mm);
 	if (gate_vma != NULL)
 		segs++;
+
+	/* for notes section */
+	segs++;
+
+	/* If segs > PN_XNUM(0xffff), then e_phnum overflows. To avoid
+	 * this, kernel supports extended numbering. Have a look at
+	 * include/linux/elf.h for further information. */
+	e_phnum = segs > PN_XNUM ? PN_XNUM : segs;
 
 	/*
 	 * Collect all the non-memory information about the process for the
 	 * notes.  This also sets up the file header.
 	 */
-	if (!fill_note_info(elf, segs + 1, /* including notes section */
-			    &info, signr, regs))
+	if (!fill_note_info(elf, e_phnum, &info, cprm->signr, cprm->regs))
 		goto cleanup;
 
 	has_dumped = 1;
@@ -1961,21 +1994,22 @@ static int elf_core_dump(long signr, struct pt_regs *regs, struct file *file, un
 	fs = get_fs();
 	set_fs(KERNEL_DS);
 
-	DUMP_WRITE(elf, sizeof(*elf));
 	offset += sizeof(*elf);				/* Elf header */
-	offset += (segs + 1) * sizeof(struct elf_phdr); /* Program headers */
+	offset += segs * sizeof(struct elf_phdr);	/* Program headers */
 	foffset = offset;
 
 	/* Write notes phdr entry */
 	{
-		struct elf_phdr phdr;
 		size_t sz = get_note_info_size(&info);
 
 		sz += elf_coredump_extra_notes_size();
 
-		fill_elf_note_phdr(&phdr, sz, offset);
+		phdr4note = kmalloc(sizeof(*phdr4note), GFP_KERNEL);
+		if (!phdr4note)
+			goto end_coredump;
+
+		fill_elf_note_phdr(phdr4note, sz, offset);
 		offset += sz;
-		DUMP_WRITE(&phdr, sizeof(phdr));
 	}
 
 	dataoff = offset = roundup(offset, ELF_EXEC_PAGESIZE);
@@ -1986,6 +2020,28 @@ static int elf_core_dump(long signr, struct pt_regs *regs, struct file *file, un
 	 * unusable core file can be generated.
 	 */
 	mm_flags = current->mm->flags;
+
+	offset += elf_core_vma_data_size(gate_vma, mm_flags);
+	offset += elf_core_extra_data_size();
+	e_shoff = offset;
+
+	if (e_phnum == PN_XNUM) {
+		shdr4extnum = kmalloc(sizeof(*shdr4extnum), GFP_KERNEL);
+		if (!shdr4extnum)
+			goto end_coredump;
+		fill_extnum_info(elf, shdr4extnum, e_shoff, segs);
+	}
+
+	offset = dataoff;
+
+	size += sizeof(*elf);
+	if (size > cprm->limit || !dump_write(cprm->file, elf, sizeof(*elf)))
+		goto end_coredump;
+
+	size += sizeof(*phdr4note);
+	if (size > cprm->limit
+	    || !dump_write(cprm->file, phdr4note, sizeof(*phdr4note)))
+		goto end_coredump;
 
 	/* Write program headers for segments dump */
 	for (vma = first_vma(current, gate_vma); vma != NULL;
@@ -2006,22 +2062,24 @@ static int elf_core_dump(long signr, struct pt_regs *regs, struct file *file, un
 			phdr.p_flags |= PF_X;
 		phdr.p_align = ELF_EXEC_PAGESIZE;
 
-		DUMP_WRITE(&phdr, sizeof(phdr));
+		size += sizeof(phdr);
+		if (size > cprm->limit
+		    || !dump_write(cprm->file, &phdr, sizeof(phdr)))
+			goto end_coredump;
 	}
 
-#ifdef ELF_CORE_WRITE_EXTRA_PHDRS
-	ELF_CORE_WRITE_EXTRA_PHDRS;
-#endif
-
- 	/* write out the notes section */
-	if (!write_note_info(&info, file, &foffset))
+	if (!elf_core_write_extra_phdrs(cprm->file, offset, &size, cprm->limit))
 		goto end_coredump;
 
-	if (elf_coredump_extra_notes_write(file, &foffset))
+ 	/* write out the notes section */
+	if (!write_note_info(&info, cprm->file, &foffset))
+		goto end_coredump;
+
+	if (elf_coredump_extra_notes_write(cprm->file, &foffset))
 		goto end_coredump;
 
 	/* Align to page */
-	if (!dump_seek(file, dataoff - foffset))
+	if (!dump_seek(cprm->file, dataoff - foffset))
 		goto end_coredump;
 
 	for (vma = first_vma(current, gate_vma); vma != NULL;
@@ -2038,26 +2096,36 @@ static int elf_core_dump(long signr, struct pt_regs *regs, struct file *file, un
 			page = get_dump_page(addr);
 			if (page) {
 				void *kaddr = kmap(page);
-				stop = ((size += PAGE_SIZE) > limit) ||
-					!dump_write(file, kaddr, PAGE_SIZE);
+				stop = ((size += PAGE_SIZE) > cprm->limit) ||
+					!dump_write(cprm->file, kaddr,
+						    PAGE_SIZE);
 				kunmap(page);
 				page_cache_release(page);
 			} else
-				stop = !dump_seek(file, PAGE_SIZE);
+				stop = !dump_seek(cprm->file, PAGE_SIZE);
 			if (stop)
 				goto end_coredump;
 		}
 	}
 
-#ifdef ELF_CORE_WRITE_EXTRA_DATA
-	ELF_CORE_WRITE_EXTRA_DATA;
-#endif
+	if (!elf_core_write_extra_data(cprm->file, &size, cprm->limit))
+		goto end_coredump;
+
+	if (e_phnum == PN_XNUM) {
+		size += sizeof(*shdr4extnum);
+		if (size > cprm->limit
+		    || !dump_write(cprm->file, shdr4extnum,
+				   sizeof(*shdr4extnum)))
+			goto end_coredump;
+	}
 
 end_coredump:
 	set_fs(fs);
 
 cleanup:
 	free_note_info(&info);
+	kfree(shdr4extnum);
+	kfree(phdr4note);
 	kfree(elf);
 out:
 	return has_dumped;

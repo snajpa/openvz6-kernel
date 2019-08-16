@@ -14,4 +14,10 @@ obj-$(CONFIG_X86_VISWS)		+= visws.o
 obj-$(CONFIG_X86_NUMAQ)		+= numaq_32.o
 
 obj-y				+= common.o early.o
-obj-y				+= amd_bus.o
+obj-y				+= bus_numa.o
+
+obj-$(CONFIG_AMD_NB)		+= amd_bus.o
+
+ifeq ($(CONFIG_PCI_DEBUG),y)
+EXTRA_CFLAGS += -DDEBUG
+endif

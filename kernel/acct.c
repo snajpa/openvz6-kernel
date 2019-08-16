@@ -122,7 +122,7 @@ static int check_free_space(struct bsd_acct_struct *acct, struct file *file)
 	spin_unlock(&acct_lock);
 
 	/* May block */
-	if (vfs_statfs(file->f_path.dentry, &sbuf))
+	if (vfs_statfs(&file->f_path, &sbuf))
 		return res;
 	suspend = sbuf.f_blocks * SUSPEND;
 	resume = sbuf.f_blocks * RESUME;
@@ -212,7 +212,7 @@ static void acct_file_reopen(struct bsd_acct_struct *acct, struct file *file,
 	}
 }
 
-static int acct_on(char *name)
+static int acct_on(const char *name)
 {
 	struct file *file;
 	struct vfsmount *mnt;
@@ -287,10 +287,10 @@ SYSCALL_DEFINE1(acct, const char __user *, name)
 		return -EPERM;
 
 	if (name) {
-		char *tmp = getname(name);
+		struct filename *tmp = getname(name);
 		if (IS_ERR(tmp))
 			return (PTR_ERR(tmp));
-		error = acct_on(tmp);
+		error = acct_on(tmp->name);
 		putname(tmp);
 	} else {
 		struct bsd_acct_struct *acct;
@@ -536,7 +536,8 @@ static void do_acct_process(struct bsd_acct_struct *acct,
 	do_div(elapsed, AHZ);
 	ac.ac_btime = get_seconds() - elapsed;
 	/* we really need to bite the bullet and change layout */
-	current_uid_gid(&ac.ac_uid, &ac.ac_gid);
+	ac.ac_uid = orig_cred->uid;
+	ac.ac_gid = orig_cred->gid;
 #if ACCT_VERSION==2
 	ac.ac_ahz = AHZ;
 #endif

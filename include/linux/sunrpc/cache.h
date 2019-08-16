@@ -47,8 +47,10 @@
 struct cache_head {
 	struct cache_head * next;
 	time_t		expiry_time;	/* After time time, don't use the data */
-	time_t		last_refresh;   /* If CACHE_PENDING, this is when upcall 
-					 * was sent, else this is when update was received
+	time_t		last_refresh;   /* If CACHE_PENDING, this is when upcall was
+					 * sent, else this is when update was
+					 * received, though it is alway set to
+					 * be *after* ->flush_time.
 					 */
 	struct kref	ref;
 	unsigned long	flags;
@@ -99,8 +101,12 @@ struct cache_detail {
 	/* fields below this comment are for internal use
 	 * and should not be touched by cache owners
 	 */
-	time_t			flush_time;		/* flush all cache items with last_refresh
-							 * earlier than this */
+	time_t			flush_time;		/* flush all cache items with
+							 * last_refresh at or earlier
+							 * than this.  last_refresh
+							 * is never set at or earlier
+							 * than this.
+							 */
 	struct list_head	others;
 	time_t			nextcheck;
 	int			entries;
@@ -125,12 +131,15 @@ struct cache_detail {
  */
 struct cache_req {
 	struct cache_deferred_req *(*defer)(struct cache_req *req);
+	int thread_wait;  /* How long (jiffies) we can block the
+			   * current thread to wait for updates.
+			   */
 };
 /* this must be embedded in a deferred_request that is being
  * delayed awaiting cache-fill
  */
 struct cache_deferred_req {
-	struct list_head	hash;	/* on hash chain */
+	struct hlist_node	hash;	/* on hash chain */
 	struct list_head	recent; /* on fifo */
 	struct cache_head	*item;  /* cache item we wait on */
 	void			*owner; /* we might need to discard all defered requests
@@ -138,6 +147,25 @@ struct cache_deferred_req {
 	void			(*revisit)(struct cache_deferred_req *req,
 					   int too_many);
 };
+
+/*
+ * timestamps kept in the cache are expressed in seconds
+ * since boot.  This is the best for measuring differences in
+ * real time.
+ */
+static inline time_t seconds_since_boot(void)
+{
+	struct timespec boot;
+	getboottime(&boot);
+	return get_seconds() - boot.tv_sec;
+}
+
+static inline time_t convert_to_wallclock(time_t sinceboot)
+{
+	struct timespec boot;
+	getboottime(&boot);
+	return boot.tv_sec + sinceboot;
+}
 
 
 extern const struct file_operations cache_file_operations_pipefs;
@@ -176,15 +204,10 @@ static inline void cache_put(struct cache_head *h, struct cache_detail *cd)
 	kref_put(&h->ref, cd->cache_put);
 }
 
-static inline int cache_valid(struct cache_head *h)
+static inline int cache_is_expired(struct cache_detail *detail, struct cache_head *h)
 {
-	/* If an item has been unhashed pending removal when
-	 * the refcount drops to 0, the expiry_time will be
-	 * set to 0.  We don't want to consider such items
-	 * valid in this context even though CACHE_VALID is
-	 * set.
-	 */
-	return (h->expiry_time != 0 && test_bit(CACHE_VALID, &h->flags));
+	return  (h->expiry_time < seconds_since_boot()) ||
+		(detail->flush_time >= h->last_refresh);
 }
 
 extern int cache_check(struct cache_detail *detail,
@@ -192,8 +215,11 @@ extern int cache_check(struct cache_detail *detail,
 extern void cache_flush(void);
 extern void cache_purge(struct cache_detail *detail);
 #define NEVER (0x7FFFFFFF)
+extern void __init cache_initialize(void);
 extern int cache_register(struct cache_detail *cd);
+extern int cache_register_net(struct cache_detail *cd, struct net *net);
 extern void cache_unregister(struct cache_detail *cd);
+extern void cache_unregister_net(struct cache_detail *cd, struct net *net);
 
 extern int sunrpc_cache_register_pipefs(struct dentry *parent, const char *,
 					mode_t, struct cache_detail *);
@@ -217,14 +243,41 @@ static inline int get_int(char **bpp, int *anint)
 	return 0;
 }
 
+static inline int get_uint(char **bpp, unsigned int *anint)
+{
+	char buf[50];
+	int len = qword_get(bpp, buf, sizeof(buf));
+
+	if (len < 0)
+		return -EINVAL;
+	if (len == 0)
+		return -ENOENT;
+
+	if (kstrtouint(buf, 0, anint))
+		return -EINVAL;
+
+	return 0;
+}
+
 static inline time_t get_expiry(char **bpp)
 {
 	int rv;
+	struct timespec boot;
+
 	if (get_int(bpp, &rv))
 		return 0;
 	if (rv < 0)
 		return 0;
-	return rv;
+	getboottime(&boot);
+	return rv - boot.tv_sec;
 }
 
+static inline void sunrpc_invalidate(struct cache_head *h,
+				     struct cache_detail *detail)
+{
+	unsigned long seconds = get_seconds();
+
+	h->expiry_time = seconds - 1;
+	detail->nextcheck = seconds;
+}
 #endif /*  _LINUX_SUNRPC_CACHE_H_ */

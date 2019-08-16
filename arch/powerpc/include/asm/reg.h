@@ -413,6 +413,7 @@
 #define SPRN_SPRG1	0x111	/* Special Purpose Register General 1 */
 #define SPRN_SPRG2	0x112	/* Special Purpose Register General 2 */
 #define SPRN_SPRG3	0x113	/* Special Purpose Register General 3 */
+#define SPRN_USPRG3	0x103	/* SPRG3 userspace read */
 #define SPRN_SPRG4	0x114	/* Special Purpose Register General 4 */
 #define SPRN_SPRG5	0x115	/* Special Purpose Register General 5 */
 #define SPRN_SPRG6	0x116	/* Special Purpose Register General 6 */
@@ -489,6 +490,8 @@
 #define SPRN_MMCR1	798
 #define SPRN_MMCRA	0x312
 #define   MMCRA_SDSYNC	0x80000000UL /* SDAR synced with SIAR */
+#define   MMCRA_SDAR_DCACHE_MISS 0x40000000UL
+#define   MMCRA_SDAR_ERAT_MISS   0x20000000UL
 #define   MMCRA_SIHV	0x10000000UL /* state of MSR HV when SIAR set */
 #define   MMCRA_SIPR	0x08000000UL /* state of MSR PR when SIAR set */
 #define   MMCRA_SLOT	0x07000000UL /* SLOT bits (37-39) */
@@ -499,6 +502,10 @@
 #define   POWER6_MMCRA_SIPR   0x0000020000000000ULL
 #define   POWER6_MMCRA_THRM	0x00000020UL
 #define   POWER6_MMCRA_OTHER	0x0000000EUL
+
+#define   POWER7P_MMCRA_SIAR_VALID 0x10000000	/* P7+ SIAR contents valid */
+#define   POWER7P_MMCRA_SDAR_VALID 0x08000000	/* P7+ SDAR contents valid */
+
 #define SPRN_PMC1	787
 #define SPRN_PMC2	788
 #define SPRN_PMC3	789
@@ -509,6 +516,11 @@
 #define SPRN_PMC8	794
 #define SPRN_SIAR	780
 #define SPRN_SDAR	781
+#define SPRN_SIER	784
+#define   SIER_SIPR		0x2000000	/* Sampled MSR_PR */
+#define   SIER_SIHV		0x1000000	/* Sampled MSR_HV */
+#define   SIER_SIAR_VALID	0x0400000	/* SIAR contents valid */
+#define   SIER_SDAR_VALID	0x0200000	/* SDAR contents valid */
 
 #define SPRN_PA6T_MMCR0 795
 #define   PA6T_MMCR0_EN0	0x0000000000000001UL
@@ -650,12 +662,12 @@
  * 64-bit server:
  *	- SPRG0 unused (reserved for HV on Power4)
  *	- SPRG2 scratch for exception vectors
- *	- SPRG3 unused (user visible)
+ *	- SPRG3 CPU and NUMA node for VDSO getcpu (user visible)
  *
  * 64-bit embedded
  *	- SPRG0 generic exception scratch
  *	- SPRG2 TLB exception stack
- *	- SPRG3 unused (user visible)
+ *	- SPRG3 CPU and NUMA node for VDSO getcpu (user visible)
  *	- SPRG4 unused (user visible)
  *	- SPRG6 TLB miss scratch (user visible, sorry !)
  *	- SPRG7 critical exception scratch
@@ -858,11 +870,15 @@
 #define PV_970		0x0039
 #define PV_POWER5	0x003A
 #define PV_POWER5p	0x003B
+#define PV_POWER7	0x003F
 #define PV_970FX	0x003C
 #define PV_630		0x0040
 #define PV_630p	0x0041
 #define PV_970MP	0x0044
 #define PV_970GX	0x0045
+#define PVR_POWER7p	0x004A
+#define PVR_POWER8E	0x004B
+#define PVR_POWER8	0x004D
 #define PV_BE		0x0070
 #define PV_PA6T		0x0090
 

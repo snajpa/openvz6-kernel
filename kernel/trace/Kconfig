@@ -46,9 +46,6 @@ config HAVE_FTRACE_MCOUNT_RECORD
 	help
 	  See Documentation/trace/ftrace-implementation.txt
 
-config HAVE_HW_BRANCH_TRACER
-	bool
-
 config HAVE_SYSCALL_TRACEPOINTS
 	bool
 	help
@@ -158,7 +155,7 @@ config IRQSOFF_TRACER
 	bool "Interrupts-off Latency Tracer"
 	default n
 	depends on TRACE_IRQFLAGS_SUPPORT
-	depends on GENERIC_TIME
+	depends on !ARCH_USES_GETTIMEOFFSET
 	select TRACE_IRQFLAGS
 	select GENERIC_TRACER
 	select TRACER_MAX_TRACE
@@ -180,7 +177,7 @@ config IRQSOFF_TRACER
 config PREEMPT_TRACER
 	bool "Preemption-off Latency Tracer"
 	default n
-	depends on GENERIC_TIME
+	depends on !ARCH_USES_GETTIMEOFFSET
 	depends on PREEMPT
 	select GENERIC_TRACER
 	select TRACER_MAX_TRACE
@@ -364,14 +361,6 @@ config STACK_TRACER
 
 	  Say N if unsure.
 
-config HW_BRANCH_TRACER
-	depends on HAVE_HW_BRANCH_TRACER
-	bool "Trace hw branches"
-	select GENERIC_TRACER
-	help
-	  This tracer records all branches on the system in a circular
-	  buffer giving access to the last N branches for each cpu.
-
 config KMEMTRACE
 	bool "Trace SLAB allocations"
 	select GENERIC_TRACER
@@ -427,6 +416,23 @@ config BLK_DEV_IO_TRACE
 	    cat /sys/kernel/debug/tracing/trace_pipe
 
 	  If unsure, say N.
+
+config KPROBE_EVENT
+	depends on KPROBES
+	depends on X86
+	bool "Enable kprobes-based dynamic events"
+	select TRACING
+	default y
+	help
+	  This allows the user to add tracing events (similar to tracepoints) on the fly
+	  via the ftrace interface. See Documentation/trace/kprobetrace.txt
+	  for more details.
+
+	  Those events can be inserted wherever kprobes can probe, and record
+	  various register and memory values.
+
+	  This option is also required by perf-probe subcommand of perf tools. If
+	  you want to use perf tools, this option is strongly recommended.
 
 config DYNAMIC_FTRACE
 	bool "enable/disable ftrace tracepoints dynamically"

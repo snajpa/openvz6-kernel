@@ -36,6 +36,9 @@ config FIRMWARE_MEMMAP
 
       See also Documentation/ABI/testing/sysfs-firmware-memmap.
 
+config UEFI_CPER
+	bool
+
 config EFI_VARS
 	tristate "EFI Variable Support via sysfs"
 	depends on EFI
@@ -112,6 +115,9 @@ config DMIID
 	  information from userspace through /sys/class/dmi/id/ or if you want
 	  DMI-based module auto-loading.
 
+config DMI_SCAN_MACHINE_NON_EFI_FALLBACK
+	bool
+
 config ISCSI_IBFT_FIND
 	bool "iSCSI Boot Firmware Table Attributes"
 	depends on X86
@@ -124,6 +130,7 @@ config ISCSI_IBFT_FIND
 
 config ISCSI_IBFT
 	tristate "iSCSI Boot Firmware Table Attributes module"
+	select ISCSI_BOOT_SYSFS
 	depends on ISCSI_IBFT_FIND
 	default	n
 	help

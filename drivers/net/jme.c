@@ -946,6 +946,8 @@ jme_alloc_and_feed_skb(struct jme_adapter *jme, int idx)
 				jme->jme_vlan_rx(skb, jme->vlgrp,
 					le16_to_cpu(rxdesc->descwb.vlan));
 				NET_STAT(jme).rx_bytes += 4;
+			} else {
+				dev_kfree_skb(skb);
 			}
 		} else {
 			jme->jme_rx(skb);
@@ -1844,9 +1846,9 @@ jme_tx_csum(struct jme_adapter *jme, struct sk_buff *skb, u8 *flags)
 static inline void
 jme_tx_vlan(struct sk_buff *skb, __le16 *vlan, u8 *flags)
 {
-	if (vlan_tx_tag_present(skb)) {
+	if (skb_vlan_tag_present(skb)) {
 		*flags |= TXFLAG_TAGON;
-		*vlan = cpu_to_le16(vlan_tx_tag_get(skb));
+		*vlan = cpu_to_le16(skb_vlan_tag_get(skb));
 	}
 }
 
@@ -2053,12 +2055,11 @@ jme_change_mtu(struct net_device *netdev, int new_mtu)
 	}
 
 	if (new_mtu > 1900) {
-		netdev->features &= ~(NETIF_F_HW_CSUM |
-				NETIF_F_TSO |
-				NETIF_F_TSO6);
+		netdev->features &= ~(NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
+				NETIF_F_TSO | NETIF_F_TSO6);
 	} else {
 		if (test_bit(JME_FLAG_TXCSUM, &jme->flags))
-			netdev->features |= NETIF_F_HW_CSUM;
+			netdev->features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
 		if (test_bit(JME_FLAG_TSO, &jme->flags))
 			netdev->features |= NETIF_F_TSO | NETIF_F_TSO6;
 	}
@@ -2085,12 +2086,45 @@ jme_tx_timeout(struct net_device *netdev)
 	jme_reset_link(jme);
 }
 
+static inline void jme_pause_rx(struct jme_adapter *jme)
+{
+	atomic_dec(&jme->link_changing);
+
+	jme_set_rx_pcc(jme, PCC_OFF);
+	if (test_bit(JME_FLAG_POLL, &jme->flags)) {
+		JME_NAPI_DISABLE(jme);
+	} else {
+		tasklet_disable(&jme->rxclean_task);
+		tasklet_disable(&jme->rxempty_task);
+	}
+}
+
+static inline void jme_resume_rx(struct jme_adapter *jme)
+{
+	struct dynpcc_info *dpi = &(jme->dpi);
+
+	if (test_bit(JME_FLAG_POLL, &jme->flags)) {
+		JME_NAPI_ENABLE(jme);
+	} else {
+		tasklet_hi_enable(&jme->rxclean_task);
+		tasklet_hi_enable(&jme->rxempty_task);
+	}
+	dpi->cur		= PCC_P1;
+	dpi->attempt		= PCC_P1;
+	dpi->cnt		= 0;
+	jme_set_rx_pcc(jme, PCC_P1);
+
+	atomic_inc(&jme->link_changing);
+}
+
 static void
 jme_vlan_rx_register(struct net_device *netdev, struct vlan_group *grp)
 {
 	struct jme_adapter *jme = netdev_priv(netdev);
 
+	jme_pause_rx(jme);
 	jme->vlgrp = grp;
+	jme_resume_rx(jme);
 }
 
 static void
@@ -2426,10 +2460,12 @@ jme_set_tx_csum(struct net_device *netdev, u32 on)
 	if (on) {
 		set_bit(JME_FLAG_TXCSUM, &jme->flags);
 		if (netdev->mtu <= 1900)
-			netdev->features |= NETIF_F_HW_CSUM;
+			netdev->features |=
+				NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
 	} else {
 		clear_bit(JME_FLAG_TXCSUM, &jme->flags);
-		netdev->features &= ~NETIF_F_HW_CSUM;
+		netdev->features &=
+				~(NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM);
 	}
 
 	return 0;
@@ -2708,7 +2744,8 @@ jme_init_one(struct pci_dev *pdev,
 	netdev->netdev_ops = &jme_netdev_ops;
 	netdev->ethtool_ops		= &jme_ethtool_ops;
 	netdev->watchdog_timeo		= TX_TIMEOUT;
-	netdev->features		=	NETIF_F_HW_CSUM |
+	netdev->features		=	NETIF_F_IP_CSUM |
+						NETIF_F_IPV6_CSUM |
 						NETIF_F_SG |
 						NETIF_F_TSO |
 						NETIF_F_TSO6 |
@@ -2752,7 +2789,7 @@ jme_init_one(struct pci_dev *pdev,
 		jwrite32(jme, JME_APMC, apmc);
 	}
 
-	NETIF_NAPI_SET(netdev, &jme->napi, jme_poll, jme->rx_ring_size >> 2)
+	NETIF_NAPI_SET(netdev, &jme->napi, jme_poll, NAPI_POLL_WEIGHT)
 
 	spin_lock_init(&jme->phy_lock);
 	spin_lock_init(&jme->macaddr_lock);

@@ -1034,7 +1034,7 @@ static void bfin_bus_post_reset(struct ata_port *ap, unsigned int devmask)
 			dev1 = 0;
 			break;
 		}
-		msleep(50);	/* give drive a breather */
+		ata_msleep(ap, 50);	/* give drive a breather */
 	}
 	if (dev1)
 		ata_sff_busy_sleep(ap, ATA_TMOUT_BOOT_QUICK, ATA_TMOUT_BOOT);
@@ -1075,7 +1075,7 @@ static unsigned int bfin_bus_softreset(struct ata_port *ap,
 	 *
 	 * Old drivers/ide uses the 2mS rule and then waits for ready
 	 */
-	msleep(150);
+	ata_msleep(ap, 150);
 
 	/* Before we perform post reset processing we want to see if
 	 * the bus shows 0xFF because the odd clown forgets the D7
@@ -1438,18 +1438,12 @@ static irqreturn_t bfin_ata_interrupt(int irq, void *dev_instance)
 	spin_lock_irqsave(&host->lock, flags);
 
 	for (i = 0; i < host->n_ports; i++) {
-		struct ata_port *ap;
+		struct ata_port *ap = host->ports[i];
+		struct ata_queued_cmd *qc;
 
-		ap = host->ports[i];
-		if (ap &&
-		    !(ap->flags & ATA_FLAG_DISABLED)) {
-			struct ata_queued_cmd *qc;
-
-			qc = ata_qc_from_tag(ap, ap->link.active_tag);
-			if (qc && (!(qc->tf.flags & ATA_TFLAG_POLLING)) &&
-			    (qc->flags & ATA_QCFLAG_ACTIVE))
-				handled |= bfin_ata_host_intr(ap, qc);
-		}
+		qc = ata_qc_from_tag(ap, ap->link.active_tag);
+		if (qc && (!(qc->tf.flags & ATA_TFLAG_POLLING)))
+			handled |= bfin_ata_host_intr(ap, qc);
 	}
 
 	spin_unlock_irqrestore(&host->lock, flags);

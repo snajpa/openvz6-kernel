@@ -45,6 +45,19 @@ static int anon_inodefs_delete_dentry(struct dentry *dentry)
 	return 1;
 }
 
+/*
+ * anon_inodefs_dname() is called from d_path().
+ */
+static char *anon_inodefs_dname(struct dentry *dentry, char *buffer, int buflen)
+{
+	/*
+ 	 * RHEL6 only: we don't use 'anon_inode:' prefix to preserve
+ 	 * the string format used since GA.
+ 	 */
+	return dynamic_dname(dentry, buffer, buflen, "%s",
+				dentry->d_name.name);
+}
+
 static struct file_system_type anon_inode_fs_type = {
 	.name		= "anon_inodefs",
 	.get_sb		= anon_inodefs_get_sb,
@@ -52,6 +65,7 @@ static struct file_system_type anon_inode_fs_type = {
 };
 static const struct dentry_operations anon_inodefs_dentry_operations = {
 	.d_delete	= anon_inodefs_delete_dentry,
+	.d_dname	= anon_inodefs_dname,
 };
 
 /*
@@ -88,7 +102,7 @@ struct file *anon_inode_getfile(const char *name,
 				void *priv, int flags)
 {
 	struct qstr this;
-	struct dentry *dentry;
+	struct path path;
 	struct file *file;
 	int error;
 
@@ -106,10 +120,11 @@ struct file *anon_inode_getfile(const char *name,
 	this.name = name;
 	this.len = strlen(name);
 	this.hash = 0;
-	dentry = d_alloc(anon_inode_mnt->mnt_sb->s_root, &this);
-	if (!dentry)
+	path.dentry = d_alloc_pseudo(anon_inode_mnt->mnt_sb, &this);
+	if (!path.dentry)
 		goto err_module;
 
+	path.mnt = mntget(anon_inode_mnt);
 	/*
 	 * We know the anon_inode inode count is always greater than zero,
 	 * so we can avoid doing an igrab() and we can use an open-coded
@@ -117,14 +132,13 @@ struct file *anon_inode_getfile(const char *name,
 	 */
 	atomic_inc(&anon_inode_inode->i_count);
 
-	dentry->d_op = &anon_inodefs_dentry_operations;
+	path.dentry->d_op = &anon_inodefs_dentry_operations;
 	/* Do not publish this dentry inside the global dentry hash table */
-	dentry->d_flags &= ~DCACHE_UNHASHED;
-	d_instantiate(dentry, anon_inode_inode);
+	path.dentry->d_flags &= ~DCACHE_UNHASHED;
+	d_instantiate(path.dentry, anon_inode_inode);
 
 	error = -ENFILE;
-	file = alloc_file(anon_inode_mnt, dentry,
-			  FMODE_READ | FMODE_WRITE, fops);
+	file = alloc_file(&path, FMODE_READ | FMODE_WRITE, fops);
 	if (!file)
 		goto err_dput;
 	file->f_mapping = anon_inode_inode->i_mapping;
@@ -137,7 +151,7 @@ struct file *anon_inode_getfile(const char *name,
 	return file;
 
 err_dput:
-	dput(dentry);
+	path_put(&path);
 err_module:
 	module_put(fops->owner);
 	return ERR_PTR(error);
@@ -209,7 +223,7 @@ static struct inode *anon_inode_mkinode(void)
 	 * that it already _is_ on the dirty list.
 	 */
 	inode->i_state = I_DIRTY;
-	inode->i_mode = S_IRUSR | S_IWUSR;
+	inode->i_mode = S_IFREG | S_IRUSR | S_IWUSR;
 	inode->i_uid = current_fsuid();
 	inode->i_gid = current_fsgid();
 	inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;

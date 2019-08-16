@@ -137,13 +137,9 @@ static void __init pirq_peer_trick(void)
 		busmap[e->bus] = 1;
 	}
 	for (i = 1; i < 256; i++) {
-		int node;
 		if (!busmap[i] || pci_find_bus(0, i))
 			continue;
-		node = get_mp_bus_to_node(i);
-		if (pci_scan_bus_on_node(i, &pci_root_ops, node))
-			printk(KERN_INFO "PCI: Discovered primary peer "
-			       "bus %02x [IRQ]\n", i);
+		pcibios_scan_root(i);
 	}
 	pcibios_last_bus = -1;
 }
@@ -585,19 +581,27 @@ static __init int intel_router_probe(struct irq_router *r, struct pci_dev *route
 	case PCI_DEVICE_ID_INTEL_ICH9_3:
 	case PCI_DEVICE_ID_INTEL_ICH9_4:
 	case PCI_DEVICE_ID_INTEL_ICH9_5:
-	case PCI_DEVICE_ID_INTEL_TOLAPAI_0:
+	case PCI_DEVICE_ID_INTEL_EP80579_0:
 	case PCI_DEVICE_ID_INTEL_ICH10_0:
 	case PCI_DEVICE_ID_INTEL_ICH10_1:
 	case PCI_DEVICE_ID_INTEL_ICH10_2:
 	case PCI_DEVICE_ID_INTEL_ICH10_3:
+	case PCI_DEVICE_ID_INTEL_PATSBURG_LPC_0:
+	case PCI_DEVICE_ID_INTEL_PATSBURG_LPC_1:
 		r->name = "PIIX/ICH";
 		r->get = pirq_piix_get;
 		r->set = pirq_piix_set;
 		return 1;
 	}
 
-	if ((device >= PCI_DEVICE_ID_INTEL_PCH_LPC_MIN) && 
-		(device <= PCI_DEVICE_ID_INTEL_PCH_LPC_MAX)) {
+	if ((device >= PCI_DEVICE_ID_INTEL_5_3400_SERIES_LPC_MIN && 
+	     device <= PCI_DEVICE_ID_INTEL_5_3400_SERIES_LPC_MAX) 
+	||  (device >= PCI_DEVICE_ID_INTEL_COUGARPOINT_LPC_MIN && 
+	     device <= PCI_DEVICE_ID_INTEL_COUGARPOINT_LPC_MAX)
+	||  (device >= PCI_DEVICE_ID_INTEL_DH89XXCC_LPC_MIN &&
+	     device <= PCI_DEVICE_ID_INTEL_DH89XXCC_LPC_MAX)
+	||  (device >= PCI_DEVICE_ID_INTEL_PANTHERPOINT_LPC_MIN &&
+	     device <= PCI_DEVICE_ID_INTEL_PANTHERPOINT_LPC_MAX)) {
 		r->name = "PIIX/ICH";
 		r->get = pirq_piix_get;
 		r->set = pirq_piix_set;

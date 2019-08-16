@@ -1,5 +1,5 @@
 /*
-	Copyright (C) 2004 - 2009 rt2x00 SourceForge Project
+	Copyright (C) 2004 - 2009 Ivo van Doorn <IvDoorn@gmail.com>
 	<http://rt2x00.serialmonkey.com>
 
 	This program is free software; you can redistribute it and/or modify
@@ -13,9 +13,7 @@
 	GNU General Public License for more details.
 
 	You should have received a copy of the GNU General Public License
-	along with this program; if not, write to the
-	Free Software Foundation, Inc.,
-	59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+	along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
 /*
@@ -28,6 +26,13 @@
 #define RT61PCI_H
 
 /*
+ * RT chip PCI IDs.
+ */
+#define RT2561s_PCI_ID			0x0301
+#define RT2561_PCI_ID			0x0302
+#define RT2661_PCI_ID			0x0401
+
+/*
  * RF chip defines.
  */
 #define RF5225				0x0001
@@ -37,7 +42,7 @@
 
 /*
  * Signal information.
- * Defaul offset is required for RSSI <-> dBm conversion.
+ * Default offset is required for RSSI <-> dBm conversion.
  */
 #define DEFAULT_RSSI_OFFSET		120
 
@@ -146,13 +151,13 @@ struct hw_key_entry {
 	u8 key[16];
 	u8 tx_mic[8];
 	u8 rx_mic[8];
-} __attribute__ ((packed));
+} __packed;
 
 struct hw_pairwise_ta_entry {
 	u8 address[6];
 	u8 cipher;
 	u8 reserved;
-} __attribute__ ((packed));
+} __packed;
 
 /*
  * Other on-chip shared memory space.
@@ -225,6 +230,8 @@ struct hw_pairwise_ta_entry {
  * MAC_CSR0: ASIC revision number.
  */
 #define MAC_CSR0			0x3000
+#define MAC_CSR0_REVISION		FIELD32(0x0000000f)
+#define MAC_CSR0_CHIPSET		FIELD32(0x000ffff0)
 
 /*
  * MAC_CSR1: System control register.
@@ -348,21 +355,22 @@ struct hw_pairwise_ta_entry {
 
 /*
  * MAC_CSR13: GPIO.
+ *	MAC_CSR13_VALx: GPIO value
+ *	MAC_CSR13_DIRx: GPIO direction: 0 = output; 1 = input
  */
 #define MAC_CSR13			0x3034
-#define MAC_CSR13_BIT0			FIELD32(0x00000001)
-#define MAC_CSR13_BIT1			FIELD32(0x00000002)
-#define MAC_CSR13_BIT2			FIELD32(0x00000004)
-#define MAC_CSR13_BIT3			FIELD32(0x00000008)
-#define MAC_CSR13_BIT4			FIELD32(0x00000010)
-#define MAC_CSR13_BIT5			FIELD32(0x00000020)
-#define MAC_CSR13_BIT6			FIELD32(0x00000040)
-#define MAC_CSR13_BIT7			FIELD32(0x00000080)
-#define MAC_CSR13_BIT8			FIELD32(0x00000100)
-#define MAC_CSR13_BIT9			FIELD32(0x00000200)
-#define MAC_CSR13_BIT10			FIELD32(0x00000400)
-#define MAC_CSR13_BIT11			FIELD32(0x00000800)
-#define MAC_CSR13_BIT12			FIELD32(0x00001000)
+#define MAC_CSR13_VAL0			FIELD32(0x00000001)
+#define MAC_CSR13_VAL1			FIELD32(0x00000002)
+#define MAC_CSR13_VAL2			FIELD32(0x00000004)
+#define MAC_CSR13_VAL3			FIELD32(0x00000008)
+#define MAC_CSR13_VAL4			FIELD32(0x00000010)
+#define MAC_CSR13_VAL5			FIELD32(0x00000020)
+#define MAC_CSR13_DIR0			FIELD32(0x00000100)
+#define MAC_CSR13_DIR1			FIELD32(0x00000200)
+#define MAC_CSR13_DIR2			FIELD32(0x00000400)
+#define MAC_CSR13_DIR3			FIELD32(0x00000800)
+#define MAC_CSR13_DIR4			FIELD32(0x00001000)
+#define MAC_CSR13_DIR5			FIELD32(0x00002000)
 
 /*
  * MAC_CSR14: LED control register.
@@ -403,7 +411,7 @@ struct hw_pairwise_ta_entry {
  * DROP_VERSION_ERROR: Drop version error frame.
  * DROP_MULTICAST: Drop multicast frames.
  * DROP_BORADCAST: Drop broadcast frames.
- * ROP_ACK_CTS: Drop received ACK and CTS.
+ * DROP_ACK_CTS: Drop received ACK and CTS.
  */
 #define TXRX_CSR0			0x3040
 #define TXRX_CSR0_RX_ACK_TIMEOUT	FIELD32(0x000001ff)
@@ -775,25 +783,25 @@ struct hw_pairwise_ta_entry {
  */
 
 /*
- * AC0_BASE_CSR: AC_BK base address.
+ * AC0_BASE_CSR: AC_VO base address.
  */
 #define AC0_BASE_CSR			0x3400
 #define AC0_BASE_CSR_RING_REGISTER	FIELD32(0xffffffff)
 
 /*
- * AC1_BASE_CSR: AC_BE base address.
+ * AC1_BASE_CSR: AC_VI base address.
  */
 #define AC1_BASE_CSR			0x3404
 #define AC1_BASE_CSR_RING_REGISTER	FIELD32(0xffffffff)
 
 /*
- * AC2_BASE_CSR: AC_VI base address.
+ * AC2_BASE_CSR: AC_BE base address.
  */
 #define AC2_BASE_CSR			0x3408
 #define AC2_BASE_CSR_RING_REGISTER	FIELD32(0xffffffff)
 
 /*
- * AC3_BASE_CSR: AC_VO base address.
+ * AC3_BASE_CSR: AC_BK base address.
  */
 #define AC3_BASE_CSR			0x340c
 #define AC3_BASE_CSR_RING_REGISTER	FIELD32(0xffffffff)
@@ -805,7 +813,7 @@ struct hw_pairwise_ta_entry {
 #define MGMT_BASE_CSR_RING_REGISTER	FIELD32(0xffffffff)
 
 /*
- * TX_RING_CSR0: TX Ring size for AC_BK, AC_BE, AC_VI, AC_VO.
+ * TX_RING_CSR0: TX Ring size for AC_VO, AC_VI, AC_BE, AC_BK.
  */
 #define TX_RING_CSR0			0x3418
 #define TX_RING_CSR0_AC0_RING_SIZE	FIELD32(0x000000ff)
@@ -824,10 +832,10 @@ struct hw_pairwise_ta_entry {
 
 /*
  * AIFSN_CSR: AIFSN for each EDCA AC.
- * AIFSN0: For AC_BK.
- * AIFSN1: For AC_BE.
- * AIFSN2: For AC_VI.
- * AIFSN3: For AC_VO.
+ * AIFSN0: For AC_VO.
+ * AIFSN1: For AC_VI.
+ * AIFSN2: For AC_BE.
+ * AIFSN3: For AC_BK.
  */
 #define AIFSN_CSR			0x3420
 #define AIFSN_CSR_AIFSN0		FIELD32(0x0000000f)
@@ -837,10 +845,10 @@ struct hw_pairwise_ta_entry {
 
 /*
  * CWMIN_CSR: CWmin for each EDCA AC.
- * CWMIN0: For AC_BK.
- * CWMIN1: For AC_BE.
- * CWMIN2: For AC_VI.
- * CWMIN3: For AC_VO.
+ * CWMIN0: For AC_VO.
+ * CWMIN1: For AC_VI.
+ * CWMIN2: For AC_BE.
+ * CWMIN3: For AC_BK.
  */
 #define CWMIN_CSR			0x3424
 #define CWMIN_CSR_CWMIN0		FIELD32(0x0000000f)
@@ -850,10 +858,10 @@ struct hw_pairwise_ta_entry {
 
 /*
  * CWMAX_CSR: CWmax for each EDCA AC.
- * CWMAX0: For AC_BK.
- * CWMAX1: For AC_BE.
- * CWMAX2: For AC_VI.
- * CWMAX3: For AC_VO.
+ * CWMAX0: For AC_VO.
+ * CWMAX1: For AC_VI.
+ * CWMAX2: For AC_BE.
+ * CWMAX3: For AC_BK.
  */
 #define CWMAX_CSR			0x3428
 #define CWMAX_CSR_CWMAX0		FIELD32(0x0000000f)
@@ -874,14 +882,14 @@ struct hw_pairwise_ta_entry {
 
 /*
  * TX_CNTL_CSR: KICK/Abort TX.
- * KICK_TX_AC0: For AC_BK.
- * KICK_TX_AC1: For AC_BE.
- * KICK_TX_AC2: For AC_VI.
- * KICK_TX_AC3: For AC_VO.
- * ABORT_TX_AC0: For AC_BK.
- * ABORT_TX_AC1: For AC_BE.
- * ABORT_TX_AC2: For AC_VI.
- * ABORT_TX_AC3: For AC_VO.
+ * KICK_TX_AC0: For AC_VO.
+ * KICK_TX_AC1: For AC_VI.
+ * KICK_TX_AC2: For AC_BE.
+ * KICK_TX_AC3: For AC_BK.
+ * ABORT_TX_AC0: For AC_VO.
+ * ABORT_TX_AC1: For AC_VI.
+ * ABORT_TX_AC2: For AC_BE.
+ * ABORT_TX_AC3: For AC_BK.
  */
 #define TX_CNTL_CSR			0x3430
 #define TX_CNTL_CSR_KICK_TX_AC0		FIELD32(0x00000001)
@@ -1001,18 +1009,18 @@ struct hw_pairwise_ta_entry {
 #define E2PROM_CSR_LOAD_STATUS		FIELD32(0x00000040)
 
 /*
- * AC_TXOP_CSR0: AC_BK/AC_BE TXOP register.
- * AC0_TX_OP: For AC_BK, in unit of 32us.
- * AC1_TX_OP: For AC_BE, in unit of 32us.
+ * AC_TXOP_CSR0: AC_VO/AC_VI TXOP register.
+ * AC0_TX_OP: For AC_VO, in unit of 32us.
+ * AC1_TX_OP: For AC_VI, in unit of 32us.
  */
 #define AC_TXOP_CSR0			0x3474
 #define AC_TXOP_CSR0_AC0_TX_OP		FIELD32(0x0000ffff)
 #define AC_TXOP_CSR0_AC1_TX_OP		FIELD32(0xffff0000)
 
 /*
- * AC_TXOP_CSR1: AC_VO/AC_VI TXOP register.
- * AC2_TX_OP: For AC_VI, in unit of 32us.
- * AC3_TX_OP: For AC_VO, in unit of 32us.
+ * AC_TXOP_CSR1: AC_BE/AC_BK TXOP register.
+ * AC2_TX_OP: For AC_BE, in unit of 32us.
+ * AC3_TX_OP: For AC_BK, in unit of 32us.
  */
 #define AC_TXOP_CSR1			0x3478
 #define AC_TXOP_CSR1_AC2_TX_OP		FIELD32(0x0000ffff)

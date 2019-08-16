@@ -83,8 +83,8 @@ static inline unsigned long pgd_entry_type(struct mm_struct *mm)
 	return _REGION2_ENTRY_EMPTY;
 }
 
-int crst_table_upgrade(struct mm_struct *, unsigned long limit);
-void crst_table_downgrade(struct mm_struct *, unsigned long limit);
+int crst_table_upgrade(struct mm_struct *);
+void crst_table_downgrade(struct mm_struct *);
 
 static inline pud_t *pud_alloc_one(struct mm_struct *mm, unsigned long address)
 {
@@ -143,7 +143,8 @@ static inline pgd_t *pgd_alloc(struct mm_struct *mm)
 	spin_lock_init(&mm->context.list_lock);
 	INIT_LIST_HEAD(&mm->context.crst_list);
 	INIT_LIST_HEAD(&mm->context.pgtable_list);
-	return (pgd_t *) crst_table_alloc(mm, s390_noexec);
+	return (pgd_t *)
+		crst_table_alloc(mm, user_mode == SECONDARY_SPACE_MODE);
 }
 #define pgd_free(mm, pgd) crst_table_free(mm, (unsigned long *) pgd)
 

@@ -144,6 +144,10 @@ static inline u64 get_jiffies_64(void)
 	 ((__s64)(a) - (__s64)(b) >= 0))
 #define time_before_eq64(a,b)	time_after_eq64(b,a)
 
+#define time_in_range64(a, b, c) \
+	(time_after_eq64(a, b) && \
+	 time_before_eq64(a, c))
+
 /*
  * These four macros compare jiffies and 'a' for convenience.
  */
@@ -307,6 +311,8 @@ extern clock_t jiffies_to_clock_t(long x);
 extern unsigned long clock_t_to_jiffies(unsigned long x);
 extern u64 jiffies_64_to_clock_t(u64 x);
 extern u64 nsec_to_clock_t(u64 x);
+extern u64 nsecs_to_jiffies64(u64 n);
+extern unsigned long nsecs_to_jiffies(u64 n);
 
 #define TIMESTAMP_SIZE	30
 

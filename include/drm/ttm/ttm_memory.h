@@ -30,9 +30,11 @@
 
 #include <linux/workqueue.h>
 #include <linux/spinlock.h>
+#include <linux/bug.h>
 #include <linux/wait.h>
 #include <linux/errno.h>
 #include <linux/kobject.h>
+#include <linux/mm.h>
 
 /**
  * struct ttm_mem_shrink - callback to shrink TTM memory usage.
@@ -40,7 +42,7 @@
  * @do_shrink: The callback function.
  *
  * Arguments to the do_shrink functions are intended to be passed using
- * inheritance. That is, the argument class derives from struct ttm_mem_srink,
+ * inheritance. That is, the argument class derives from struct ttm_mem_shrink,
  * and can be accessed using container_of().
  */
 
@@ -58,7 +60,6 @@ struct ttm_mem_shrink {
  * for the GPU, and this will otherwise block other workqueue tasks(?)
  * At this point we use only a single-threaded workqueue.
  * @work: The workqueue callback for the shrink queue.
- * @queue: Wait queue for processes suspended waiting for memory.
  * @lock: Lock to protect the @shrink - and the memory accounting members,
  * that is, essentially the whole structure with some exceptions.
  * @zones: Array of pointers to accounting zones.
@@ -78,7 +79,6 @@ struct ttm_mem_global {
 	struct ttm_mem_shrink *shrink;
 	struct workqueue_struct *swap_queue;
 	struct work_struct work;
-	wait_queue_head_t queue;
 	spinlock_t lock;
 	struct ttm_mem_zone *zones[TTM_MEM_MAX_ZONES];
 	unsigned int num_zones;

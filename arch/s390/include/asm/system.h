@@ -9,6 +9,7 @@
 
 #include <linux/kernel.h>
 #include <linux/errno.h>
+#include <asm/alternative.h>
 #include <asm/types.h>
 #include <asm/ptrace.h>
 #include <asm/setup.h>
@@ -20,59 +21,96 @@
 struct task_struct;
 
 extern struct task_struct *__switch_to(void *, void *);
+extern void update_per_regs(struct task_struct *task);
 
-static inline void save_fp_regs(s390_fp_regs *fpregs)
+static inline int test_fp_ctl(u32 fpc)
 {
-	asm volatile(
-		"	std	0,8(%1)\n"
-		"	std	2,24(%1)\n"
-		"	std	4,40(%1)\n"
-		"	std	6,56(%1)"
-		: "=m" (*fpregs) : "a" (fpregs), "m" (*fpregs) : "memory");
+	u32 orig_fpc;
+	int rc;
+
 	if (!MACHINE_HAS_IEEE)
-		return;
+		return 0;
+
 	asm volatile(
-		"	stfpc	0(%1)\n"
-		"	std	1,16(%1)\n"
-		"	std	3,32(%1)\n"
-		"	std	5,48(%1)\n"
-		"	std	7,64(%1)\n"
-		"	std	8,72(%1)\n"
-		"	std	9,80(%1)\n"
-		"	std	10,88(%1)\n"
-		"	std	11,96(%1)\n"
-		"	std	12,104(%1)\n"
-		"	std	13,112(%1)\n"
-		"	std	14,120(%1)\n"
-		"	std	15,128(%1)\n"
-		: "=m" (*fpregs) : "a" (fpregs), "m" (*fpregs) : "memory");
+		"	efpc    %1\n"
+		"	sfpc	%2\n"
+		"0:	sfpc	%1\n"
+		"	la	%0,0\n"
+		"1:\n"
+		EX_TABLE(0b,1b)
+		: "=d" (rc), "=&d" (orig_fpc)
+		: "d" (fpc), "0" (-EINVAL));
+	return rc;
 }
 
-static inline void restore_fp_regs(s390_fp_regs *fpregs)
+static inline void save_fp_ctl(u32 *fpc)
 {
-	asm volatile(
-		"	ld	0,8(%0)\n"
-		"	ld	2,24(%0)\n"
-		"	ld	4,40(%0)\n"
-		"	ld	6,56(%0)"
-		: : "a" (fpregs), "m" (*fpregs));
 	if (!MACHINE_HAS_IEEE)
 		return;
+
 	asm volatile(
-		"	lfpc	0(%0)\n"
-		"	ld	1,16(%0)\n"
-		"	ld	3,32(%0)\n"
-		"	ld	5,48(%0)\n"
-		"	ld	7,64(%0)\n"
-		"	ld	8,72(%0)\n"
-		"	ld	9,80(%0)\n"
-		"	ld	10,88(%0)\n"
-		"	ld	11,96(%0)\n"
-		"	ld	12,104(%0)\n"
-		"	ld	13,112(%0)\n"
-		"	ld	14,120(%0)\n"
-		"	ld	15,128(%0)\n"
-		: : "a" (fpregs), "m" (*fpregs));
+		"       stfpc   %0\n"
+		: "+Q" (*fpc));
+}
+
+static inline int restore_fp_ctl(u32 *fpc)
+{
+	int rc;
+
+	if (!MACHINE_HAS_IEEE)
+		return 0;
+
+	asm volatile(
+		"	lfpc    %1\n"
+		"0:	la	%0,0\n"
+		"1:\n"
+		EX_TABLE(0b,1b)
+		: "=d" (rc) : "Q" (*fpc), "0" (-EINVAL));
+	return rc;
+}
+
+static inline void save_fp_regs(freg_t *fprs)
+{
+	asm volatile("std 0,%0" : "=Q" (fprs[0]));
+	asm volatile("std 2,%0" : "=Q" (fprs[2]));
+	asm volatile("std 4,%0" : "=Q" (fprs[4]));
+	asm volatile("std 6,%0" : "=Q" (fprs[6]));
+	if (!MACHINE_HAS_IEEE)
+		return;
+	asm volatile("std 1,%0" : "=Q" (fprs[1]));
+	asm volatile("std 3,%0" : "=Q" (fprs[3]));
+	asm volatile("std 5,%0" : "=Q" (fprs[5]));
+	asm volatile("std 7,%0" : "=Q" (fprs[7]));
+	asm volatile("std 8,%0" : "=Q" (fprs[8]));
+	asm volatile("std 9,%0" : "=Q" (fprs[9]));
+	asm volatile("std 10,%0" : "=Q" (fprs[10]));
+	asm volatile("std 11,%0" : "=Q" (fprs[11]));
+	asm volatile("std 12,%0" : "=Q" (fprs[12]));
+	asm volatile("std 13,%0" : "=Q" (fprs[13]));
+	asm volatile("std 14,%0" : "=Q" (fprs[14]));
+	asm volatile("std 15,%0" : "=Q" (fprs[15]));
+}
+
+static inline void restore_fp_regs(freg_t *fprs)
+{
+	asm volatile("ld 0,%0" : : "Q" (fprs[0]));
+	asm volatile("ld 2,%0" : : "Q" (fprs[2]));
+	asm volatile("ld 4,%0" : : "Q" (fprs[4]));
+	asm volatile("ld 6,%0" : : "Q" (fprs[6]));
+	if (!MACHINE_HAS_IEEE)
+		return;
+	asm volatile("ld 1,%0" : : "Q" (fprs[1]));
+	asm volatile("ld 3,%0" : : "Q" (fprs[3]));
+	asm volatile("ld 5,%0" : : "Q" (fprs[5]));
+	asm volatile("ld 7,%0" : : "Q" (fprs[7]));
+	asm volatile("ld 8,%0" : : "Q" (fprs[8]));
+	asm volatile("ld 9,%0" : : "Q" (fprs[9]));
+	asm volatile("ld 10,%0" : : "Q" (fprs[10]));
+	asm volatile("ld 11,%0" : : "Q" (fprs[11]));
+	asm volatile("ld 12,%0" : : "Q" (fprs[12]));
+	asm volatile("ld 13,%0" : : "Q" (fprs[13]));
+	asm volatile("ld 14,%0" : : "Q" (fprs[14]));
+	asm volatile("ld 15,%0" : : "Q" (fprs[15]));
 }
 
 static inline void save_access_regs(unsigned int *acrs)
@@ -88,10 +126,15 @@ static inline void restore_access_regs(unsigned int *acrs)
 #define switch_to(prev,next,last) do {					     \
 	if (prev == next)						     \
 		break;							     \
-	save_fp_regs(&prev->thread.fp_regs);				     \
-	restore_fp_regs(&next->thread.fp_regs);				     \
+	save_fp_ctl(&prev->thread.fp_regs.fpc);				     \
+	save_fp_regs(prev->thread.fp_regs.fprs);			     \
+	restore_fp_ctl(&next->thread.fp_regs.fpc);			     \
+	restore_fp_regs(next->thread.fp_regs.fprs);			     \
 	save_access_regs(&prev->thread.acrs[0]);			     \
+	save_ri_cb(prev->thread.ri_cb);					     \
 	restore_access_regs(&next->thread.acrs[0]);			     \
+	restore_ri_cb(next->thread.ri_cb, prev->thread.ri_cb);		     \
+	update_per_regs(next);						     \
 	prev = __switch_to(prev,next);					     \
 } while (0)
 
@@ -110,6 +153,10 @@ extern void pfault_fini(void);
 #endif /* CONFIG_PFAULT */
 
 extern void cmma_init(void);
+extern int memcpy_real(void *, void *, size_t);
+extern void copy_to_absolute_zero(void *dest, void *src, size_t count);
+extern int copy_to_user_real(void __user *dest, void *src, size_t count);
+extern int copy_from_user_real(void *dest, void __user *src, size_t count);
 
 #define finish_arch_switch(prev) do {					     \
 	set_fs(current->thread.mm_segment);				     \
@@ -281,6 +328,38 @@ __cmpxchg(volatile void *ptr, unsigned long old, unsigned long new, int size)
  * all memory ops have completed wrt other CPU's ( see 7-15 POP  DJB ).
  */
 
+static inline void gmb(void)
+{
+	asm volatile(
+		ALTERNATIVE("", ".long 0xb2e8f000", 81)
+		: : : "memory");
+}
+#define gmb gmb
+
+/**
+ * array_index_mask_nospec - generate a mask for array_idx() that is
+ * ~0UL when the bounds check succeeds and 0 otherwise
+ * @index: array element index
+ * @size: number of elements in array
+ */
+#define array_index_mask_nospec array_index_mask_nospec
+static inline unsigned long array_index_mask_nospec(unsigned long index,
+						    unsigned long size)
+{
+	unsigned long mask;
+
+	if (__builtin_constant_p(size) && size > 0) {
+		asm("	clgr	%2,%1\n"
+		    "	slbgr	%0,%0\n"
+		    :"=d" (mask) : "d" (size-1), "d" (index) :"cc");
+		return mask;
+	}
+	asm("	clgr	%1,%2\n"
+	    "	slbgr	%0,%0\n"
+	    :"=d" (mask) : "d" (size), "d" (index) :"cc");
+	return ~mask;
+}
+
 #define eieio()	asm volatile("bcr 15,0" : : : "memory")
 #define SYNC_OTHER_CORES(x)   eieio()
 #define mb()    eieio()
@@ -293,7 +372,6 @@ __cmpxchg(volatile void *ptr, unsigned long old, unsigned long new, int size)
 #define smp_read_barrier_depends()    read_barrier_depends()
 #define smp_mb__before_clear_bit()     smp_mb()
 #define smp_mb__after_clear_bit()      smp_mb()
-
 
 #define set_mb(var, value)      do { var = value; mb(); } while (0)
 
@@ -455,11 +533,6 @@ extern void (*_machine_halt)(void);
 extern void (*_machine_power_off)(void);
 
 #define arch_align_stack(x) (x)
-
-#ifdef CONFIG_TRACE_IRQFLAGS
-extern psw_t sysc_restore_trace_psw;
-extern psw_t io_restore_trace_psw;
-#endif
 
 static inline int tprot(unsigned long addr)
 {

@@ -14,7 +14,9 @@
 #define ILO_NAME "hpilo"
 
 /* max number of open channel control blocks per device, hw limited to 32 */
-#define MAX_CCB		8
+#define MAX_CCB		24
+/* min number of open channel control blocks per device, hw limited to 32 */
+#define MIN_CCB		8
 /* max number of supported devices */
 #define MAX_ILO_DEV	1
 /* max number of files */
@@ -68,21 +70,21 @@ struct ilo_hwinfo {
 struct ccb {
 	union {
 		char *send_fifobar;
-		u64 padding1;
+		u64 send_fifobar_pa;
 	} ccb_u1;
 	union {
 		char *send_desc;
-		u64 padding2;
+		u64 send_desc_pa;
 	} ccb_u2;
 	u64 send_ctrl;
 
 	union {
 		char *recv_fifobar;
-		u64 padding3;
+		u64 recv_fifobar_pa;
 	} ccb_u3;
 	union {
 		char *recv_desc;
-		u64 padding4;
+		u64 recv_desc_pa;
 	} ccb_u4;
 	u64 recv_ctrl;
 

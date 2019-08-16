@@ -21,16 +21,17 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
+#include <linux/vmalloc.h>
 
 /*
  * General memory allocation interfaces
  */
 
-#define KM_SLEEP	0x0001u
-#define KM_NOSLEEP	0x0002u
-#define KM_NOFS		0x0004u
-#define KM_MAYFAIL	0x0008u
-#define KM_LARGE	0x0010u
+typedef unsigned __bitwise xfs_km_flags_t;
+#define KM_SLEEP	((__force xfs_km_flags_t)0x0001u)
+#define KM_NOSLEEP	((__force xfs_km_flags_t)0x0002u)
+#define KM_NOFS		((__force xfs_km_flags_t)0x0004u)
+#define KM_MAYFAIL	((__force xfs_km_flags_t)0x0008u)
 
 /*
  * We use a special process flag to avoid recursive callbacks into
@@ -38,11 +39,11 @@
  * warnings, so we explicitly skip any generic ones (silly of us).
  */
 static inline gfp_t
-kmem_flags_convert(unsigned int __nocast flags)
+kmem_flags_convert(xfs_km_flags_t flags)
 {
 	gfp_t	lflags;
 
-	BUG_ON(flags & ~(KM_SLEEP|KM_NOSLEEP|KM_NOFS|KM_MAYFAIL|KM_LARGE));
+	BUG_ON(flags & ~(KM_SLEEP|KM_NOSLEEP|KM_NOFS|KM_MAYFAIL));
 
 	if (flags & KM_NOSLEEP) {
 		lflags = GFP_ATOMIC | __GFP_NOWARN;
@@ -54,11 +55,26 @@ kmem_flags_convert(unsigned int __nocast flags)
 	return lflags;
 }
 
-extern void *kmem_alloc(size_t, unsigned int __nocast);
-extern void *kmem_zalloc(size_t, unsigned int __nocast);
-extern void *kmem_zalloc_greedy(size_t *, size_t, size_t, unsigned int __nocast);
-extern void *kmem_realloc(const void *, size_t, size_t, unsigned int __nocast);
+extern void *kmem_alloc(size_t, xfs_km_flags_t);
+extern void *kmem_zalloc(size_t, xfs_km_flags_t);
+extern void *kmem_realloc(const void *, size_t, size_t, xfs_km_flags_t);
 extern void  kmem_free(const void *);
+
+static inline void *kmem_zalloc_large(size_t size)
+{
+	void *ptr;
+
+	ptr = vmalloc(size);
+	if (ptr)
+		memset(ptr, 0, size);
+	return ptr;
+}
+static inline void kmem_free_large(void *ptr)
+{
+	vfree(ptr);
+}
+
+extern void *kmem_zalloc_greedy(size_t *, size_t, size_t);
 
 /*
  * Zone interfaces
@@ -97,8 +113,8 @@ kmem_zone_destroy(kmem_zone_t *zone)
 		kmem_cache_destroy(zone);
 }
 
-extern void *kmem_zone_alloc(kmem_zone_t *, unsigned int __nocast);
-extern void *kmem_zone_zalloc(kmem_zone_t *, unsigned int __nocast);
+extern void *kmem_zone_alloc(kmem_zone_t *, xfs_km_flags_t);
+extern void *kmem_zone_zalloc(kmem_zone_t *, xfs_km_flags_t);
 
 static inline int
 kmem_shake_allow(gfp_t gfp_mask)

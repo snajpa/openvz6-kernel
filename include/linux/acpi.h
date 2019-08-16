@@ -35,6 +35,7 @@
 
 #include <linux/list.h>
 #include <linux/mod_devicetable.h>
+#include <linux/dynamic_debug.h>
 
 #include <acpi/acpi.h>
 #include <acpi/acpi_bus.h>
@@ -76,6 +77,12 @@ typedef int (*acpi_table_handler) (struct acpi_table_header *table);
 
 typedef int (*acpi_table_entry_handler) (struct acpi_subtable_header *header, const unsigned long end);
 
+struct acpi_subtable_proc {
+	int id;
+	acpi_table_entry_handler handler;
+	int count;
+};
+
 char * __acpi_map_table (unsigned long phys_addr, unsigned long size);
 void __acpi_unmap_table(char *map, unsigned long size);
 int early_acpi_boot_init(void);
@@ -86,8 +93,21 @@ int acpi_numa_init (void);
 
 int acpi_table_init (void);
 int acpi_table_parse (char *id, acpi_table_handler handler);
+int __init acpi_parse_entries(char *id, unsigned long table_size,
+			      acpi_table_entry_handler handler,
+			      struct acpi_table_header *table_header,
+			      int entry_id, unsigned int max_entries);
 int __init acpi_table_parse_entries(char *id, unsigned long table_size,
-	int entry_id, acpi_table_entry_handler handler, unsigned int max_entries);
+			      int entry_id,
+			      acpi_table_entry_handler handler,
+			      unsigned int max_entries);
+int __init acpi_table_parse_entries(char *id, unsigned long table_size,
+			      int entry_id,
+			      acpi_table_entry_handler handler,
+			      unsigned int max_entries);
+int __init acpi_table_parse_entries_array(char *id, unsigned long table_size,
+			      struct acpi_subtable_proc *proc, int proc_num,
+			      unsigned int max_entries);
 int acpi_table_parse_madt (enum acpi_madt_type id, acpi_table_entry_handler handler, unsigned int max_entries);
 int acpi_parse_mcfg (struct acpi_table_header *header);
 void acpi_table_print_madt_entry (struct acpi_subtable_header *madt);
@@ -101,7 +121,7 @@ void acpi_numa_arch_fixup(void);
 
 #ifdef CONFIG_ACPI_HOTPLUG_CPU
 /* Arch dependent functions for cpu hotplug support */
-int acpi_map_lsapic(acpi_handle handle, int *pcpu);
+int acpi_map_lsapic(acpi_handle handle, int physid, int *pcpu);
 int acpi_unmap_lsapic(int cpu);
 #endif /* CONFIG_ACPI_HOTPLUG_CPU */
 
@@ -221,14 +241,9 @@ extern void acpi_dmi_osi_linux(int enable, const struct dmi_system_id *d);
 extern int acpi_osi_setup(char *str);
 
 #ifdef CONFIG_ACPI_NUMA
-int acpi_get_pxm(acpi_handle handle);
-int acpi_get_node(acpi_handle *handle);
+int acpi_get_node(acpi_handle handle);
 #else
-static inline int acpi_get_pxm(acpi_handle handle)
-{
-	return 0;
-}
-static inline int acpi_get_node(acpi_handle *handle)
+static inline int acpi_get_node(acpi_handle handle)
 {
 	return 0;
 }
@@ -239,6 +254,26 @@ extern int pnpacpi_disabled;
 
 #define PXM_INVAL	(-1)
 #define NID_INVAL	(-1)
+
+bool acpi_dev_resource_memory(struct acpi_resource *ares, struct resource *res);
+bool acpi_dev_resource_io(struct acpi_resource *ares, struct resource *res);
+bool acpi_dev_resource_address_space(struct acpi_resource *ares,
+				     struct resource *res);
+bool acpi_dev_resource_ext_address_space(struct acpi_resource *ares,
+					 struct resource *res);
+unsigned long acpi_dev_irq_flags(u8 triggering, u8 polarity, u8 shareable);
+bool acpi_dev_resource_interrupt(struct acpi_resource *ares, int index,
+				 struct resource *res);
+
+struct resource_list_entry {
+	struct list_head node;
+	struct resource res;
+};
+
+void acpi_dev_free_resource_list(struct list_head *list);
+int acpi_dev_get_resources(struct acpi_device *adev, struct list_head *list,
+			   int (*preproc)(struct acpi_resource *, void *),
+			   void *preproc_data);
 
 int acpi_check_resource_conflict(struct resource *res);
 
@@ -253,10 +288,16 @@ void __init acpi_old_suspend_ordering(void);
 void __init acpi_s4_no_nvs(void);
 #endif /* CONFIG_PM_SLEEP */
 
+struct acpi_osc_context {
+	char *uuid_str; /* uuid string */
+	int rev;
+	struct acpi_buffer cap; /* arg2/arg3 */
+	struct acpi_buffer ret; /* free by caller if success */
+};
+
 #define OSC_QUERY_TYPE			0
 #define OSC_SUPPORT_TYPE 		1
 #define OSC_CONTROL_TYPE		2
-#define OSC_SUPPORT_MASKS		0x1f
 
 /* _OSC DW0 Definition */
 #define OSC_QUERY_ENABLE		1
@@ -265,12 +306,26 @@ void __init acpi_s4_no_nvs(void);
 #define OSC_INVALID_REVISION_ERROR	8
 #define OSC_CAPABILITIES_MASK_ERROR	16
 
+acpi_status acpi_str_to_uuid(char *str, u8 *uuid);
+acpi_status acpi_run_osc(acpi_handle handle, struct acpi_osc_context *context);
+
+/* platform-wide _OSC bits */
+#define OSC_SB_PAD_SUPPORT		1
+#define OSC_SB_PPC_OST_SUPPORT		2
+#define OSC_SB_PR3_SUPPORT		4
+#define OSC_SB_HOTPLUG_OST_SUPPORT	8
+#define OSC_SB_APEI_SUPPORT		16
+
+extern bool osc_sb_apei_support_acked;
+
+/* PCI defined _OSC bits */
 /* _OSC DW1 Definition (OS Support Fields) */
 #define OSC_EXT_PCI_CONFIG_SUPPORT		1
 #define OSC_ACTIVE_STATE_PWR_SUPPORT 		2
 #define OSC_CLOCK_PWR_CAPABILITY_SUPPORT	4
 #define OSC_PCI_SEGMENT_GROUPS_SUPPORT		8
 #define OSC_MSI_SUPPORT				16
+#define OSC_PCI_SUPPORT_MASKS			0x1f
 
 /* _OSC DW1 Definition (OS Control Fields) */
 #define OSC_PCI_EXPRESS_NATIVE_HP_CONTROL	1
@@ -279,13 +334,51 @@ void __init acpi_s4_no_nvs(void);
 #define OSC_PCI_EXPRESS_AER_CONTROL		8
 #define OSC_PCI_EXPRESS_CAP_STRUCTURE_CONTROL	16
 
-#define OSC_CONTROL_MASKS 	(OSC_PCI_EXPRESS_NATIVE_HP_CONTROL | 	\
+#define OSC_PCI_CONTROL_MASKS 	(OSC_PCI_EXPRESS_NATIVE_HP_CONTROL | 	\
 				OSC_SHPC_NATIVE_HP_CONTROL | 		\
 				OSC_PCI_EXPRESS_PME_CONTROL |		\
 				OSC_PCI_EXPRESS_AER_CONTROL |		\
 				OSC_PCI_EXPRESS_CAP_STRUCTURE_CONTROL)
+extern acpi_status acpi_pci_osc_control_set(acpi_handle handle,
+					     u32 *mask, u32 req);
 
-extern acpi_status acpi_pci_osc_control_set(acpi_handle handle, u32 flags);
+/* Enable _OST when all relevant hotplug operations are enabled */
+#if defined(CONFIG_ACPI_HOTPLUG_CPU) &&			\
+	(defined(CONFIG_ACPI_HOTPLUG_MEMORY) ||		\
+	 defined(CONFIG_ACPI_HOTPLUG_MEMORY_MODULE)) &&	\
+	(defined(CONFIG_ACPI_CONTAINER) ||		\
+	 defined(CONFIG_ACPI_CONTAINER_MODULE))
+#define ACPI_HOTPLUG_OST
+#endif
+
+/* _OST Source Event Code (OSPM Action) */
+#define ACPI_OST_EC_OSPM_SHUTDOWN		0x100
+#define ACPI_OST_EC_OSPM_EJECT			0x103
+#define ACPI_OST_EC_OSPM_INSERTION		0x200
+
+/* _OST General Processing Status Code */
+#define ACPI_OST_SC_SUCCESS			0x0
+#define ACPI_OST_SC_NON_SPECIFIC_FAILURE	0x1
+#define ACPI_OST_SC_UNRECOGNIZED_NOTIFY		0x2
+
+/* _OST OS Shutdown Processing (0x100) Status Code */
+#define ACPI_OST_SC_OS_SHUTDOWN_DENIED		0x80
+#define ACPI_OST_SC_OS_SHUTDOWN_IN_PROGRESS	0x81
+#define ACPI_OST_SC_OS_SHUTDOWN_COMPLETED	0x82
+#define ACPI_OST_SC_OS_SHUTDOWN_NOT_SUPPORTED	0x83
+
+/* _OST Ejection Request (0x3, 0x103) Status Code */
+#define ACPI_OST_SC_EJECT_NOT_SUPPORTED		0x80
+#define ACPI_OST_SC_DEVICE_IN_USE		0x81
+#define ACPI_OST_SC_DEVICE_BUSY			0x82
+#define ACPI_OST_SC_EJECT_DEPENDENCY_BUSY	0x83
+#define ACPI_OST_SC_EJECT_IN_PROGRESS		0x84
+
+/* _OST Insertion Request (0x200) Status Code */
+#define ACPI_OST_SC_INSERT_IN_PROGRESS		0x80
+#define ACPI_OST_SC_DRIVER_LOAD_FAILURE		0x81
+#define ACPI_OST_SC_INSERT_NOT_SUPPORTED	0x82
+
 extern void acpi_early_init(void);
 
 #else	/* !CONFIG_ACPI */
@@ -337,4 +430,65 @@ static inline int acpi_table_parse(char *id,
 	return -1;
 }
 #endif	/* !CONFIG_ACPI */
+
+#ifdef CONFIG_ACPI
+__printf(3, 4)
+void acpi_handle_printk(const char *level, acpi_handle handle,
+			const char *fmt, ...);
+#else	/* !CONFIG_ACPI */
+static inline __printf(3, 4) void
+acpi_handle_printk(const char *level, void *handle, const char *fmt, ...) {}
+#endif	/* !CONFIG_ACPI */
+
+#if defined(CONFIG_ACPI) && defined(CONFIG_DYNAMIC_DEBUG)
+__printf(3, 4)
+void __acpi_handle_debug(struct _ddebug *descriptor, acpi_handle handle, const char *fmt, ...);
+#else
+#define __acpi_handle_debug(descriptor, handle, fmt, ...)		\
+	acpi_handle_printk(KERN_DEBUG, handle, fmt, ##__VA_ARGS__);
+#endif
+
+/*
+ * acpi_handle_<level>: Print message with ACPI prefix and object path
+ *
+ * These interfaces acquire the global namespace mutex to obtain an object
+ * path.  In interrupt context, it shows the object path as <n/a>.
+ */
+#define acpi_handle_emerg(handle, fmt, ...)				\
+	acpi_handle_printk(KERN_EMERG, handle, fmt, ##__VA_ARGS__)
+#define acpi_handle_alert(handle, fmt, ...)				\
+	acpi_handle_printk(KERN_ALERT, handle, fmt, ##__VA_ARGS__)
+#define acpi_handle_crit(handle, fmt, ...)				\
+	acpi_handle_printk(KERN_CRIT, handle, fmt, ##__VA_ARGS__)
+#define acpi_handle_err(handle, fmt, ...)				\
+	acpi_handle_printk(KERN_ERR, handle, fmt, ##__VA_ARGS__)
+#define acpi_handle_warn(handle, fmt, ...)				\
+	acpi_handle_printk(KERN_WARNING, handle, fmt, ##__VA_ARGS__)
+#define acpi_handle_notice(handle, fmt, ...)				\
+	acpi_handle_printk(KERN_NOTICE, handle, fmt, ##__VA_ARGS__)
+#define acpi_handle_info(handle, fmt, ...)				\
+	acpi_handle_printk(KERN_INFO, handle, fmt, ##__VA_ARGS__)
+
+#if defined(DEBUG)
+#define acpi_handle_debug(handle, fmt, ...)				\
+	acpi_handle_printk(KERN_DEBUG, handle, fmt, ##__VA_ARGS__)
+#else
+#if defined(CONFIG_DYNAMIC_DEBUG)
+#define acpi_handle_debug(handle, fmt, ...)				\
+do {									\
+	DEFINE_DYNAMIC_DEBUG_METADATA(descriptor, fmt);			\
+	if (unlikely(descriptor.flags & _DPRINTK_FLAGS_PRINT))		\
+		__acpi_handle_debug(&descriptor, handle, pr_fmt(fmt),	\
+				##__VA_ARGS__);				\
+} while (0)
+#else
+#define acpi_handle_debug(handle, fmt, ...)				\
+({									\
+	if (0)								\
+		acpi_handle_printk(KERN_DEBUG, handle, fmt, ##__VA_ARGS__); \
+	0;								\
+})
+#endif
+#endif
+
 #endif	/*_LINUX_ACPI_H*/

@@ -3,9 +3,11 @@
 #include <linux/mm.h>
 
 #include <linux/io.h>
+#include <linux/random.h>
 #include <asm/processor.h>
 #include <asm/apic.h>
 #include <asm/cpu.h>
+#include <asm/nospec-branch.h>
 #include <asm/pci-direct.h>
 
 #ifdef CONFIG_X86_64
@@ -253,60 +255,55 @@ static int __cpuinit nearby_node(int apicid)
 #endif
 
 /*
- * Fixup core topology information for AMD multi-node processors.
- * Assumption 1: Number of cores in each internal node is the same.
- * Assumption 2: Mixed systems with both single-node and dual-node
- *               processors are not supported.
+ * Fixup core topology information for
+ * (1) AMD multi-node processors
+ *     Assumption: Number of cores in each internal node is the same.
+ * (2) AMD processors supporting compute units
  */
 #ifdef CONFIG_X86_HT
-static void __cpuinit amd_fixup_dcm(struct cpuinfo_x86 *c)
+static void __cpuinit amd_get_topology(struct cpuinfo_x86 *c)
 {
-#ifdef CONFIG_PCI
-	u32 t, cpn;
-	u8 n, n_id;
+	u32 nodes, cores_per_cu = 1;
+	u8 node_id;
 	int cpu = smp_processor_id();
 
-	/* fixup topology information only once for a core */
-	if (cpu_has(c, X86_FEATURE_AMD_DCM))
+	/* get information required for multi-node processors */
+	if (cpu_has_topoext) {
+		u32 eax, ebx, ecx, edx;
+
+		cpuid(0x8000001e, &eax, &ebx, &ecx, &edx);
+		nodes = ((ecx >> 8) & 7) + 1;
+		node_id = ecx & 7;
+
+		/* get compute unit information */
+		smp_num_siblings = ((ebx >> 8) & 3) + 1;
+		c->compute_unit_id = ebx & 0xff;
+		cores_per_cu += ((ebx >> 8) & 3);
+	} else if (cpu_has(c, X86_FEATURE_NODEID_MSR)) {
+		u64 value;
+
+		rdmsrl(MSR_FAM10H_NODE_ID, value);
+		nodes = ((value >> 3) & 7) + 1;
+		node_id = value & 7;
+	} else
 		return;
 
-	/* check for multi-node processor on boot cpu */
-	t = read_pci_config(0, 24, 3, 0xe8);
-	if (!(t & (1 << 29)))
-		return;
+	/* fixup multi-node processor information */
+	if (nodes > 1) {
+		u32 cores_per_node;
+		u32 cus_per_node;
 
-	set_cpu_cap(c, X86_FEATURE_AMD_DCM);
+		set_cpu_cap(c, X86_FEATURE_AMD_DCM);
+		cores_per_node = c->x86_max_cores / nodes;
+		cus_per_node = cores_per_node / cores_per_cu;
 
-	/* cores per node: each internal node has half the number of cores */
-	cpn = c->x86_max_cores >> 1;
+		/* store NodeID, use llc_shared_map to store sibling info */
+		per_cpu(cpu_llc_id, cpu) = node_id;
 
-	/* even-numbered NB_id of this dual-node processor */
-	n = c->phys_proc_id << 1;
-
-	/*
-	 * determine internal node id and assign cores fifty-fifty to
-	 * each node of the dual-node processor
-	 */
-	t = read_pci_config(0, 24 + n, 3, 0xe8);
-	n = (t>>30) & 0x3;
-	if (n == 0) {
-		if (c->cpu_core_id < cpn)
-			n_id = 0;
-		else
-			n_id = 1;
-	} else {
-		if (c->cpu_core_id < cpn)
-			n_id = 1;
-		else
-			n_id = 0;
+		/* core id has to be in the [0 .. cores_per_node - 1] range */
+		c->cpu_core_id %= cores_per_node;
+		c->compute_unit_id %= cus_per_node;
 	}
-
-	/* compute entire NodeID, use llc_shared_map to store sibling info */
-	per_cpu(cpu_llc_id, cpu) = (c->phys_proc_id << 1) + n_id;
-
-	/* fixup core id to be in range from 0 to cpn */
-	c->cpu_core_id = c->cpu_core_id % cpn;
-#endif
 }
 #endif
 
@@ -327,9 +324,7 @@ static void __cpuinit amd_detect_cmp(struct cpuinfo_x86 *c)
 	c->phys_proc_id = c->initial_apicid >> bits;
 	/* use socket ID also for last level cache */
 	per_cpu(cpu_llc_id, cpu) = c->phys_proc_id;
-	/* fixup topology information on multi-node processors */
-	if ((c->x86 == 0x10) && (c->x86_model == 9))
-		amd_fixup_dcm(c);
+	amd_get_topology(c);
 #endif
 }
 
@@ -375,8 +370,6 @@ static void __cpuinit srat_detect_node(struct cpuinfo_x86 *c)
 			node = nearby_node(apicid);
 	}
 	numa_set_node(cpu, node);
-
-	printk(KERN_INFO "CPU %d/0x%x -> Node %d\n", cpu, apicid, node);
 #endif
 }
 
@@ -406,6 +399,24 @@ static void __cpuinit early_init_amd_mc(struct cpuinfo_x86 *c)
 #endif
 }
 
+static void __cpuinit bsp_init_amd(struct cpuinfo_x86 *c)
+{
+	if (c->x86 == 0x15) {
+		unsigned long upperbit;
+		u32 cpuid, assoc;
+
+		cpuid    = cpuid_edx(0x80000005);
+		assoc    = cpuid >> 16 & 0xff;
+		upperbit = ((cpuid >> 24) << 10) / assoc;
+
+		va_align.mask     = (upperbit - 1) & PAGE_MASK;
+		va_align.flags    = ALIGN_VA_32 | ALIGN_VA_64;
+
+		/* A random value per boot for bit slice [12:upper_bit) */
+		va_align.bits = get_random_int() & va_align.mask;
+	}
+}
+
 static void __cpuinit early_init_amd(struct cpuinfo_x86 *c)
 {
 	early_init_amd_mc(c);
@@ -429,14 +440,67 @@ static void __cpuinit early_init_amd(struct cpuinfo_x86 *c)
 			set_cpu_cap(c, X86_FEATURE_K6_MTRR);
 #endif
 #if defined(CONFIG_X86_LOCAL_APIC) && defined(CONFIG_PCI)
-	/* check CPU config space for extended APIC ID */
-	if (cpu_has_apic && c->x86 >= 0xf) {
+	/*
+	 * ApicID can always be treated as an 8-bit value for AMD APIC versions
+	 * >= 0x10, but even old K8s came out of reset with version 0x10. So, we
+	 * can safely set X86_FEATURE_EXTD_APICID unconditionally for families
+	 * after 16h.
+	 */
+	if (cpu_has_apic && c->x86 > 0x16) {
+		set_cpu_cap(c, X86_FEATURE_EXTD_APICID);
+	} else if (cpu_has_apic && c->x86 >= 0xf) {
+		/* check CPU config space for extended APIC ID */
 		unsigned int val;
 		val = read_pci_config(0, 24, 0, 0x68);
 		if ((val & ((1 << 17) | (1 << 18))) == ((1 << 17) | (1 << 18)))
 			set_cpu_cap(c, X86_FEATURE_EXTD_APICID);
 	}
 #endif
+
+	/* We need to do the following only once */
+	if (c != &boot_cpu_data)
+		return;
+
+	if (cpu_has(c, X86_FEATURE_CONSTANT_TSC)) {
+
+		if (c->x86 > 0x10 ||
+		    (c->x86 == 0x10 && c->x86_model >= 0x2)) {
+			u64 val;
+
+			rdmsrl(MSR_K7_HWCR, val);
+			if (!(val & BIT(24)))
+				printk(KERN_WARNING FW_BUG "TSC doesn't count "
+					"with P0 frequency!\n");
+		}
+	}
+
+	if (c->x86 >= 0x15 && c->x86 <= 0x17) {
+		unsigned int bit;
+
+		switch (c->x86) {
+		case 0x15: bit = 54; break;
+		case 0x16: bit = 33; break;
+		case 0x17: bit = 10; break;
+		default: return;
+		}
+		/*
+		 * Try to cache the base value so further operations can
+		 * avoid RMW. If that faults, do not enable SSBD.
+		 *
+		 * RHEL6 specific:
+		 * The access of the non-architectural MSR_AMD64_LS_CFG
+		 * MSR may cause fault in a VM. Fault in early boot may
+		 * panic the system. As a result, we have to disable the
+		 * AMD SSBD mitigation when running in a VM for the time
+		 * being.
+		 */
+		if (!boot_cpu_has(X86_FEATURE_HYPERVISOR) &&
+		    !rdmsrl_safe(MSR_AMD64_LS_CFG, &x86_amd_ls_cfg_base)) {
+			setup_force_cpu_cap(X86_FEATURE_SSBD);
+			setup_force_cpu_cap(X86_FEATURE_AMD_SSBD);
+			x86_amd_ls_cfg_ssbd_mask = (1ULL << bit);
+		}
+	}
 }
 
 static void __cpuinit init_amd(struct cpuinfo_x86 *c)
@@ -491,7 +555,7 @@ static void __cpuinit init_amd(struct cpuinfo_x86 *c)
 		}
 
 	}
-	if (c->x86 == 0x10 || c->x86 == 0x11)
+	if (c->x86 >= 0x10)
 		set_cpu_cap(c, X86_FEATURE_REP_GOOD);
 
 	/* get apicid instead of initial apic id from cpuid */
@@ -535,7 +599,25 @@ static void __cpuinit init_amd(struct cpuinfo_x86 *c)
 		}
 	}
 
-	display_cacheinfo(c);
+	/* re-enable TopologyExtensions if switched off by BIOS */
+	if ((c->x86 == 0x15) &&
+	    (c->x86_model >= 0x10) && (c->x86_model <= 0x1f) &&
+	    !cpu_has_topoext) {
+		u64 val;
+
+		if (!rdmsrl_safe(0xc0011005, &val)) {
+			val |= 1ULL << 54;
+			checking_wrmsrl(0xc0011005, val);
+			rdmsrl(0xc0011005, val);
+			if (val & (1ULL << 54)) {
+				set_cpu_cap(c, X86_FEATURE_TOPOEXT);
+				printk(KERN_INFO FW_INFO "CPU: Re-enabling "
+				  "disabled Topology Extensions Support\n");
+			}
+		}
+	}
+
+	cpu_detect_cache_sizes(c);
 
 	/* Multi core CPU? */
 	if (c->extended_cpuid_level >= 0x80000008) {
@@ -547,19 +629,23 @@ static void __cpuinit init_amd(struct cpuinfo_x86 *c)
 	detect_ht(c);
 #endif
 
-	if (c->extended_cpuid_level >= 0x80000006) {
-		if ((c->x86 >= 0x0f) && (cpuid_edx(0x80000006) & 0xf000))
-			num_cache_leaves = 4;
-		else
-			num_cache_leaves = 3;
-	}
+	init_amd_cacheinfo(c);
 
-	if (c->x86 >= 0xf && c->x86 <= 0x11)
+	if (c->x86 >= 0xf)
 		set_cpu_cap(c, X86_FEATURE_K8);
 
 	if (cpu_has_xmm2) {
-		/* MFENCE stops RDTSC speculation */
-		set_cpu_cap(c, X86_FEATURE_MFENCE_RDTSC);
+		/*
+		 * Use LFENCE for execution serialization. On some families
+		 * LFENCE is already serialized and the MSR is not available,
+		 * but msr_set_bit() uses rdmsrl_safe() and wrmsrl_safe().
+		 */
+		if (c->x86 > 0xf)
+			msr_set_bit(MSR_F10H_DECFG,
+				    MSR_F10H_DECFG_LFENCE_SERIALIZE_BIT);
+
+		/* LFENCE with MSR_F10H_DECFG[1]=1 stops RDTSC speculation */
+		set_cpu_cap(c, X86_FEATURE_LFENCE_RDTSC);
 	}
 
 #ifdef CONFIG_X86_64
@@ -571,7 +657,7 @@ static void __cpuinit init_amd(struct cpuinfo_x86 *c)
 		fam10h_check_enable_mmcfg();
 	}
 
-	if (c == &boot_cpu_data && c->x86 >= 0xf && c->x86 <= 0x11) {
+	if (c == &boot_cpu_data && c->x86 >= 0xf) {
 		unsigned long long tseg;
 
 		/*
@@ -590,6 +676,28 @@ static void __cpuinit init_amd(struct cpuinfo_x86 *c)
 		}
 	}
 #endif
+
+	/*
+	 * Disable GART TLB Walk Errors on Fam10h. We do this here
+	 * because this is always needed when GART is enabled, even in a
+	 * kernel which has no MCE support built in.
+	 */
+	if (c->x86 == 0x10) {
+		/*
+		 * BIOS should disable GartTlbWlk Errors themself. If
+		 * it doesn't do it here as suggested by the BKDG.
+		 *
+		 * Fixes: https://bugzilla.kernel.org/show_bug.cgi?id=33012
+		 */
+		u64 mask;
+
+		rdmsrl(MSR_AMD64_MCx_MASK(4), mask);
+		mask |= (1 << 10);
+		wrmsrl(MSR_AMD64_MCx_MASK(4), mask);
+	}
+
+	if (c->x86 == 0x10 || c->x86 == 0x12)
+		set_cpu_cap(c, X86_FEATURE_IBP_DISABLE);
 }
 
 #ifdef CONFIG_X86_32
@@ -629,6 +737,7 @@ static const struct cpu_dev __cpuinitconst amd_cpu_dev = {
 	.c_size_cache	= amd_size_cache,
 #endif
 	.c_early_init   = early_init_amd,
+	.c_bsp_init	= bsp_init_amd,
 	.c_init		= init_amd,
 	.c_x86_vendor	= X86_VENDOR_AMD,
 };

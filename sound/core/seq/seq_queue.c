@@ -112,7 +112,7 @@ static struct snd_seq_queue *queue_new(int owner, int locked)
 
 	q = kzalloc(sizeof(*q), GFP_KERNEL);
 	if (q == NULL) {
-		snd_printd("malloc failed for snd_seq_queue_new()\n");
+		pr_debug("ALSA: seq: malloc failed for snd_seq_queue_new()\n");
 		return NULL;
 	}
 
@@ -467,13 +467,11 @@ int snd_seq_queue_timer_open(int queueid)
 int snd_seq_queue_timer_close(int queueid)
 {
 	struct snd_seq_queue *queue;
-	struct snd_seq_timer *tmr;
 	int result = 0;
 
 	queue = queueptr(queueid);
 	if (queue == NULL)
 		return -EINVAL;
-	tmr = queue->timer;
 	snd_seq_timer_close(queue);
 	queuefree(queue);
 	return result;

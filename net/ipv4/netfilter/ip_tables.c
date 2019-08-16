@@ -570,14 +570,12 @@ cleanup_match(struct ipt_entry_match *m, unsigned int *i)
 }
 
 static int
-check_entry(struct ipt_entry *e, const char *name)
+check_entry(struct ipt_entry *e)
 {
 	struct ipt_entry_target *t;
 
-	if (!ip_checkentry(&e->ip)) {
-		duprintf("ip_tables: ip check failed %p %s.\n", e, name);
+	if (!ip_checkentry(&e->ip))
 		return -EINVAL;
-	}
 
 	if (e->target_offset + sizeof(struct ipt_entry_target) >
 	    e->next_offset)
@@ -670,10 +668,6 @@ find_check_entry(struct ipt_entry *e, const char *name, unsigned int size,
 	unsigned int j;
 	struct xt_mtchk_param mtpar;
 
-	ret = check_entry(e, name);
-	if (ret)
-		return ret;
-
 	j = 0;
 	mtpar.table     = name;
 	mtpar.entryinfo = &e->ip;
@@ -734,9 +728,11 @@ check_entry_size_and_hooks(struct ipt_entry *e,
 			   unsigned int *i)
 {
 	unsigned int h;
+	int err;
 
 	if ((unsigned long)e % __alignof__(struct ipt_entry) != 0
-	    || (unsigned char *)e + sizeof(struct ipt_entry) >= limit) {
+	    || (unsigned char *)e + sizeof(struct ipt_entry) >= limit
+	    || (unsigned char *)e + e->next_offset > limit) {
 		duprintf("Bad offset %p\n", e);
 		return -EINVAL;
 	}
@@ -747,6 +743,13 @@ check_entry_size_and_hooks(struct ipt_entry *e,
 			 e, e->next_offset);
 		return -EINVAL;
 	}
+
+	err = check_entry(e);
+	if (err)
+		return err;
+
+	if (e->target_offset < e->elems - (unsigned char *)e)
+		return -EINVAL;
 
 	/* Check hooks & underflows */
 	for (h = 0; h < NF_INET_NUMHOOKS; h++) {
@@ -1132,10 +1135,10 @@ static int get_info(struct net *net, void __user *user, int *len, int compat)
 	if (t && !IS_ERR(t)) {
 		struct ipt_getinfo info;
 		const struct xt_table_info *private = t->private;
-
 #ifdef CONFIG_COMPAT
+		struct xt_table_info tmp;
+
 		if (compat) {
-			struct xt_table_info tmp;
 			ret = compat_table_info(private, &tmp);
 			xt_compat_flush_offsets(AF_INET);
 			private = &tmp;
@@ -1290,6 +1293,7 @@ do_replace(struct net *net, void __user *user, unsigned int len)
 	/* overflow check */
 	if (tmp.num_counters >= INT_MAX / sizeof(struct xt_counters))
 		return -ENOMEM;
+	tmp.name[sizeof(tmp.name)-1] = 0;
 
 	newinfo = xt_alloc_table_info(tmp.size);
 	if (!newinfo)
@@ -1549,10 +1553,14 @@ check_compat_entry_size_and_hooks(struct compat_ipt_entry *e,
 
 	duprintf("check_compat_entry_size_and_hooks %p\n", e);
 	if ((unsigned long)e % __alignof__(struct compat_ipt_entry) != 0
-	    || (unsigned char *)e + sizeof(struct compat_ipt_entry) >= limit) {
+	    || (unsigned char *)e + sizeof(struct compat_ipt_entry) >= limit
+	    || (unsigned char *)e + e->next_offset > limit) {
 		duprintf("Bad offset %p, limit = %p\n", e, limit);
 		return -EINVAL;
 	}
+
+	if (e->target_offset < e->elems - (unsigned char *)e)
+		return -EINVAL;
 
 	if (e->next_offset < sizeof(struct compat_ipt_entry) +
 			     sizeof(struct compat_xt_entry_target)) {
@@ -1562,7 +1570,7 @@ check_compat_entry_size_and_hooks(struct compat_ipt_entry *e,
 	}
 
 	/* For purposes of check_entry casting the compat entry is fine */
-	ret = check_entry((struct ipt_entry *)e, name);
+	ret = check_entry((struct ipt_entry *)e);
 	if (ret)
 		return ret;
 
@@ -1820,6 +1828,7 @@ compat_do_replace(struct net *net, void __user *user, unsigned int len)
 		return -ENOMEM;
 	if (tmp.num_counters >= INT_MAX / sizeof(struct xt_counters))
 		return -ENOMEM;
+	tmp.name[sizeof(tmp.name)-1] = 0;
 
 	newinfo = xt_alloc_table_info(tmp.size);
 	if (!newinfo)
@@ -2044,6 +2053,7 @@ do_ipt_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 			ret = -EFAULT;
 			break;
 		}
+		rev.name[sizeof(rev.name)-1] = 0;
 
 		if (cmd == IPT_SO_GET_REVISION_TARGET)
 			target = 1;

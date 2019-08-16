@@ -15,6 +15,7 @@
 #include <linux/blkdev.h>
 #include <linux/poll.h>
 #include <linux/cdev.h>
+#include <linux/jiffies.h>
 #include <linux/percpu.h>
 #include <linux/uio.h>
 #include <linux/idr.h>
@@ -186,7 +187,7 @@ static int blk_fill_sgv4_hdr_rq(struct request_queue *q, struct request *rq,
 		return -EFAULT;
 
 	if (hdr->subprotocol == BSG_SUB_PROTOCOL_SCSI_CMD) {
-		if (blk_verify_command(rq->cmd, has_write_perm))
+		if (blk_verify_command(q, rq->cmd, has_write_perm))
 			return -EPERM;
 	} else if (!capable(CAP_SYS_RAWIO))
 		return -EPERM;
@@ -197,7 +198,7 @@ static int blk_fill_sgv4_hdr_rq(struct request_queue *q, struct request *rq,
 	rq->cmd_len = hdr->request_len;
 	rq->cmd_type = REQ_TYPE_BLOCK_PC;
 
-	rq->timeout = (hdr->timeout * HZ) / 1000;
+	rq->timeout = msecs_to_jiffies(hdr->timeout);
 	if (!rq->timeout)
 		rq->timeout = q->sg_timeout;
 	if (!rq->timeout)
@@ -249,6 +250,14 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
 	int ret, rw;
 	unsigned int dxfer_len;
 	void *dxferp = NULL;
+	struct bsg_class_device *bcd = &q->bsg_dev;
+
+	/* if the LLD has been removed then the bsg_unregister_queue will
+	 * eventually be called and the class_dev was freed, so we can no
+	 * longer use this request_queue. Return no such address.
+	 */
+	if (!bcd->class_dev)
+		return ERR_PTR(-ENXIO);
 
 	dprintk("map hdr %llx/%u %llx/%u\n", (unsigned long long) hdr->dout_xferp,
 		hdr->dout_xfer_len, (unsigned long long) hdr->din_xferp,
@@ -263,7 +272,7 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
 	 */
 	rq = blk_get_request(q, rw, GFP_KERNEL);
 	if (!rq)
-		return ERR_PTR(-ENOMEM);
+		return ERR_PTR(-ENODEV);
 	ret = blk_fill_sgv4_hdr_rq(q, rq, hdr, bd, has_write_perm);
 	if (ret)
 		goto out;
@@ -276,7 +285,7 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
 
 		next_rq = blk_get_request(q, READ, GFP_KERNEL);
 		if (!next_rq) {
-			ret = -ENOMEM;
+			ret = -ENODEV;
 			goto out;
 		}
 		rq->next_rq = next_rq;
@@ -666,6 +675,9 @@ bsg_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 
 	dprintk("%s: write %Zd bytes\n", bd->name, count);
 
+	if (unlikely(segment_eq(get_fs(), KERNEL_DS)))
+		return -EINVAL;
+
 	bsg_set_block(bd, file);
 
 	bytes_written = 0;
@@ -760,12 +772,10 @@ static struct bsg_device *bsg_add_device(struct inode *inode,
 					 struct file *file)
 {
 	struct bsg_device *bd;
-	int ret;
 #ifdef BSG_DEBUG
 	unsigned char buf[32];
 #endif
-	ret = blk_get_queue(rq);
-	if (ret)
+	if (!blk_get_request_queue(rq))
 		return ERR_PTR(-ENXIO);
 
 	bd = bsg_alloc_device();

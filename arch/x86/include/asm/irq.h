@@ -15,10 +15,6 @@ static inline int irq_canonicalize(int irq)
 	return ((irq == 2) ? 9 : irq);
 }
 
-#ifdef CONFIG_X86_LOCAL_APIC
-# define ARCH_HAS_NMI_WATCHDOG
-#endif
-
 #ifdef CONFIG_4KSTACKS
   extern void irq_ctx_init(int cpu);
   extern void irq_ctx_exit(int cpu);
@@ -33,10 +29,12 @@ static inline int irq_canonicalize(int irq)
 
 #ifdef CONFIG_HOTPLUG_CPU
 #include <linux/cpumask.h>
+extern int check_irq_vectors_for_cpu_disable(void);
 extern void fixup_irqs(void);
+extern void irq_force_complete_move(int);
 #endif
 
-extern void (*generic_interrupt_extension)(void);
+extern void (*x86_platform_ipi_callback)(void);
 extern void native_init_IRQ(void);
 extern bool handle_irq(unsigned irq, struct pt_regs *regs);
 

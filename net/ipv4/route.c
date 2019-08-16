@@ -107,11 +107,10 @@
 #ifdef CONFIG_SYSCTL
 #include <linux/sysctl.h>
 #endif
+#include <net/secure_seq.h>
 
 #define RT_FL_TOS(oldflp) \
     ((u32)(oldflp->fl4_tos & (IPTOS_RT_MASK | RTO_ONLINK)))
-
-#define IP_MAX_MTU	0xFFF0
 
 #define RT_GC_TIMEOUT (300*HZ)
 
@@ -139,6 +138,7 @@ static unsigned long expires_ljiffies;
  */
 
 static struct dst_entry *ipv4_dst_check(struct dst_entry *dst, u32 cookie);
+static unsigned int	 ipv4_default_advmss(const struct dst_entry *dst);
 static void		 ipv4_dst_destroy(struct dst_entry *dst);
 static void		 ipv4_dst_ifdown(struct dst_entry *dst,
 					 struct net_device *dev, int how);
@@ -146,8 +146,9 @@ static struct dst_entry *ipv4_negative_advice(struct dst_entry *dst);
 static void		 ipv4_link_failure(struct sk_buff *skb);
 static void		 ip_rt_update_pmtu(struct dst_entry *dst, u32 mtu);
 static int rt_garbage_collect(struct dst_ops *ops);
-static void rt_emergency_hash_rebuild(struct net *net);
 
+static void __rt_garbage_collect(struct work_struct *w);
+static DECLARE_WORK(rt_gc_worker, __rt_garbage_collect);
 
 static struct dst_ops ipv4_dst_ops = {
 	.family =		AF_INET,
@@ -183,7 +184,7 @@ const __u8 ip_tos2prio[16] = {
 	TC_PRIO_INTERACTIVE_BULK,
 	ECN_OR_COST(INTERACTIVE_BULK)
 };
-
+EXPORT_SYMBOL(ip_tos2prio);
 
 /*
  * Route cache.
@@ -384,8 +385,7 @@ static int rt_cache_seq_show(struct seq_file *seq, void *v)
 			(unsigned long)r->rt_dst, (unsigned long)r->rt_gateway,
 			r->rt_flags, atomic_read(&r->u.dst.__refcnt),
 			r->u.dst.__use, 0, (unsigned long)r->rt_src,
-			(dst_metric(&r->u.dst, RTAX_ADVMSS) ?
-			     (int)dst_metric(&r->u.dst, RTAX_ADVMSS) + 40 : 0),
+			dst_metric_advmss(&r->u.dst) + 40,
 			dst_metric(&r->u.dst, RTAX_WINDOW),
 			(int)((dst_metric(&r->u.dst, RTAX_RTT) >> 3) +
 			      dst_metric(&r->u.dst, RTAX_RTTVAR)),
@@ -780,11 +780,30 @@ static void rt_do_flush(int process_context)
 #define FRACT_BITS 3
 #define ONE (1UL << FRACT_BITS)
 
+/*
+ * Given a hash chain and an item in this hash chain,
+ * find if a previous entry has the same hash_inputs
+ * (but differs on tos, mark or oif)
+ * Returns 0 if an alias is found.
+ * Returns ONE if rth has no alias before itself.
+ */
+static int has_noalias(const struct rtable *head, const struct rtable *rth)
+{
+	const struct rtable *aux = head;
+
+	while (aux != rth) {
+		if (compare_hash_inputs(&aux->fl, &rth->fl))
+			return 0;
+		aux = aux->u.dst.rt_next;
+	}
+	return ONE;
+}
+
 static void rt_check_expire(void)
 {
 	static unsigned int rover;
 	unsigned int i = rover, goal;
-	struct rtable *rth, *aux, **rthp;
+	struct rtable *rth, **rthp;
 	unsigned long samples = 0;
 	unsigned long sum = 0, sum2 = 0;
 	unsigned long delta;
@@ -835,15 +854,7 @@ nofree:
 					 * attributes don't unfairly skew
 					 * the length computation
 					 */
-					for (aux = rt_hash_table[i].chain;;) {
-						if (aux == rth) {
-							length += ONE;
-							break;
-						}
-						if (compare_hash_inputs(&aux->fl, &rth->fl))
-							break;
-						aux = aux->u.dst.rt_next;
-					}
+					length += has_noalias(rt_hash_table[i].chain, rth);
 					continue;
 				}
 			} else if (!rt_may_expire(rth, tmo, ip_rt_gc_timeout))
@@ -902,6 +913,12 @@ void rt_cache_flush(struct net *net, int delay)
 		rt_do_flush(!in_softirq());
 }
 
+/* Flush previous cache invalidated entries from the cache */
+void rt_cache_flush_batch(void)
+{
+	rt_do_flush(!in_softirq());
+}
+
 /*
  * We change rt_genid and let gc do the cleanup
  */
@@ -945,13 +962,14 @@ static void rt_emergency_hash_rebuild(struct net *net)
    and when load increases it reduces to limit cache size.
  */
 
-static int rt_garbage_collect(struct dst_ops *ops)
+static void __do_rt_garbage_collect(int elasticity, int min_interval)
 {
 	static unsigned long expire = RT_GC_TIMEOUT;
 	static unsigned long last_gc;
 	static int rover;
 	static int equilibrium;
 	struct rtable *rth, **rthp;
+	static DEFINE_SPINLOCK(rt_gc_lock);
 	unsigned long now = jiffies;
 	int goal;
 
@@ -960,9 +978,11 @@ static int rt_garbage_collect(struct dst_ops *ops)
 	 * do not make it too frequently.
 	 */
 
+	spin_lock_bh(&rt_gc_lock);
+
 	RT_CACHE_STAT_INC(gc_total);
 
-	if (now - last_gc < ip_rt_gc_min_interval &&
+	if (now - last_gc < min_interval &&
 	    atomic_read(&ipv4_dst_ops.entries) < ip_rt_max_size) {
 		RT_CACHE_STAT_INC(gc_ignored);
 		goto out;
@@ -970,7 +990,7 @@ static int rt_garbage_collect(struct dst_ops *ops)
 
 	/* Calculate number of entries, which we want to expire now. */
 	goal = atomic_read(&ipv4_dst_ops.entries) -
-		(ip_rt_gc_elasticity << rt_hash_log);
+		(elasticity << rt_hash_log);
 	if (goal <= 0) {
 		if (equilibrium < ipv4_dst_ops.gc_thresh)
 			equilibrium = ipv4_dst_ops.gc_thresh;
@@ -987,7 +1007,7 @@ static int rt_garbage_collect(struct dst_ops *ops)
 		equilibrium = atomic_read(&ipv4_dst_ops.entries) - goal;
 	}
 
-	if (now - last_gc >= ip_rt_gc_min_interval)
+	if (now - last_gc >= min_interval)
 		last_gc = now;
 
 	if (goal <= 0) {
@@ -1053,10 +1073,10 @@ static int rt_garbage_collect(struct dst_ops *ops)
 	if (net_ratelimit())
 		printk(KERN_WARNING "dst cache overflow\n");
 	RT_CACHE_STAT_INC(gc_dst_overflow);
-	return 1;
+	goto out;
 
 work_done:
-	expire += ip_rt_gc_min_interval;
+	expire += min_interval;
 	if (expire > ip_rt_gc_timeout ||
 	    atomic_read(&ipv4_dst_ops.entries) < ipv4_dst_ops.gc_thresh)
 		expire = ip_rt_gc_timeout;
@@ -1064,7 +1084,40 @@ work_done:
 	printk(KERN_DEBUG "expire++ %u %d %d %d\n", expire,
 			atomic_read(&ipv4_dst_ops.entries), goal, rover);
 #endif
-out:	return 0;
+out:
+	spin_unlock_bh(&rt_gc_lock);
+}
+
+static void __rt_garbage_collect(struct work_struct *w)
+{
+	__do_rt_garbage_collect(ip_rt_gc_elasticity, ip_rt_gc_min_interval);
+}
+
+static int rt_garbage_collect(struct dst_ops *ops)
+{
+	if (!work_pending(&rt_gc_worker))
+		schedule_work(&rt_gc_worker);
+
+	if (atomic_read(&ipv4_dst_ops.entries) >= ip_rt_max_size) {
+		RT_CACHE_STAT_INC(gc_dst_overflow);
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * Returns number of entries in a hash chain that have different hash_inputs
+ */
+static int slow_chain_length(const struct rtable *head)
+{
+	int length = 0;
+	const struct rtable *rth = head;
+
+	while (rth) {
+		length += has_noalias(head, rth);
+		rth = rth->u.dst.rt_next;
+	}
+	return length >> FRACT_BITS;
 }
 
 static int rt_intern_hash(unsigned hash, struct rtable *rt,
@@ -1075,7 +1128,7 @@ static int rt_intern_hash(unsigned hash, struct rtable *rt,
 	struct rtable *cand, **candp;
 	u32 		min_score;
 	int		chain_length;
-	int attempts = !in_softirq();
+	int attempts = 1;
 
 restart:
 	chain_length = 0;
@@ -1179,7 +1232,8 @@ restart:
 			rt_free(cand);
 		}
 	} else {
-		if (chain_length > rt_chain_length_max) {
+		if (chain_length > rt_chain_length_max &&
+		    slow_chain_length(rt_hash_table[hash].chain) > rt_chain_length_max) {
 			struct net *net = dev_net(rt->u.dst.dev);
 			int num = ++net->ipv4.current_rt_cache_rebuild_count;
 			if (!rt_caching(dev_net(rt->u.dst.dev))) {
@@ -1207,14 +1261,15 @@ restart:
 			   can be released. Try to shrink route cache,
 			   it is most likely it holds some neighbour records.
 			 */
-			if (attempts-- > 0) {
-				int saved_elasticity = ip_rt_gc_elasticity;
-				int saved_int = ip_rt_gc_min_interval;
-				ip_rt_gc_elasticity	= 1;
-				ip_rt_gc_min_interval	= 0;
-				rt_garbage_collect(&ipv4_dst_ops);
-				ip_rt_gc_min_interval	= saved_int;
-				ip_rt_gc_elasticity	= saved_elasticity;
+			if (!in_softirq() && attempts-- > 0) {
+				static DEFINE_SPINLOCK(lock);
+
+				if (spin_trylock(&lock)) {
+					__do_rt_garbage_collect(1, 0);
+					spin_unlock(&lock);
+				} else {
+					spin_unlock_wait(&lock);
+				}
 				goto restart;
 			}
 
@@ -1411,7 +1466,7 @@ void ip_rt_redirect(__be32 old_gw, __be32 daddr, __be32 new_gw,
 					dev_hold(rt->u.dst.dev);
 				if (rt->idev)
 					in_dev_hold(rt->idev);
-				rt->u.dst.obsolete	= 0;
+				rt->u.dst.obsolete	= -1;
 				rt->u.dst.lastuse	= jiffies;
 				rt->u.dst.path		= &rt->u.dst;
 				rt->u.dst.neighbour	= NULL;
@@ -1476,7 +1531,7 @@ static struct dst_entry *ipv4_negative_advice(struct dst_entry *dst)
 	struct dst_entry *ret = dst;
 
 	if (rt) {
-		if (dst->obsolete) {
+		if (dst->obsolete > 0) {
 			ip_rt_put(rt);
 			ret = NULL;
 		} else if ((rt->rt_flags & RTCF_REDIRECTED) ||
@@ -1628,7 +1683,7 @@ unsigned short ip_rt_frag_needed(struct net *net, struct iphdr *iph,
 	__be32  daddr = iph->daddr;
 	unsigned short est_mtu = 0;
 
-	if (ipv4_config.no_pmtu_disc)
+	if (net->sysctl_ip_no_pmtu_disc)
 		return 0;
 
 	for (k = 0; k < 2; k++) {
@@ -1699,7 +1754,9 @@ static void ip_rt_update_pmtu(struct dst_entry *dst, u32 mtu)
 
 static struct dst_entry *ipv4_dst_check(struct dst_entry *dst, u32 cookie)
 {
-	return NULL;
+	if (rt_is_expired((struct rtable *)dst))
+		return NULL;
+	return dst;
 }
 
 static void ipv4_dst_destroy(struct dst_entry *dst)
@@ -1789,6 +1846,19 @@ static void set_class_tag(struct rtable *rt, u32 tag)
 }
 #endif
 
+static unsigned int ipv4_default_advmss(const struct dst_entry *dst)
+{
+	unsigned int advmss = dst_metric(dst, RTAX_ADVMSS);
+
+	if (advmss == 0) {
+		advmss = max_t(unsigned int, dst->dev->mtu - 40,
+			       ip_rt_min_advmss);
+		if (advmss > 65535 - 40)
+			advmss = 65535 - 40;
+	}
+	return advmss;
+}
+
 static void rt_set_nexthop(struct rtable *rt, struct fib_result *res, u32 itag)
 {
 	struct fib_info *fi = res->fi;
@@ -1816,9 +1886,6 @@ static void rt_set_nexthop(struct rtable *rt, struct fib_result *res, u32 itag)
 		rt->u.dst.metrics[RTAX_HOPLIMIT-1] = sysctl_ip_default_ttl;
 	if (dst_mtu(&rt->u.dst) > IP_MAX_MTU)
 		rt->u.dst.metrics[RTAX_MTU-1] = IP_MAX_MTU;
-	if (dst_metric(&rt->u.dst, RTAX_ADVMSS) == 0)
-		rt->u.dst.metrics[RTAX_ADVMSS-1] = max_t(unsigned int, rt->u.dst.dev->mtu - 40,
-				       ip_rt_min_advmss);
 	if (dst_metric(&rt->u.dst, RTAX_ADVMSS) > 65535 - 40)
 		rt->u.dst.metrics[RTAX_ADVMSS-1] = 65535 - 40;
 
@@ -1846,8 +1913,12 @@ static int ip_route_input_mc(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		return -EINVAL;
 
 	if (ipv4_is_multicast(saddr) || ipv4_is_lbcast(saddr) ||
-	    ipv4_is_loopback(saddr) || skb->protocol != htons(ETH_P_IP))
+	    skb->protocol != htons(ETH_P_IP))
 		goto e_inval;
+
+	if (likely(!IN_DEV_ROUTE_LOCALNET(in_dev)))
+		if (ipv4_is_loopback(saddr))
+			goto e_inval;
 
 	if (ipv4_is_zeronet(saddr)) {
 		if (!ipv4_is_local_multicast(daddr))
@@ -1861,7 +1932,8 @@ static int ip_route_input_mc(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	if (!rth)
 		goto e_nobufs;
 
-	rth->u.dst.output= ip_rt_bug;
+	rth->u.dst.output = ip_rt_bug;
+	rth->u.dst.obsolete = -1;
 
 	atomic_set(&rth->u.dst.__refcnt, 1);
 	rth->u.dst.flags= DST_HOST;
@@ -1987,8 +2059,13 @@ static int __mkroute_input(struct sk_buff *skb,
 	if (skb->protocol != htons(ETH_P_IP)) {
 		/* Not IP (i.e. ARP). Do not create route, if it is
 		 * invalid for proxy arp. DNAT routes are always valid.
+		 *
+		 * Proxy arp feature have been extended to allow, ARP
+		 * replies back to the same interface, to support
+		 * Private VLAN switch technologies. See arp.c.
 		 */
-		if (out_dev == in_dev) {
+		if (out_dev == in_dev &&
+		    IN_DEV_PROXY_ARP_PVLAN(in_dev) == 0) {
 			err = -EINVAL;
 			goto cleanup;
 		}
@@ -2022,6 +2099,7 @@ static int __mkroute_input(struct sk_buff *skb,
 	rth->fl.oif 	= 0;
 	rth->rt_spec_dst= spec_dst;
 
+	rth->u.dst.obsolete = -1;
 	rth->u.dst.input = ip_forward;
 	rth->u.dst.output = ip_output;
 	rth->rt_genid = rt_genid(dev_net(rth->u.dst.dev));
@@ -2105,8 +2183,7 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	   by fib_lookup.
 	 */
 
-	if (ipv4_is_multicast(saddr) || ipv4_is_lbcast(saddr) ||
-	    ipv4_is_loopback(saddr))
+	if (ipv4_is_multicast(saddr) || ipv4_is_lbcast(saddr))
 		goto martian_source;
 
 	if (daddr == htonl(0xFFFFFFFF) || (saddr == 0 && daddr == 0))
@@ -2118,9 +2195,16 @@ static int ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	if (ipv4_is_zeronet(saddr))
 		goto martian_source;
 
-	if (ipv4_is_lbcast(daddr) || ipv4_is_zeronet(daddr) ||
-	    ipv4_is_loopback(daddr))
+	if (ipv4_is_lbcast(daddr) || ipv4_is_zeronet(daddr))
 		goto martian_destination;
+
+	if (likely(!IN_DEV_ROUTE_LOCALNET(in_dev))) {
+		if (ipv4_is_loopback(daddr))
+			goto martian_destination;
+
+		if (ipv4_is_loopback(saddr))
+			goto martian_source;
+	}
 
 	/*
 	 *	Now we are ready to route packet.
@@ -2186,6 +2270,7 @@ local_input:
 		goto e_nobufs;
 
 	rth->u.dst.output= ip_rt_bug;
+	rth->u.dst.obsolete = -1;
 	rth->rt_genid = rt_genid(net);
 
 	atomic_set(&rth->u.dst.__refcnt, 1);
@@ -2341,9 +2426,6 @@ static int __mkroute_output(struct rtable **result,
 	u32 tos = RT_FL_TOS(oldflp);
 	int err = 0;
 
-	if (ipv4_is_loopback(fl->fl4_src) && !(dev_out->flags&IFF_LOOPBACK))
-		return -EINVAL;
-
 	if (fl->fl4_dst == htonl(0xFFFFFFFF))
 		res->type = RTN_BROADCAST;
 	else if (ipv4_is_multicast(fl->fl4_dst))
@@ -2358,6 +2440,13 @@ static int __mkroute_output(struct rtable **result,
 	in_dev = in_dev_get(dev_out);
 	if (!in_dev)
 		return -EINVAL;
+
+	if (likely(!IN_DEV_ROUTE_LOCALNET(in_dev))) {
+		if (ipv4_is_loopback(fl->fl4_src) && !(dev_out->flags & IFF_LOOPBACK)) {
+			err = -EINVAL;
+			goto cleanup;
+		}
+	}
 
 	if (res->type == RTN_BROADCAST) {
 		flags |= RTCF_BROADCAST | RTCF_LOCAL;
@@ -2411,6 +2500,7 @@ static int __mkroute_output(struct rtable **result,
 	rth->rt_spec_dst= fl->fl4_src;
 
 	rth->u.dst.output=ip_output;
+	rth->u.dst.obsolete = -1;
 	rth->rt_genid = rt_genid(dev_net(dev_out));
 
 	RT_CACHE_STAT_INC(out_slow_tot);
@@ -2491,7 +2581,7 @@ static int ip_route_output_slow(struct net *net, struct rtable **rp,
 	unsigned flags = 0;
 	struct net_device *dev_out = NULL;
 	int free_res = 0;
-	int err;
+	int err = -ENETUNREACH;
 
 
 	res.fi		= NULL;
@@ -2595,7 +2685,8 @@ static int ip_route_output_slow(struct net *net, struct rtable **rp,
 		goto make_route;
 	}
 
-	if (fib_lookup(net, &fl, &res)) {
+	err = fib_lookup(net, &fl, &res);
+	if (err) {
 		res.fi = NULL;
 		if (oldflp->oif) {
 			/* Apparently, routing tables are wrong. Assume,
@@ -2624,7 +2715,6 @@ static int ip_route_output_slow(struct net *net, struct rtable **rp,
 		}
 		if (dev_out)
 			dev_put(dev_out);
-		err = -ENETUNREACH;
 		goto out;
 	}
 	free_res = 1;
@@ -2712,6 +2802,11 @@ slow_output:
 
 EXPORT_SYMBOL_GPL(__ip_route_output_key);
 
+static struct dst_entry *ipv4_blackhole_dst_check(struct dst_entry *dst, u32 cookie)
+{
+	return NULL;
+}
+
 static void ipv4_rt_blackhole_update_pmtu(struct dst_entry *dst, u32 mtu)
 {
 }
@@ -2720,7 +2815,7 @@ static struct dst_ops ipv4_dst_blackhole_ops = {
 	.family			=	AF_INET,
 	.protocol		=	cpu_to_be16(ETH_P_IP),
 	.destroy		=	ipv4_dst_destroy,
-	.check			=	ipv4_dst_check,
+	.check			=	ipv4_blackhole_dst_check,
 	.update_pmtu		=	ipv4_rt_blackhole_update_pmtu,
 	.entries		=	ATOMIC_INIT(0),
 };
@@ -3425,6 +3520,11 @@ int __init ip_rt_init(void)
 	ipv4_dst_ops.gc_thresh = (rt_hash_mask + 1);
 	ip_rt_max_size = (rt_hash_mask + 1) * 16;
 
+	if (dst_ops_extend_register(&ipv4_dst_ops, ipv4_default_advmss))
+		panic("IP: failed to register extended ipv4_dst_ops\n");
+	if (dst_ops_extend_register(&ipv4_dst_blackhole_ops, ipv4_default_advmss))
+		panic("IP: failed to register extended ipv4_dst_blackhole_ops\n");
+
 	devinet_init();
 	ip_fib_init();
 
@@ -3445,7 +3545,7 @@ int __init ip_rt_init(void)
 	xfrm_init();
 	xfrm4_init(ip_rt_max_size);
 #endif
-	rtnl_register(PF_INET, RTM_GETROUTE, inet_rtm_getroute, NULL);
+	rtnl_register(PF_INET, RTM_GETROUTE, inet_rtm_getroute, NULL, NULL);
 
 #ifdef CONFIG_SYSCTL
 	register_pernet_subsys(&sysctl_route_ops);

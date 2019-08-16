@@ -73,8 +73,8 @@ __setup("ether=", netdev_boot_setup);
  * @len:   packet length (<= skb->len)
  *
  *
- * Set the protocol type. For a packet of type ETH_P_802_3 we put the length
- * in here instead. It is up to the 802.2 layer to carry protocol information.
+ * Set the protocol type. For a packet of type ETH_P_802_3/2 we put the length
+ * in here instead.
  */
 int eth_header(struct sk_buff *skb, struct net_device *dev,
 	       unsigned short type,
@@ -82,7 +82,7 @@ int eth_header(struct sk_buff *skb, struct net_device *dev,
 {
 	struct ethhdr *eth = (struct ethhdr *)skb_push(skb, ETH_HLEN);
 
-	if (type != ETH_P_802_3)
+	if (type != ETH_P_802_3 && type != ETH_P_802_2)
 		eth->h_proto = htons(type);
 	else
 		eth->h_proto = htons(len);
@@ -145,6 +145,33 @@ int eth_rebuild_header(struct sk_buff *skb)
 	return 0;
 }
 EXPORT_SYMBOL(eth_rebuild_header);
+
+/**
+ * eth_get_headlen - determine the the length of header for an ethernet frame
+ * @data: pointer to start of frame
+ * @len: total length of frame
+ *
+ * Make a best effort attempt to pull the length for all of the headers for
+ * a given frame in a linear buffer.
+ */
+u32 eth_get_headlen(void *data, unsigned int len)
+{
+	const struct ethhdr *eth = (const struct ethhdr *)data;
+	struct flow_keys keys;
+
+	/* this should never happen, but better safe than sorry */
+	if (unlikely(len < sizeof(*eth)))
+		return len;
+
+	/* parse any remaining L2/L3 headers, check for L4 */
+	if (!__skb_flow_dissect(NULL, &keys, data,
+				eth->h_proto, sizeof(*eth), len))
+		return max_t(u32, keys.thoff, sizeof(*eth));
+
+	/* parse for any L4 headers */
+	return min_t(u32, __skb_get_poff(NULL, data, &keys, len), len);
+}
+EXPORT_SYMBOL(eth_get_headlen);
 
 /**
  * eth_type_trans - determine the packet's protocol ID.
@@ -274,6 +301,39 @@ void eth_header_cache_update(struct hh_cache *hh,
 EXPORT_SYMBOL(eth_header_cache_update);
 
 /**
+ * eth_prepare_mac_addr_change - prepare for mac change
+ * @dev: network device
+ * @p: socket address
+ */
+int eth_prepare_mac_addr_change(struct net_device *dev, void *p)
+{
+	struct sockaddr *addr = p;
+
+	if (!(netdev_extended(dev)->ext_priv_flags & IFF_LIVE_ADDR_CHANGE)
+	    && netif_running(dev))
+		return -EBUSY;
+	if (!is_valid_ether_addr(addr->sa_data))
+		return -EADDRNOTAVAIL;
+	return 0;
+}
+EXPORT_SYMBOL(eth_prepare_mac_addr_change);
+
+/**
+ * eth_commit_mac_addr_change - commit mac change
+ * @dev: network device
+ * @p: socket address
+ */
+void eth_commit_mac_addr_change(struct net_device *dev, void *p)
+{
+	struct sockaddr *addr = p;
+
+	memcpy(dev->dev_addr, addr->sa_data, ETH_ALEN);
+	/* if device marked as NET_ADDR_RANDOM, reset it */
+	dev->addr_assign_type = NET_ADDR_PERM;
+}
+EXPORT_SYMBOL(eth_commit_mac_addr_change);
+
+/**
  * eth_mac_addr - set new Ethernet hardware address
  * @dev: network device
  * @p: socket address
@@ -284,13 +344,12 @@ EXPORT_SYMBOL(eth_header_cache_update);
  */
 int eth_mac_addr(struct net_device *dev, void *p)
 {
-	struct sockaddr *addr = p;
+	int ret;
 
-	if (netif_running(dev))
-		return -EBUSY;
-	if (!is_valid_ether_addr(addr->sa_data))
-		return -EADDRNOTAVAIL;
-	memcpy(dev->dev_addr, addr->sa_data, ETH_ALEN);
+	ret = eth_prepare_mac_addr_change(dev, p);
+	if (ret < 0)
+		return ret;
+	eth_commit_mac_addr_change(dev, p);
 	return 0;
 }
 EXPORT_SYMBOL(eth_mac_addr);
@@ -343,6 +402,7 @@ void ether_setup(struct net_device *dev)
 	dev->addr_len		= ETH_ALEN;
 	dev->tx_queue_len	= 1000;	/* Ethernet wants good queues */
 	dev->flags		= IFF_BROADCAST|IFF_MULTICAST;
+	netdev_extended(dev)->ext_priv_flags = IFF_TX_SKB_SHARING;
 
 	memset(dev->broadcast, 0xFF, ETH_ALEN);
 
@@ -365,9 +425,32 @@ EXPORT_SYMBOL(ether_setup);
 
 struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int queue_count)
 {
-	return alloc_netdev_mq(sizeof_priv, "eth%d", ether_setup, queue_count);
+	return alloc_netdev_mqs(sizeof_priv, "eth%d", ether_setup,
+				queue_count, queue_count);
 }
 EXPORT_SYMBOL(alloc_etherdev_mq);
+
+/**
+ * alloc_etherdev_mqs - Allocates and sets up an Ethernet device
+ * @sizeof_priv: Size of additional driver-private structure to be allocated
+ *	for this Ethernet device
+ * @txqs: The number of TX queues this device has.
+ * @rxqs: The number of RX queues this device has.
+ *
+ * Fill in the fields of the device structure with Ethernet-generic
+ * values. Basically does everything except registering the device.
+ *
+ * Constructs a new net device, complete with a private data area of
+ * size (sizeof_priv).  A 32-byte (not bit) alignment is enforced for
+ * this private data area.
+ */
+
+struct net_device *alloc_etherdev_mqs(int sizeof_priv, unsigned int txqs,
+				      unsigned int rxqs)
+{
+	return alloc_netdev_mqs(sizeof_priv, "eth%d", ether_setup, txqs, rxqs);
+}
+EXPORT_SYMBOL(alloc_etherdev_mqs);
 
 static size_t _format_mac_addr(char *buf, int buflen,
 				const unsigned char *addr, int len)

@@ -39,6 +39,7 @@ struct fib6_config
 	int		fc_ifindex;
 	u32		fc_flags;
 	u32		fc_protocol;
+	u32		fc_type;	/* only 8 bits are used */
 
 	struct in6_addr	fc_dst;
 	struct in6_addr	fc_src;
@@ -49,6 +50,7 @@ struct fib6_config
 	int		fc_mx_len;
 
 	struct nl_info	fc_nlinfo;
+	struct in6_addr	fc_prefsrc;
 };
 
 struct fib6_node
@@ -120,6 +122,9 @@ struct rt6_info
 #endif
 
 	struct rt6key			rt6i_src;
+#ifndef __GENKSYMS__
+	struct rt6key                   rt6i_prefsrc;
+#endif
 };
 
 static inline struct inet6_dev *ip6_dst_idev(struct dst_entry *dst)
@@ -217,7 +222,7 @@ extern void			inet6_rt_notify(int event, struct rt6_info *rt,
 						struct nl_info *info);
 
 extern void			fib6_run_gc(unsigned long expires,
-					    struct net *net);
+					    struct net *net, bool force);
 
 extern void			fib6_gc_cleanup(void);
 

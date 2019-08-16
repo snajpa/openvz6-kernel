@@ -39,7 +39,7 @@ static ssize_t legacy_show(struct kobject *kobj, struct attribute *attr,
 
 static void remove_callback(void *data)
 {
-	pci_remove_bus_device((struct pci_dev *)data);
+	pci_stop_and_remove_bus_device((struct pci_dev *)data);
 }
 
 static ssize_t legacy_store(struct kobject *kobj, struct attribute *attr,
@@ -73,7 +73,7 @@ static void legacy_release(struct kobject *kobj)
 }
 
 static struct kobj_type legacy_ktype = {
-	.sysfs_ops = &(struct sysfs_ops){
+	.sysfs_ops = &(const struct sysfs_ops){
 		.store = legacy_store, .show = legacy_show
 	},
 	.release = &legacy_release,

@@ -16,7 +16,6 @@
  * published by the Free Software Foundation.
  */
 
-#include <linux/init.h>
 #include <linux/firmware.h>
 #include <linux/etherdevice.h>
 
@@ -57,8 +56,8 @@ static void p54_update_leds(struct work_struct *work)
 
 	err = p54_set_leds(priv);
 	if (err && net_ratelimit())
-		printk(KERN_ERR "%s: failed to update LEDs (%d).\n",
-			wiphy_name(priv->hw->wiphy), err);
+		wiphy_err(priv->hw->wiphy,
+			  "failed to update LEDs (%d).\n", err);
 
 	if (rerun)
 		ieee80211_queue_delayed_work(priv->hw, &priv->led_work,
@@ -84,7 +83,7 @@ static void p54_led_brightness_set(struct led_classdev *led_dev,
 
 static int p54_register_led(struct p54_common *priv,
 			    unsigned int led_index,
-			    char *name, char *trigger)
+			    char *name, const char *trigger)
 {
 	struct p54_led_dev *led = &priv->leds[led_index];
 	int err;
@@ -102,8 +101,8 @@ static int p54_register_led(struct p54_common *priv,
 
 	err = led_classdev_register(wiphy_dev(priv->hw->wiphy), &led->led_dev);
 	if (err)
-		printk(KERN_ERR "%s: Failed to register %s LED.\n",
-			wiphy_name(priv->hw->wiphy), name);
+		wiphy_err(priv->hw->wiphy,
+			  "Failed to register %s LED.\n", name);
 	else
 		led->registered = 1;
 

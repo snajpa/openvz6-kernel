@@ -70,13 +70,12 @@ static struct sctp_endpoint *sctp_endpoint_init(struct sctp_endpoint *ep,
 	struct sctp_shared_key *null_key;
 	int err;
 
-	memset(ep, 0, sizeof(struct sctp_endpoint));
-
 	ep->digest = kzalloc(SCTP_SIGNATURE_SIZE, gfp);
 	if (!ep->digest)
 		return NULL;
 
-	if (sctp_auth_enable) {
+	ep->auth_enable = sctp_auth_enable;
+	if (ep->auth_enable) {
 		/* Allocate space for HMACS and CHUNKS authentication
 		 * variables.  There are arrays that we encode directly
 		 * into parameters to make the rest of the operations easier.
@@ -144,6 +143,7 @@ static struct sctp_endpoint *sctp_endpoint_init(struct sctp_endpoint *ep,
 	/* Use SCTP specific send buffer space queues.  */
 	ep->sndbuf_policy = sctp_sndbuf_policy;
 
+	sk->sk_data_ready = sctp_data_ready;
 	sk->sk_write_space = sctp_write_space;
 	sock_set_flag(sk, SOCK_USE_WRITE_QUEUE);
 
@@ -466,11 +466,14 @@ normal:
 		 */
 		if (asoc && sctp_chunk_is_data(chunk))
 			asoc->peer.last_data_from = chunk->transport;
-		else
+		else {
 			SCTP_INC_STATS(SCTP_MIB_INCTRLCHUNKS);
+			if (asoc)
+				asoc->stats.ictrlchunks++;
+		}
 
 		if (chunk->transport)
-			chunk->transport->last_time_heard = jiffies;
+			chunk->transport->last_time_heard = ktime_get();
 
 		error = sctp_do_sm(SCTP_EVENT_T_CHUNK, subtype, state,
 				   ep, asoc, chunk, GFP_ATOMIC);

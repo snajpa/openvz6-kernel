@@ -10,12 +10,96 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/pci.h>
+#include <linux/pcieport_if.h>
 #include <linux/errno.h>
 #include <linux/ioport.h>
 #include <linux/proc_fs.h>
 #include <linux/init.h>
 
 #include "pci.h"
+
+void pci_add_resource_offset(struct list_head *resources, struct resource *res,
+			     resource_size_t offset)
+{
+	struct pci_host_bridge_window *window;
+
+	window = kzalloc(sizeof(struct pci_host_bridge_window), GFP_KERNEL);
+	if (!window) {
+		printk(KERN_ERR "PCI: can't add host bridge window %pR\n", res);
+		return;
+	}
+
+	window->res = res;
+	window->offset = offset;
+	list_add_tail(&window->list, resources);
+}
+EXPORT_SYMBOL(pci_add_resource_offset);
+
+void pci_add_resource(struct list_head *resources, struct resource *res)
+{
+	pci_add_resource_offset(resources, res, 0);
+}
+EXPORT_SYMBOL(pci_add_resource);
+
+void pci_free_resource_list(struct list_head *resources)
+{
+	struct pci_host_bridge_window *window, *tmp;
+
+	list_for_each_entry_safe(window, tmp, resources, list) {
+		list_del(&window->list);
+		kfree(window);
+	}
+}
+EXPORT_SYMBOL(pci_free_resource_list);
+
+void pci_bus_add_resource(struct pci_bus *bus, struct resource *res,
+			  unsigned int flags)
+{
+	struct pci_bus_resource *bus_res;
+	int i;
+
+	for (i = PCI_BRIDGE_RESOURCE_NUM; i < PCI_BUS_NUM_RESOURCES; i++)
+		if (bus->resource[i] == 0) {
+			bus->resource[i] = res;
+			return;
+		}
+
+	bus_res = kzalloc(sizeof(struct pci_bus_resource), GFP_KERNEL);
+	if (!bus_res) {
+		dev_err(&bus->dev, "can't add %pR resource\n", res);
+		return;
+	}
+
+	bus_res->res = res;
+	bus_res->flags = flags;
+	list_add_tail(&bus_res->list, &bus->resources);
+}
+
+struct resource *pci_bus_resource_n(const struct pci_bus *bus, int n)
+{
+	struct pci_bus_resource *bus_res;
+
+	if (n < PCI_BUS_NUM_RESOURCES)
+		return bus->resource[n];
+
+	n -= PCI_BUS_NUM_RESOURCES;
+	list_for_each_entry(bus_res, &bus->resources, list) {
+		if (n-- == 0)
+			return bus_res->res;
+	}
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(pci_bus_resource_n);
+
+void pci_bus_remove_resources(struct pci_bus *bus)
+{
+	int i;
+
+	for (i = 0; i < PCI_BUS_NUM_RESOURCES; i++)
+		bus->resource[i] = 0;
+
+	pci_free_resource_list(&bus->resources);
+}
 
 /**
  * pci_bus_alloc_resource - allocate a resource from a parent bus
@@ -41,6 +125,7 @@ pci_bus_alloc_resource(struct pci_bus *bus, struct resource *res,
 		void *alignf_data)
 {
 	int i, ret = -ENOMEM;
+	struct resource *r;
 	resource_size_t max = -1;
 
 	type_mask |= IORESOURCE_IO | IORESOURCE_MEM;
@@ -49,8 +134,7 @@ pci_bus_alloc_resource(struct pci_bus *bus, struct resource *res,
 	if (!(res->flags & IORESOURCE_MEM_64))
 		max = PCIBIOS_MAX_MEM_32;
 
-	for (i = 0; i < PCI_BUS_NUM_RESOURCES; i++) {
-		struct resource *r = bus->resource[i];
+	pci_bus_for_each_resource(bus, r, i) {
 		if (!r)
 			continue;
 
@@ -85,6 +169,13 @@ pci_bus_alloc_resource(struct pci_bus *bus, struct resource *res,
 int pci_bus_add_device(struct pci_dev *dev)
 {
 	int retval;
+
+	pci_fixup_device(pci_fixup_final, dev);
+
+	retval = pcibios_add_device(dev);
+	if (retval)
+		return retval;
+
 	retval = device_add(&dev->dev);
 	if (retval)
 		return retval;
@@ -113,12 +204,6 @@ int pci_bus_add_child(struct pci_bus *bus)
 		return retval;
 
 	bus->is_added = 1;
-
-	retval = device_create_file(&bus->dev, &dev_attr_cpuaffinity);
-	if (retval)
-		return retval;
-
-	retval = device_create_file(&bus->dev, &dev_attr_cpulistaffinity);
 
 	/* Create legacy_io and legacy_mem files for this bus */
 	pci_create_legacy_files(bus);
@@ -190,6 +275,8 @@ void pci_enable_bridges(struct pci_bus *bus)
 	list_for_each_entry(dev, &bus->devices, bus_list) {
 		if (dev->subordinate) {
 			if (!pci_is_enabled(dev)) {
+				if (dev->is_pcie)
+					pcie_get_port_device_capability(dev);
 				retval = pci_enable_device(dev);
 				pci_set_master(dev);
 			}
@@ -239,10 +326,7 @@ void pci_walk_bus(struct pci_bus *top, int (*cb)(struct pci_dev *, void *),
 		} else
 			next = dev->bus_list.next;
 
-		/* Run device routines with the device locked */
-		down(&dev->dev.sem);
 		retval = cb(dev, userdata);
-		up(&dev->dev.sem);
 		if (retval)
 			break;
 	}

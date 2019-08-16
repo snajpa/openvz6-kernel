@@ -13,6 +13,8 @@
 #include <asm/tlbflush.h>
 #include <asm/tlb.h>
 #include <asm/proto.h>
+#include <asm/cpufeature.h>
+#include <asm/mmu_context.h>
 
 DEFINE_PER_CPU(struct mmu_gather, mmu_gathers);
 
@@ -28,35 +30,49 @@ int direct_gbpages
 #endif
 ;
 
-static void __init find_early_table_space(unsigned long end, int use_pse,
-					  int use_gbpages)
+struct map_range {
+	unsigned long start;
+	unsigned long end;
+	unsigned page_size_mask;
+};
+
+/*
+ * First calculate space needed for kernel direct mapping page tables to cover
+ * mr[0].start to mr[nr_range - 1].end, while accounting for possible 2M and 1GB
+ * pages. Then find enough contiguous space for those page tables.
+ */
+static void __init find_early_table_space(struct map_range *mr, int nr_range)
 {
-	unsigned long puds, pmds, ptes, tables, start;
+	int i;
+	unsigned long puds = 0, pmds = 0, ptes = 0, tables;
+	unsigned long start = 0;
 
-	puds = (end + PUD_SIZE - 1) >> PUD_SHIFT;
-	tables = roundup(puds * sizeof(pud_t), PAGE_SIZE);
+	for (i = 0; i < nr_range; i++) {
+		unsigned long range, extra;
 
-	if (use_gbpages) {
-		unsigned long extra;
+		range = mr[i].end - mr[i].start;
+		puds += (range + PUD_SIZE - 1) >> PUD_SHIFT;
 
-		extra = end - ((end>>PUD_SHIFT) << PUD_SHIFT);
-		pmds = (extra + PMD_SIZE - 1) >> PMD_SHIFT;
-	} else
-		pmds = (end + PMD_SIZE - 1) >> PMD_SHIFT;
+		if (mr[i].page_size_mask & (1 << PG_LEVEL_1G)) {
+			extra = range - ((range >> PUD_SHIFT) << PUD_SHIFT);
+			pmds += (extra + PMD_SIZE - 1) >> PMD_SHIFT;
+		} else {
+			pmds += (range + PMD_SIZE - 1) >> PMD_SHIFT;
+		}
 
-	tables += roundup(pmds * sizeof(pmd_t), PAGE_SIZE);
-
-	if (use_pse) {
-		unsigned long extra;
-
-		extra = end - ((end>>PMD_SHIFT) << PMD_SHIFT);
+		if (mr[i].page_size_mask & (1 << PG_LEVEL_2M)) {
+			extra = range - ((range >> PMD_SHIFT) << PMD_SHIFT);
 #ifdef CONFIG_X86_32
-		extra += PMD_SIZE;
+			extra += PMD_SIZE;
 #endif
-		ptes = (extra + PAGE_SIZE - 1) >> PAGE_SHIFT;
-	} else
-		ptes = (end + PAGE_SIZE - 1) >> PAGE_SHIFT;
-
+			ptes += (extra + PAGE_SIZE - 1) >> PAGE_SHIFT;
+		} else {
+			ptes += (range + PAGE_SIZE - 1) >> PAGE_SHIFT;
+		}
+	}
+ 
+	tables = roundup(puds * sizeof(pud_t), PAGE_SIZE);
+	tables += roundup(pmds * sizeof(pmd_t), PAGE_SIZE);
 	tables += roundup(ptes * sizeof(pte_t), PAGE_SIZE);
 
 #ifdef CONFIG_X86_32
@@ -84,14 +100,50 @@ static void __init find_early_table_space(unsigned long end, int use_pse,
 	e820_table_top = e820_table_start + (tables >> PAGE_SHIFT);
 
 	printk(KERN_DEBUG "kernel direct mapping tables up to %lx @ %lx-%lx\n",
-		end, e820_table_start << PAGE_SHIFT, e820_table_top << PAGE_SHIFT);
+		mr[nr_range - 1].end, e820_table_start << PAGE_SHIFT,
+		e820_table_top << PAGE_SHIFT);
 }
 
-struct map_range {
-	unsigned long start;
-	unsigned long end;
-	unsigned page_size_mask;
-};
+static void setup_pcid(void)
+{
+#ifdef CONFIG_X86_64
+	if (boot_cpu_has(X86_FEATURE_PCID)) {
+		if (boot_cpu_has(X86_FEATURE_PGE)) {
+			/*
+			 * This can't be cr4_set_bits_and_update_boot() --
+			 * the trampoline code can't handle CR4.PCIDE and
+			 * it wouldn't do any good anyway.  Despite the name,
+			 * cr4_set_bits_and_update_boot() doesn't actually
+			 * cause the bits in question to remain set all the
+			 * way through the secondary boot asm.
+			 *
+			 * Instead, we brute-force it and set CR4.PCIDE
+			 * manually in start_secondary().
+			 */
+			set_in_cr4(X86_CR4_PCIDE);
+			/*
+			 * INVPCID's single-context modes (2/3) only work
+			 * if we set X86_CR4_PCIDE, *and* we INVPCID
+			 * support.  It's unusable on systems that have
+			 * X86_CR4_PCIDE clear, or that have no INVPCID
+			 * support at all.
+			 */
+			if (boot_cpu_has(X86_FEATURE_INVPCID))
+				setup_force_cpu_cap(X86_FEATURE_INVPCID_SINGLE);
+		} else {
+			/*
+			 * flush_tlb_all(), as currently implemented, won't
+			 * work if PCID is on but PGE is not.  Since that
+			 * combination doesn't exist on real hardware, there's
+			 * no reason to try to fully support it, but it's
+			 * polite to avoid corrupting data if we're on
+			 * an improperly configured VM.
+			 */
+			setup_clear_cpu_cap(X86_FEATURE_PCID);
+		}
+	}
+#endif
+}
 
 #ifdef CONFIG_X86_32
 #define NR_RANGE_MR 3
@@ -133,6 +185,7 @@ unsigned long __init_refok init_memory_mapping(unsigned long start,
 	int use_pse, use_gbpages;
 
 	printk(KERN_INFO "init_memory_mapping: %016lx-%016lx\n", start, end);
+	setup_pcid();
 
 #if defined(CONFIG_DEBUG_PAGEALLOC) || defined(CONFIG_KMEMCHECK)
 	/*
@@ -149,6 +202,12 @@ unsigned long __init_refok init_memory_mapping(unsigned long start,
 	set_nx();
 	if (nx_enabled)
 		printk(KERN_INFO "NX (Execute Disable) protection: active\n");
+#ifdef CONFIG_X86_32
+	else
+	if (exec_shield)
+		printk(KERN_INFO "Using x86 segment limits to approximate "
+			"NX protection\n");
+#endif
 
 	/* Enable PSE if available */
 	if (cpu_has_pse)
@@ -268,7 +327,7 @@ unsigned long __init_refok init_memory_mapping(unsigned long start,
 	 * nodes are discovered.
 	 */
 	if (!after_bootmem)
-		find_early_table_space(end, use_pse, use_gbpages);
+		find_early_table_space(mr, nr_range);
 
 #ifdef CONFIG_X86_32
 	for (i = 0; i < nr_range; i++)
@@ -323,21 +382,40 @@ unsigned long __init_refok init_memory_mapping(unsigned long start,
  * devmem_is_allowed() checks to see if /dev/mem access to a certain address
  * is valid. The argument is a physical page number.
  *
- *
- * On x86, access has to be given to the first megabyte of ram because that area
- * contains bios code and data regions used by X and dosemu and similar apps.
- * Access has to be given to non-kernel-ram areas as well, these contain the PCI
- * mmio resources as well as potential bios/acpi data regions.
+ * On x86, access has to be given to the first megabyte of RAM because that
+ * area traditionally contains BIOS code and data regions used by X, dosemu,
+ * and similar apps. Since they map the entire memory range, the whole range
+ * must be allowed (for mapping), but any areas that would otherwise be
+ * disallowed are flagged as being "zero filled" instead of rejected.
+ * Access has to be given to non-kernel-ram areas as well, these contain the
+ * PCI mmio resources as well as potential bios/acpi data regions.
  */
 int devmem_is_allowed(unsigned long pagenr)
 {
-	if (pagenr <= 256)
-		return 1;
-	if (iomem_is_exclusive(pagenr << PAGE_SHIFT))
+	if (page_is_ram(pagenr)) {
+		/*
+		 * For disallowed memory regions in the low 1MB range,
+		 * request that the page be shown as all zeros.
+		 */
+		if (pagenr < 256)
+			return 2;
+
 		return 0;
-	if (!page_is_ram(pagenr))
-		return 1;
-	return 0;
+	}
+
+	/*
+	 * This must follow RAM test, since System RAM is considered a
+	 * restricted resource under CONFIG_STRICT_IOMEM.
+	 */
+	if (iomem_is_exclusive(pagenr << PAGE_SHIFT)) {
+		/* Low 1MB bypasses iomem restrictions. */
+		if (pagenr < 256)
+			return 1;
+
+		return 0;
+	}
+
+	return 1;
 }
 
 void free_init_pages(char *what, unsigned long begin, unsigned long end)

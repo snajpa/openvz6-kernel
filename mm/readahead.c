@@ -173,7 +173,7 @@ __do_page_cache_readahead(struct address_space *mapping, struct file *filp,
 		if (page)
 			continue;
 
-		page = page_cache_alloc_cold(mapping);
+		page = page_cache_alloc_readahead(mapping);
 		if (!page)
 			break;
 		page->index = page_offset;
@@ -195,6 +195,7 @@ out:
 	return ret;
 }
 
+#define MAX_READAHEAD   ((512*4096)/PAGE_CACHE_SIZE)
 /*
  * Chunk the readahead into 2 megabyte units, so that we don't pin too much
  * memory at once.
@@ -211,7 +212,7 @@ int force_page_cache_readahead(struct address_space *mapping, struct file *filp,
 	while (nr_to_read) {
 		int err;
 
-		unsigned long this_chunk = (2 * 1024 * 1024) / PAGE_CACHE_SIZE;
+		unsigned long this_chunk = MAX_READAHEAD;
 
 		if (this_chunk > nr_to_read)
 			this_chunk = nr_to_read;
@@ -234,8 +235,9 @@ int force_page_cache_readahead(struct address_space *mapping, struct file *filp,
  */
 unsigned long max_sane_readahead(unsigned long nr)
 {
-	return min(nr, (node_page_state(numa_node_id(), NR_INACTIVE_FILE)
-		+ node_page_state(numa_node_id(), NR_FREE_PAGES)) / 2);
+	return min(nr, max(MAX_READAHEAD,
+			  (node_page_state(numa_node_id(), NR_INACTIVE_FILE) +
+			   node_page_state(numa_node_id(), NR_FREE_PAGES)) / 2));
 }
 
 /*
@@ -501,6 +503,12 @@ void page_cache_sync_readahead(struct address_space *mapping,
 	if (!ra->ra_pages)
 		return;
 
+	/* be dumb */
+	if (filp && (filp->f_mode & FMODE_RANDOM)) {
+		force_page_cache_readahead(mapping, filp, offset, req_size);
+		return;
+	}
+
 	/* do read-ahead */
 	ondemand_readahead(mapping, ra, filp, false, offset, req_size);
 }
@@ -547,5 +555,17 @@ page_cache_async_readahead(struct address_space *mapping,
 
 	/* do read-ahead */
 	ondemand_readahead(mapping, ra, filp, true, offset, req_size);
+
+#ifdef CONFIG_BLOCK
+	/*
+	 * Normally the current page is !uptodate and lock_page() will be
+	 * immediately called to implicitly unplug the device. However this
+	 * is not always true for RAID conifgurations, where data arrives
+	 * not strictly in their submission order. In this case we need to
+	 * explicitly kick off the IO.
+	 */
+	if (PageUptodate(page))
+		blk_run_backing_dev(mapping->backing_dev_info, NULL);
+#endif
 }
 EXPORT_SYMBOL_GPL(page_cache_async_readahead);

@@ -32,6 +32,8 @@
 #include <linux/kernel_stat.h>
 #include <linux/syscalls.h>
 #include <linux/compat.h>
+#include <linux/personality.h>
+#include <linux/random.h>
 #include <asm/compat.h>
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
@@ -41,6 +43,7 @@
 #include <asm/irq.h>
 #include <asm/timer.h>
 #include <asm/nmi.h>
+#include <asm/runtime_instr.h>
 #include "entry.h"
 
 asmlinkage void ret_from_fork(void) asm ("ret_from_fork");
@@ -149,6 +152,7 @@ EXPORT_SYMBOL(kernel_thread);
  */
 void exit_thread(void)
 {
+	exit_thread_runtime_instr();
 }
 
 void flush_thread(void)
@@ -189,12 +193,18 @@ int copy_thread(unsigned long clone_flags, unsigned long new_stackp,
 	/* Save access registers to new thread structure. */
 	save_access_regs(&p->thread.acrs[0]);
 
+	/* Don't copy runtime instrumentation info */
+	p->thread.ri_cb = NULL;
+	p->thread.ri_signum = 0;
+	frame->childregs.psw.mask &= ~PSW_MASK_RI;
+
 #ifndef CONFIG_64BIT
 	/*
 	 * save fprs to current->thread.fp_regs to merge them with
 	 * the emulated registers and then copy the result to the child.
 	 */
-	save_fp_regs(&current->thread.fp_regs);
+	save_fp_ctl(&current->thread.fp_regs.fpc);
+	save_fp_regs(current->thread.fp_regs.fprs);
 	memcpy(&p->thread.fp_regs, &current->thread.fp_regs,
 	       sizeof(s390_fp_regs));
 	/* Set a new TLS ?  */
@@ -202,7 +212,9 @@ int copy_thread(unsigned long clone_flags, unsigned long new_stackp,
 		p->thread.acrs[0] = regs->gprs[6];
 #else /* CONFIG_64BIT */
 	/* Save the fpu registers to new thread structure. */
-	save_fp_regs(&p->thread.fp_regs);
+	save_fp_ctl(&p->thread.fp_regs.fpc);
+	save_fp_regs(p->thread.fp_regs.fprs);
+	p->thread.fp_regs.pad = 0;
 	/* Set a new TLS ?  */
 	if (clone_flags & CLONE_SETTLS) {
 		if (is_compat_task()) {
@@ -217,6 +229,7 @@ int copy_thread(unsigned long clone_flags, unsigned long new_stackp,
 	p->thread.mm_segment = get_fs();
 	/* Don't copy debug registers */
 	memset(&p->thread.per_info, 0, sizeof(p->thread.per_info));
+	p->thread.per_flags = 0;
 	/* Initialize per thread user and system timer values */
 	ti = task_thread_info(p);
 	ti->user_timer = 0;
@@ -272,14 +285,14 @@ SYSCALL_DEFINE3(execve, char __user *, name, char __user * __user *, argv,
 		char __user * __user *, envp)
 {
 	struct pt_regs *regs = task_pt_regs(current);
-	char *filename;
+	struct filename *filename;
 	long rc;
 
 	filename = getname(name);
 	rc = PTR_ERR(filename);
 	if (IS_ERR(filename))
 		return rc;
-	rc = do_execve(filename, argv, envp, regs);
+	rc = do_execve(filename->name, argv, envp, regs);
 	if (rc)
 		goto out;
 	execve_tail();
@@ -299,10 +312,12 @@ int dump_fpu (struct pt_regs * regs, s390_fp_regs *fpregs)
 	 * save fprs to current->thread.fp_regs to merge them with
 	 * the emulated registers and then copy the result to the dump.
 	 */
-	save_fp_regs(&current->thread.fp_regs);
+	save_fp_ctl(&current->thread.fp_regs.fpc);
+	save_fp_regs(current->thread.fp_regs.fprs);
 	memcpy(fpregs, &current->thread.fp_regs, sizeof(s390_fp_regs));
 #else /* CONFIG_64BIT */
-	save_fp_regs(fpregs);
+	save_fp_ctl(&fpregs->fpc);
+	save_fp_regs(fpregs->fprs);
 #endif /* CONFIG_64BIT */
 	return 1;
 }
@@ -331,3 +346,22 @@ unsigned long get_wchan(struct task_struct *p)
 	}
 	return 0;
 }
+
+static inline unsigned long brk_rnd(void)
+{
+	/* 8MB for 32bit, 1GB for 64bit */
+	if (is_32bit_task())
+		return (get_random_int() & 0x7ffUL) << PAGE_SHIFT;
+	else
+		return (get_random_int() & 0x3ffffUL) << PAGE_SHIFT;
+}
+
+unsigned long arch_randomize_brk(struct mm_struct *mm)
+{
+	unsigned long ret = PAGE_ALIGN(mm->brk + brk_rnd());
+
+	if (ret < mm->brk)
+		return mm->brk;
+	return ret;
+}
+

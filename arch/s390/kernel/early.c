@@ -82,7 +82,8 @@ asm(
 	"	lm	6,15,24(15)\n"
 #endif
 	"	br	14\n"
-	"	.size	savesys_ipl_nss, .-savesys_ipl_nss\n");
+	"	.size	savesys_ipl_nss, .-savesys_ipl_nss\n"
+	"	.previous\n");
 
 static __initdata char upper_command_line[COMMAND_LINE_SIZE];
 
@@ -227,7 +228,7 @@ static noinline __init void detect_machine_type(void)
 		S390_lowcore.machine_flags |= MACHINE_FLAG_VM;
 }
 
-static __init void early_pgm_check_handler(void)
+static void early_pgm_check_handler(void)
 {
 	unsigned long addr;
 	const struct exception_table_entry *fixup;
@@ -249,19 +250,6 @@ static noinline __init void setup_lowcore_early(void)
 	psw.addr = PSW_ADDR_AMODE | (unsigned long) s390_base_pgm_handler;
 	S390_lowcore.program_new_psw = psw;
 	s390_base_pgm_handler_fn = early_pgm_check_handler;
-}
-
-static noinline __init void setup_hpage(void)
-{
-#ifndef CONFIG_DEBUG_PAGEALLOC
-	unsigned int facilities;
-
-	facilities = stfl();
-	if (!(facilities & (1UL << 23)) || !(facilities & (1UL << 29)))
-		return;
-	S390_lowcore.machine_flags |= MACHINE_FLAG_HPAGE;
-	__ctl_set_bit(0, 23);
-#endif
 }
 
 static __init void detect_mvpg(void)
@@ -352,31 +340,42 @@ static __init void detect_machine_facilities(void)
 {
 #ifdef CONFIG_64BIT
 	unsigned int facilities;
+	unsigned long long facility_bits[2];
+	int dwords;
 
 	facilities = stfl();
+	if (facilities & (1 << 23)) {
+		S390_lowcore.machine_flags |= MACHINE_FLAG_EDAT1;
+		__ctl_set_bit(0,23);
+	}
 	if (facilities & (1 << 28))
 		S390_lowcore.machine_flags |= MACHINE_FLAG_IDTE;
-	if (facilities & (1 << 23))
-		S390_lowcore.machine_flags |= MACHINE_FLAG_PFMF;
 	if (facilities & (1 << 4))
 		S390_lowcore.machine_flags |= MACHINE_FLAG_MVCOS;
+	dwords = stfle(facility_bits, 2);
+	if ((dwords > 0) && (facility_bits[0] & (1ULL << (63 - 40))))
+		S390_lowcore.machine_flags |= MACHINE_FLAG_SPP;
+	if ((dwords > 1) && (facility_bits[1] & (1ULL << (127 - 78))))
+		S390_lowcore.machine_flags |= MACHINE_FLAG_EDAT2;
 #endif
 }
 
 static __init void rescue_initrd(void)
 {
 #ifdef CONFIG_BLK_DEV_INITRD
+	unsigned long min_initrd_addr = (unsigned long) _end + (4UL << 20);
 	/*
-	 * Move the initrd right behind the bss section in case it starts
-	 * within the bss section. So we don't overwrite it when the bss
-	 * section gets cleared.
+	 * Just like in case of IPL from VM reader we make sure there is a
+	 * gap of 4MB between end of kernel and start of initrd.
+	 * That way we can also be sure that saving an NSS will succeed,
+	 * which however only requires different segments.
 	 */
 	if (!INITRD_START || !INITRD_SIZE)
 		return;
-	if (INITRD_START >= (unsigned long) __bss_stop)
+	if (INITRD_START >= min_initrd_addr)
 		return;
-	memmove(__bss_stop, (void *) INITRD_START, INITRD_SIZE);
-	INITRD_START = (unsigned long) __bss_stop;
+	memmove((void *) min_initrd_addr, (void *) INITRD_START, INITRD_SIZE);
+	INITRD_START = min_initrd_addr;
 #endif
 }
 
@@ -412,6 +411,21 @@ static void __init setup_boot_command_line(void)
 	append_to_cmdline(append_ipl_scpdata);
 }
 
+static __init void setup_transactional_execution(void)
+{
+#ifdef CONFIG_64BIT
+	unsigned long long facility_bits[2];
+
+	if (stfle(facility_bits, 2) <= 1)
+		return;
+	if (!(facility_bits[0] & (1ULL << (63 - 50))) ||
+	    !(facility_bits[1] & (1ULL << (127 - 73))))
+		return;
+	S390_lowcore.machine_flags |= MACHINE_FLAG_TE;
+	__ctl_set_bit(0, 55);
+#endif
+}
+
 
 /*
  * Save ipl parameters, clear bss memory, initialize storage keys
@@ -423,6 +437,7 @@ void __init startup_init(void)
 	ipl_save_parameters();
 	rescue_initrd();
 	clear_bss_section();
+	ptff_init();
 	init_kernel_storage_key();
 	lockdep_init();
 	lockdep_off();
@@ -438,8 +453,9 @@ void __init startup_init(void)
 	detect_diag9c();
 	detect_diag44();
 	detect_machine_facilities();
-	setup_hpage();
+	setup_transactional_execution();
 	sclp_facilities_detect();
+	sclp_hsa_size_detect();
 	detect_memory_layout(memory_chunk);
 #ifdef CONFIG_DYNAMIC_FTRACE
 	S390_lowcore.ftrace_func = (unsigned long)ftrace_caller;

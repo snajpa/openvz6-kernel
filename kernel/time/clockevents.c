@@ -20,6 +20,8 @@
 #include <linux/sysdev.h>
 #include <linux/tick.h>
 
+#include "tick-internal.h"
+
 /* The registered clock event devices */
 static LIST_HEAD(clockevent_devices);
 static LIST_HEAD(clockevents_released);
@@ -94,42 +96,139 @@ void clockevents_shutdown(struct clock_event_device *dev)
 	dev->next_event.tv64 = KTIME_MAX;
 }
 
+#ifdef CONFIG_GENERIC_CLOCKEVENTS_MIN_ADJUST
+
+/* Limit min_delta to a jiffie */
+#define MIN_DELTA_LIMIT		(NSEC_PER_SEC / HZ)
+
+/**
+ * clockevents_increase_min_delta - raise minimum delta of a clock event device
+ * @dev:       device to increase the minimum delta
+ *
+ * Returns 0 on success, -ETIME when the minimum delta reached the limit.
+ */
+static int clockevents_increase_min_delta(struct clock_event_device *dev)
+{
+	/* Nothing to do if we already reached the limit */
+	if (dev->min_delta_ns >= MIN_DELTA_LIMIT) {
+		printk(KERN_WARNING "CE: Reprogramming failure. Giving up\n");
+		dev->next_event.tv64 = KTIME_MAX;
+		return -ETIME;
+	}
+
+	if (dev->min_delta_ns < 5000)
+		dev->min_delta_ns = 5000;
+	else
+		dev->min_delta_ns += dev->min_delta_ns >> 1;
+
+	if (dev->min_delta_ns > MIN_DELTA_LIMIT)
+		dev->min_delta_ns = MIN_DELTA_LIMIT;
+
+	printk(KERN_WARNING "CE: %s increased min_delta_ns to %llu nsec\n",
+	       dev->name ? dev->name : "?",
+	       (unsigned long long) dev->min_delta_ns);
+	return 0;
+}
+
+/**
+ * clockevents_program_min_delta - Set clock event device to the minimum delay.
+ * @dev:	device to program
+ *
+ * Returns 0 on success, -ETIME when the retry loop failed.
+ */
+static int clockevents_program_min_delta(struct clock_event_device *dev)
+{
+	unsigned long long clc;
+	int64_t delta;
+	int i;
+
+	for (i = 0;;) {
+		delta = dev->min_delta_ns;
+		dev->next_event = ktime_add_ns(ktime_get(), delta);
+
+		if (dev->mode == CLOCK_EVT_MODE_SHUTDOWN)
+			return 0;
+
+		dev->retries++;
+		clc = ((unsigned long long) delta * dev->mult) >> dev->shift;
+		if (dev->set_next_event((unsigned long) clc, dev) == 0)
+			return 0;
+
+		if (++i > 2) {
+			/*
+			 * We tried 3 times to program the device with the
+			 * given min_delta_ns. Try to increase the minimum
+			 * delta, if that fails as well get out of here.
+			 */
+			if (clockevents_increase_min_delta(dev))
+				return -ETIME;
+			i = 0;
+		}
+	}
+}
+
+#else  /* CONFIG_GENERIC_CLOCKEVENTS_MIN_ADJUST */
+
+/**
+ * clockevents_program_min_delta - Set clock event device to the minimum delay.
+ * @dev:	device to program
+ *
+ * Returns 0 on success, -ETIME when the retry loop failed.
+ */
+static int clockevents_program_min_delta(struct clock_event_device *dev)
+{
+	unsigned long long clc;
+	int64_t delta;
+
+	delta = dev->min_delta_ns;
+	dev->next_event = ktime_add_ns(ktime_get(), delta);
+
+	if (dev->mode == CLOCK_EVT_MODE_SHUTDOWN)
+		return 0;
+
+	dev->retries++;
+	clc = ((unsigned long long) delta * dev->mult) >> dev->shift;
+	return dev->set_next_event((unsigned long) clc, dev);
+}
+
+#endif /* CONFIG_GENERIC_CLOCKEVENTS_MIN_ADJUST */
+
 /**
  * clockevents_program_event - Reprogram the clock event device.
+ * @dev:	device to program
  * @expires:	absolute expiry time (monotonic clock)
+ * @force:	program minimum delay if expires can not be set
  *
  * Returns 0 on success, -ETIME when the event is in the past.
  */
 int clockevents_program_event(struct clock_event_device *dev, ktime_t expires,
-			      ktime_t now)
+			      bool force)
 {
 	unsigned long long clc;
 	int64_t delta;
+	int rc;
 
 	if (unlikely(expires.tv64 < 0)) {
 		WARN_ON_ONCE(1);
 		return -ETIME;
 	}
 
-	delta = ktime_to_ns(ktime_sub(expires, now));
-
-	if (delta <= 0)
-		return -ETIME;
-
 	dev->next_event = expires;
 
 	if (dev->mode == CLOCK_EVT_MODE_SHUTDOWN)
 		return 0;
 
-	if (delta > dev->max_delta_ns)
-		delta = dev->max_delta_ns;
-	if (delta < dev->min_delta_ns)
-		delta = dev->min_delta_ns;
+	delta = ktime_to_ns(ktime_sub(expires, ktime_get()));
+	if (delta <= 0)
+		return force ? clockevents_program_min_delta(dev) : -ETIME;
 
-	clc = delta * dev->mult;
-	clc >>= dev->shift;
+	delta = min(delta, (int64_t) dev->max_delta_ns);
+	delta = max(delta, (int64_t) dev->min_delta_ns);
 
-	return dev->set_next_event((unsigned long) clc, dev);
+	clc = ((unsigned long long) delta * dev->mult) >> dev->shift;
+	rc = dev->set_next_event((unsigned long) clc, dev);
+
+	return (rc && force) ? clockevents_program_min_delta(dev) : rc;
 }
 
 /**
@@ -237,8 +336,9 @@ void clockevents_exchange_device(struct clock_event_device *old,
  */
 void clockevents_notify(unsigned long reason, void *arg)
 {
-	struct list_head *node, *tmp;
+	struct clock_event_device *dev, *tmp;
 	unsigned long flags;
+	int cpu;
 
 	spin_lock_irqsave(&clockevents_lock, flags);
 	clockevents_do_notify(reason, arg);
@@ -249,8 +349,20 @@ void clockevents_notify(unsigned long reason, void *arg)
 		 * Unregister the clock event devices which were
 		 * released from the users in the notify chain.
 		 */
-		list_for_each_safe(node, tmp, &clockevents_released)
-			list_del(node);
+		list_for_each_entry_safe(dev, tmp, &clockevents_released, list)
+			list_del(&dev->list);
+		/*
+		 * Now check whether the CPU has left unused per cpu devices
+		 */
+		cpu = *((int *)arg);
+		list_for_each_entry_safe(dev, tmp, &clockevent_devices, list) {
+			if (cpumask_test_cpu(cpu, dev->cpumask) &&
+			    cpumask_weight(dev->cpumask) == 1 &&
+			    !tick_is_broadcast_device(dev)) {
+				BUG_ON(dev->mode != CLOCK_EVT_MODE_UNUSED);
+				list_del(&dev->list);
+			}
+		}
 		break;
 	default:
 		break;

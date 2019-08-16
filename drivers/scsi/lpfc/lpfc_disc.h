@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2004-2008 Emulex.  All rights reserved.           *
+ * Copyright (C) 2004-2013 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
  * www.emulex.com                                                  *
  *                                                                 *
@@ -19,7 +19,7 @@
  *******************************************************************/
 
 #define FC_MAX_HOLD_RSCN     32	      /* max number of deferred RSCNs */
-#define FC_MAX_NS_RSP        65536    /* max size NameServer rsp */
+#define FC_MAX_NS_RSP        64512    /* max size NameServer rsp */
 #define FC_MAXLOOP           126      /* max devices supported on a fc loop */
 #define LPFC_DISC_FLOGI_TMO  10	      /* Discovery FLOGI ratov */
 
@@ -38,6 +38,7 @@ enum lpfc_work_type {
 	LPFC_EVT_ELS_RETRY,
 	LPFC_EVT_DEV_LOSS,
 	LPFC_EVT_FASTPATH_MGMT_EVT,
+	LPFC_EVT_RESET_HBA,
 };
 
 /* structure used to queue event to the discovery tasklet */
@@ -67,11 +68,17 @@ struct lpfc_fast_path_event {
 	} un;
 };
 
+#define LPFC_SLI4_MAX_XRI	1024	/* Used to make the ndlp's xri_bitmap */
+#define XRI_BITMAP_ULONGS (LPFC_SLI4_MAX_XRI / BITS_PER_LONG)
+struct lpfc_node_rrqs {
+	unsigned long xri_bitmap[XRI_BITMAP_ULONGS];
+};
+
 struct lpfc_nodelist {
 	struct list_head nlp_listp;
 	struct lpfc_name nlp_portname;
 	struct lpfc_name nlp_nodename;
-	uint32_t         nlp_flag;		/* entry  flags */
+	uint32_t         nlp_flag;		/* entry flags */
 	uint32_t         nlp_DID;		/* FC D_ID of entry */
 	uint32_t         nlp_last_elscmd;	/* Last ELS cmd sent */
 	uint16_t         nlp_type;
@@ -105,16 +112,27 @@ struct lpfc_nodelist {
 	struct lpfc_vport *vport;
 	struct lpfc_work_evt els_retry_evt;
 	struct lpfc_work_evt dev_loss_evt;
-	unsigned long last_ramp_up_time;        /* jiffy of last ramp up */
-	unsigned long last_q_full_time;		/* jiffy of last queue full */
 	struct kref     kref;
 	atomic_t cmd_pending;
 	uint32_t cmd_qdepth;
 	unsigned long last_change_time;
+	unsigned long *active_rrqs_xri_bitmap;
 	struct lpfc_scsicmd_bkt *lat_data;	/* Latency data */
+};
+struct lpfc_node_rrq {
+	struct list_head list;
+	uint16_t xritag;
+	uint16_t send_rrq;
+	uint16_t rxid;
+	uint32_t         nlp_DID;		/* FC D_ID of entry */
+	struct lpfc_vport *vport;
+	struct lpfc_nodelist *ndlp;
+	unsigned long rrq_stop_time;
 };
 
 /* Defines for nlp_flag (uint32) */
+#define NLP_IGNR_REG_CMPL  0x00000001 /* Rcvd rscn before we cmpl reg login */
+#define NLP_REG_LOGIN_SEND 0x00000002   /* sent reglogin to adapter */
 #define NLP_PLOGI_SND      0x00000020	/* sent PLOGI request for this entry */
 #define NLP_PRLI_SND       0x00000040	/* sent PRLI request for this entry */
 #define NLP_ADISC_SND      0x00000080	/* sent ADISC request for this entry */
@@ -127,6 +145,8 @@ struct lpfc_nodelist {
 #define NLP_RCV_PLOGI      0x00080000	/* Rcv'ed PLOGI from remote system */
 #define NLP_LOGO_ACC       0x00100000	/* Process LOGO after ACC completes */
 #define NLP_TGT_NO_SCSIID  0x00200000	/* good PRLI but no binding for scsid */
+#define NLP_ISSUE_LOGO     0x00400000	/* waiting to issue a LOGO */
+#define NLP_IN_DEV_LOSS    0x00800000	/* devloss in progress */
 #define NLP_ACC_REGLOGIN   0x01000000	/* Issue Reg Login after successful
 					   ACC */
 #define NLP_NPR_ADISC      0x02000000	/* Issue ADISC when dq'ed from
@@ -135,7 +155,9 @@ struct lpfc_nodelist {
 #define NLP_NODEV_REMOVE   0x08000000	/* Defer removal till discovery ends */
 #define NLP_TARGET_REMOVE  0x10000000   /* Target remove in process */
 #define NLP_SC_REQ         0x20000000	/* Target requires authentication */
-#define NLP_RPI_VALID      0x80000000	/* nlp_rpi is valid */
+#define NLP_FIRSTBURST     0x40000000	/* Target supports FirstBurst */
+#define NLP_RPI_REGISTERED 0x80000000	/* nlp_rpi is valid */
+
 
 /* ndlp usage management macros */
 #define NLP_CHK_NODE_ACT(ndlp)		(((ndlp)->nlp_usg_map \
@@ -183,10 +205,11 @@ struct lpfc_nodelist {
 #define NLP_STE_ADISC_ISSUE       0x2	/* ADISC was sent to NL_PORT */
 #define NLP_STE_REG_LOGIN_ISSUE   0x3	/* REG_LOGIN was issued for NL_PORT */
 #define NLP_STE_PRLI_ISSUE        0x4	/* PRLI was sent to NL_PORT */
-#define NLP_STE_UNMAPPED_NODE     0x5	/* PRLI completed from NL_PORT */
-#define NLP_STE_MAPPED_NODE       0x6	/* Identified as a FCP Target */
-#define NLP_STE_NPR_NODE          0x7	/* NPort disappeared */
-#define NLP_STE_MAX_STATE         0x8
+#define NLP_STE_LOGO_ISSUE	  0x5	/* LOGO was sent to NL_PORT */
+#define NLP_STE_UNMAPPED_NODE     0x6	/* PRLI completed from NL_PORT */
+#define NLP_STE_MAPPED_NODE       0x7	/* Identified as a FCP Target */
+#define NLP_STE_NPR_NODE          0x8	/* NPort disappeared */
+#define NLP_STE_MAX_STATE         0x9
 #define NLP_STE_FREED_NODE        0xff	/* node entry was freed to MEM_NLP */
 
 /* For UNUSED_NODE state, the node has just been allocated.

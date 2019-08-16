@@ -297,6 +297,7 @@ static struct pci_device_id snd_atiixp_ids[] = {
 MODULE_DEVICE_TABLE(pci, snd_atiixp_ids);
 
 static struct snd_pci_quirk atiixp_quirks[] __devinitdata = {
+	SND_PCI_QUIRK(0x105b, 0x0c81, "Foxconn RC4107MA-RS2", 0),
 	SND_PCI_QUIRK(0x15bd, 0x3100, "DFI RS482", 0),
 	{ } /* terminator */
 };
@@ -566,8 +567,9 @@ static int __devinit ac97_probing_bugs(struct pci_dev *pci)
 
 	q = snd_pci_quirk_lookup(pci, atiixp_quirks);
 	if (q) {
-		snd_printdd(KERN_INFO "Atiixp quirk for %s.  "
-			    "Forcing codec %d\n", q->name, q->value);
+		snd_printdd(KERN_INFO
+			    "Atiixp quirk for %s.  Forcing codec %d\n",
+			    snd_pci_quirk_name(q), q->value);
 		return q->value;
 	}
 	/* this hardware doesn't need workarounds.  Probe for codec */
@@ -1637,8 +1639,6 @@ static int __devinit snd_atiixp_create(struct snd_card *card,
 		return err;
 	}
 
-	snd_card_set_dev(card, &pci->dev);
-
 	*r_chip = chip;
 	return 0;
 }
@@ -1651,7 +1651,7 @@ static int __devinit snd_atiixp_probe(struct pci_dev *pci,
 	struct atiixp *chip;
 	int err;
 
-	err = snd_card_create(index, id, THIS_MODULE, 0, &card);
+	err = snd_card_new(&pci->dev, index, id, THIS_MODULE, 0, &card);
 	if (err < 0)
 		return err;
 

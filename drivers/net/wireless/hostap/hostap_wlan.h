@@ -1,8 +1,10 @@
 #ifndef HOSTAP_WLAN_H
 #define HOSTAP_WLAN_H
 
+#include <linux/interrupt.h>
 #include <linux/wireless.h>
 #include <linux/netdevice.h>
+#include <linux/etherdevice.h>
 #include <linux/mutex.h>
 #include <net/iw_handler.h>
 #include <net/ieee80211_radiotap.h>
@@ -31,14 +33,14 @@ struct linux_wlan_ng_val {
 	u32 did;
 	u16 status, len;
 	u32 data;
-} __attribute__ ((packed));
+} __packed;
 
 struct linux_wlan_ng_prism_hdr {
 	u32 msgcode, msglen;
 	char devname[16];
 	struct linux_wlan_ng_val hosttime, mactime, channel, rssi, sq, signal,
 		noise, rate, istx, frmlen;
-} __attribute__ ((packed));
+} __packed;
 
 struct linux_wlan_ng_cap_hdr {
 	__be32 version;
@@ -55,7 +57,7 @@ struct linux_wlan_ng_cap_hdr {
 	__be32 ssi_noise;
 	__be32 preamble;
 	__be32 encoding;
-} __attribute__ ((packed));
+} __packed;
 
 struct hostap_radiotap_rx {
 	struct ieee80211_radiotap_header hdr;
@@ -66,7 +68,7 @@ struct hostap_radiotap_rx {
 	__le16 chan_flags;
 	s8 dbm_antsignal;
 	s8 dbm_antnoise;
-} __attribute__ ((packed));
+} __packed;
 
 #define LWNG_CAP_DID_BASE   (4 | (1 << 6)) /* section 4, group 1 */
 #define LWNG_CAPHDR_VERSION 0x80211001
@@ -84,20 +86,20 @@ struct hfa384x_rx_frame {
 	/* 802.11 */
 	__le16 frame_control;
 	__le16 duration_id;
-	u8 addr1[6];
-	u8 addr2[6];
-	u8 addr3[6];
+	u8 addr1[ETH_ALEN];
+	u8 addr2[ETH_ALEN];
+	u8 addr3[ETH_ALEN];
 	__le16 seq_ctrl;
-	u8 addr4[6];
+	u8 addr4[ETH_ALEN];
 	__le16 data_len;
 
 	/* 802.3 */
-	u8 dst_addr[6];
-	u8 src_addr[6];
+	u8 dst_addr[ETH_ALEN];
+	u8 src_addr[ETH_ALEN];
 	__be16 len;
 
 	/* followed by frame data; max 2304 bytes */
-} __attribute__ ((packed));
+} __packed;
 
 
 struct hfa384x_tx_frame {
@@ -113,27 +115,27 @@ struct hfa384x_tx_frame {
 	/* 802.11 */
 	__le16 frame_control; /* parts not used */
 	__le16 duration_id;
-	u8 addr1[6];
-	u8 addr2[6]; /* filled by firmware */
-	u8 addr3[6];
+	u8 addr1[ETH_ALEN];
+	u8 addr2[ETH_ALEN]; /* filled by firmware */
+	u8 addr3[ETH_ALEN];
 	__le16 seq_ctrl; /* filled by firmware */
-	u8 addr4[6];
+	u8 addr4[ETH_ALEN];
 	__le16 data_len;
 
 	/* 802.3 */
-	u8 dst_addr[6];
-	u8 src_addr[6];
+	u8 dst_addr[ETH_ALEN];
+	u8 src_addr[ETH_ALEN];
 	__be16 len;
 
 	/* followed by frame data; max 2304 bytes */
-} __attribute__ ((packed));
+} __packed;
 
 
 struct hfa384x_rid_hdr
 {
 	__le16 len;
 	__le16 rid;
-} __attribute__ ((packed));
+} __packed;
 
 
 /* Macro for converting signal levels (range 27 .. 154) to wireless ext
@@ -145,24 +147,24 @@ struct hfa384x_rid_hdr
 struct hfa384x_scan_request {
 	__le16 channel_list;
 	__le16 txrate; /* HFA384X_RATES_* */
-} __attribute__ ((packed));
+} __packed;
 
 struct hfa384x_hostscan_request {
 	__le16 channel_list;
 	__le16 txrate;
 	__le16 target_ssid_len;
 	u8 target_ssid[32];
-} __attribute__ ((packed));
+} __packed;
 
 struct hfa384x_join_request {
-	u8 bssid[6];
+	u8 bssid[ETH_ALEN];
 	__le16 channel;
-} __attribute__ ((packed));
+} __packed;
 
 struct hfa384x_info_frame {
 	__le16 len;
 	__le16 type;
-} __attribute__ ((packed));
+} __packed;
 
 struct hfa384x_comm_tallies {
 	__le16 tx_unicast_frames;
@@ -186,7 +188,7 @@ struct hfa384x_comm_tallies {
 	__le16 rx_discards_wep_undecryptable;
 	__le16 rx_message_in_msg_fragments;
 	__le16 rx_message_in_bad_msg_fragments;
-} __attribute__ ((packed));
+} __packed;
 
 struct hfa384x_comm_tallies32 {
 	__le32 tx_unicast_frames;
@@ -210,7 +212,7 @@ struct hfa384x_comm_tallies32 {
 	__le32 rx_discards_wep_undecryptable;
 	__le32 rx_message_in_msg_fragments;
 	__le32 rx_message_in_bad_msg_fragments;
-} __attribute__ ((packed));
+} __packed;
 
 struct hfa384x_scan_result_hdr {
 	__le16 reserved;
@@ -219,7 +221,7 @@ struct hfa384x_scan_result_hdr {
 #define HFA384X_SCAN_HOST_INITIATED 1
 #define HFA384X_SCAN_FIRMWARE_INITIATED 2
 #define HFA384X_SCAN_INQUIRY_FROM_HOST 3
-} __attribute__ ((packed));
+} __packed;
 
 #define HFA384X_SCAN_MAX_RESULTS 32
 
@@ -227,20 +229,20 @@ struct hfa384x_scan_result {
 	__le16 chid;
 	__le16 anl;
 	__le16 sl;
-	u8 bssid[6];
+	u8 bssid[ETH_ALEN];
 	__le16 beacon_interval;
 	__le16 capability;
 	__le16 ssid_len;
 	u8 ssid[32];
 	u8 sup_rates[10];
 	__le16 rate;
-} __attribute__ ((packed));
+} __packed;
 
 struct hfa384x_hostscan_result {
 	__le16 chid;
 	__le16 anl;
 	__le16 sl;
-	u8 bssid[6];
+	u8 bssid[ETH_ALEN];
 	__le16 beacon_interval;
 	__le16 capability;
 	__le16 ssid_len;
@@ -248,7 +250,7 @@ struct hfa384x_hostscan_result {
 	u8 sup_rates[10];
 	__le16 rate;
 	__le16 atim;
-} __attribute__ ((packed));
+} __packed;
 
 struct comm_tallies_sums {
 	unsigned int tx_unicast_frames;
@@ -595,8 +597,7 @@ struct prism2_helper_functions {
 			struct prism2_download_param *param);
 	int (*tx)(struct sk_buff *skb, struct net_device *dev);
 	int (*set_tim)(struct net_device *dev, int aid, int set);
-	int (*read_aux)(struct net_device *dev, unsigned addr, int len,
-			u8 *buf);
+	const struct file_operations *read_aux_fops;
 
 	int need_tx_headroom; /* number of bytes of headroom needed before
 			       * IEEE 802.11 header */
@@ -654,7 +655,7 @@ struct local_info {
 	rwlock_t iface_lock; /* hostap_interfaces read lock; use write lock
 			      * when removing entries from the list.
 			      * TX and RX paths can use read lock. */
-	spinlock_t cmdlock, baplock, lock;
+	spinlock_t cmdlock, baplock, lock, irq_init_lock;
 	struct mutex rid_bap_mtx;
 	u16 infofid; /* MAC buffer id for info frame */
 	/* txfid, intransmitfid, next_txtid, and next_alloc are protected by
@@ -824,7 +825,7 @@ struct local_info {
 #define PRISM2_INFO_PENDING_SCANRESULTS 1
 	int prev_link_status; /* previous received LinkStatus info */
 	int prev_linkstatus_connected;
-	u8 preferred_ap[6]; /* use this AP if possible */
+	u8 preferred_ap[ETH_ALEN]; /* use this AP if possible */
 
 #ifdef PRISM2_CALLBACK
 	void *callback_data; /* Can be used in callbacks; e.g., allocate
@@ -853,7 +854,7 @@ struct local_info {
 	struct work_struct comms_qual_update;
 
 	/* RSSI to dBm adjustment (for RX descriptor fields) */
-	int rssi_to_dBm; /* substract from RSSI to get approximate dBm value */
+	int rssi_to_dBm; /* subtract from RSSI to get approximate dBm value */
 
 	/* BSS list / protected by local->lock */
 	struct list_head bss_list;

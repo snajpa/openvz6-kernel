@@ -111,6 +111,23 @@ static inline __wsum udp_csum_outgoing(struct sock *sk, struct sk_buff *skb)
 	return csum;
 }
 
+static inline __wsum udp_csum(struct sk_buff *skb)
+{
+	__wsum csum = csum_partial(skb_transport_header(skb),
+				   sizeof(struct udphdr), skb->csum);
+
+	for (skb = skb_shinfo(skb)->frag_list; skb; skb = skb->next) {
+		csum = csum_add(csum, skb->csum);
+	}
+	return csum;
+}
+
+static inline __sum16 udp_v4_check(int len, __be32 saddr,
+				   __be32 daddr, __wsum base)
+{
+	return csum_tcpudp_magic(saddr, daddr, len, IPPROTO_UDP, base);
+}
+
 /* hash routines shared between UDPv4/6 and UDP-Litev4/6 */
 static inline void udp_lib_hash(struct sock *sk)
 {
@@ -134,6 +151,7 @@ extern void	udp_err(struct sk_buff *, u32);
 
 extern int	udp_sendmsg(struct kiocb *iocb, struct sock *sk,
 			    struct msghdr *msg, size_t len);
+extern int	udp_push_pending_frames(struct sock *sk);
 extern void	udp_flush_pending_frames(struct sock *sk);
 
 extern int	udp_rcv(struct sk_buff *skb);
@@ -149,6 +167,9 @@ extern int 	udp_lib_setsockopt(struct sock *sk, int level, int optname,
 
 extern struct sock *udp4_lib_lookup(struct net *net, __be32 saddr, __be16 sport,
 				    __be32 daddr, __be16 dport,
+				    int dif);
+extern struct sock *udp6_lib_lookup(struct net *net, const struct in6_addr *saddr, __be16 sport,
+				    const struct in6_addr *daddr, __be16 dport,
 				    int dif);
 
 /*

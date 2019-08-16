@@ -82,9 +82,13 @@ static ssize_t  show_##name(struct device *dev,				\
 		struct device_attribute *attr, char *buf)		\
 {									\
 	struct usb_device *udev;					\
+	int retval;							\
 									\
 	udev = to_usb_device(dev);					\
-	return sprintf(buf, "%s\n", udev->name);			\
+	usb_lock_device(udev);						\
+	retval = sprintf(buf, "%s\n", udev->name);			\
+	usb_unlock_device(udev);					\
+	return retval;							\
 }									\
 static DEVICE_ATTR(name, S_IRUGO, show_##name, NULL);
 
@@ -110,6 +114,12 @@ show_speed(struct device *dev, struct device_attribute *attr, char *buf)
 		break;
 	case USB_SPEED_HIGH:
 		speed = "480";
+		break;
+	case USB_SPEED_WIRELESS:
+		speed = "480";
+		break;
+	case USB_SPEED_SUPER:
+		speed = "5000";
 		break;
 	default:
 		speed = "unknown";
@@ -180,6 +190,15 @@ show_urbnum(struct device *dev, struct device_attribute *attr, char *buf)
 }
 static DEVICE_ATTR(urbnum, S_IRUGO, show_urbnum, NULL);
 
+
+static ssize_t
+show_ltm_capable(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	if (usb_device_supports_ltm(to_usb_device(dev)))
+		return sprintf(buf, "%s\n", "yes");
+	return sprintf(buf, "%s\n", "no");
+}
+static DEVICE_ATTR(ltm_capable, S_IRUGO, show_ltm_capable, NULL);
 
 #ifdef	CONFIG_PM
 
@@ -387,11 +406,55 @@ set_level(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR(level, S_IRUGO | S_IWUSR, show_level, set_level);
 
+static ssize_t
+show_usb2_hardware_lpm(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct usb_device *udev = to_usb_device(dev);
+	const char *p;
+
+	if (udev->usb2_hw_lpm_allowed == 1)
+		p = "enabled";
+	else
+		p = "disabled";
+
+	return sprintf(buf, "%s\n", p);
+}
+
+static ssize_t
+set_usb2_hardware_lpm(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct usb_device *udev = to_usb_device(dev);
+	bool value;
+	int ret;
+
+	usb_lock_device(udev);
+
+	ret = strtobool(buf, &value);
+
+	if (!ret) {
+		udev->usb2_hw_lpm_allowed = value;
+		ret = usb_set_usb2_hardware_lpm(udev, value);
+	}
+
+	usb_unlock_device(udev);
+
+	if (!ret)
+		return count;
+
+	return ret;
+}
+
+static DEVICE_ATTR(usb2_hardware_lpm, S_IRUGO | S_IWUSR, show_usb2_hardware_lpm,
+			set_usb2_hardware_lpm);
+
 static int add_power_attributes(struct device *dev)
 {
 	int rc = 0;
 
 	if (is_usb_device(dev)) {
+		struct usb_device *udev = to_usb_device(dev);
 		rc = sysfs_add_file_to_group(&dev->kobj,
 				&dev_attr_autosuspend.attr,
 				power_group);
@@ -407,12 +470,20 @@ static int add_power_attributes(struct device *dev)
 			rc = sysfs_add_file_to_group(&dev->kobj,
 					&dev_attr_active_duration.attr,
 					power_group);
+		if (udev->usb2_hw_lpm_capable == 1)
+			rc = sysfs_add_file_to_group(&dev->kobj,
+					&dev_attr_usb2_hardware_lpm.attr,
+					power_group);
 	}
+
 	return rc;
 }
 
 static void remove_power_attributes(struct device *dev)
 {
+	sysfs_remove_file_from_group(&dev->kobj,
+			&dev_attr_usb2_hardware_lpm.attr,
+			power_group);
 	sysfs_remove_file_from_group(&dev->kobj,
 			&dev_attr_active_duration.attr,
 			power_group);
@@ -508,6 +579,28 @@ static ssize_t usb_dev_authorized_store(struct device *dev,
 static DEVICE_ATTR(authorized, 0644,
 	    usb_dev_authorized_show, usb_dev_authorized_store);
 
+/* "Safely remove a device" */
+static ssize_t usb_remove_store(struct device *dev,
+		struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct usb_device *udev = to_usb_device(dev);
+	int rc = 0;
+
+	usb_lock_device(udev);
+	if (udev->state != USB_STATE_NOTATTACHED) {
+
+		/* To avoid races, first unconfigure and then remove */
+		usb_set_configuration(udev, -1);
+		rc = usb_remove_device(udev);
+	}
+	if (rc == 0)
+		rc = count;
+	usb_unlock_device(udev);
+	return rc;
+}
+static DEVICE_ATTR(remove, 0200, NULL, usb_remove_store);
+
 
 static struct attribute *dev_attrs[] = {
 	/* current configuration's attributes */
@@ -533,6 +626,8 @@ static struct attribute *dev_attrs[] = {
 	&dev_attr_maxchild.attr,
 	&dev_attr_quirks.attr,
 	&dev_attr_authorized.attr,
+	&dev_attr_remove.attr,
+	&dev_attr_ltm_capable.attr,
 	NULL,
 };
 static struct attribute_group dev_attr_grp = {
@@ -582,7 +677,8 @@ const struct attribute_group *usb_device_groups[] = {
 /* Binary descriptors */
 
 static ssize_t
-read_descriptors(struct kobject *kobj, struct bin_attribute *attr,
+read_descriptors(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr,
 		char *buf, loff_t off, size_t count)
 {
 	struct device *dev = container_of(kobj, struct device, kobj);

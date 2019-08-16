@@ -524,7 +524,8 @@ static const struct rtc_class_ops cmos_rtc_ops = {
 #define NVRAM_OFFSET	(RTC_REG_D + 1)
 
 static ssize_t
-cmos_nvram_read(struct kobject *kobj, struct bin_attribute *attr,
+cmos_nvram_read(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr,
 		char *buf, loff_t off, size_t count)
 {
 	int	retval;
@@ -552,7 +553,8 @@ cmos_nvram_read(struct kobject *kobj, struct bin_attribute *attr,
 }
 
 static ssize_t
-cmos_nvram_write(struct kobject *kobj, struct bin_attribute *attr,
+cmos_nvram_write(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr,
 		char *buf, loff_t off, size_t count)
 {
 	struct cmos_rtc	*cmos;
@@ -871,8 +873,9 @@ static int cmos_suspend(struct device *dev, pm_message_t mesg)
 			mask = RTC_IRQMASK;
 		tmp &= ~mask;
 		CMOS_WRITE(tmp, RTC_CONTROL);
-		hpet_mask_rtc_irq_bit(mask);
 
+		/* shut down hpet emulation - we don't need it for alarm */
+		hpet_mask_rtc_irq_bit(RTC_PIE|RTC_AIE|RTC_UIE);
 		cmos_checkintr(cmos, tmp);
 	}
 	spin_unlock_irq(&rtc_lock);
@@ -1099,9 +1102,9 @@ static int cmos_pnp_resume(struct pnp_dev *pnp)
 #define	cmos_pnp_resume		NULL
 #endif
 
-static void cmos_pnp_shutdown(struct device *pdev)
+static void cmos_pnp_shutdown(struct pnp_dev *pnp)
 {
-	if (system_state == SYSTEM_POWER_OFF && !cmos_poweroff(pdev))
+	if (system_state == SYSTEM_POWER_OFF && !cmos_poweroff(&pnp->dev))
 		return;
 
 	cmos_do_shutdown();
@@ -1120,15 +1123,12 @@ static struct pnp_driver cmos_pnp_driver = {
 	.id_table	= rtc_ids,
 	.probe		= cmos_pnp_probe,
 	.remove		= __exit_p(cmos_pnp_remove),
+	.shutdown	= cmos_pnp_shutdown,
 
 	/* flag ensures resume() gets called, and stops syslog spam */
 	.flags		= PNP_DRIVER_RES_DO_NOT_CHANGE,
 	.suspend	= cmos_pnp_suspend,
 	.resume		= cmos_pnp_resume,
-	.driver		= {
-		.name	  = (char *)driver_name,
-		.shutdown = cmos_pnp_shutdown,
-	}
 };
 
 #endif	/* CONFIG_PNP */

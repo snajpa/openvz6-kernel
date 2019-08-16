@@ -1,7 +1,7 @@
 /****************************************************************************
- * Driver for Solarflare Solarstorm network controllers and boards
+ * Driver for Solarflare network controllers and boards
  * Copyright 2005-2006 Fen Systems Ltd.
- * Copyright 2005-2008 Solarflare Communications Inc.
+ * Copyright 2005-2013 Solarflare Communications Inc.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 as published
@@ -10,295 +10,334 @@
 
 #include <linux/socket.h>
 #include <linux/in.h>
+#include <linux/slab.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+#include <linux/prefetch.h>
+#include <linux/moduleparam.h>
+#include <linux/iommu.h>
 #include <net/ip.h>
 #include <net/checksum.h>
 #include "net_driver.h"
-#include "rx.h"
 #include "efx.h"
-#include "falcon.h"
+#include "filter.h"
+#include "nic.h"
 #include "selftest.h"
 #include "workarounds.h"
 
-/* Number of RX descriptors pushed at once. */
-#define EFX_RX_BATCH  8
+/* Preferred number of descriptors to fill at once */
+#define EFX_RX_PREFERRED_BATCH 8U
+
+/* Number of RX buffers to recycle pages for.  When creating the RX page recycle
+ * ring, this number is divided by the number of buffers per page to calculate
+ * the number of pages to store in the RX page recycle ring.
+ */
+#define EFX_RECYCLE_RING_SIZE_IOMMU 4096
+#define EFX_RECYCLE_RING_SIZE_NOIOMMU (2 * EFX_RX_PREFERRED_BATCH)
 
 /* Size of buffer allocated for skb header area. */
-#define EFX_SKB_HEADERS  64u
-
-/*
- * rx_alloc_method - RX buffer allocation method
- *
- * This driver supports two methods for allocating and using RX buffers:
- * each RX buffer may be backed by an skb or by an order-n page.
- *
- * When LRO is in use then the second method has a lower overhead,
- * since we don't have to allocate then free skbs on reassembled frames.
- *
- * Values:
- *   - RX_ALLOC_METHOD_AUTO = 0
- *   - RX_ALLOC_METHOD_SKB  = 1
- *   - RX_ALLOC_METHOD_PAGE = 2
- *
- * The heuristic for %RX_ALLOC_METHOD_AUTO is a simple hysteresis count
- * controlled by the parameters below.
- *
- *   - Since pushing and popping descriptors are separated by the rx_queue
- *     size, so the watermarks should be ~rxd_size.
- *   - The performance win by using page-based allocation for LRO is less
- *     than the performance hit of using page-based allocation of non-LRO,
- *     so the watermarks should reflect this.
- *
- * Per channel we maintain a single variable, updated by each channel:
- *
- *   rx_alloc_level += (lro_performed ? RX_ALLOC_FACTOR_LRO :
- *                      RX_ALLOC_FACTOR_SKB)
- * Per NAPI poll interval, we constrain rx_alloc_level to 0..MAX (which
- * limits the hysteresis), and update the allocation strategy:
- *
- *   rx_alloc_method = (rx_alloc_level > RX_ALLOC_LEVEL_LRO ?
- *                      RX_ALLOC_METHOD_PAGE : RX_ALLOC_METHOD_SKB)
- */
-static int rx_alloc_method = RX_ALLOC_METHOD_PAGE;
-
-#define RX_ALLOC_LEVEL_LRO 0x2000
-#define RX_ALLOC_LEVEL_MAX 0x3000
-#define RX_ALLOC_FACTOR_LRO 1
-#define RX_ALLOC_FACTOR_SKB (-2)
+#define EFX_SKB_HEADERS  128u
 
 /* This is the percentage fill level below which new RX descriptors
  * will be added to the RX descriptor ring.
  */
-static unsigned int rx_refill_threshold = 90;
+static unsigned int rx_refill_threshold;
 
-/* This is the percentage fill level to which an RX queue will be refilled
- * when the "RX refill threshold" is reached.
- */
-static unsigned int rx_refill_limit = 95;
+/* Each packet can consume up to ceil(max_frame_len / buffer_size) buffers */
+#define EFX_RX_MAX_FRAGS DIV_ROUND_UP(EFX_MAX_FRAME_LEN(EFX_MAX_MTU), \
+				      EFX_RX_USR_BUF_SIZE)
 
 /*
  * RX maximum head room required.
  *
- * This must be at least 1 to prevent overflow and at least 2 to allow
- * pipelined receives.
+ * This must be at least 1 to prevent overflow, plus one packet-worth
+ * to allow pipelined receives.
  */
-#define EFX_RXD_HEAD_ROOM 2
+#define EFX_RXD_HEAD_ROOM (1 + EFX_RX_MAX_FRAGS)
 
-static inline unsigned int efx_rx_buf_offset(struct efx_rx_buffer *buf)
+static inline u8 *efx_rx_buf_va(struct efx_rx_buffer *buf)
 {
-	/* Offset is always within one page, so we don't need to consider
-	 * the page order.
-	 */
-	return (__force unsigned long) buf->data & (PAGE_SIZE - 1);
-}
-static inline unsigned int efx_rx_buf_size(struct efx_nic *efx)
-{
-	return PAGE_SIZE << efx->rx_buffer_order;
+	return page_address(buf->page) + buf->page_offset;
 }
 
+static inline u32 efx_rx_buf_hash(struct efx_nic *efx, const u8 *eh)
+{
+#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
+	return __le32_to_cpup((const __le32 *)(eh + efx->rx_packet_hash_offset));
+#else
+	const u8 *data = eh + efx->rx_packet_hash_offset;
+	return (u32)data[0]	  |
+	       (u32)data[1] << 8  |
+	       (u32)data[2] << 16 |
+	       (u32)data[3] << 24;
+#endif
+}
 
-/**
- * efx_init_rx_buffer_skb - create new RX buffer using skb-based allocation
- *
- * @rx_queue:		Efx RX queue
- * @rx_buf:		RX buffer structure to populate
- *
- * This allocates memory for a new receive buffer, maps it for DMA,
- * and populates a struct efx_rx_buffer with the relevant
- * information.  Return a negative error code or 0 on success.
- */
-static int efx_init_rx_buffer_skb(struct efx_rx_queue *rx_queue,
-				  struct efx_rx_buffer *rx_buf)
+static inline struct efx_rx_buffer *
+efx_rx_buf_next(struct efx_rx_queue *rx_queue, struct efx_rx_buffer *rx_buf)
+{
+	if (unlikely(rx_buf == efx_rx_buffer(rx_queue, rx_queue->ptr_mask)))
+		return efx_rx_buffer(rx_queue, 0);
+	else
+		return rx_buf + 1;
+}
+
+static inline void efx_sync_rx_buffer(struct efx_nic *efx,
+				      struct efx_rx_buffer *rx_buf,
+				      unsigned int len)
+{
+	dma_sync_single_for_cpu(&efx->pci_dev->dev, rx_buf->dma_addr, len,
+				DMA_FROM_DEVICE);
+}
+
+void efx_rx_config_page_split(struct efx_nic *efx)
+{
+	efx->rx_page_buf_step = ALIGN(efx->rx_dma_len + efx->rx_ip_align,
+				      EFX_RX_BUF_ALIGNMENT);
+	efx->rx_bufs_per_page = efx->rx_buffer_order ? 1 :
+		((PAGE_SIZE - sizeof(struct efx_rx_page_state)) /
+		 efx->rx_page_buf_step);
+	efx->rx_buffer_truesize = (PAGE_SIZE << efx->rx_buffer_order) /
+		efx->rx_bufs_per_page;
+	efx->rx_pages_per_batch = DIV_ROUND_UP(EFX_RX_PREFERRED_BATCH,
+					       efx->rx_bufs_per_page);
+}
+
+/* Check the RX page recycle ring for a page that can be reused. */
+static struct page *efx_reuse_page(struct efx_rx_queue *rx_queue)
 {
 	struct efx_nic *efx = rx_queue->efx;
-	struct net_device *net_dev = efx->net_dev;
-	int skb_len = efx->rx_buffer_len;
+	struct page *page;
+	struct efx_rx_page_state *state;
+	unsigned index;
 
-	rx_buf->skb = netdev_alloc_skb(net_dev, skb_len);
-	if (unlikely(!rx_buf->skb))
-		return -ENOMEM;
+	index = rx_queue->page_remove & rx_queue->page_ptr_mask;
+	page = rx_queue->page_ring[index];
+	if (page == NULL)
+		return NULL;
 
-	/* Adjust the SKB for padding and checksum */
-	skb_reserve(rx_buf->skb, NET_IP_ALIGN);
-	rx_buf->len = skb_len - NET_IP_ALIGN;
-	rx_buf->data = (char *)rx_buf->skb->data;
-	rx_buf->skb->ip_summed = CHECKSUM_UNNECESSARY;
+	rx_queue->page_ring[index] = NULL;
+	/* page_remove cannot exceed page_add. */
+	if (rx_queue->page_remove != rx_queue->page_add)
+		++rx_queue->page_remove;
 
-	rx_buf->dma_addr = pci_map_single(efx->pci_dev,
-					  rx_buf->data, rx_buf->len,
-					  PCI_DMA_FROMDEVICE);
-
-	if (unlikely(pci_dma_mapping_error(efx->pci_dev, rx_buf->dma_addr))) {
-		dev_kfree_skb_any(rx_buf->skb);
-		rx_buf->skb = NULL;
-		return -EIO;
-	}
-
-	return 0;
-}
-
-/**
- * efx_init_rx_buffer_page - create new RX buffer using page-based allocation
- *
- * @rx_queue:		Efx RX queue
- * @rx_buf:		RX buffer structure to populate
- *
- * This allocates memory for a new receive buffer, maps it for DMA,
- * and populates a struct efx_rx_buffer with the relevant
- * information.  Return a negative error code or 0 on success.
- */
-static int efx_init_rx_buffer_page(struct efx_rx_queue *rx_queue,
-				   struct efx_rx_buffer *rx_buf)
-{
-	struct efx_nic *efx = rx_queue->efx;
-	int bytes, space, offset;
-
-	bytes = efx->rx_buffer_len - EFX_PAGE_IP_ALIGN;
-
-	/* If there is space left in the previously allocated page,
-	 * then use it. Otherwise allocate a new one */
-	rx_buf->page = rx_queue->buf_page;
-	if (rx_buf->page == NULL) {
-		dma_addr_t dma_addr;
-
-		rx_buf->page = alloc_pages(__GFP_COLD | __GFP_COMP | GFP_ATOMIC,
-					   efx->rx_buffer_order);
-		if (unlikely(rx_buf->page == NULL))
-			return -ENOMEM;
-
-		dma_addr = pci_map_page(efx->pci_dev, rx_buf->page,
-					0, efx_rx_buf_size(efx),
-					PCI_DMA_FROMDEVICE);
-
-		if (unlikely(pci_dma_mapping_error(efx->pci_dev, dma_addr))) {
-			__free_pages(rx_buf->page, efx->rx_buffer_order);
-			rx_buf->page = NULL;
-			return -EIO;
-		}
-
-		rx_queue->buf_page = rx_buf->page;
-		rx_queue->buf_dma_addr = dma_addr;
-		rx_queue->buf_data = (page_address(rx_buf->page) +
-				      EFX_PAGE_IP_ALIGN);
-	}
-
-	rx_buf->len = bytes;
-	rx_buf->data = rx_queue->buf_data;
-	offset = efx_rx_buf_offset(rx_buf);
-	rx_buf->dma_addr = rx_queue->buf_dma_addr + offset;
-
-	/* Try to pack multiple buffers per page */
-	if (efx->rx_buffer_order == 0) {
-		/* The next buffer starts on the next 512 byte boundary */
-		rx_queue->buf_data += ((bytes + 0x1ff) & ~0x1ff);
-		offset += ((bytes + 0x1ff) & ~0x1ff);
-
-		space = efx_rx_buf_size(efx) - offset;
-		if (space >= bytes) {
-			/* Refs dropped on kernel releasing each skb */
-			get_page(rx_queue->buf_page);
-			goto out;
-		}
-	}
-
-	/* This is the final RX buffer for this page, so mark it for
-	 * unmapping */
-	rx_queue->buf_page = NULL;
-	rx_buf->unmap_addr = rx_queue->buf_dma_addr;
-
- out:
-	return 0;
-}
-
-/* This allocates memory for a new receive buffer, maps it for DMA,
- * and populates a struct efx_rx_buffer with the relevant
- * information.
- */
-static int efx_init_rx_buffer(struct efx_rx_queue *rx_queue,
-			      struct efx_rx_buffer *new_rx_buf)
-{
-	int rc = 0;
-
-	if (rx_queue->channel->rx_alloc_push_pages) {
-		new_rx_buf->skb = NULL;
-		rc = efx_init_rx_buffer_page(rx_queue, new_rx_buf);
-		rx_queue->alloc_page_count++;
+	/* If page_count is 1 then we hold the only reference to this page. */
+	if (page_count(page) == 1) {
+		++rx_queue->page_recycle_count;
+		return page;
 	} else {
-		new_rx_buf->page = NULL;
-		rc = efx_init_rx_buffer_skb(rx_queue, new_rx_buf);
-		rx_queue->alloc_skb_count++;
+		state = page_address(page);
+		dma_unmap_page(&efx->pci_dev->dev, state->dma_addr,
+			       PAGE_SIZE << efx->rx_buffer_order,
+			       DMA_FROM_DEVICE);
+		put_page(page);
+		++rx_queue->page_recycle_failed;
 	}
 
-	if (unlikely(rc < 0))
-		EFX_LOG_RL(rx_queue->efx, "%s RXQ[%d] =%d\n", __func__,
-			   rx_queue->queue, rc);
-	return rc;
+	return NULL;
 }
 
+/**
+ * efx_init_rx_buffers - create EFX_RX_BATCH page-based RX buffers
+ *
+ * @rx_queue:		Efx RX queue
+ *
+ * This allocates a batch of pages, maps them for DMA, and populates
+ * struct efx_rx_buffers for each one. Return a negative error code or
+ * 0 on success. If a single page can be used for multiple buffers,
+ * then the page will either be inserted fully, or not at all.
+ */
+static int efx_init_rx_buffers(struct efx_rx_queue *rx_queue, bool atomic)
+{
+	struct efx_nic *efx = rx_queue->efx;
+	struct efx_rx_buffer *rx_buf;
+	struct page *page;
+	unsigned int page_offset;
+	struct efx_rx_page_state *state;
+	dma_addr_t dma_addr;
+	unsigned index, count;
+
+	count = 0;
+	do {
+		page = efx_reuse_page(rx_queue);
+		if (page == NULL) {
+			page = alloc_pages(__GFP_COLD | __GFP_COMP |
+					   (atomic ? GFP_ATOMIC : GFP_KERNEL),
+					   efx->rx_buffer_order);
+			if (unlikely(page == NULL))
+				return -ENOMEM;
+			dma_addr =
+				dma_map_page(&efx->pci_dev->dev, page, 0,
+					     PAGE_SIZE << efx->rx_buffer_order,
+					     DMA_FROM_DEVICE);
+			if (unlikely(dma_mapping_error(&efx->pci_dev->dev,
+						       dma_addr))) {
+				__free_pages(page, efx->rx_buffer_order);
+				return -EIO;
+			}
+			state = page_address(page);
+			state->dma_addr = dma_addr;
+		} else {
+			state = page_address(page);
+			dma_addr = state->dma_addr;
+		}
+
+		dma_addr += sizeof(struct efx_rx_page_state);
+		page_offset = sizeof(struct efx_rx_page_state);
+
+		do {
+			index = rx_queue->added_count & rx_queue->ptr_mask;
+			rx_buf = efx_rx_buffer(rx_queue, index);
+			rx_buf->dma_addr = dma_addr + efx->rx_ip_align;
+			rx_buf->page = page;
+			rx_buf->page_offset = page_offset + efx->rx_ip_align;
+			rx_buf->len = efx->rx_dma_len;
+			rx_buf->flags = 0;
+			++rx_queue->added_count;
+			get_page(page);
+			dma_addr += efx->rx_page_buf_step;
+			page_offset += efx->rx_page_buf_step;
+		} while (page_offset + efx->rx_page_buf_step <= PAGE_SIZE);
+
+		rx_buf->flags = EFX_RX_BUF_LAST_IN_PAGE;
+	} while (++count < efx->rx_pages_per_batch);
+
+	return 0;
+}
+
+/* Unmap a DMA-mapped page.  This function is only called for the final RX
+ * buffer in a page.
+ */
 static void efx_unmap_rx_buffer(struct efx_nic *efx,
 				struct efx_rx_buffer *rx_buf)
 {
-	if (rx_buf->page) {
-		EFX_BUG_ON_PARANOID(rx_buf->skb);
-		if (rx_buf->unmap_addr) {
-			pci_unmap_page(efx->pci_dev, rx_buf->unmap_addr,
-				       efx_rx_buf_size(efx),
-				       PCI_DMA_FROMDEVICE);
-			rx_buf->unmap_addr = 0;
-		}
-	} else if (likely(rx_buf->skb)) {
-		pci_unmap_single(efx->pci_dev, rx_buf->dma_addr,
-				 rx_buf->len, PCI_DMA_FROMDEVICE);
+	struct page *page = rx_buf->page;
+
+	if (page) {
+		struct efx_rx_page_state *state = page_address(page);
+		dma_unmap_page(&efx->pci_dev->dev,
+			       state->dma_addr,
+			       PAGE_SIZE << efx->rx_buffer_order,
+			       DMA_FROM_DEVICE);
 	}
 }
 
-static void efx_free_rx_buffer(struct efx_nic *efx,
-			       struct efx_rx_buffer *rx_buf)
+static void efx_free_rx_buffers(struct efx_rx_queue *rx_queue,
+				struct efx_rx_buffer *rx_buf,
+				unsigned int num_bufs)
 {
-	if (rx_buf->page) {
-		__free_pages(rx_buf->page, efx->rx_buffer_order);
-		rx_buf->page = NULL;
-	} else if (likely(rx_buf->skb)) {
-		dev_kfree_skb_any(rx_buf->skb);
-		rx_buf->skb = NULL;
+	do {
+		if (rx_buf->page) {
+			put_page(rx_buf->page);
+			rx_buf->page = NULL;
+		}
+		rx_buf = efx_rx_buf_next(rx_queue, rx_buf);
+	} while (--num_bufs);
+}
+
+/* Attempt to recycle the page if there is an RX recycle ring; the page can
+ * only be added if this is the final RX buffer, to prevent pages being used in
+ * the descriptor ring and appearing in the recycle ring simultaneously.
+ */
+static void efx_recycle_rx_page(struct efx_channel *channel,
+				struct efx_rx_buffer *rx_buf)
+{
+	struct page *page = rx_buf->page;
+	struct efx_rx_queue *rx_queue = efx_channel_get_rx_queue(channel);
+	struct efx_nic *efx = rx_queue->efx;
+	unsigned index;
+
+	/* Only recycle the page after processing the final buffer. */
+	if (!(rx_buf->flags & EFX_RX_BUF_LAST_IN_PAGE))
+		return;
+
+	index = rx_queue->page_add & rx_queue->page_ptr_mask;
+	if (rx_queue->page_ring[index] == NULL) {
+		unsigned read_index = rx_queue->page_remove &
+			rx_queue->page_ptr_mask;
+
+		/* The next slot in the recycle ring is available, but
+		 * increment page_remove if the read pointer currently
+		 * points here.
+		 */
+		if (read_index == index)
+			++rx_queue->page_remove;
+		rx_queue->page_ring[index] = page;
+		++rx_queue->page_add;
+		return;
 	}
+	++rx_queue->page_recycle_full;
+	efx_unmap_rx_buffer(efx, rx_buf);
+	put_page(rx_buf->page);
 }
 
 static void efx_fini_rx_buffer(struct efx_rx_queue *rx_queue,
 			       struct efx_rx_buffer *rx_buf)
 {
-	efx_unmap_rx_buffer(rx_queue->efx, rx_buf);
-	efx_free_rx_buffer(rx_queue->efx, rx_buf);
+	/* Release the page reference we hold for the buffer. */
+	if (rx_buf->page)
+		put_page(rx_buf->page);
+
+	/* If this is the last buffer in a page, unmap and free it. */
+	if (rx_buf->flags & EFX_RX_BUF_LAST_IN_PAGE) {
+		efx_unmap_rx_buffer(rx_queue->efx, rx_buf);
+		efx_free_rx_buffers(rx_queue, rx_buf, 1);
+	}
+	rx_buf->page = NULL;
+}
+
+/* Recycle the pages that are used by buffers that have just been received. */
+static void efx_recycle_rx_pages(struct efx_channel *channel,
+				 struct efx_rx_buffer *rx_buf,
+				 unsigned int n_frags)
+{
+	struct efx_rx_queue *rx_queue = efx_channel_get_rx_queue(channel);
+
+	do {
+		efx_recycle_rx_page(channel, rx_buf);
+		rx_buf = efx_rx_buf_next(rx_queue, rx_buf);
+	} while (--n_frags);
+}
+
+static void efx_discard_rx_packet(struct efx_channel *channel,
+				  struct efx_rx_buffer *rx_buf,
+				  unsigned int n_frags)
+{
+	struct efx_rx_queue *rx_queue = efx_channel_get_rx_queue(channel);
+
+	efx_recycle_rx_pages(channel, rx_buf, n_frags);
+
+	efx_free_rx_buffers(rx_queue, rx_buf, n_frags);
 }
 
 /**
  * efx_fast_push_rx_descriptors - push new RX descriptors quickly
  * @rx_queue:		RX descriptor queue
- * @retry:              Recheck the fill level
+ *
  * This will aim to fill the RX descriptor queue up to
- * @rx_queue->@fast_fill_limit. If there is insufficient atomic
- * memory to do so, the caller should retry.
+ * @rx_queue->@max_fill. If there is insufficient atomic
+ * memory to do so, a slow fill will be scheduled.
+ *
+ * The caller must provide serialisation (none is used here). In practise,
+ * this means this function must run from the NAPI handler, or be called
+ * when NAPI is disabled.
  */
-static int __efx_fast_push_rx_descriptors(struct efx_rx_queue *rx_queue,
-					  int retry)
+void efx_fast_push_rx_descriptors(struct efx_rx_queue *rx_queue, bool atomic)
 {
-	struct efx_rx_buffer *rx_buf;
-	unsigned fill_level, index;
-	int i, space, rc = 0;
+	struct efx_nic *efx = rx_queue->efx;
+	unsigned int fill_level, batch_size;
+	int space, rc = 0;
 
-	/* Calculate current fill level.  Do this outside the lock,
-	 * because most of the time we'll end up not wanting to do the
-	 * fill anyway.
-	 */
+	if (!rx_queue->refill_enabled)
+		return;
+
+	/* Calculate current fill level, and exit if we don't need to fill */
 	fill_level = (rx_queue->added_count - rx_queue->removed_count);
-	EFX_BUG_ON_PARANOID(fill_level >
-			    rx_queue->efx->type->rxd_ring_mask + 1);
-
-	/* Don't fill if we don't need to */
+	EFX_BUG_ON_PARANOID(fill_level > rx_queue->efx->rxq_entries);
 	if (fill_level >= rx_queue->fast_fill_trigger)
-		return 0;
+		goto out;
 
 	/* Record minimum fill level */
 	if (unlikely(fill_level < rx_queue->min_fill)) {
@@ -306,107 +345,49 @@ static int __efx_fast_push_rx_descriptors(struct efx_rx_queue *rx_queue,
 			rx_queue->min_fill = fill_level;
 	}
 
-	/* Acquire RX add lock.  If this lock is contended, then a fast
-	 * fill must already be in progress (e.g. in the refill
-	 * tasklet), so we don't need to do anything
-	 */
-	if (!spin_trylock_bh(&rx_queue->add_lock))
-		return -1;
+	batch_size = efx->rx_pages_per_batch * efx->rx_bufs_per_page;
+	space = rx_queue->max_fill - fill_level;
+	EFX_BUG_ON_PARANOID(space < batch_size);
 
- retry:
-	/* Recalculate current fill level now that we have the lock */
-	fill_level = (rx_queue->added_count - rx_queue->removed_count);
-	EFX_BUG_ON_PARANOID(fill_level >
-			    rx_queue->efx->type->rxd_ring_mask + 1);
-	space = rx_queue->fast_fill_limit - fill_level;
-	if (space < EFX_RX_BATCH)
-		goto out_unlock;
+	netif_vdbg(rx_queue->efx, rx_status, rx_queue->efx->net_dev,
+		   "RX queue %d fast-filling descriptor ring from"
+		   " level %d to level %d\n",
+		   efx_rx_queue_index(rx_queue), fill_level,
+		   rx_queue->max_fill);
 
-	EFX_TRACE(rx_queue->efx, "RX queue %d fast-filling descriptor ring from"
-		  " level %d to level %d using %s allocation\n",
-		  rx_queue->queue, fill_level, rx_queue->fast_fill_limit,
-		  rx_queue->channel->rx_alloc_push_pages ? "page" : "skb");
 
 	do {
-		for (i = 0; i < EFX_RX_BATCH; ++i) {
-			index = (rx_queue->added_count &
-				 rx_queue->efx->type->rxd_ring_mask);
-			rx_buf = efx_rx_buffer(rx_queue, index);
-			rc = efx_init_rx_buffer(rx_queue, rx_buf);
-			if (unlikely(rc))
-				goto out;
-			++rx_queue->added_count;
+		rc = efx_init_rx_buffers(rx_queue, atomic);
+		if (unlikely(rc)) {
+			/* Ensure that we don't leave the rx queue empty */
+			if (rx_queue->added_count == rx_queue->removed_count)
+				efx_schedule_slow_fill(rx_queue);
+			goto out;
 		}
-	} while ((space -= EFX_RX_BATCH) >= EFX_RX_BATCH);
+	} while ((space -= batch_size) >= batch_size);
 
-	EFX_TRACE(rx_queue->efx, "RX queue %d fast-filled descriptor ring "
-		  "to level %d\n", rx_queue->queue,
-		  rx_queue->added_count - rx_queue->removed_count);
+	netif_vdbg(rx_queue->efx, rx_status, rx_queue->efx->net_dev,
+		   "RX queue %d fast-filled descriptor ring "
+		   "to level %d\n", efx_rx_queue_index(rx_queue),
+		   rx_queue->added_count - rx_queue->removed_count);
 
  out:
-	/* Send write pointer to card. */
-	falcon_notify_rx_desc(rx_queue);
-
-	/* If the fast fill is running inside from the refill tasklet, then
-	 * for SMP systems it may be running on a different CPU to
-	 * RX event processing, which means that the fill level may now be
-	 * out of date. */
-	if (unlikely(retry && (rc == 0)))
-		goto retry;
-
- out_unlock:
-	spin_unlock_bh(&rx_queue->add_lock);
-
-	return rc;
+	if (rx_queue->notified_count != rx_queue->added_count)
+		efx_nic_notify_rx_desc(rx_queue);
 }
 
-/**
- * efx_fast_push_rx_descriptors - push new RX descriptors quickly
- * @rx_queue:		RX descriptor queue
- *
- * This will aim to fill the RX descriptor queue up to
- * @rx_queue->@fast_fill_limit.  If there is insufficient memory to do so,
- * it will schedule a work item to immediately continue the fast fill
- */
-void efx_fast_push_rx_descriptors(struct efx_rx_queue *rx_queue)
+void efx_rx_slow_fill(unsigned long context)
 {
-	int rc;
+	struct efx_rx_queue *rx_queue = (struct efx_rx_queue *)context;
 
-	rc = __efx_fast_push_rx_descriptors(rx_queue, 0);
-	if (unlikely(rc)) {
-		/* Schedule the work item to run immediately. The hope is
-		 * that work is immediately pending to free some memory
-		 * (e.g. an RX event or TX completion)
-		 */
-		efx_schedule_slow_fill(rx_queue, 0);
-	}
-}
-
-void efx_rx_work(struct work_struct *data)
-{
-	struct efx_rx_queue *rx_queue;
-	int rc;
-
-	rx_queue = container_of(data, struct efx_rx_queue, work.work);
-
-	if (unlikely(!rx_queue->channel->enabled))
-		return;
-
-	EFX_TRACE(rx_queue->efx, "RX queue %d worker thread executing on CPU "
-		  "%d\n", rx_queue->queue, raw_smp_processor_id());
-
+	/* Post an event to cause NAPI to run and refill the queue */
+	efx_nic_generate_fill_event(rx_queue);
 	++rx_queue->slow_fill_count;
-	/* Push new RX descriptors, allowing at least 1 jiffy for
-	 * the kernel to free some more memory. */
-	rc = __efx_fast_push_rx_descriptors(rx_queue, 1);
-	if (rc)
-		efx_schedule_slow_fill(rx_queue, 1);
 }
 
 static void efx_rx_packet__check_len(struct efx_rx_queue *rx_queue,
 				     struct efx_rx_buffer *rx_buf,
-				     int len, bool *discard,
-				     bool *leak_packet)
+				     int len)
 {
 	struct efx_nic *efx = rx_queue->efx;
 	unsigned max_len = rx_buf->len - efx->type->rx_buffer_padding;
@@ -417,304 +398,600 @@ static void efx_rx_packet__check_len(struct efx_rx_queue *rx_queue,
 	/* The packet must be discarded, but this is only a fatal error
 	 * if the caller indicated it was
 	 */
-	*discard = true;
+	rx_buf->flags |= EFX_RX_PKT_DISCARD;
 
 	if ((len > rx_buf->len) && EFX_WORKAROUND_8071(efx)) {
-		EFX_ERR_RL(efx, " RX queue %d seriously overlength "
-			   "RX event (0x%x > 0x%x+0x%x). Leaking\n",
-			   rx_queue->queue, len, max_len,
-			   efx->type->rx_buffer_padding);
-		/* If this buffer was skb-allocated, then the meta
-		 * data at the end of the skb will be trashed. So
-		 * we have no choice but to leak the fragment.
-		 */
-		*leak_packet = (rx_buf->skb != NULL);
+		if (net_ratelimit())
+			netif_err(efx, rx_err, efx->net_dev,
+				  " RX queue %d seriously overlength "
+				  "RX event (0x%x > 0x%x+0x%x). Leaking\n",
+				  efx_rx_queue_index(rx_queue), len, max_len,
+				  efx->type->rx_buffer_padding);
 		efx_schedule_reset(efx, RESET_TYPE_RX_RECOVERY);
 	} else {
-		EFX_ERR_RL(efx, " RX queue %d overlength RX event "
-			   "(0x%x > 0x%x)\n", rx_queue->queue, len, max_len);
+		if (net_ratelimit())
+			netif_err(efx, rx_err, efx->net_dev,
+				  " RX queue %d overlength RX event "
+				  "(0x%x > 0x%x)\n",
+				  efx_rx_queue_index(rx_queue), len, max_len);
 	}
 
-	rx_queue->channel->n_rx_overlength++;
+	efx_rx_queue_channel(rx_queue)->n_rx_overlength++;
 }
 
-/* Pass a received packet up through the generic LRO stack
- *
- * Handles driverlink veto, and passes the fragment up via
- * the appropriate LRO method
+/* Pass a received packet up through GRO.  GRO can handle pages
+ * regardless of checksum state and skbs with a good checksum.
  */
-static void efx_rx_packet_lro(struct efx_channel *channel,
-			      struct efx_rx_buffer *rx_buf,
-			      bool checksummed)
+static void
+efx_rx_packet_gro(struct efx_channel *channel, struct efx_rx_buffer *rx_buf,
+		  unsigned int n_frags, u8 *eh)
 {
 	struct napi_struct *napi = &channel->napi_str;
+	gro_result_t gro_result;
+	struct efx_nic *efx = channel->efx;
+	struct sk_buff *skb;
 
-	/* Pass the skb/page into the LRO engine */
-	if (rx_buf->page) {
-		struct sk_buff *skb = napi_get_frags(napi);
+	skb = napi_get_frags(napi);
+	if (unlikely(!skb)) {
+		struct efx_rx_queue *rx_queue;
 
-		if (!skb) {
-			put_page(rx_buf->page);
-			goto out;
-		}
-
-		skb_shinfo(skb)->frags[0].page = rx_buf->page;
-		skb_shinfo(skb)->frags[0].page_offset =
-			efx_rx_buf_offset(rx_buf);
-		skb_shinfo(skb)->frags[0].size = rx_buf->len;
-		skb_shinfo(skb)->nr_frags = 1;
-
-		skb->len = rx_buf->len;
-		skb->data_len = rx_buf->len;
-		skb->truesize += rx_buf->len;
-		skb->ip_summed =
-			checksummed ? CHECKSUM_UNNECESSARY : CHECKSUM_NONE;
-
-		napi_gro_frags(napi);
-
-out:
-		EFX_BUG_ON_PARANOID(rx_buf->skb);
-		rx_buf->page = NULL;
-	} else {
-		EFX_BUG_ON_PARANOID(!rx_buf->skb);
-		EFX_BUG_ON_PARANOID(!checksummed);
-
-		napi_gro_receive(napi, rx_buf->skb);
-		rx_buf->skb = NULL;
-	}
-}
-
-void efx_rx_packet(struct efx_rx_queue *rx_queue, unsigned int index,
-		   unsigned int len, bool checksummed, bool discard)
-{
-	struct efx_nic *efx = rx_queue->efx;
-	struct efx_rx_buffer *rx_buf;
-	bool leak_packet = false;
-
-	rx_buf = efx_rx_buffer(rx_queue, index);
-	EFX_BUG_ON_PARANOID(!rx_buf->data);
-	EFX_BUG_ON_PARANOID(rx_buf->skb && rx_buf->page);
-	EFX_BUG_ON_PARANOID(!(rx_buf->skb || rx_buf->page));
-
-	/* This allows the refill path to post another buffer.
-	 * EFX_RXD_HEAD_ROOM ensures that the slot we are using
-	 * isn't overwritten yet.
-	 */
-	rx_queue->removed_count++;
-
-	/* Validate the length encoded in the event vs the descriptor pushed */
-	efx_rx_packet__check_len(rx_queue, rx_buf, len,
-				 &discard, &leak_packet);
-
-	EFX_TRACE(efx, "RX queue %d received id %x at %llx+%x %s%s\n",
-		  rx_queue->queue, index,
-		  (unsigned long long)rx_buf->dma_addr, len,
-		  (checksummed ? " [SUMMED]" : ""),
-		  (discard ? " [DISCARD]" : ""));
-
-	/* Discard packet, if instructed to do so */
-	if (unlikely(discard)) {
-		if (unlikely(leak_packet))
-			rx_queue->channel->n_skbuff_leaks++;
-		else
-			/* We haven't called efx_unmap_rx_buffer yet,
-			 * so fini the entire rx_buffer here */
-			efx_fini_rx_buffer(rx_queue, rx_buf);
+		rx_queue = efx_channel_get_rx_queue(channel);
+		efx_free_rx_buffers(rx_queue, rx_buf, n_frags);
 		return;
 	}
 
-	/* Release card resources - assumes all RX buffers consumed in-order
-	 * per RX queue
+	if (efx->net_dev->features & NETIF_F_RXHASH)
+		skb_set_hash(skb, efx_rx_buf_hash(efx, eh),
+			     PKT_HASH_TYPE_L3);
+	skb->ip_summed = ((rx_buf->flags & EFX_RX_PKT_CSUMMED) ?
+			  CHECKSUM_UNNECESSARY : CHECKSUM_NONE);
+
+	for (;;) {
+		skb_fill_page_desc(skb, skb_shinfo(skb)->nr_frags,
+				   rx_buf->page, rx_buf->page_offset,
+				   rx_buf->len);
+		rx_buf->page = NULL;
+		skb->len += rx_buf->len;
+		if (skb_shinfo(skb)->nr_frags == n_frags)
+			break;
+
+		rx_buf = efx_rx_buf_next(&channel->rx_queue, rx_buf);
+	}
+
+	skb->data_len = skb->len;
+	skb->truesize += n_frags * efx->rx_buffer_truesize;
+
+	skb_record_rx_queue(skb, channel->rx_queue.core_index);
+
+	skb_mark_napi_id(skb, &channel->napi_str);
+	gro_result = napi_gro_frags_gr(napi);
+	if (gro_result != GRO_DROP)
+		channel->irq_mod_score += 2;
+}
+
+/* Allocate and construct an SKB around page fragments */
+static struct sk_buff *efx_rx_mk_skb(struct efx_channel *channel,
+				     struct efx_rx_buffer *rx_buf,
+				     unsigned int n_frags,
+				     u8 *eh, int hdr_len)
+{
+	struct efx_nic *efx = channel->efx;
+	struct sk_buff *skb;
+
+	/* Allocate an SKB to store the headers */
+	skb = netdev_alloc_skb(efx->net_dev,
+			       efx->rx_ip_align + efx->rx_prefix_size +
+			       hdr_len);
+	if (unlikely(skb == NULL)) {
+		atomic_inc(&efx->n_rx_noskb_drops);
+		return NULL;
+	}
+
+	EFX_BUG_ON_PARANOID(rx_buf->len < hdr_len);
+
+	memcpy(skb->data + efx->rx_ip_align, eh - efx->rx_prefix_size,
+	       efx->rx_prefix_size + hdr_len);
+	skb_reserve(skb, efx->rx_ip_align + efx->rx_prefix_size);
+	__skb_put(skb, hdr_len);
+
+	/* Append the remaining page(s) onto the frag list */
+	if (rx_buf->len > hdr_len) {
+		rx_buf->page_offset += hdr_len;
+		rx_buf->len -= hdr_len;
+
+		for (;;) {
+			skb_fill_page_desc(skb, skb_shinfo(skb)->nr_frags,
+					   rx_buf->page, rx_buf->page_offset,
+					   rx_buf->len);
+			rx_buf->page = NULL;
+			skb->len += rx_buf->len;
+			skb->data_len += rx_buf->len;
+			if (skb_shinfo(skb)->nr_frags == n_frags)
+				break;
+
+			rx_buf = efx_rx_buf_next(&channel->rx_queue, rx_buf);
+		}
+	} else {
+		__free_pages(rx_buf->page, efx->rx_buffer_order);
+		rx_buf->page = NULL;
+		n_frags = 0;
+	}
+
+	skb->truesize += n_frags * efx->rx_buffer_truesize;
+
+	/* Move past the ethernet header */
+	skb->protocol = eth_type_trans(skb, efx->net_dev);
+
+	skb_mark_napi_id(skb, &channel->napi_str);
+
+	return skb;
+}
+
+void efx_rx_packet(struct efx_rx_queue *rx_queue, unsigned int index,
+		   unsigned int n_frags, unsigned int len, u16 flags)
+{
+	struct efx_nic *efx = rx_queue->efx;
+	struct efx_channel *channel = efx_rx_queue_channel(rx_queue);
+	struct efx_rx_buffer *rx_buf;
+
+	rx_queue->rx_packets++;
+
+	rx_buf = efx_rx_buffer(rx_queue, index);
+	rx_buf->flags |= flags;
+
+	/* Validate the number of fragments and completed length */
+	if (n_frags == 1) {
+		if (!(flags & EFX_RX_PKT_PREFIX_LEN))
+			efx_rx_packet__check_len(rx_queue, rx_buf, len);
+	} else if (unlikely(n_frags > EFX_RX_MAX_FRAGS) ||
+		   unlikely(len <= (n_frags - 1) * efx->rx_dma_len) ||
+		   unlikely(len > n_frags * efx->rx_dma_len) ||
+		   unlikely(!efx->rx_scatter)) {
+		/* If this isn't an explicit discard request, either
+		 * the hardware or the driver is broken.
+		 */
+		WARN_ON(!(len == 0 && rx_buf->flags & EFX_RX_PKT_DISCARD));
+		rx_buf->flags |= EFX_RX_PKT_DISCARD;
+	}
+
+	netif_vdbg(efx, rx_status, efx->net_dev,
+		   "RX queue %d received ids %x-%x len %d %s%s\n",
+		   efx_rx_queue_index(rx_queue), index,
+		   (index + n_frags - 1) & rx_queue->ptr_mask, len,
+		   (rx_buf->flags & EFX_RX_PKT_CSUMMED) ? " [SUMMED]" : "",
+		   (rx_buf->flags & EFX_RX_PKT_DISCARD) ? " [DISCARD]" : "");
+
+	/* Discard packet, if instructed to do so.  Process the
+	 * previous receive first.
 	 */
-	efx_unmap_rx_buffer(efx, rx_buf);
+	if (unlikely(rx_buf->flags & EFX_RX_PKT_DISCARD)) {
+		efx_rx_flush_packet(channel);
+		efx_discard_rx_packet(channel, rx_buf, n_frags);
+		return;
+	}
+
+	if (n_frags == 1 && !(flags & EFX_RX_PKT_PREFIX_LEN))
+		rx_buf->len = len;
+
+	/* Release and/or sync the DMA mapping - assumes all RX buffers
+	 * consumed in-order per RX queue.
+	 */
+	efx_sync_rx_buffer(efx, rx_buf, rx_buf->len);
 
 	/* Prefetch nice and early so data will (hopefully) be in cache by
 	 * the time we look at it.
 	 */
-	prefetch(rx_buf->data);
+	prefetch(efx_rx_buf_va(rx_buf));
+
+	rx_buf->page_offset += efx->rx_prefix_size;
+	rx_buf->len -= efx->rx_prefix_size;
+
+	if (n_frags > 1) {
+		/* Release/sync DMA mapping for additional fragments.
+		 * Fix length for last fragment.
+		 */
+		unsigned int tail_frags = n_frags - 1;
+
+		for (;;) {
+			rx_buf = efx_rx_buf_next(rx_queue, rx_buf);
+			if (--tail_frags == 0)
+				break;
+			efx_sync_rx_buffer(efx, rx_buf, efx->rx_dma_len);
+		}
+		rx_buf->len = len - (n_frags - 1) * efx->rx_dma_len;
+		efx_sync_rx_buffer(efx, rx_buf, rx_buf->len);
+	}
+
+	/* All fragments have been DMA-synced, so recycle pages. */
+	rx_buf = efx_rx_buffer(rx_queue, index);
+	efx_recycle_rx_pages(channel, rx_buf, n_frags);
 
 	/* Pipeline receives so that we give time for packet headers to be
 	 * prefetched into cache.
 	 */
-	rx_buf->len = len;
-	if (rx_queue->channel->rx_pkt)
-		__efx_rx_packet(rx_queue->channel,
-				rx_queue->channel->rx_pkt,
-				rx_queue->channel->rx_pkt_csummed);
-	rx_queue->channel->rx_pkt = rx_buf;
-	rx_queue->channel->rx_pkt_csummed = checksummed;
+	efx_rx_flush_packet(channel);
+	channel->rx_pkt_n_frags = n_frags;
+	channel->rx_pkt_index = index;
+}
+
+static void efx_rx_deliver(struct efx_channel *channel, u8 *eh,
+			   struct efx_rx_buffer *rx_buf,
+			   unsigned int n_frags)
+{
+	struct sk_buff *skb;
+	u16 hdr_len = min_t(u16, rx_buf->len, EFX_SKB_HEADERS);
+
+	skb = efx_rx_mk_skb(channel, rx_buf, n_frags, eh, hdr_len);
+	if (unlikely(skb == NULL)) {
+		struct efx_rx_queue *rx_queue;
+
+		rx_queue = efx_channel_get_rx_queue(channel);
+		efx_free_rx_buffers(rx_queue, rx_buf, n_frags);
+		return;
+	}
+	skb_record_rx_queue(skb, channel->rx_queue.core_index);
+
+	/* Set the SKB flags */
+	skb_checksum_none_assert(skb);
+	if (likely(rx_buf->flags & EFX_RX_PKT_CSUMMED))
+		skb->ip_summed = CHECKSUM_UNNECESSARY;
+
+	efx_rx_skb_attach_timestamp(channel, skb);
+
+	if (channel->type->receive_skb)
+		if (channel->type->receive_skb(channel, skb))
+			return;
+
+	/* Pass the packet up */
+	netif_receive_skb(skb);
 }
 
 /* Handle a received packet.  Second half: Touches packet payload. */
-void __efx_rx_packet(struct efx_channel *channel,
-		     struct efx_rx_buffer *rx_buf, bool checksummed)
+void __efx_rx_packet(struct efx_channel *channel)
 {
 	struct efx_nic *efx = channel->efx;
-	struct sk_buff *skb;
+	struct efx_rx_buffer *rx_buf =
+		efx_rx_buffer(&channel->rx_queue, channel->rx_pkt_index);
+	u8 *eh = efx_rx_buf_va(rx_buf);
+
+	/* Read length from the prefix if necessary.  This already
+	 * excludes the length of the prefix itself.
+	 */
+	if (rx_buf->flags & EFX_RX_PKT_PREFIX_LEN)
+		rx_buf->len = le16_to_cpup((__le16 *)
+					   (eh + efx->rx_packet_len_offset));
 
 	/* If we're in loopback test, then pass the packet directly to the
 	 * loopback layer, and free the rx_buf here
 	 */
 	if (unlikely(efx->loopback_selftest)) {
-		efx_loopback_rx_packet(efx, rx_buf->data, rx_buf->len);
-		efx_free_rx_buffer(efx, rx_buf);
-		goto done;
+		struct efx_rx_queue *rx_queue;
+
+		efx_loopback_rx_packet(efx, eh, rx_buf->len);
+		rx_queue = efx_channel_get_rx_queue(channel);
+		efx_free_rx_buffers(rx_queue, rx_buf,
+				    channel->rx_pkt_n_frags);
+		goto out;
 	}
 
-	if (rx_buf->skb) {
-		prefetch(skb_shinfo(rx_buf->skb));
+	if (unlikely(!(efx->net_dev->features & NETIF_F_RXCSUM)))
+		rx_buf->flags &= ~EFX_RX_PKT_CSUMMED;
 
-		skb_put(rx_buf->skb, rx_buf->len);
-
-		/* Move past the ethernet header. rx_buf->data still points
-		 * at the ethernet header */
-		rx_buf->skb->protocol = eth_type_trans(rx_buf->skb,
-						       efx->net_dev);
-	}
-
-	if (likely(checksummed || rx_buf->page)) {
-		efx_rx_packet_lro(channel, rx_buf, checksummed);
-		goto done;
-	}
-
-	/* We now own the SKB */
-	skb = rx_buf->skb;
-	rx_buf->skb = NULL;
-
-	EFX_BUG_ON_PARANOID(rx_buf->page);
-	EFX_BUG_ON_PARANOID(rx_buf->skb);
-	EFX_BUG_ON_PARANOID(!skb);
-
-	/* Set the SKB flags */
-	skb->ip_summed = CHECKSUM_NONE;
-
-	skb_record_rx_queue(skb, channel->channel);
-
-	/* Pass the packet up */
-	netif_receive_skb(skb);
-
-	/* Update allocation strategy method */
-	channel->rx_alloc_level += RX_ALLOC_FACTOR_SKB;
-
-done:
-	;
-}
-
-void efx_rx_strategy(struct efx_channel *channel)
-{
-	enum efx_rx_alloc_method method = rx_alloc_method;
-
-	/* Only makes sense to use page based allocation if LRO is enabled */
-	if (!(channel->efx->net_dev->features & NETIF_F_GRO)) {
-		method = RX_ALLOC_METHOD_SKB;
-	} else if (method == RX_ALLOC_METHOD_AUTO) {
-		/* Constrain the rx_alloc_level */
-		if (channel->rx_alloc_level < 0)
-			channel->rx_alloc_level = 0;
-		else if (channel->rx_alloc_level > RX_ALLOC_LEVEL_MAX)
-			channel->rx_alloc_level = RX_ALLOC_LEVEL_MAX;
-
-		/* Decide on the allocation method */
-		method = ((channel->rx_alloc_level > RX_ALLOC_LEVEL_LRO) ?
-			  RX_ALLOC_METHOD_PAGE : RX_ALLOC_METHOD_SKB);
-	}
-
-	/* Push the option */
-	channel->rx_alloc_push_pages = (method == RX_ALLOC_METHOD_PAGE);
+	if ((rx_buf->flags & EFX_RX_PKT_TCP) && !channel->type->receive_skb &&
+	    !efx_channel_busy_polling(channel))
+		efx_rx_packet_gro(channel, rx_buf, channel->rx_pkt_n_frags, eh);
+	else
+		efx_rx_deliver(channel, eh, rx_buf, channel->rx_pkt_n_frags);
+out:
+	channel->rx_pkt_n_frags = 0;
 }
 
 int efx_probe_rx_queue(struct efx_rx_queue *rx_queue)
 {
 	struct efx_nic *efx = rx_queue->efx;
-	unsigned int rxq_size;
+	unsigned int entries;
 	int rc;
 
-	EFX_LOG(efx, "creating RX queue %d\n", rx_queue->queue);
+	/* Create the smallest power-of-two aligned ring */
+	entries = max(roundup_pow_of_two(efx->rxq_entries), EFX_MIN_DMAQ_SIZE);
+	EFX_BUG_ON_PARANOID(entries > EFX_MAX_DMAQ_SIZE);
+	rx_queue->ptr_mask = entries - 1;
+
+	netif_dbg(efx, probe, efx->net_dev,
+		  "creating RX queue %d size %#x mask %#x\n",
+		  efx_rx_queue_index(rx_queue), efx->rxq_entries,
+		  rx_queue->ptr_mask);
 
 	/* Allocate RX buffers */
-	rxq_size = (efx->type->rxd_ring_mask + 1) * sizeof(*rx_queue->buffer);
-	rx_queue->buffer = kzalloc(rxq_size, GFP_KERNEL);
+	rx_queue->buffer = kcalloc(entries, sizeof(*rx_queue->buffer),
+				   GFP_KERNEL);
 	if (!rx_queue->buffer)
 		return -ENOMEM;
 
-	rc = falcon_probe_rx(rx_queue);
+	rc = efx_nic_probe_rx(rx_queue);
 	if (rc) {
 		kfree(rx_queue->buffer);
 		rx_queue->buffer = NULL;
 	}
+
 	return rc;
+}
+
+static void efx_init_rx_recycle_ring(struct efx_nic *efx,
+				     struct efx_rx_queue *rx_queue)
+{
+	unsigned int bufs_in_recycle_ring, page_ring_size;
+
+	/* Set the RX recycle ring size */
+#ifdef CONFIG_PPC64
+	bufs_in_recycle_ring = EFX_RECYCLE_RING_SIZE_IOMMU;
+#else
+	if (iommu_found())
+		bufs_in_recycle_ring = EFX_RECYCLE_RING_SIZE_IOMMU;
+	else
+		bufs_in_recycle_ring = EFX_RECYCLE_RING_SIZE_NOIOMMU;
+#endif /* CONFIG_PPC64 */
+
+	page_ring_size = roundup_pow_of_two(bufs_in_recycle_ring /
+					    efx->rx_bufs_per_page);
+	rx_queue->page_ring = kcalloc(page_ring_size,
+				      sizeof(*rx_queue->page_ring), GFP_KERNEL);
+	rx_queue->page_ptr_mask = page_ring_size - 1;
 }
 
 void efx_init_rx_queue(struct efx_rx_queue *rx_queue)
 {
 	struct efx_nic *efx = rx_queue->efx;
-	unsigned int max_fill, trigger, limit;
+	unsigned int max_fill, trigger, max_trigger;
 
-	EFX_LOG(rx_queue->efx, "initialising RX queue %d\n", rx_queue->queue);
+	netif_dbg(rx_queue->efx, drv, rx_queue->efx->net_dev,
+		  "initialising RX queue %d\n", efx_rx_queue_index(rx_queue));
 
 	/* Initialise ptr fields */
 	rx_queue->added_count = 0;
 	rx_queue->notified_count = 0;
 	rx_queue->removed_count = 0;
 	rx_queue->min_fill = -1U;
-	rx_queue->min_overfill = -1U;
+	efx_init_rx_recycle_ring(efx, rx_queue);
+
+	rx_queue->page_remove = 0;
+	rx_queue->page_add = rx_queue->page_ptr_mask + 1;
+	rx_queue->page_recycle_count = 0;
+	rx_queue->page_recycle_failed = 0;
+	rx_queue->page_recycle_full = 0;
 
 	/* Initialise limit fields */
-	max_fill = efx->type->rxd_ring_mask + 1 - EFX_RXD_HEAD_ROOM;
-	trigger = max_fill * min(rx_refill_threshold, 100U) / 100U;
-	limit = max_fill * min(rx_refill_limit, 100U) / 100U;
+	max_fill = efx->rxq_entries - EFX_RXD_HEAD_ROOM;
+	max_trigger =
+		max_fill - efx->rx_pages_per_batch * efx->rx_bufs_per_page;
+	if (rx_refill_threshold != 0) {
+		trigger = max_fill * min(rx_refill_threshold, 100U) / 100U;
+		if (trigger > max_trigger)
+			trigger = max_trigger;
+	} else {
+		trigger = max_trigger;
+	}
 
 	rx_queue->max_fill = max_fill;
 	rx_queue->fast_fill_trigger = trigger;
-	rx_queue->fast_fill_limit = limit;
+	rx_queue->refill_enabled = true;
 
 	/* Set up RX descriptor ring */
-	falcon_init_rx(rx_queue);
+	efx_nic_init_rx(rx_queue);
 }
 
 void efx_fini_rx_queue(struct efx_rx_queue *rx_queue)
 {
 	int i;
+	struct efx_nic *efx = rx_queue->efx;
 	struct efx_rx_buffer *rx_buf;
 
-	EFX_LOG(rx_queue->efx, "shutting down RX queue %d\n", rx_queue->queue);
+	netif_dbg(rx_queue->efx, drv, rx_queue->efx->net_dev,
+		  "shutting down RX queue %d\n", efx_rx_queue_index(rx_queue));
 
-	falcon_fini_rx(rx_queue);
+	del_timer_sync(&rx_queue->slow_fill);
 
-	/* Release RX buffers NB start at index 0 not current HW ptr */
+	/* Release RX buffers from the current read ptr to the write ptr */
 	if (rx_queue->buffer) {
-		for (i = 0; i <= rx_queue->efx->type->rxd_ring_mask; i++) {
-			rx_buf = efx_rx_buffer(rx_queue, i);
+		for (i = rx_queue->removed_count; i < rx_queue->added_count;
+		     i++) {
+			unsigned index = i & rx_queue->ptr_mask;
+			rx_buf = efx_rx_buffer(rx_queue, index);
 			efx_fini_rx_buffer(rx_queue, rx_buf);
 		}
 	}
 
-	/* For a page that is part-way through splitting into RX buffers */
-	if (rx_queue->buf_page != NULL) {
-		pci_unmap_page(rx_queue->efx->pci_dev, rx_queue->buf_dma_addr,
-			       efx_rx_buf_size(rx_queue->efx),
-			       PCI_DMA_FROMDEVICE);
-		__free_pages(rx_queue->buf_page,
-			     rx_queue->efx->rx_buffer_order);
-		rx_queue->buf_page = NULL;
+	/* Unmap and release the pages in the recycle ring. Remove the ring. */
+	for (i = 0; i <= rx_queue->page_ptr_mask; i++) {
+		struct page *page = rx_queue->page_ring[i];
+		struct efx_rx_page_state *state;
+
+		if (page == NULL)
+			continue;
+
+		state = page_address(page);
+		dma_unmap_page(&efx->pci_dev->dev, state->dma_addr,
+			       PAGE_SIZE << efx->rx_buffer_order,
+			       DMA_FROM_DEVICE);
+		put_page(page);
 	}
+	kfree(rx_queue->page_ring);
+	rx_queue->page_ring = NULL;
 }
 
 void efx_remove_rx_queue(struct efx_rx_queue *rx_queue)
 {
-	EFX_LOG(rx_queue->efx, "destroying RX queue %d\n", rx_queue->queue);
+	netif_dbg(rx_queue->efx, drv, rx_queue->efx->net_dev,
+		  "destroying RX queue %d\n", efx_rx_queue_index(rx_queue));
 
-	falcon_remove_rx(rx_queue);
+	efx_nic_remove_rx(rx_queue);
 
 	kfree(rx_queue->buffer);
 	rx_queue->buffer = NULL;
 }
 
 
-module_param(rx_alloc_method, int, 0644);
-MODULE_PARM_DESC(rx_alloc_method, "Allocation method used for RX buffers");
-
 module_param(rx_refill_threshold, uint, 0444);
 MODULE_PARM_DESC(rx_refill_threshold,
-		 "RX descriptor ring fast/slow fill threshold (%)");
+		 "RX descriptor ring refill threshold (%)");
 
+#ifdef CONFIG_RFS_ACCEL
+
+int efx_filter_rfs(struct net_device *net_dev, const struct sk_buff *skb,
+		   u16 rxq_index, u32 flow_id)
+{
+	struct efx_nic *efx = netdev_priv(net_dev);
+	struct efx_channel *channel;
+	struct efx_filter_spec spec;
+	const __be16 *ports;
+	__be16 ether_type;
+	int nhoff;
+	int rc;
+
+	/* The core RPS/RFS code has already parsed and validated
+	 * VLAN, IP and transport headers.  We assume they are in the
+	 * header area.
+	 */
+
+	if (skb->protocol == htons(ETH_P_8021Q)) {
+		const struct vlan_hdr *vh =
+			(const struct vlan_hdr *)skb->data;
+
+		/* We can't filter on the IP 5-tuple and the vlan
+		 * together, so just strip the vlan header and filter
+		 * on the IP part.
+		 */
+		EFX_BUG_ON_PARANOID(skb_headlen(skb) < sizeof(*vh));
+		ether_type = vh->h_vlan_encapsulated_proto;
+		nhoff = sizeof(struct vlan_hdr);
+	} else {
+		ether_type = skb->protocol;
+		nhoff = 0;
+	}
+
+	if (ether_type != htons(ETH_P_IP) && ether_type != htons(ETH_P_IPV6))
+		return -EPROTONOSUPPORT;
+
+	efx_filter_init_rx(&spec, EFX_FILTER_PRI_HINT,
+			   efx->rx_scatter ? EFX_FILTER_FLAG_RX_SCATTER : 0,
+			   rxq_index);
+	spec.match_flags =
+		EFX_FILTER_MATCH_ETHER_TYPE | EFX_FILTER_MATCH_IP_PROTO |
+		EFX_FILTER_MATCH_LOC_HOST | EFX_FILTER_MATCH_LOC_PORT |
+		EFX_FILTER_MATCH_REM_HOST | EFX_FILTER_MATCH_REM_PORT;
+	spec.ether_type = ether_type;
+
+	if (ether_type == htons(ETH_P_IP)) {
+		const struct iphdr *ip =
+			(const struct iphdr *)(skb->data + nhoff);
+
+		EFX_BUG_ON_PARANOID(skb_headlen(skb) < nhoff + sizeof(*ip));
+		if (ip->frag_off & htons(IP_MF | IP_OFFSET))
+			return -EPROTONOSUPPORT;
+		spec.ip_proto = ip->protocol;
+		spec.rem_host[0] = ip->saddr;
+		spec.loc_host[0] = ip->daddr;
+		EFX_BUG_ON_PARANOID(skb_headlen(skb) < nhoff + 4 * ip->ihl + 4);
+		ports = (const __be16 *)(skb->data + nhoff + 4 * ip->ihl);
+	} else {
+		const struct ipv6hdr *ip6 =
+			(const struct ipv6hdr *)(skb->data + nhoff);
+
+		EFX_BUG_ON_PARANOID(skb_headlen(skb) <
+				    nhoff + sizeof(*ip6) + 4);
+		spec.ip_proto = ip6->nexthdr;
+		memcpy(spec.rem_host, &ip6->saddr, sizeof(ip6->saddr));
+		memcpy(spec.loc_host, &ip6->daddr, sizeof(ip6->daddr));
+		ports = (const __be16 *)(ip6 + 1);
+	}
+
+	spec.rem_port = ports[0];
+	spec.loc_port = ports[1];
+
+	rc = efx->type->filter_rfs_insert(efx, &spec);
+	if (rc < 0)
+		return rc;
+
+	/* Remember this so we can check whether to expire the filter later */
+	efx->rps_flow_id[rc] = flow_id;
+	channel = efx_get_channel(efx, skb_get_rx_queue(skb));
+	++channel->rfs_filters_added;
+
+	if (ether_type == htons(ETH_P_IP))
+		netif_info(efx, rx_status, efx->net_dev,
+			   "steering %s %pI4:%u:%pI4:%u to queue %u [flow %u filter %d]\n",
+			   (spec.ip_proto == IPPROTO_TCP) ? "TCP" : "UDP",
+			   spec.rem_host, ntohs(ports[0]), spec.loc_host,
+			   ntohs(ports[1]), rxq_index, flow_id, rc);
+	else
+		netif_info(efx, rx_status, efx->net_dev,
+			   "steering %s [%pI6]:%u:[%pI6]:%u to queue %u [flow %u filter %d]\n",
+			   (spec.ip_proto == IPPROTO_TCP) ? "TCP" : "UDP",
+			   spec.rem_host, ntohs(ports[0]), spec.loc_host,
+			   ntohs(ports[1]), rxq_index, flow_id, rc);
+
+	return rc;
+}
+
+bool __efx_filter_rfs_expire(struct efx_nic *efx, unsigned int quota)
+{
+	bool (*expire_one)(struct efx_nic *efx, u32 flow_id, unsigned int index);
+	unsigned int index, size;
+	u32 flow_id;
+
+	if (!spin_trylock_bh(&efx->filter_lock))
+		return false;
+
+	expire_one = efx->type->filter_rfs_expire_one;
+	index = efx->rps_expire_index;
+	size = efx->type->max_rx_ip_filters;
+	while (quota--) {
+		flow_id = efx->rps_flow_id[index];
+		if (expire_one(efx, flow_id, index))
+			netif_info(efx, rx_status, efx->net_dev,
+				   "expired filter %d [flow %u]\n",
+				   index, flow_id);
+		if (++index == size)
+			index = 0;
+	}
+	efx->rps_expire_index = index;
+
+	spin_unlock_bh(&efx->filter_lock);
+	return true;
+}
+
+#endif /* CONFIG_RFS_ACCEL */
+
+/**
+ * efx_filter_is_mc_recipient - test whether spec is a multicast recipient
+ * @spec: Specification to test
+ *
+ * Return: %true if the specification is a non-drop RX filter that
+ * matches a local MAC address I/G bit value of 1 or matches a local
+ * IPv4 or IPv6 address value in the respective multicast address
+ * range.  Otherwise %false.
+ */
+bool efx_filter_is_mc_recipient(const struct efx_filter_spec *spec)
+{
+	if (!(spec->flags & EFX_FILTER_FLAG_RX) ||
+	    spec->dmaq_id == EFX_FILTER_RX_DMAQ_ID_DROP)
+		return false;
+
+	if (spec->match_flags &
+	    (EFX_FILTER_MATCH_LOC_MAC | EFX_FILTER_MATCH_LOC_MAC_IG) &&
+	    is_multicast_ether_addr(spec->loc_mac))
+		return true;
+
+	if ((spec->match_flags &
+	     (EFX_FILTER_MATCH_ETHER_TYPE | EFX_FILTER_MATCH_LOC_HOST)) ==
+	    (EFX_FILTER_MATCH_ETHER_TYPE | EFX_FILTER_MATCH_LOC_HOST)) {
+		if (spec->ether_type == htons(ETH_P_IP) &&
+		    ipv4_is_multicast(spec->loc_host[0]))
+			return true;
+		if (spec->ether_type == htons(ETH_P_IPV6) &&
+		    ((const u8 *)spec->loc_host)[0] == 0xff)
+			return true;
+	}
+
+	return false;
+}

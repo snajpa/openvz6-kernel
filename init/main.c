@@ -63,12 +63,16 @@
 #include <linux/sched.h>
 #include <linux/signal.h>
 #include <linux/idr.h>
+#include <linux/idr2.h>
 #include <linux/ftrace.h>
 #include <linux/async.h>
 #include <linux/kmemcheck.h>
 #include <linux/kmemtrace.h>
 #include <linux/sfi.h>
 #include <linux/shmem_fs.h>
+#include <linux/perf_event.h>
+#include <linux/list.h>
+#include <linux/kaiser.h>
 #include <trace/boot.h>
 
 #include <asm/io.h>
@@ -124,7 +128,9 @@ static char *ramdisk_execute_command;
 
 #ifdef CONFIG_SMP
 /* Setup configured maximum number of CPUs to activate */
-unsigned int __initdata setup_max_cpus = NR_CPUS;
+unsigned int setup_max_cpus = NR_CPUS;
+EXPORT_SYMBOL(setup_max_cpus);
+
 
 /*
  * Setup routine for controlling SMP activation
@@ -148,6 +154,20 @@ static int __init nosmp(char *str)
 }
 
 early_param("nosmp", nosmp);
+
+/* this is hard limit */
+static int __init nrcpus(char *str)
+{
+	int nr_cpus;
+
+	get_option(&str, &nr_cpus);
+	if (nr_cpus > 0 && nr_cpus < nr_cpu_ids)
+		nr_cpu_ids = nr_cpus;
+
+	return 0;
+}
+
+early_param("nr_cpus", nrcpus);
 
 static int __init maxcpus(char *str)
 {
@@ -182,6 +202,21 @@ static int __init set_reset_devices(char *str)
 }
 
 __setup("reset_devices", set_reset_devices);
+
+unsigned int usevirtefi = 1;
+static int __init set_virt_efi(char *str)
+{
+	usevirtefi = 1;
+	return 1;
+}
+__setup("virtefi", set_virt_efi);
+
+static int __init set_phys_efi(char *str)
+{
+	usevirtefi = 0;
+	return 1;
+}
+__setup("physefi", set_phys_efi);
 
 static char * argv_init[MAX_INIT_ARGS+2] = { "init", NULL, };
 char * envp_init[MAX_INIT_ENVS+2] = { "HOME=/", "TERM=linux", NULL, };
@@ -253,7 +288,8 @@ early_param("loglevel", loglevel);
  * Unknown boot options get handed to init, unless they look like
  * unused parameters (modprobe will find them in /proc/cmdline).
  */
-static int __init unknown_bootoption(char *param, char *val)
+static int __init unknown_bootoption(char *param, char *val,
+				const char *unused)
 {
 	/* Change NUL term back to "=", to make "param" the whole string. */
 	if (val) {
@@ -364,16 +400,14 @@ static void __init setup_nr_cpu_ids(void)
 	nr_cpu_ids = find_last_bit(cpumask_bits(cpu_possible_mask),NR_CPUS) + 1;
 }
 
+#include <linux/ext3_fs_i.h>
+#include <linux/skbuff.h>
+#include <linux/sched.h>
+
 /* Called by boot processor to activate the rest. */
 static void __init smp_init(void)
 {
 	unsigned int cpu;
-
-	/*
-	 * Set up the current CPU as possible to migrate to.
-	 * The other ones will be done by cpu_up/cpu_down()
-	 */
-	set_cpu_active(smp_processor_id(), true);
 
 	/* FIXME: This should be done in userspace --RR */
 	for_each_present_cpu(cpu) {
@@ -386,6 +420,15 @@ static void __init smp_init(void)
 	/* Any cleanup work */
 	printk(KERN_INFO "Brought up %ld CPUs\n", (long)num_online_cpus());
 	smp_cpus_done(setup_max_cpus);
+
+	printk(KERN_DEBUG "sizeof(vma)=%u bytes\n", (unsigned int) sizeof(struct vm_area_struct));
+	printk(KERN_DEBUG "sizeof(page)=%u bytes\n", (unsigned int) sizeof(struct page));
+	printk(KERN_DEBUG "sizeof(inode)=%u bytes\n", (unsigned int) sizeof(struct inode));
+	printk(KERN_DEBUG "sizeof(dentry)=%u bytes\n", (unsigned int) sizeof(struct dentry));
+	printk(KERN_DEBUG "sizeof(ext3inode)=%u bytes\n", (unsigned int) sizeof(struct ext3_inode_info));
+	printk(KERN_DEBUG "sizeof(buffer_head)=%u bytes\n", (unsigned int) sizeof(struct buffer_head));
+	printk(KERN_DEBUG "sizeof(skbuff)=%u bytes\n", (unsigned int) sizeof(struct sk_buff));
+	printk(KERN_DEBUG "sizeof(task_struct)=%u bytes\n", (unsigned int) sizeof(struct task_struct));
 }
 
 #endif
@@ -413,16 +456,24 @@ static void __init setup_command_line(char *command_line)
  * gcc-3.4 accidentally inlines this function, so use noinline.
  */
 
+static __initdata DECLARE_COMPLETION(kthreadd_done);
+
 static noinline void __init_refok rest_init(void)
 	__releases(kernel_lock)
 {
 	int pid;
 
 	rcu_scheduler_starting();
+	/*
+	 * We need to spawn init first so that it obtains pid-1, however
+	 * the init task will end up wanting to create kthreads, which, if
+	 * we schedule it before we create kthreadd, will OOPS.
+	 */
 	kernel_thread(kernel_init, NULL, CLONE_FS | CLONE_SIGHAND);
 	numa_default_policy();
 	pid = kernel_thread(kthreadd, NULL, CLONE_FS | CLONE_FILES);
 	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);
+	complete(&kthreadd_done);
 	unlock_kernel();
 
 	/*
@@ -439,7 +490,7 @@ static noinline void __init_refok rest_init(void)
 }
 
 /* Check for early params. */
-static int __init do_early_param(char *param, char *val)
+static int __init do_early_param(char *param, char *val, const char *unused)
 {
 	struct obs_kernel_param *p;
 
@@ -486,6 +537,7 @@ static void __init boot_cpu_init(void)
 	int cpu = smp_processor_id();
 	/* Mark the boot cpu "present", "online" etc for SMP and UP case */
 	set_cpu_online(cpu, true);
+	set_cpu_active(cpu, true);
 	set_cpu_present(cpu, true);
 	set_cpu_possible(cpu, true);
 }
@@ -512,6 +564,8 @@ static void __init mm_init(void)
 	kmem_cache_init();
 	pgtable_cache_init();
 	vmalloc_init();
+	/* This just needs to be done before we first run userspace: */
+	kaiser_init();
 }
 
 asmlinkage void __init start_kernel(void)
@@ -555,7 +609,7 @@ asmlinkage void __init start_kernel(void)
 	setup_per_cpu_areas();
 	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
 
-	build_all_zonelists();
+	build_all_zonelists(NULL);
 	page_alloc_init();
 
 	printk(KERN_NOTICE "Kernel command line: %s\n", boot_command_line);
@@ -567,9 +621,11 @@ asmlinkage void __init start_kernel(void)
 	 * These use large bootmem allocations and must precede
 	 * kmem_cache_init()
 	 */
+	setup_log_buf(NULL);
 	pidhash_init();
 	vfs_caches_init_early();
 	sort_main_extable();
+	kaiser_early_init(0);
 	trap_init();
 	mm_init();
 	/*
@@ -588,6 +644,8 @@ asmlinkage void __init start_kernel(void)
 				"enabled *very* early, fixing it\n");
 		local_irq_disable();
 	}
+	idr_init_cache();
+	idr2_init_cache();
 	rcu_init();
 	/* init some links before init_ISA_irqs() */
 	early_irq_init();
@@ -598,7 +656,9 @@ asmlinkage void __init start_kernel(void)
 	softirq_init();
 	timekeeping_init();
 	time_init();
+	perf_event_init();
 	profile_init();
+	call_function_init();
 	if (!irqs_disabled())
 		printk(KERN_CRIT "start_kernel(): bug: interrupts were "
 				 "enabled early\n");
@@ -606,7 +666,7 @@ asmlinkage void __init start_kernel(void)
 	local_irq_enable();
 
 	/* Interrupts are enabled now so all GFP allocations are safe. */
-	set_gfp_allowed_mask(__GFP_BITS_MASK);
+	gfp_allowed_mask = __GFP_BITS_MASK;
 
 	kmem_cache_init_late();
 
@@ -643,7 +703,6 @@ asmlinkage void __init start_kernel(void)
 	kmemtrace_init();
 	kmemleak_init();
 	debug_objects_mem_init();
-	idr_init_cache();
 	setup_per_cpu_pageset();
 	numa_policy_init();
 	if (late_time_init)
@@ -653,8 +712,12 @@ asmlinkage void __init start_kernel(void)
 	pidmap_init();
 	anon_vma_init();
 #ifdef CONFIG_X86
-	if (efi_enabled)
-		efi_enter_virtual_mode();
+	if (efi_enabled) {
+		if (usevirtefi)
+			efi_enter_virtual_mode();
+		else
+			efi_setup_physical_mode();
+	}
 #endif
 	thread_info_cache_init();
 	cred_init();
@@ -662,9 +725,9 @@ asmlinkage void __init start_kernel(void)
 	proc_caches_init();
 	buffer_init();
 	key_init();
+	radix_tree_init();
 	security_init();
 	vfs_caches_init(totalram_pages);
-	radix_tree_init();
 	signals_init();
 	/* rootfs populating might need page-writeback */
 	page_writeback_init();
@@ -701,6 +764,70 @@ static void __init do_ctors(void)
 int initcall_debug;
 core_param(initcall_debug, initcall_debug, bool, 0644);
 
+#ifdef CONFIG_KALLSYMS
+struct blacklist_entry {
+	struct list_head next;
+	char *buf;
+};
+
+static __initdata_or_module LIST_HEAD(blacklisted_initcalls);
+
+static int __init initcall_blacklist(char *str)
+{
+	char *str_entry;
+	struct blacklist_entry *entry;
+
+	/* str argument is a comma-separated list of functions */
+	do {
+		str_entry = strsep(&str, ",");
+		if (str_entry) {
+			pr_debug("blacklisting initcall %s\n", str_entry);
+			entry = alloc_bootmem(sizeof(*entry));
+			entry->buf = alloc_bootmem(strlen(str_entry) + 1);
+			strcpy(entry->buf, str_entry);
+			list_add(&entry->next, &blacklisted_initcalls);
+		}
+	} while (str_entry);
+
+	return 0;
+}
+
+static bool __init_or_module initcall_blacklisted(initcall_t fn)
+{
+	struct list_head *tmp;
+	struct blacklist_entry *entry;
+	char *fn_name;
+
+	fn_name = kasprintf(GFP_KERNEL, "%pf", fn);
+	if (!fn_name)
+		return false;
+
+	list_for_each(tmp, &blacklisted_initcalls) {
+		entry = list_entry(tmp, struct blacklist_entry, next);
+		if (!strcmp(fn_name, entry->buf)) {
+			pr_debug("initcall %s blacklisted\n", fn_name);
+			kfree(fn_name);
+			return true;
+		}
+	}
+
+	kfree(fn_name);
+	return false;
+}
+#else
+static int __init initcall_blacklist(char *str)
+{
+	pr_warn("initcall_blacklist requires CONFIG_KALLSYMS\n");
+	return 0;
+}
+
+static bool __init_or_module initcall_blacklisted(initcall_t fn)
+{
+	return false;
+}
+#endif
+__setup("initcall_blacklist=", initcall_blacklist);
+
 static char msgbuf[64];
 static struct boot_trace_call call;
 static struct boot_trace_ret ret;
@@ -709,6 +836,9 @@ int do_one_initcall(initcall_t fn)
 {
 	int count = preempt_count();
 	ktime_t calltime, delta, rettime;
+
+	if (initcall_blacklisted(fn))
+		return -EPERM;
 
 	if (initcall_debug) {
 		call.caller = task_pid_nr(current);
@@ -750,7 +880,6 @@ int do_one_initcall(initcall_t fn)
 	return ret.result;
 }
 
-
 extern initcall_t __initcall_start[], __initcall_end[], __early_initcall_end[];
 
 static void __init do_initcalls(void)
@@ -774,9 +903,10 @@ static void __init do_initcalls(void)
 static void __init do_basic_setup(void)
 {
 	init_workqueues();
+	cgroup_wq_init();
 	cpuset_init_smp();
 	usermodehelper_init();
-	init_tmpfs();
+	shmem_init();
 	driver_init();
 	init_irq_proc();
 	do_ctors();
@@ -817,8 +947,6 @@ static noinline int init_post(void)
 	(void) sys_dup(0);
 	(void) sys_dup(0);
 
-	current->signal->flags |= SIGNAL_UNKILLABLE;
-
 	if (ramdisk_execute_command) {
 		run_init_process(ramdisk_execute_command);
 		printk(KERN_WARNING "Failed to execute %s\n",
@@ -846,25 +974,20 @@ static noinline int init_post(void)
 
 static int __init kernel_init(void * unused)
 {
+	/*
+	 * Wait until kthreadd is all set-up.
+	 */
+	wait_for_completion(&kthreadd_done);
 	lock_kernel();
 
 	/*
 	 * init can allocate pages on any node
 	 */
-	set_mems_allowed(node_possible_map);
+	set_mems_allowed(node_states[N_HIGH_MEMORY]);
 	/*
 	 * init can run on any cpu.
 	 */
 	set_cpus_allowed_ptr(current, cpu_all_mask);
-	/*
-	 * Tell the world that we're going to be the grim
-	 * reaper of innocent orphaned children.
-	 *
-	 * We don't want people to have to make incorrect
-	 * assumptions about where in the task array this
-	 * can be found.
-	 */
-	init_pid_ns.child_reaper = current;
 
 	cad_pid = task_pid(current);
 
@@ -872,6 +995,7 @@ static int __init kernel_init(void * unused)
 
 	do_pre_smp_initcalls();
 	start_boot_trace();
+	lockup_detector_init();
 
 	smp_init();
 	sched_init_smp();

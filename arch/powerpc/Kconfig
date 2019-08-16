@@ -22,14 +22,14 @@ config WORD_SIZE
 config ARCH_PHYS_ADDR_T_64BIT
        def_bool PPC64 || PHYS_64BIT
 
+config ARCH_DMA_ADDR_T_64BIT
+	def_bool ARCH_PHYS_ADDR_T_64BIT
+
 config MMU
 	bool
 	default y
 
 config GENERIC_CMOS_UPDATE
-	def_bool y
-
-config GENERIC_TIME
 	def_bool y
 
 config GENERIC_TIME_VSYSCALL
@@ -110,6 +110,7 @@ config ARCH_NO_VIRT_TO_BUS
 config PPC
 	bool
 	default y
+	select ARCH_HAS_ELF_RANDOMIZE
 	select HAVE_FTRACE_MCOUNT_RECORD
 	select HAVE_DYNAMIC_FTRACE
 	select HAVE_FUNCTION_TRACER
@@ -129,7 +130,10 @@ config PPC
 	select HAVE_OPROFILE
 	select HAVE_SYSCALL_WRAPPERS if PPC64
 	select GENERIC_ATOMIC64 if PPC32
+	select HAVE_IRQ_WORK
 	select HAVE_PERF_EVENTS
+	select ARCH_HAVE_NMI_SAFE_CMPXCHG
+	select GENERIC_CPU_VULNERABILITIES	if PPC_BOOK3S_64
 
 config EARLY_PRINTK
 	bool
@@ -216,7 +220,7 @@ config ARCH_HIBERNATION_POSSIBLE
 
 config ARCH_SUSPEND_POSSIBLE
 	def_bool y
-	depends on ADB_PMU || PPC_EFIKA || PPC_LITE5200 || PPC_83xx
+	depends on ADB_PMU || PPC_EFIKA || PPC_LITE5200 || PPC_83xx || PPC_PSERIES
 
 config PPC_DCR_NATIVE
 	bool
@@ -320,6 +324,10 @@ config HOTPLUG_CPU
 
 	  Say N if you are unsure.
 
+config ARCH_CPU_PROBE_RELEASE
+	def_bool y
+	depends on HOTPLUG_CPU
+
 config ARCH_ENABLE_MEMORY_HOTPLUG
 	def_bool y
 
@@ -346,6 +354,17 @@ config KEXEC
 	  support.  As of this writing the exact hardware interface is
 	  strongly in flux, so no good recommendation can be made.
 
+config KEXEC_AUTO_RESERVE
+	bool "automatically reserve memory for kexec kernel"
+	depends on KEXEC
+	default y
+	---help---
+	  Automatically reserve memory for a kexec kernel, so that you don't
+	  need to specify numbers for the "crashkernel=X@Y" boot option,
+	  instead you can use "crashkernel=auto". To make this work, you need
+	  to have more than 2G/8G memory. On PPC, 128M or 256M is reserved, on
+	  PPC64 1/32 of your physical memory, but it will not exceed 4G.
+
 config CRASH_DUMP
 	bool "Build a kdump crash kernel"
 	depends on PPC64 || 6xx
@@ -355,13 +374,16 @@ config CRASH_DUMP
 	  The same kernel binary can be used as production kernel and dump
 	  capture kernel.
 
-config PHYP_DUMP
-	bool "Hypervisor-assisted dump (EXPERIMENTAL)"
-	depends on PPC_PSERIES && EXPERIMENTAL
+config FA_DUMP
+	bool "Firmware-assisted dump"
+	depends on PPC64 && PPC_RTAS && CRASH_DUMP
 	help
-	  Hypervisor-assisted dump is meant to be a kdump replacement
-	  offering robustness and speed not possible without system
-	  hypervisor assistance.
+	  A robust mechanism to get reliable kernel crash dump with
+	  assistance from firmware. This approach does not use kexec,
+	  instead firmware assists in booting the kdump kernel
+	  while preserving memory contents. Firmware-assisted dump
+	  is meant to be a kdump replacement offering robustness and
+	  speed not possible without system firmware assistance.
 
 	  If unsure, say "N"
 
@@ -626,6 +648,9 @@ config ISA
 config ZONE_DMA
 	bool
 	default y
+
+config NEED_DMA_MAP_STATE
+	def_bool (PPC64 || NOT_COHERENT_CACHE)
 
 config GENERIC_ISA_DMA
 	bool

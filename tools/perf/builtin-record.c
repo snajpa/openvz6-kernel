@@ -9,150 +9,80 @@
 
 #include "perf.h"
 
+#include "util/build-id.h"
 #include "util/util.h"
 #include "util/parse-options.h"
 #include "util/parse-events.h"
-#include "util/string.h"
 
+#include "util/callchain.h"
+#include "util/cgroup.h"
 #include "util/header.h"
 #include "util/event.h"
+#include "util/evlist.h"
+#include "util/evsel.h"
 #include "util/debug.h"
-#include "util/trace-event.h"
+#include "util/session.h"
+#include "util/tool.h"
+#include "util/symbol.h"
+#include "util/cpumap.h"
+#include "util/thread_map.h"
+#include "util/data.h"
+#include "util/parse-branch-options.h"
 
 #include <unistd.h>
 #include <sched.h>
+#include <sys/mman.h>
+#include "compat.h"
 
-#define ALIGN(x, a)		__ALIGN_MASK(x, (typeof(x))(a)-1)
-#define __ALIGN_MASK(x, mask)	(((x)+(mask))&~(mask))
 
-static int			fd[MAX_NR_CPUS][MAX_COUNTERS];
-
-static long			default_interval		= 100000;
-
-static int			nr_cpus				= 0;
-static unsigned int		page_size;
-static unsigned int		mmap_pages			= 128;
-static int			freq				= 0;
-static int			output;
-static const char		*output_name			= "perf.data";
-static int			group				= 0;
-static unsigned int		realtime_prio			= 0;
-static int			raw_samples			= 0;
-static int			system_wide			= 0;
-static int			profile_cpu			= -1;
-static pid_t			target_pid			= -1;
-static pid_t			child_pid			= -1;
-static int			inherit				= 1;
-static int			force				= 0;
-static int			append_file			= 0;
-static int			call_graph			= 0;
-static int			inherit_stat			= 0;
-static int			no_samples			= 0;
-static int			sample_address			= 0;
-static int			multiplex			= 0;
-static int			multiplex_fd			= -1;
-
-static long			samples;
-static struct timeval		last_read;
-static struct timeval		this_read;
-
-static u64			bytes_written;
-
-static struct pollfd		event_array[MAX_NR_CPUS * MAX_COUNTERS];
-
-static int			nr_poll;
-static int			nr_cpu;
-
-static int			file_new = 1;
-
-struct perf_header		*header;
-
-struct mmap_data {
-	int			counter;
-	void			*base;
-	unsigned int		mask;
-	unsigned int		prev;
+struct record {
+	struct perf_tool	tool;
+	struct record_opts	opts;
+	u64			bytes_written;
+	struct perf_data_file	file;
+	struct perf_evlist	*evlist;
+	struct perf_session	*session;
+	const char		*progname;
+	int			realtime_prio;
+	bool			no_buildid;
+	bool			no_buildid_cache;
+	long			samples;
 };
 
-static struct mmap_data		mmap_array[MAX_NR_CPUS][MAX_COUNTERS];
-
-static unsigned long mmap_read_head(struct mmap_data *md)
+static int record__write(struct record *rec, void *bf, size_t size)
 {
-	struct perf_event_mmap_page *pc = md->base;
-	long head;
-
-	head = pc->data_head;
-	rmb();
-
-	return head;
-}
-
-static void mmap_write_tail(struct mmap_data *md, unsigned long tail)
-{
-	struct perf_event_mmap_page *pc = md->base;
-
-	/*
-	 * ensure all reads are done before we write the tail out.
-	 */
-	/* mb(); */
-	pc->data_tail = tail;
-}
-
-static void write_output(void *buf, size_t size)
-{
-	while (size) {
-		int ret = write(output, buf, size);
-
-		if (ret < 0)
-			die("failed to write");
-
-		size -= ret;
-		buf += ret;
-
-		bytes_written += ret;
+	if (perf_data_file__write(rec->session->file, bf, size) < 0) {
+		pr_err("failed to write perf data, error: %m\n");
+		return -1;
 	}
+
+	rec->bytes_written += size;
+	return 0;
 }
 
-static void mmap_read(struct mmap_data *md)
+static int process_synthesized_event(struct perf_tool *tool,
+				     union perf_event *event,
+				     struct perf_sample *sample __maybe_unused,
+				     struct machine *machine __maybe_unused)
 {
-	unsigned int head = mmap_read_head(md);
-	unsigned int old = md->prev;
+	struct record *rec = container_of(tool, struct record, tool);
+	return record__write(rec, event, event->header.size);
+}
+
+static int record__mmap_read(struct record *rec, int idx)
+{
+	struct perf_mmap *md = &rec->evlist->mmap[idx];
+	u64 head = perf_mmap__read_head(md);
+	u64 old = md->prev;
 	unsigned char *data = md->base + page_size;
 	unsigned long size;
 	void *buf;
-	int diff;
+	int rc = 0;
 
-	gettimeofday(&this_read, NULL);
+	if (old == head)
+		return 0;
 
-	/*
-	 * If we're further behind than half the buffer, there's a chance
-	 * the writer will bite our tail and mess up the samples under us.
-	 *
-	 * If we somehow ended up ahead of the head, we got messed up.
-	 *
-	 * In either case, truncate and restart at head.
-	 */
-	diff = head - old;
-	if (diff < 0) {
-		struct timeval iv;
-		unsigned long msecs;
-
-		timersub(&this_read, &last_read, &iv);
-		msecs = iv.tv_sec*1000 + iv.tv_usec/1000;
-
-		fprintf(stderr, "WARNING: failed to keep up with mmap data."
-				"  Last read %lu msecs ago.\n", msecs);
-
-		/*
-		 * head points to a known good entry, start there.
-		 */
-		old = head;
-	}
-
-	last_read = this_read;
-
-	if (old != head)
-		samples++;
+	rec->samples++;
 
 	size = head - old;
 
@@ -161,582 +91,750 @@ static void mmap_read(struct mmap_data *md)
 		size = md->mask + 1 - (old & md->mask);
 		old += size;
 
-		write_output(buf, size);
+		if (record__write(rec, buf, size) < 0) {
+			rc = -1;
+			goto out;
+		}
 	}
 
 	buf = &data[old & md->mask];
 	size = head - old;
 	old += size;
 
-	write_output(buf, size);
+	if (record__write(rec, buf, size) < 0) {
+		rc = -1;
+		goto out;
+	}
 
 	md->prev = old;
-	mmap_write_tail(md, old);
+	perf_evlist__mmap_consume(rec->evlist, idx);
+out:
+	return rc;
 }
 
 static volatile int done = 0;
 static volatile int signr = -1;
+static volatile int child_finished = 0;
 
 static void sig_handler(int sig)
 {
+	if (sig == SIGCHLD)
+		child_finished = 1;
+	else
+		signr = sig;
+
 	done = 1;
-	signr = sig;
 }
 
-static void sig_atexit(void)
+static void record__sig_exit(void)
 {
-	if (child_pid != -1)
-		kill(child_pid, SIGTERM);
-
 	if (signr == -1)
 		return;
 
 	signal(signr, SIG_DFL);
-	kill(getpid(), signr);
+	raise(signr);
 }
 
-static pid_t pid_synthesize_comm_event(pid_t pid, int full)
+static int record__open(struct record *rec)
 {
-	struct comm_event comm_ev;
-	char filename[PATH_MAX];
-	char bf[BUFSIZ];
-	FILE *fp;
-	size_t size = 0;
-	DIR *tasks;
-	struct dirent dirent, *next;
-	pid_t tgid = 0;
+	char msg[512];
+	struct perf_evsel *pos;
+	struct perf_evlist *evlist = rec->evlist;
+	struct perf_session *session = rec->session;
+	struct record_opts *opts = &rec->opts;
+	int rc = 0;
 
-	snprintf(filename, sizeof(filename), "/proc/%d/status", pid);
+	perf_evlist__config(evlist, opts);
 
-	fp = fopen(filename, "r");
-	if (fp == NULL) {
-		/*
-		 * We raced with a task exiting - just return:
-		 */
-		if (verbose)
-			fprintf(stderr, "couldn't open %s\n", filename);
-		return 0;
-	}
-
-	memset(&comm_ev, 0, sizeof(comm_ev));
-	while (!comm_ev.comm[0] || !comm_ev.pid) {
-		if (fgets(bf, sizeof(bf), fp) == NULL)
-			goto out_failure;
-
-		if (memcmp(bf, "Name:", 5) == 0) {
-			char *name = bf + 5;
-			while (*name && isspace(*name))
-				++name;
-			size = strlen(name) - 1;
-			memcpy(comm_ev.comm, name, size++);
-		} else if (memcmp(bf, "Tgid:", 5) == 0) {
-			char *tgids = bf + 5;
-			while (*tgids && isspace(*tgids))
-				++tgids;
-			tgid = comm_ev.pid = atoi(tgids);
-		}
-	}
-
-	comm_ev.header.type = PERF_RECORD_COMM;
-	size = ALIGN(size, sizeof(u64));
-	comm_ev.header.size = sizeof(comm_ev) - (sizeof(comm_ev.comm) - size);
-
-	if (!full) {
-		comm_ev.tid = pid;
-
-		write_output(&comm_ev, comm_ev.header.size);
-		goto out_fclose;
-	}
-
-	snprintf(filename, sizeof(filename), "/proc/%d/task", pid);
-
-	tasks = opendir(filename);
-	while (!readdir_r(tasks, &dirent, &next) && next) {
-		char *end;
-		pid = strtol(dirent.d_name, &end, 10);
-		if (*end)
-			continue;
-
-		comm_ev.tid = pid;
-
-		write_output(&comm_ev, comm_ev.header.size);
-	}
-	closedir(tasks);
-
-out_fclose:
-	fclose(fp);
-	return tgid;
-
-out_failure:
-	fprintf(stderr, "couldn't get COMM and pgid, malformed %s\n",
-		filename);
-	exit(EXIT_FAILURE);
-}
-
-static void pid_synthesize_mmap_samples(pid_t pid, pid_t tgid)
-{
-	char filename[PATH_MAX];
-	FILE *fp;
-
-	snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
-
-	fp = fopen(filename, "r");
-	if (fp == NULL) {
-		/*
-		 * We raced with a task exiting - just return:
-		 */
-		if (verbose)
-			fprintf(stderr, "couldn't open %s\n", filename);
-		return;
-	}
-	while (1) {
-		char bf[BUFSIZ], *pbf = bf;
-		struct mmap_event mmap_ev = {
-			.header = { .type = PERF_RECORD_MMAP },
-		};
-		int n;
-		size_t size;
-		if (fgets(bf, sizeof(bf), fp) == NULL)
-			break;
-
-		/* 00400000-0040c000 r-xp 00000000 fd:01 41038  /bin/cat */
-		n = hex2u64(pbf, &mmap_ev.start);
-		if (n < 0)
-			continue;
-		pbf += n + 1;
-		n = hex2u64(pbf, &mmap_ev.len);
-		if (n < 0)
-			continue;
-		pbf += n + 3;
-		if (*pbf == 'x') { /* vm_exec */
-			char *execname = strchr(bf, '/');
-
-			/* Catch VDSO */
-			if (execname == NULL)
-				execname = strstr(bf, "[vdso]");
-
-			if (execname == NULL)
-				continue;
-
-			size = strlen(execname);
-			execname[size - 1] = '\0'; /* Remove \n */
-			memcpy(mmap_ev.filename, execname, size);
-			size = ALIGN(size, sizeof(u64));
-			mmap_ev.len -= mmap_ev.start;
-			mmap_ev.header.size = (sizeof(mmap_ev) -
-					       (sizeof(mmap_ev.filename) - size));
-			mmap_ev.pid = tgid;
-			mmap_ev.tid = pid;
-
-			write_output(&mmap_ev, mmap_ev.header.size);
-		}
-	}
-
-	fclose(fp);
-}
-
-static void synthesize_all(void)
-{
-	DIR *proc;
-	struct dirent dirent, *next;
-
-	proc = opendir("/proc");
-
-	while (!readdir_r(proc, &dirent, &next) && next) {
-		char *end;
-		pid_t pid, tgid;
-
-		pid = strtol(dirent.d_name, &end, 10);
-		if (*end) /* only interested in proper numerical dirents */
-			continue;
-
-		tgid = pid_synthesize_comm_event(pid, 1);
-		pid_synthesize_mmap_samples(pid, tgid);
-	}
-
-	closedir(proc);
-}
-
-static int group_fd;
-
-static struct perf_header_attr *get_header_attr(struct perf_event_attr *a, int nr)
-{
-	struct perf_header_attr *h_attr;
-
-	if (nr < header->attrs) {
-		h_attr = header->attr[nr];
-	} else {
-		h_attr = perf_header_attr__new(a);
-		perf_header__add_attr(header, h_attr);
-	}
-
-	return h_attr;
-}
-
-static void create_counter(int counter, int cpu, pid_t pid)
-{
-	struct perf_event_attr *attr = attrs + counter;
-	struct perf_header_attr *h_attr;
-	int track = !counter; /* only the first counter needs these */
-	struct {
-		u64 count;
-		u64 time_enabled;
-		u64 time_running;
-		u64 id;
-	} read_data;
-
-	attr->read_format	= PERF_FORMAT_TOTAL_TIME_ENABLED |
-				  PERF_FORMAT_TOTAL_TIME_RUNNING |
-				  PERF_FORMAT_ID;
-
-	attr->sample_type	|= PERF_SAMPLE_IP | PERF_SAMPLE_TID;
-
-	if (freq) {
-		attr->sample_type	|= PERF_SAMPLE_PERIOD;
-		attr->freq		= 1;
-		attr->sample_freq	= freq;
-	}
-
-	if (no_samples)
-		attr->sample_freq = 0;
-
-	if (inherit_stat)
-		attr->inherit_stat = 1;
-
-	if (sample_address)
-		attr->sample_type	|= PERF_SAMPLE_ADDR;
-
-	if (call_graph)
-		attr->sample_type	|= PERF_SAMPLE_CALLCHAIN;
-
-	if (raw_samples) {
-		attr->sample_type	|= PERF_SAMPLE_TIME;
-		attr->sample_type	|= PERF_SAMPLE_RAW;
-		attr->sample_type	|= PERF_SAMPLE_CPU;
-	}
-
-	attr->mmap		= track;
-	attr->comm		= track;
-	attr->inherit		= (cpu < 0) && inherit;
-	attr->disabled		= 1;
-
+	evlist__for_each(evlist, pos) {
 try_again:
-	fd[nr_cpu][counter] = sys_perf_event_open(attr, pid, cpu, group_fd, 0);
+		if (perf_evsel__open(pos, evlist->cpus, evlist->threads) < 0) {
+			if (perf_evsel__fallback(pos, errno, msg, sizeof(msg))) {
+				if (verbose)
+					ui__warning("%s\n", msg);
+				goto try_again;
+			}
 
-	if (fd[nr_cpu][counter] < 0) {
-		int err = errno;
-
-		if (err == EPERM || err == EACCES)
-			die("Permission error - are you root?\n");
-		else if (err ==  ENODEV && profile_cpu != -1)
-			die("No such device - did you specify an out-of-range profile CPU?\n");
-
-		/*
-		 * If it's cycles then fall back to hrtimer
-		 * based cpu-clock-tick sw counter, which
-		 * is always available even if no PMU support:
-		 */
-		if (attr->type == PERF_TYPE_HARDWARE
-			&& attr->config == PERF_COUNT_HW_CPU_CYCLES) {
-
-			if (verbose)
-				warning(" ... trying to fall back to cpu-clock-ticks\n");
-			attr->type = PERF_TYPE_SOFTWARE;
-			attr->config = PERF_COUNT_SW_CPU_CLOCK;
-			goto try_again;
-		}
-		printf("\n");
-		error("perfcounter syscall returned with %d (%s)\n",
-			fd[nr_cpu][counter], strerror(err));
-		die("No CONFIG_PERF_EVENTS=y kernel support configured?\n");
-		exit(-1);
-	}
-
-	h_attr = get_header_attr(attr, counter);
-
-	if (!file_new) {
-		if (memcmp(&h_attr->attr, attr, sizeof(*attr))) {
-			fprintf(stderr, "incompatible append\n");
-			exit(-1);
+			rc = -errno;
+			perf_evsel__open_strerror(pos, &opts->target,
+						  errno, msg, sizeof(msg));
+			ui__error("%s\n", msg);
+			goto out;
 		}
 	}
 
-	if (read(fd[nr_cpu][counter], &read_data, sizeof(read_data)) == -1) {
-		perror("Unable to read perf file descriptor\n");
-		exit(-1);
+	if (perf_evlist__apply_filters(evlist, &pos)) {
+		error("failed to set filter \"%s\" on event %s with %d (%s)\n",
+			pos->filter, perf_evsel__name(pos), errno,
+			strerror_r(errno, msg, sizeof(msg)));
+		rc = -1;
+		goto out;
 	}
 
-	perf_header_attr__add_id(h_attr, read_data.id);
+	if (perf_evlist__mmap(evlist, opts->mmap_pages, false) < 0) {
+		if (errno == EPERM) {
+			pr_err("Permission error mapping pages.\n"
+			       "Consider increasing "
+			       "/proc/sys/kernel/perf_event_mlock_kb,\n"
+			       "or try again with a smaller value of -m/--mmap_pages.\n"
+			       "(current value: %u)\n", opts->mmap_pages);
+			rc = -errno;
+		} else {
+			pr_err("failed to mmap with %d (%s)\n", errno,
+				strerror_r(errno, msg, sizeof(msg)));
+			rc = -errno;
+		}
+		goto out;
+	}
 
-	assert(fd[nr_cpu][counter] >= 0);
-	fcntl(fd[nr_cpu][counter], F_SETFL, O_NONBLOCK);
+	session->evlist = evlist;
+	perf_session__set_id_hdr_size(session);
+out:
+	return rc;
+}
+
+static int process_sample_event(struct perf_tool *tool,
+				union perf_event *event,
+				struct perf_sample *sample,
+				struct perf_evsel *evsel,
+				struct machine *machine)
+{
+	struct record *rec = container_of(tool, struct record, tool);
+
+	rec->samples++;
+
+	return build_id__mark_dso_hit(tool, event, sample, evsel, machine);
+}
+
+static int process_buildids(struct record *rec)
+{
+	struct perf_data_file *file  = &rec->file;
+	struct perf_session *session = rec->session;
+
+	u64 size = lseek(perf_data_file__fd(file), 0, SEEK_CUR);
+	if (size == 0)
+		return 0;
+
+	file->size = size;
 
 	/*
-	 * First counter acts as the group leader:
+	 * During this process, it'll load kernel map and replace the
+	 * dso->long_name to a real pathname it found.  In this case
+	 * we prefer the vmlinux path like
+	 *   /lib/modules/3.16.4/build/vmlinux
+	 *
+	 * rather than build-id path (in debug directory).
+	 *   $HOME/.debug/.build-id/f0/6e17aa50adf4d00b88925e03775de107611551
 	 */
-	if (group && group_fd == -1)
-		group_fd = fd[nr_cpu][counter];
-	if (multiplex && multiplex_fd == -1)
-		multiplex_fd = fd[nr_cpu][counter];
+	symbol_conf.ignore_vmlinux_buildid = true;
 
-	if (multiplex && fd[nr_cpu][counter] != multiplex_fd) {
-		int ret;
+	return perf_session__process_events(session);
+}
 
-		ret = ioctl(fd[nr_cpu][counter], PERF_EVENT_IOC_SET_OUTPUT, multiplex_fd);
-		assert(ret != -1);
-	} else {
-		event_array[nr_poll].fd = fd[nr_cpu][counter];
-		event_array[nr_poll].events = POLLIN;
-		nr_poll++;
+static void perf_event__synthesize_guest_os(struct machine *machine, void *data)
+{
+	int err;
+	struct perf_tool *tool = data;
+	/*
+	 *As for guest kernel when processing subcommand record&report,
+	 *we arrange module mmap prior to guest kernel mmap and trigger
+	 *a preload dso because default guest module symbols are loaded
+	 *from guest kallsyms instead of /lib/modules/XXX/XXX. This
+	 *method is used to avoid symbol missing when the first addr is
+	 *in module instead of in guest kernel.
+	 */
+	err = perf_event__synthesize_modules(tool, process_synthesized_event,
+					     machine);
+	if (err < 0)
+		pr_err("Couldn't record guest kernel [%d]'s reference"
+		       " relocation symbol.\n", machine->pid);
 
-		mmap_array[nr_cpu][counter].counter = counter;
-		mmap_array[nr_cpu][counter].prev = 0;
-		mmap_array[nr_cpu][counter].mask = mmap_pages*page_size - 1;
-		mmap_array[nr_cpu][counter].base = mmap(NULL, (mmap_pages+1)*page_size,
-				PROT_READ|PROT_WRITE, MAP_SHARED, fd[nr_cpu][counter], 0);
-		if (mmap_array[nr_cpu][counter].base == MAP_FAILED) {
-			error("failed to mmap with %d (%s)\n", errno, strerror(errno));
-			exit(-1);
+	/*
+	 * We use _stext for guest kernel because guest kernel's /proc/kallsyms
+	 * have no _text sometimes.
+	 */
+	err = perf_event__synthesize_kernel_mmap(tool, process_synthesized_event,
+						 machine);
+	if (err < 0)
+		pr_err("Couldn't record guest kernel [%d]'s reference"
+		       " relocation symbol.\n", machine->pid);
+}
+
+static struct perf_event_header finished_round_event = {
+	.size = sizeof(struct perf_event_header),
+	.type = PERF_RECORD_FINISHED_ROUND,
+};
+
+static int record__mmap_read_all(struct record *rec)
+{
+	u64 bytes_written = rec->bytes_written;
+	int i;
+	int rc = 0;
+
+	for (i = 0; i < rec->evlist->nr_mmaps; i++) {
+		if (rec->evlist->mmap[i].base) {
+			if (record__mmap_read(rec, i) != 0) {
+				rc = -1;
+				goto out;
+			}
 		}
 	}
 
-	ioctl(fd[nr_cpu][counter], PERF_EVENT_IOC_ENABLE);
+	/*
+	 * Mark the round finished in case we wrote
+	 * at least one event.
+	 */
+	if (bytes_written != rec->bytes_written)
+		rc = record__write(rec, &finished_round_event, sizeof(finished_round_event));
+
+out:
+	return rc;
 }
 
-static void open_counters(int cpu, pid_t pid)
+static void record__init_features(struct record *rec)
 {
-	int counter;
+	struct perf_session *session = rec->session;
+	int feat;
 
-	group_fd = -1;
-	for (counter = 0; counter < nr_counters; counter++)
-		create_counter(counter, cpu, pid);
+	for (feat = HEADER_FIRST_FEATURE; feat < HEADER_LAST_FEATURE; feat++)
+		perf_header__set_feat(&session->header, feat);
 
-	nr_cpu++;
+	if (rec->no_buildid)
+		perf_header__clear_feat(&session->header, HEADER_BUILD_ID);
+
+	if (!have_tracepoints(&rec->evlist->entries))
+		perf_header__clear_feat(&session->header, HEADER_TRACING_DATA);
+
+	if (!rec->opts.branch_stack)
+		perf_header__clear_feat(&session->header, HEADER_BRANCH_STACK);
 }
 
-static void atexit_header(void)
-{
-	header->data_size += bytes_written;
+static volatile int workload_exec_errno;
 
-	perf_header__write(header, output);
+/*
+ * perf_evlist__prepare_workload will send a SIGUSR1
+ * if the fork fails, since we asked by setting its
+ * want_signal to true.
+ */
+static void workload_exec_failed_signal(int signo __maybe_unused,
+					siginfo_t *info,
+					void *ucontext __maybe_unused)
+{
+	workload_exec_errno = info->si_value.sival_int;
+	done = 1;
+	child_finished = 1;
 }
 
-static int __cmd_record(int argc, const char **argv)
+static int __cmd_record(struct record *rec, int argc, const char **argv)
 {
-	int i, counter;
-	struct stat st;
-	pid_t pid = 0;
-	int flags;
-	int ret;
+	int err;
+	int status = 0;
 	unsigned long waking = 0;
+	const bool forks = argc > 0;
+	struct machine *machine;
+	struct perf_tool *tool = &rec->tool;
+	struct record_opts *opts = &rec->opts;
+	struct perf_data_file *file = &rec->file;
+	struct perf_session *session;
+	bool disabled = false, draining = false;
+	int fd;
 
-	page_size = sysconf(_SC_PAGE_SIZE);
-	nr_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-	assert(nr_cpus <= MAX_NR_CPUS);
-	assert(nr_cpus >= 0);
+	rec->progname = argv[0];
 
-	atexit(sig_atexit);
+	atexit(record__sig_exit);
 	signal(SIGCHLD, sig_handler);
 	signal(SIGINT, sig_handler);
+	signal(SIGTERM, sig_handler);
 
-	if (!stat(output_name, &st) && st.st_size) {
-		if (!force && !append_file) {
-			fprintf(stderr, "Error, output file %s exists, use -A to append or -f to overwrite.\n",
-					output_name);
-			exit(-1);
+	session = perf_session__new(file, false, tool);
+	if (session == NULL) {
+		pr_err("Perf session creation failed.\n");
+		return -1;
+	}
+
+	fd = perf_data_file__fd(file);
+	rec->session = session;
+
+	record__init_features(rec);
+
+	if (forks) {
+		err = perf_evlist__prepare_workload(rec->evlist, &opts->target,
+						    argv, file->is_pipe,
+						    workload_exec_failed_signal);
+		if (err < 0) {
+			pr_err("Couldn't run the workload!\n");
+			status = err;
+			goto out_delete_session;
 		}
-	} else {
-		append_file = 0;
 	}
 
-	flags = O_CREAT|O_RDWR;
-	if (append_file)
-		file_new = 0;
-	else
-		flags |= O_TRUNC;
-
-	output = open(output_name, flags, S_IRUSR|S_IWUSR);
-	if (output < 0) {
-		perror("failed to create output file");
-		exit(-1);
+	if (record__open(rec) != 0) {
+		err = -1;
+		goto out_child;
 	}
 
-	if (!file_new)
-		header = perf_header__read(output);
-	else
-		header = perf_header__new();
+	if (!rec->evlist->nr_groups)
+		perf_header__clear_feat(&session->header, HEADER_GROUP_DESC);
 
-
-	if (raw_samples) {
-		read_tracing_data(attrs, nr_counters);
+	if (file->is_pipe) {
+		err = perf_header__write_pipe(fd);
+		if (err < 0)
+			goto out_child;
 	} else {
-		for (i = 0; i < nr_counters; i++) {
-			if (attrs[i].sample_type & PERF_SAMPLE_RAW) {
-				read_tracing_data(attrs, nr_counters);
-				break;
+		err = perf_session__write_header(session, rec->evlist, fd, false);
+		if (err < 0)
+			goto out_child;
+	}
+
+	if (!rec->no_buildid
+	    && !perf_header__has_feat(&session->header, HEADER_BUILD_ID)) {
+		pr_err("Couldn't generate buildids. "
+		       "Use --no-buildid to profile anyway.\n");
+		err = -1;
+		goto out_child;
+	}
+
+	machine = &session->machines.host;
+
+	if (file->is_pipe) {
+		err = perf_event__synthesize_attrs(tool, session,
+						   process_synthesized_event);
+		if (err < 0) {
+			pr_err("Couldn't synthesize attrs.\n");
+			goto out_child;
+		}
+
+		if (have_tracepoints(&rec->evlist->entries)) {
+			/*
+			 * FIXME err <= 0 here actually means that
+			 * there were no tracepoints so its not really
+			 * an error, just that we don't need to
+			 * synthesize anything.  We really have to
+			 * return this more properly and also
+			 * propagate errors that now are calling die()
+			 */
+			err = perf_event__synthesize_tracing_data(tool,	fd, rec->evlist,
+								  process_synthesized_event);
+			if (err <= 0) {
+				pr_err("Couldn't record tracing data.\n");
+				goto out_child;
 			}
-		}
-	}
-	atexit(atexit_header);
-
-	if (!system_wide) {
-		pid = target_pid;
-		if (pid == -1)
-			pid = getpid();
-
-		open_counters(profile_cpu, pid);
-	} else {
-		if (profile_cpu != -1) {
-			open_counters(profile_cpu, target_pid);
-		} else {
-			for (i = 0; i < nr_cpus; i++)
-				open_counters(i, target_pid);
+			rec->bytes_written += err;
 		}
 	}
 
-	if (file_new)
-		perf_header__write(header, output);
+	err = perf_event__synthesize_kernel_mmap(tool, process_synthesized_event,
+						 machine);
+	if (err < 0)
+		pr_err("Couldn't record kernel reference relocation symbol\n"
+		       "Symbol resolution may be skewed if relocation was used (e.g. kexec).\n"
+		       "Check /proc/kallsyms permission or run as root.\n");
 
-	if (!system_wide) {
-		pid_t tgid = pid_synthesize_comm_event(pid, 0);
-		pid_synthesize_mmap_samples(pid, tgid);
-	} else
-		synthesize_all();
+	err = perf_event__synthesize_modules(tool, process_synthesized_event,
+					     machine);
+	if (err < 0)
+		pr_err("Couldn't record kernel module information.\n"
+		       "Symbol resolution may be skewed if relocation was used (e.g. kexec).\n"
+		       "Check /proc/modules permission or run as root.\n");
 
-	if (target_pid == -1 && argc) {
-		pid = fork();
-		if (pid < 0)
-			perror("failed to fork");
-
-		if (!pid) {
-			if (execvp(argv[0], (char **)argv)) {
-				perror(argv[0]);
-				exit(-1);
-			}
-		}
-
-		child_pid = pid;
+	if (perf_guest) {
+		machines__process_guests(&session->machines,
+					 perf_event__synthesize_guest_os, tool);
 	}
 
-	if (realtime_prio) {
+	err = __machine__synthesize_threads(machine, tool, &opts->target, rec->evlist->threads,
+					    process_synthesized_event, opts->sample_address);
+	if (err != 0)
+		goto out_child;
+
+	if (rec->realtime_prio) {
 		struct sched_param param;
 
-		param.sched_priority = realtime_prio;
+		param.sched_priority = rec->realtime_prio;
 		if (sched_setscheduler(0, SCHED_FIFO, &param)) {
-			printf("Could not set realtime priority.\n");
-			exit(-1);
+			pr_err("Could not set realtime priority.\n");
+			err = -1;
+			goto out_child;
 		}
+	}
+
+	/*
+	 * When perf is starting the traced process, all the events
+	 * (apart from group members) have enable_on_exec=1 set,
+	 * so don't spoil it by prematurely enabling them.
+	 */
+	if (!target__none(&opts->target) && !opts->initial_delay)
+		perf_evlist__enable(rec->evlist);
+
+	/*
+	 * Let the child rip
+	 */
+	if (forks)
+		perf_evlist__start_workload(rec->evlist);
+
+	if (opts->initial_delay) {
+		usleep(opts->initial_delay * 1000);
+		perf_evlist__enable(rec->evlist);
 	}
 
 	for (;;) {
-		int hits = samples;
+		int hits = rec->samples;
 
-		for (i = 0; i < nr_cpu; i++) {
-			for (counter = 0; counter < nr_counters; counter++) {
-				if (mmap_array[i][counter].base)
-					mmap_read(&mmap_array[i][counter]);
-			}
+		if (record__mmap_read_all(rec) < 0) {
+			err = -1;
+			goto out_child;
 		}
 
-		if (hits == samples) {
-			if (done)
+		if (hits == rec->samples) {
+			if (done || draining)
 				break;
-			ret = poll(event_array, nr_poll, -1);
+			err = perf_evlist__poll(rec->evlist, -1);
+			/*
+			 * Propagate error, only if there's any. Ignore positive
+			 * number of returned events and interrupt error.
+			 */
+			if (err > 0 || (err < 0 && errno == EINTR))
+				err = 0;
 			waking++;
+
+			if (perf_evlist__filter_pollfd(rec->evlist, POLLERR | POLLHUP) == 0)
+				draining = true;
 		}
 
-		if (done) {
-			for (i = 0; i < nr_cpu; i++) {
-				for (counter = 0; counter < nr_counters; counter++)
-					ioctl(fd[i][counter], PERF_EVENT_IOC_DISABLE);
-			}
+		/*
+		 * When perf is starting the traced process, at the end events
+		 * die with the process and we wait for that. Thus no need to
+		 * disable events in this case.
+		 */
+		if (done && !disabled && !target__none(&opts->target)) {
+			perf_evlist__disable(rec->evlist);
+			disabled = true;
 		}
 	}
 
-	fprintf(stderr, "[ perf record: Woken up %ld times to write data ]\n", waking);
+	if (forks && workload_exec_errno) {
+		char msg[STRERR_BUFSIZE];
+		const char *emsg = strerror_r(workload_exec_errno, msg, sizeof(msg));
+		pr_err("Workload failed: %s\n", emsg);
+		err = -1;
+		goto out_child;
+	}
 
-	/*
-	 * Approximate RIP event size: 24 bytes.
-	 */
-	fprintf(stderr,
-		"[ perf record: Captured and wrote %.3f MB %s (~%lld samples) ]\n",
-		(double)bytes_written / 1024.0 / 1024.0,
-		output_name,
-		bytes_written / 24);
+	if (!quiet)
+		fprintf(stderr, "[ perf record: Woken up %ld times to write data ]\n", waking);
 
+out_child:
+	if (forks) {
+		int exit_status;
+
+		if (!child_finished)
+			kill(rec->evlist->workload.pid, SIGTERM);
+
+		wait(&exit_status);
+
+		if (err < 0)
+			status = err;
+		else if (WIFEXITED(exit_status))
+			status = WEXITSTATUS(exit_status);
+		else if (WIFSIGNALED(exit_status))
+			signr = WTERMSIG(exit_status);
+	} else
+		status = err;
+
+	/* this will be recalculated during process_buildids() */
+	rec->samples = 0;
+
+	if (!err && !file->is_pipe) {
+		rec->session->header.data_size += rec->bytes_written;
+
+		if (!rec->no_buildid)
+			process_buildids(rec);
+		perf_session__write_header(rec->session, rec->evlist, fd, true);
+	}
+
+	if (!err && !quiet) {
+		char samples[128];
+
+		if (rec->samples)
+			scnprintf(samples, sizeof(samples),
+				  " (%" PRIu64 " samples)", rec->samples);
+		else
+			samples[0] = '\0';
+
+		fprintf(stderr,	"[ perf record: Captured and wrote %.3f MB %s%s ]\n",
+			perf_data_file__size(file) / 1024.0 / 1024.0,
+			file->path, samples);
+	}
+
+out_delete_session:
+	perf_session__delete(session);
+	return status;
+}
+
+static void callchain_debug(void)
+{
+	static const char *str[CALLCHAIN_MAX] = { "NONE", "FP", "DWARF", "LBR" };
+
+	pr_debug("callchain: type %s\n", str[callchain_param.record_mode]);
+
+	if (callchain_param.record_mode == CALLCHAIN_DWARF)
+		pr_debug("callchain: stack dump size %d\n",
+			 callchain_param.dump_size);
+}
+
+int record_parse_callchain_opt(const struct option *opt __maybe_unused,
+			       const char *arg,
+			       int unset)
+{
+	int ret;
+
+	callchain_param.enabled = !unset;
+
+	/* --no-call-graph */
+	if (unset) {
+		callchain_param.record_mode = CALLCHAIN_NONE;
+		pr_debug("callchain: disabled\n");
+		return 0;
+	}
+
+	ret = parse_callchain_record_opt(arg);
+	if (!ret)
+		callchain_debug();
+
+	return ret;
+}
+
+int record_callchain_opt(const struct option *opt __maybe_unused,
+			 const char *arg __maybe_unused,
+			 int unset __maybe_unused)
+{
+	callchain_param.enabled = true;
+
+	if (callchain_param.record_mode == CALLCHAIN_NONE)
+		callchain_param.record_mode = CALLCHAIN_FP;
+
+	callchain_debug();
 	return 0;
 }
 
-static const char * const record_usage[] = {
+static int perf_record_config(const char *var, const char *value, void *cb)
+{
+	if (!strcmp(var, "record.call-graph"))
+		var = "call-graph.record-mode"; /* fall-through */
+
+	return perf_default_config(var, value, cb);
+}
+
+static const char * const __record_usage[] = {
 	"perf record [<options>] [<command>]",
 	"perf record [<options>] -- <command> [<options>]",
 	NULL
 };
+const char * const *record_usage = __record_usage;
 
-static const struct option options[] = {
-	OPT_CALLBACK('e', "event", NULL, "event",
+/*
+ * XXX Ideally would be local to cmd_record() and passed to a record__new
+ * because we need to have access to it in record__exit, that is called
+ * after cmd_record() exits, but since record_options need to be accessible to
+ * builtin-script, leave it here.
+ *
+ * At least we don't ouch it in all the other functions here directly.
+ *
+ * Just say no to tons of global variables, sigh.
+ */
+static struct record record = {
+	.opts = {
+		.sample_time	     = true,
+		.mmap_pages	     = UINT_MAX,
+		.user_freq	     = UINT_MAX,
+		.user_interval	     = ULLONG_MAX,
+		.freq		     = 4000,
+		.target		     = {
+			.uses_mmap   = true,
+			.default_per_cpu = true,
+		},
+	},
+	.tool = {
+		.sample		= process_sample_event,
+		.fork		= perf_event__process_fork,
+		.comm		= perf_event__process_comm,
+		.mmap		= perf_event__process_mmap,
+		.mmap2		= perf_event__process_mmap2,
+	},
+};
+
+#define CALLCHAIN_HELP "setup and enables call-graph (stack chain/backtrace) recording: "
+
+#ifdef HAVE_DWARF_UNWIND_SUPPORT
+const char record_callchain_help[] = CALLCHAIN_HELP "fp dwarf lbr";
+#else
+const char record_callchain_help[] = CALLCHAIN_HELP "fp lbr";
+#endif
+
+/*
+ * XXX Will stay a global variable till we fix builtin-script.c to stop messing
+ * with it and switch to use the library functions in perf_evlist that came
+ * from builtin-record.c, i.e. use record_opts,
+ * perf_evlist__prepare_workload, etc instead of fork+exec'in 'perf record',
+ * using pipes, etc.
+ */
+struct option __record_options[] = {
+	OPT_CALLBACK('e', "event", &record.evlist, "event",
 		     "event selector. use 'perf list' to list available events",
-		     parse_events),
-	OPT_INTEGER('p', "pid", &target_pid,
-		    "record events on existing pid"),
-	OPT_INTEGER('r', "realtime", &realtime_prio,
+		     parse_events_option),
+	OPT_CALLBACK(0, "filter", &record.evlist, "filter",
+		     "event filter", parse_filter),
+	OPT_STRING('p', "pid", &record.opts.target.pid, "pid",
+		    "record events on existing process id"),
+	OPT_STRING('t', "tid", &record.opts.target.tid, "tid",
+		    "record events on existing thread id"),
+	OPT_INTEGER('r', "realtime", &record.realtime_prio,
 		    "collect data with this RT SCHED_FIFO priority"),
-	OPT_BOOLEAN('R', "raw-samples", &raw_samples,
+	OPT_BOOLEAN(0, "no-buffering", &record.opts.no_buffering,
+		    "collect data without buffering"),
+	OPT_BOOLEAN('R', "raw-samples", &record.opts.raw_samples,
 		    "collect raw sample records from all opened counters"),
-	OPT_BOOLEAN('a', "all-cpus", &system_wide,
+	OPT_BOOLEAN('a', "all-cpus", &record.opts.target.system_wide,
 			    "system-wide collection from all CPUs"),
-	OPT_BOOLEAN('A', "append", &append_file,
-			    "append to the output file to do incremental profiling"),
-	OPT_INTEGER('C', "profile_cpu", &profile_cpu,
-			    "CPU to profile on"),
-	OPT_BOOLEAN('f', "force", &force,
-			"overwrite existing data file"),
-	OPT_LONG('c', "count", &default_interval,
-		    "event period to sample"),
-	OPT_STRING('o', "output", &output_name, "file",
+	OPT_STRING('C', "cpu", &record.opts.target.cpu_list, "cpu",
+		    "list of cpus to monitor"),
+	OPT_U64('c', "count", &record.opts.user_interval, "event period to sample"),
+	OPT_STRING('o', "output", &record.file.path, "file",
 		    "output file name"),
-	OPT_BOOLEAN('i', "inherit", &inherit,
-		    "child tasks inherit counters"),
-	OPT_INTEGER('F', "freq", &freq,
-		    "profile at this frequency"),
-	OPT_INTEGER('m', "mmap-pages", &mmap_pages,
-		    "number of mmap data pages"),
-	OPT_BOOLEAN('g', "call-graph", &call_graph,
-		    "do call-graph (stack chain/backtrace) recording"),
-	OPT_BOOLEAN('v', "verbose", &verbose,
+	OPT_BOOLEAN_SET('i', "no-inherit", &record.opts.no_inherit,
+			&record.opts.no_inherit_set,
+			"child tasks do not inherit counters"),
+	OPT_UINTEGER('F', "freq", &record.opts.user_freq, "profile at this frequency"),
+	OPT_CALLBACK('m', "mmap-pages", &record.opts.mmap_pages, "pages",
+		     "number of mmap data pages",
+		     perf_evlist__parse_mmap_pages),
+	OPT_BOOLEAN(0, "group", &record.opts.group,
+		    "put the counters into a counter group"),
+	OPT_CALLBACK_NOOPT('g', NULL, &record.opts,
+			   NULL, "enables call-graph recording" ,
+			   &record_callchain_opt),
+	OPT_CALLBACK(0, "call-graph", &record.opts,
+		     "mode[,dump_size]", record_callchain_help,
+		     &record_parse_callchain_opt),
+	OPT_INCR('v', "verbose", &verbose,
 		    "be more verbose (show counter open errors, etc)"),
-	OPT_BOOLEAN('s', "stat", &inherit_stat,
+	OPT_BOOLEAN('q', "quiet", &quiet, "don't print any message"),
+	OPT_BOOLEAN('s', "stat", &record.opts.inherit_stat,
 		    "per thread counts"),
-	OPT_BOOLEAN('d', "data", &sample_address,
+	OPT_BOOLEAN('d', "data", &record.opts.sample_address,
 		    "Sample addresses"),
-	OPT_BOOLEAN('n', "no-samples", &no_samples,
+	OPT_BOOLEAN('T', "timestamp", &record.opts.sample_time, "Sample timestamps"),
+	OPT_BOOLEAN('P', "period", &record.opts.period, "Sample period"),
+	OPT_BOOLEAN('n', "no-samples", &record.opts.no_samples,
 		    "don't sample"),
-	OPT_BOOLEAN('M', "multiplex", &multiplex,
-		    "multiplex counter output in a single channel"),
+	OPT_BOOLEAN('N', "no-buildid-cache", &record.no_buildid_cache,
+		    "do not update the buildid cache"),
+	OPT_BOOLEAN('B', "no-buildid", &record.no_buildid,
+		    "do not collect buildids in perf.data"),
+	OPT_CALLBACK('G', "cgroup", &record.evlist, "name",
+		     "monitor event in cgroup name only",
+		     parse_cgroups),
+	OPT_UINTEGER('D', "delay", &record.opts.initial_delay,
+		  "ms to wait before starting measurement after program start"),
+	OPT_STRING('u', "uid", &record.opts.target.uid_str, "user",
+		   "user to profile"),
+	OPT_CALLBACK_NOOPT('b', "branch-any", &record.opts.branch_stack,
+		     "branch any", "sample any taken branches",
+		     parse_branch_stack),
+	OPT_CALLBACK('j', "branch-filter", &record.opts.branch_stack,
+		     "branch filter mask", "branch stack filter modes",
+		     parse_branch_stack),
+	OPT_BOOLEAN('W', "weight", &record.opts.sample_weight,
+		    "sample by weight (on special events only)"),
+	OPT_BOOLEAN(0, "transaction", &record.opts.sample_transaction,
+		    "sample transaction flags (special events only)"),
+	OPT_BOOLEAN(0, "per-thread", &record.opts.target.per_thread,
+		    "use per-thread mmaps"),
+	OPT_BOOLEAN('I', "intr-regs", &record.opts.sample_intr_regs,
+		    "Sample machine registers on interrupt"),
+	OPT_BOOLEAN(0, "running-time", &record.opts.running_time,
+		    "Record running/enabled time of read (:S) events"),
 	OPT_END()
 };
 
-int cmd_record(int argc, const char **argv, const char *prefix __used)
+struct option *record_options = __record_options;
+
+int cmd_record(int argc, const char **argv, const char *prefix __maybe_unused)
 {
-	int counter;
+	int err = -ENOMEM;
+	struct record *rec = &record;
+	char errbuf[BUFSIZ];
 
-	argc = parse_options(argc, argv, options, record_usage,
-		PARSE_OPT_STOP_AT_NON_OPTION);
-	if (!argc && target_pid == -1 && !system_wide)
-		usage_with_options(record_usage, options);
+	rec->evlist = perf_evlist__new();
+	if (rec->evlist == NULL)
+		return -ENOMEM;
 
-	if (!nr_counters) {
-		nr_counters	= 1;
-		attrs[0].type	= PERF_TYPE_HARDWARE;
-		attrs[0].config = PERF_COUNT_HW_CPU_CYCLES;
+	perf_config(perf_record_config, rec);
+
+	argc = parse_options(argc, argv, record_options, record_usage,
+			    PARSE_OPT_STOP_AT_NON_OPTION);
+	if (!argc && target__none(&rec->opts.target))
+		usage_with_options(record_usage, record_options);
+
+	if (nr_cgroups && !rec->opts.target.system_wide) {
+		ui__error("cgroup monitoring only available in"
+			  " system-wide mode\n");
+		usage_with_options(record_usage, record_options);
 	}
 
-	for (counter = 0; counter < nr_counters; counter++) {
-		if (attrs[counter].sample_period)
-			continue;
+	symbol__init(NULL);
 
-		attrs[counter].sample_period = default_interval;
+	if (symbol_conf.kptr_restrict)
+		pr_warning(
+"WARNING: Kernel address maps (/proc/{kallsyms,modules}) are restricted,\n"
+"check /proc/sys/kernel/kptr_restrict.\n\n"
+"Samples in kernel functions may not be resolved if a suitable vmlinux\n"
+"file is not found in the buildid cache or in the vmlinux path.\n\n"
+"Samples in kernel modules won't be resolved at all.\n\n"
+"If some relocation was applied (e.g. kexec) symbols may be misresolved\n"
+"even with a suitable vmlinux or kallsyms file.\n\n");
+
+	if (rec->no_buildid_cache || rec->no_buildid)
+		disable_buildid_cache();
+
+	if (rec->evlist->nr_entries == 0 &&
+	    perf_evlist__add_default(rec->evlist) < 0) {
+		pr_err("Not enough memory for event selector list\n");
+		goto out_symbol_exit;
 	}
 
-	return __cmd_record(argc, argv);
+	if (rec->opts.target.tid && !rec->opts.no_inherit_set)
+		rec->opts.no_inherit = true;
+
+	err = target__validate(&rec->opts.target);
+	if (err) {
+		target__strerror(&rec->opts.target, err, errbuf, BUFSIZ);
+		ui__warning("%s", errbuf);
+	}
+
+	err = target__parse_uid(&rec->opts.target);
+	if (err) {
+		int saved_errno = errno;
+
+		target__strerror(&rec->opts.target, err, errbuf, BUFSIZ);
+		ui__error("%s", errbuf);
+
+		err = -saved_errno;
+		goto out_symbol_exit;
+	}
+
+	err = -ENOMEM;
+	if (perf_evlist__create_maps(rec->evlist, &rec->opts.target) < 0)
+		usage_with_options(record_usage, record_options);
+
+	if (record_opts__config(&rec->opts)) {
+		err = -EINVAL;
+		goto out_symbol_exit;
+	}
+
+	err = __cmd_record(&record, argc, argv);
+out_symbol_exit:
+	perf_evlist__delete(rec->evlist);
+	symbol__exit();
+	return err;
 }

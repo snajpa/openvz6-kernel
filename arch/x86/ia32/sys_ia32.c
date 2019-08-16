@@ -155,9 +155,6 @@ struct mmap_arg_struct {
 asmlinkage long sys32_mmap(struct mmap_arg_struct __user *arg)
 {
 	struct mmap_arg_struct a;
-	struct file *file = NULL;
-	unsigned long retval;
-	struct mm_struct *mm ;
 
 	if (copy_from_user(&a, arg, sizeof(a)))
 		return -EFAULT;
@@ -165,22 +162,8 @@ asmlinkage long sys32_mmap(struct mmap_arg_struct __user *arg)
 	if (a.offset & ~PAGE_MASK)
 		return -EINVAL;
 
-	if (!(a.flags & MAP_ANONYMOUS)) {
-		file = fget(a.fd);
-		if (!file)
-			return -EBADF;
-	}
-
-	mm = current->mm;
-	down_write(&mm->mmap_sem);
-	retval = do_mmap_pgoff(file, a.addr, a.len, a.prot, a.flags,
+	return sys_mmap_pgoff(a.addr, a.len, a.prot, a.flags, a.fd,
 			       a.offset>>PAGE_SHIFT);
-	if (file)
-		fput(file);
-
-	up_write(&mm->mmap_sem);
-
-	return retval;
 }
 
 asmlinkage long sys32_mprotect(unsigned long start, size_t len,
@@ -539,30 +522,6 @@ asmlinkage long sys32_sendfile(int out_fd, int in_fd,
 	return ret;
 }
 
-asmlinkage long sys32_mmap2(unsigned long addr, unsigned long len,
-			    unsigned long prot, unsigned long flags,
-			    unsigned long fd, unsigned long pgoff)
-{
-	struct mm_struct *mm = current->mm;
-	unsigned long error;
-	struct file *file = NULL;
-
-	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
-	if (!(flags & MAP_ANONYMOUS)) {
-		file = fget(fd);
-		if (!file)
-			return -EBADF;
-	}
-
-	down_write(&mm->mmap_sem);
-	error = do_mmap_pgoff(file, addr, len, prot, flags, pgoff);
-	up_write(&mm->mmap_sem);
-
-	if (file)
-		fput(file);
-	return error;
-}
-
 asmlinkage long sys32_olduname(struct oldold_utsname __user *name)
 {
 	char *arch = "x86_64";
@@ -619,13 +578,13 @@ asmlinkage long sys32_execve(char __user *name, compat_uptr_t __user *argv,
 			     compat_uptr_t __user *envp, struct pt_regs *regs)
 {
 	long error;
-	char *filename;
+	struct filename *filename;
 
 	filename = getname(name);
 	error = PTR_ERR(filename);
 	if (IS_ERR(filename))
 		return error;
-	error = compat_do_execve(filename, argv, envp, regs);
+	error = compat_do_execve(filename->name, argv, envp, regs);
 	putname(filename);
 	return error;
 }

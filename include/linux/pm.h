@@ -26,6 +26,8 @@
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/timer.h>
+#include <linux/completion.h>
+
 
 /*
  * Callbacks for platform drivers to implement.
@@ -213,18 +215,34 @@ struct dev_pm_ops {
 	int (*runtime_idle)(struct device *dev);
 };
 
+#ifdef CONFIG_PM_SLEEP
+#define SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
+	.suspend = suspend_fn, \
+	.resume = resume_fn, \
+	.freeze = suspend_fn, \
+	.thaw = resume_fn, \
+	.poweroff = suspend_fn, \
+	.restore = resume_fn,
+#else
+#define SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
+#endif
+
+#ifdef CONFIG_PM_RUNTIME
+#define SET_RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn) \
+	.runtime_suspend = suspend_fn, \
+	.runtime_resume = resume_fn, \
+	.runtime_idle = idle_fn,
+#else
+#define SET_RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn)
+#endif
+
 /*
  * Use this if you want to use the same suspend and resume callbacks for suspend
  * to RAM and hibernation.
  */
 #define SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn) \
 struct dev_pm_ops name = { \
-	.suspend = suspend_fn, \
-	.resume = resume_fn, \
-	.freeze = suspend_fn, \
-	.thaw = resume_fn, \
-	.poweroff = suspend_fn, \
-	.restore = resume_fn, \
+	SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
 }
 
 /**
@@ -411,9 +429,11 @@ struct dev_pm_info {
 	pm_message_t		power_state;
 	unsigned int		can_wakeup:1;
 	unsigned int		should_wakeup:1;
+	unsigned		async_suspend:1;
 	enum dpm_state		status;		/* Owned by the PM core */
-#ifdef CONFIG_PM_SLEEP
+#if defined(CONFIG_PM_SLEEP) && !defined(CONFIG_PPC_PSERIES)
 	struct list_head	entry;
+	struct completion	completion;
 #endif
 #ifdef CONFIG_PM_RUNTIME
 	struct timer_list	suspend_timer;
@@ -428,11 +448,21 @@ struct dev_pm_info {
 	unsigned int		idle_notification:1;
 	unsigned int		request_pending:1;
 	unsigned int		deferred_resume:1;
+	unsigned int		run_wake:1;
+	unsigned int		runtime_auto:1;
 	enum rpm_request	request;
 	enum rpm_status		runtime_status;
 	int			runtime_error;
 #endif
 };
+
+#ifdef CONFIG_PPC_PSERIES
+struct dev_pm_info_entry {
+	struct device		*dev;
+	struct list_head	entry;
+	struct completion	completion;
+};
+#endif /* CONFIG_PPC_PSERIES */
 
 /*
  * The PM_EVENT_ messages are also used by drivers implementing the legacy

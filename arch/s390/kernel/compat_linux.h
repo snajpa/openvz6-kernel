@@ -4,10 +4,6 @@
 #include <linux/compat.h>
 #include <linux/socket.h>
 #include <linux/syscalls.h>
-#include <linux/nfs_fs.h>
-#include <linux/sunrpc/svc.h>
-#include <linux/nfsd/nfsd.h>
-#include <linux/nfsd/export.h>
 
 /* Macro that masks the high order bit of an 32 bit pointer and converts it*/
 /*       to a 64 bit pointer */
@@ -106,6 +102,9 @@ typedef union
 typedef struct
 {
 	unsigned int	fpc;
+#ifndef __GENKSYMS__
+	unsigned int	pad;
+#endif
 	freg_t32	fprs[__NUM_FPRS];              
 } _s390_fp_regs32;
 

@@ -6,7 +6,7 @@
 #include <linux/log2.h>
 #include <linux/usb.h>
 #include <linux/wait.h>
-#include "hcd.h"
+#include <linux/usb/hcd.h>
 
 #define to_urb(d) container_of(d, struct urb, kref)
 
@@ -137,6 +137,16 @@ void usb_anchor_urb(struct urb *urb, struct usb_anchor *anchor)
 }
 EXPORT_SYMBOL_GPL(usb_anchor_urb);
 
+/* Callers must hold anchor->lock */
+static void __usb_unanchor_urb(struct urb *urb, struct usb_anchor *anchor)
+{
+	urb->anchor = NULL;
+	list_del(&urb->anchor_list);
+	usb_put_urb(urb);
+	if (list_empty(&anchor->urb_list))
+		wake_up(&anchor->wait);
+}
+
 /**
  * usb_unanchor_urb - unanchors an URB
  * @urb: pointer to the urb to anchor
@@ -156,17 +166,14 @@ void usb_unanchor_urb(struct urb *urb)
 		return;
 
 	spin_lock_irqsave(&anchor->lock, flags);
-	if (unlikely(anchor != urb->anchor)) {
-		/* we've lost the race to another thread */
-		spin_unlock_irqrestore(&anchor->lock, flags);
-		return;
-	}
-	urb->anchor = NULL;
-	list_del(&urb->anchor_list);
+	/*
+	 * At this point, we could be competing with another thread which
+	 * has the same intention. To protect the urb from being unanchored
+	 * twice, only the winner of the race gets the job.
+	 */
+	if (likely(anchor == urb->anchor))
+		__usb_unanchor_urb(urb, anchor);
 	spin_unlock_irqrestore(&anchor->lock, flags);
-	usb_put_urb(urb);
-	if (list_empty(&anchor->urb_list))
-		wake_up(&anchor->wait);
 }
 EXPORT_SYMBOL_GPL(usb_unanchor_urb);
 
@@ -308,8 +315,7 @@ int usb_submit_urb(struct urb *urb, gfp_t mem_flags)
 	 * will be required to set urb->ep directly and we will eliminate
 	 * urb->pipe.
 	 */
-	ep = (usb_pipein(urb->pipe) ? dev->ep_in : dev->ep_out)
-			[usb_pipeendpoint(urb->pipe)];
+	ep = usb_pipe_endpoint(dev, urb->pipe);
 	if (!ep)
 		return -ENOENT;
 
@@ -387,6 +393,13 @@ int usb_submit_urb(struct urb *urb, gfp_t mem_flags)
 	{
 	unsigned int	orig_flags = urb->transfer_flags;
 	unsigned int	allowed;
+	static int pipetypes[4] = {
+		PIPE_CONTROL, PIPE_ISOCHRONOUS, PIPE_BULK, PIPE_INTERRUPT
+	};
+
+	/* Check that the pipe's type matches the endpoint's type */
+	if (usb_pipetype(urb->pipe) != pipetypes[xfertype])
+		return -EPIPE;		/* The most suitable error code :-) */
 
 	/* enforce simple/standard policy */
 	allowed = (URB_NO_TRANSFER_DMA_MAP | URB_NO_SETUP_DMA_MAP |
@@ -725,20 +738,11 @@ EXPORT_SYMBOL_GPL(usb_unpoison_anchored_urbs);
 void usb_unlink_anchored_urbs(struct usb_anchor *anchor)
 {
 	struct urb *victim;
-	unsigned long flags;
 
-	spin_lock_irqsave(&anchor->lock, flags);
-	while (!list_empty(&anchor->urb_list)) {
-		victim = list_entry(anchor->urb_list.prev, struct urb,
-				    anchor_list);
-		usb_get_urb(victim);
-		spin_unlock_irqrestore(&anchor->lock, flags);
-		/* this will unanchor the URB */
+	while ((victim = usb_get_from_anchor(anchor)) != NULL) {
 		usb_unlink_urb(victim);
 		usb_put_urb(victim);
-		spin_lock_irqsave(&anchor->lock, flags);
 	}
-	spin_unlock_irqrestore(&anchor->lock, flags);
 }
 EXPORT_SYMBOL_GPL(usb_unlink_anchored_urbs);
 
@@ -775,12 +779,11 @@ struct urb *usb_get_from_anchor(struct usb_anchor *anchor)
 		victim = list_entry(anchor->urb_list.next, struct urb,
 				    anchor_list);
 		usb_get_urb(victim);
-		spin_unlock_irqrestore(&anchor->lock, flags);
-		usb_unanchor_urb(victim);
+		__usb_unanchor_urb(victim, anchor);
 	} else {
-		spin_unlock_irqrestore(&anchor->lock, flags);
 		victim = NULL;
 	}
+	spin_unlock_irqrestore(&anchor->lock, flags);
 
 	return victim;
 }
@@ -802,12 +805,7 @@ void usb_scuttle_anchored_urbs(struct usb_anchor *anchor)
 	while (!list_empty(&anchor->urb_list)) {
 		victim = list_entry(anchor->urb_list.prev, struct urb,
 				    anchor_list);
-		usb_get_urb(victim);
-		spin_unlock_irqrestore(&anchor->lock, flags);
-		/* this may free the URB */
-		usb_unanchor_urb(victim);
-		usb_put_urb(victim);
-		spin_lock_irqsave(&anchor->lock, flags);
+		__usb_unanchor_urb(victim, anchor);
 	}
 	spin_unlock_irqrestore(&anchor->lock, flags);
 }

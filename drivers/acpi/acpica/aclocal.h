@@ -184,8 +184,9 @@ struct acpi_namespace_node {
 	u8 flags;		/* Miscellaneous flags */
 	acpi_owner_id owner_id;	/* Node creator */
 	union acpi_name_union name;	/* ACPI Name, always 4 chars per ACPI spec */
+	struct acpi_namespace_node *parent;	/* Parent node */
 	struct acpi_namespace_node *child;	/* First child */
-	struct acpi_namespace_node *peer;	/* Peer. Parent if ANOBJ_END_OF_PEER_LIST set */
+	struct acpi_namespace_node *peer;	/* First peer */
 
 	/*
 	 * The following fields are used by the ASL compiler and disassembler only
@@ -199,7 +200,7 @@ struct acpi_namespace_node {
 
 /* Namespace Node flags */
 
-#define ANOBJ_END_OF_PEER_LIST          0x01	/* End-of-list, Peer field points to parent */
+#define ANOBJ_RESERVED                  0x01	/* Available for use */
 #define ANOBJ_TEMPORARY                 0x02	/* Node is create by a method and is temporary */
 #define ANOBJ_METHOD_ARG                0x04	/* Node is a method argument */
 #define ANOBJ_METHOD_LOCAL              0x08	/* Node is a method local */
@@ -426,6 +427,8 @@ struct acpi_gpe_event_info {
 	struct acpi_gpe_register_info *register_info;	/* Backpointer to register info */
 	u8 flags;		/* Misc info about this GPE */
 	u8 gpe_number;		/* This GPE */
+	u8 runtime_count;
+	u8 wakeup_count;
 };
 
 /* Information about a GPE register pair, one per each status/enable pair in an array */
@@ -626,6 +629,15 @@ union acpi_generic_state {
  ****************************************************************************/
 
 typedef acpi_status(*ACPI_EXECUTE_OP) (struct acpi_walk_state * walk_state);
+
+/* Address Range info block */
+
+struct acpi_address_range {
+	struct acpi_address_range *next;
+	struct acpi_namespace_node *region_node;
+	acpi_physical_address start_address;
+	acpi_physical_address end_address;
+};
 
 /*****************************************************************************
  *
@@ -890,17 +902,6 @@ struct acpi_bit_register_info {
 #define ACPI_BITPOSITION_ARB_DISABLE            0x00
 
 /* Structs and definitions for _OSI support and I/O port validation */
-
-#define ACPI_OSI_WIN_2000               0x01
-#define ACPI_OSI_WIN_XP                 0x02
-#define ACPI_OSI_WIN_XP_SP1             0x03
-#define ACPI_OSI_WINSRV_2003            0x04
-#define ACPI_OSI_WIN_XP_SP2             0x05
-#define ACPI_OSI_WINSRV_2003_SP1        0x06
-#define ACPI_OSI_WIN_VISTA              0x07
-#define ACPI_OSI_WINSRV_2008            0x08
-#define ACPI_OSI_WIN_VISTA_SP1          0x09
-#define ACPI_OSI_WIN_7                  0x0A
 
 #define ACPI_ALWAYS_ILLEGAL             0x00
 

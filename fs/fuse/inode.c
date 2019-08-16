@@ -71,6 +71,11 @@ struct fuse_mount_data {
 	unsigned blksize;
 };
 
+struct fuse_forget_link *fuse_alloc_forget()
+{
+	return kzalloc(sizeof(struct fuse_forget_link), GFP_KERNEL);
+}
+
 static struct inode *fuse_alloc_inode(struct super_block *sb)
 {
 	struct inode *inode;
@@ -86,12 +91,14 @@ static struct inode *fuse_alloc_inode(struct super_block *sb)
 	fi->nlookup = 0;
 	fi->attr_version = 0;
 	fi->writectr = 0;
+	fi->orig_ino = 0;
+	fi->state = 0;
 	INIT_LIST_HEAD(&fi->write_files);
 	INIT_LIST_HEAD(&fi->queued_writes);
 	INIT_LIST_HEAD(&fi->writepages);
 	init_waitqueue_head(&fi->page_waitq);
-	fi->forget_req = fuse_request_alloc();
-	if (!fi->forget_req) {
+	fi->forget = fuse_alloc_forget();
+	if (!fi->forget) {
 		kmem_cache_free(fuse_inode_cachep, inode);
 		return NULL;
 	}
@@ -104,22 +111,8 @@ static void fuse_destroy_inode(struct inode *inode)
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	BUG_ON(!list_empty(&fi->write_files));
 	BUG_ON(!list_empty(&fi->queued_writes));
-	if (fi->forget_req)
-		fuse_request_free(fi->forget_req);
+	kfree(fi->forget);
 	kmem_cache_free(fuse_inode_cachep, inode);
-}
-
-void fuse_send_forget(struct fuse_conn *fc, struct fuse_req *req,
-		      u64 nodeid, u64 nlookup)
-{
-	struct fuse_forget_in *inarg = &req->misc.forget_in;
-	inarg->nlookup = nlookup;
-	req->in.h.opcode = FUSE_FORGET;
-	req->in.h.nodeid = nodeid;
-	req->in.numargs = 1;
-	req->in.args[0].size = sizeof(struct fuse_forget_in);
-	req->in.args[0].value = inarg;
-	fuse_request_send_noreply(fc, req);
 }
 
 static void fuse_clear_inode(struct inode *inode)
@@ -127,8 +120,8 @@ static void fuse_clear_inode(struct inode *inode)
 	if (inode->i_sb->s_flags & MS_ACTIVE) {
 		struct fuse_conn *fc = get_fuse_conn(inode);
 		struct fuse_inode *fi = get_fuse_inode(inode);
-		fuse_send_forget(fc, fi->forget_req, fi->nodeid, fi->nlookup);
-		fi->forget_req = NULL;
+		fuse_queue_forget(fc, fi->forget, fi->nodeid, fi->nlookup);
+		fi->forget = NULL;
 	}
 }
 
@@ -140,6 +133,18 @@ static int fuse_remount_fs(struct super_block *sb, int *flags, char *data)
 	return 0;
 }
 
+/*
+ * ino_t is 32-bits on 32-bit arch. We have to squash the 64-bit value down
+ * so that it will fit.
+ */
+static ino_t fuse_squash_ino(u64 ino64)
+{
+	ino_t ino = (ino_t) ino64;
+	if (sizeof(ino_t) < sizeof(u64))
+		ino ^= ino64 >> (sizeof(u64) - sizeof(ino_t)) * 8;
+	return ino;
+}
+
 void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 				   u64 attr_valid)
 {
@@ -149,7 +154,7 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	fi->attr_version = ++fc->attr_version;
 	fi->i_time = attr_valid;
 
-	inode->i_ino     = attr->ino;
+	inode->i_ino     = fuse_squash_ino(attr->ino);
 	inode->i_mode    = (inode->i_mode & S_IFMT) | (attr->mode & 07777);
 	inode->i_nlink   = attr->nlink;
 	inode->i_uid     = attr->uid;
@@ -175,6 +180,8 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	fi->orig_i_mode = inode->i_mode;
 	if (!(fc->flags & FUSE_DEFAULT_PERMISSIONS))
 		inode->i_mode &= ~S_ISVTX;
+
+	fi->orig_ino = attr->ino;
 }
 
 void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
@@ -183,22 +190,44 @@ void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	loff_t oldsize;
+	struct timespec old_mtime;
 
 	spin_lock(&fc->lock);
-	if (attr_version != 0 && fi->attr_version > attr_version) {
+	if ((attr_version != 0 && fi->attr_version > attr_version) ||
+	    test_bit(FUSE_I_SIZE_UNSTABLE, &fi->state)) {
 		spin_unlock(&fc->lock);
 		return;
 	}
 
+	old_mtime = inode->i_mtime;
 	fuse_change_attributes_common(inode, attr, attr_valid);
 
 	oldsize = inode->i_size;
 	i_size_write(inode, attr->size);
 	spin_unlock(&fc->lock);
 
-	if (S_ISREG(inode->i_mode) && oldsize != attr->size) {
-		truncate_pagecache(inode, oldsize, attr->size);
-		invalidate_inode_pages2(inode->i_mapping);
+	if (S_ISREG(inode->i_mode)) {
+		bool inval = false;
+
+		if (oldsize != attr->size) {
+			truncate_pagecache(inode, oldsize, attr->size);
+			inval = true;
+		} else if (fc->auto_inval_data) {
+			struct timespec new_mtime = {
+				.tv_sec = attr->mtime,
+				.tv_nsec = attr->mtimensec,
+			};
+
+			/*
+			 * Auto inval mode also checks and invalidates if mtime
+			 * has changed.
+			 */
+			if (!timespec_equal(&old_mtime, &new_mtime))
+				inval = true;
+		}
+
+		if (inval)
+			invalidate_inode_pages2(inode->i_mapping);
 	}
 }
 
@@ -310,6 +339,7 @@ static void fuse_send_destroy(struct fuse_conn *fc)
 		fc->destroy_req = NULL;
 		req->in.h.opcode = FUSE_DESTROY;
 		req->force = 1;
+		req->background = 0;
 		fuse_request_send(fc, req);
 		fuse_put_request(fc, req);
 	}
@@ -326,6 +356,7 @@ void fuse_conn_kill(struct fuse_conn *fc)
 	spin_lock(&fc->lock);
 	fc->connected = 0;
 	fc->blocked = 0;
+	fc->initialized = 1;
 	spin_unlock(&fc->lock);
 	/* Flush all readers on this fs */
 	kill_fasync(&fc->fasync, SIGIO, POLL_IN);
@@ -371,12 +402,12 @@ static int fuse_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct fuse_statfs_out outarg;
 	int err;
 
-	if (!fuse_allow_task(fc, current)) {
+	if (!fuse_allow_current_process(fc)) {
 		buf->f_type = FUSE_SUPER_MAGIC;
 		return 0;
 	}
 
-	req = fuse_get_req(fc);
+	req = fuse_get_req_nopages(fc);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 
@@ -532,13 +563,15 @@ void fuse_conn_init(struct fuse_conn *fc)
 	INIT_LIST_HEAD(&fc->interrupts);
 	INIT_LIST_HEAD(&fc->bg_queue);
 	INIT_LIST_HEAD(&fc->entry);
+	fc->forget_list_tail = &fc->forget_list_head;
 	atomic_set(&fc->num_waiting, 0);
 	fc->max_background = FUSE_DEFAULT_MAX_BACKGROUND;
 	fc->congestion_threshold = FUSE_DEFAULT_CONGESTION_THRESHOLD;
 	fc->khctr = 0;
 	fc->polled_files = RB_ROOT;
 	fc->reqctr = 0;
-	fc->blocked = 1;
+	fc->blocked = 0;
+	fc->initialized = 0;
 	fc->attr_version = 1;
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
 }
@@ -821,6 +854,15 @@ static void process_init_reply(struct fuse_conn *fc, struct fuse_req *req)
 				fc->big_writes = 1;
 			if (arg->flags & FUSE_DONT_MASK)
 				fc->dont_mask = 1;
+			if (arg->flags & FUSE_AUTO_INVAL_DATA)
+				fc->auto_inval_data = 1;
+			if (arg->flags & FUSE_DO_READDIRPLUS) {
+				fc->do_readdirplus = 1;
+				if (arg->flags & FUSE_READDIRPLUS_AUTO)
+					fc->readdirplus_auto = 1;
+			}
+			if (arg->flags & FUSE_ASYNC_DIO)
+				fc->async_dio = 1;
 		} else {
 			ra_pages = fc->max_read / PAGE_CACHE_SIZE;
 			fc->no_lock = 1;
@@ -832,7 +874,7 @@ static void process_init_reply(struct fuse_conn *fc, struct fuse_req *req)
 		fc->max_write = max_t(unsigned, 4096, fc->max_write);
 		fc->conn_init = 1;
 	}
-	fc->blocked = 0;
+	fc->initialized = 1;
 	wake_up_all(&fc->blocked_waitq);
 }
 
@@ -844,7 +886,9 @@ static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
 	arg->minor = FUSE_KERNEL_MINOR_VERSION;
 	arg->max_readahead = fc->bdi.ra_pages * PAGE_CACHE_SIZE;
 	arg->flags |= FUSE_ASYNC_READ | FUSE_POSIX_LOCKS | FUSE_ATOMIC_O_TRUNC |
-		FUSE_EXPORT_SUPPORT | FUSE_BIG_WRITES | FUSE_DONT_MASK;
+		FUSE_EXPORT_SUPPORT | FUSE_BIG_WRITES | FUSE_DONT_MASK |
+		FUSE_AUTO_INVAL_DATA | FUSE_DO_READDIRPLUS |
+		FUSE_READDIRPLUS_AUTO | FUSE_ASYNC_DIO;
 	req->in.h.opcode = FUSE_INIT;
 	req->in.numargs = 1;
 	req->in.args[0].size = sizeof(*arg);
@@ -989,12 +1033,13 @@ static int fuse_fill_super(struct super_block *sb, void *data, int silent)
 		goto err_put_conn;
 	}
 
-	init_req = fuse_request_alloc();
+	init_req = fuse_request_alloc(0);
 	if (!init_req)
 		goto err_put_root;
+	init_req->background = 1;
 
 	if (is_bdev) {
-		fc->destroy_req = fuse_request_alloc();
+		fc->destroy_req = fuse_request_alloc(0);
 		if (!fc->destroy_req)
 			goto err_free_init_req;
 	}
@@ -1062,7 +1107,7 @@ static void fuse_kill_sb_anon(struct super_block *sb)
 static struct file_system_type fuse_fs_type = {
 	.owner		= THIS_MODULE,
 	.name		= "fuse",
-	.fs_flags	= FS_HAS_SUBTYPE,
+	.fs_flags	= FS_HAS_SUBTYPE | FS_HAS_NEW_FREEZE,
 	.get_sb		= fuse_get_sb,
 	.kill_sb	= fuse_kill_sb_anon,
 };
@@ -1094,7 +1139,7 @@ static struct file_system_type fuseblk_fs_type = {
 	.name		= "fuseblk",
 	.get_sb		= fuse_get_sb_blk,
 	.kill_sb	= fuse_kill_sb_blk,
-	.fs_flags	= FS_REQUIRES_DEV | FS_HAS_SUBTYPE,
+	.fs_flags	= FS_REQUIRES_DEV | FS_HAS_SUBTYPE | FS_HAS_NEW_FREEZE,
 };
 
 static inline int register_fuseblk(void)

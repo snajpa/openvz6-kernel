@@ -87,8 +87,8 @@ static void blk_rq_timed_out(struct request *req)
 		__blk_complete_request(req);
 		break;
 	case BLK_EH_RESET_TIMER:
-		blk_clear_rq_complete(req);
 		blk_add_timer(req);
+		blk_clear_rq_complete(req);
 		break;
 	case BLK_EH_NOT_HANDLED:
 		/*
@@ -109,6 +109,7 @@ void blk_rq_timed_out_timer(unsigned long data)
 	struct request_queue *q = (struct request_queue *) data;
 	unsigned long flags, next = 0;
 	struct request *rq, *tmp;
+	int next_set = 0;
 
 	spin_lock_irqsave(q->queue_lock, flags);
 
@@ -122,16 +123,13 @@ void blk_rq_timed_out_timer(unsigned long data)
 			if (blk_mark_rq_complete(rq))
 				continue;
 			blk_rq_timed_out(rq);
-		} else if (!next || time_after(next, rq->deadline))
+		} else if (!next_set || time_after(next, rq->deadline)) {
 			next = rq->deadline;
+			next_set = 1;
+		}
 	}
 
-	/*
-	 * next can never be 0 here with the list non-empty, since we always
-	 * bump ->deadline to 1 so we can detect if the timer was ever added
-	 * or not. See comment in blk_add_timer()
-	 */
-	if (next)
+	if (next_set)
 		mod_timer(&q->timeout, round_jiffies_up(next));
 
 	spin_unlock_irqrestore(q->queue_lock, flags);
@@ -172,7 +170,6 @@ void blk_add_timer(struct request *req)
 		return;
 
 	BUG_ON(!list_empty(&req->timeout_list));
-	BUG_ON(test_bit(REQ_ATOM_COMPLETE, &req->atomic_flags));
 
 	/*
 	 * Some LLDs, like scsi, peek at the timeout to prevent a

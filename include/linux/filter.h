@@ -123,7 +123,15 @@ struct sock_fprog	/* Required for SO_ATTACH_FILTER. */
 #define SKF_AD_IFINDEX 	8
 #define SKF_AD_NLATTR	12
 #define SKF_AD_NLATTR_NEST	16
-#define SKF_AD_MAX	20
+#define SKF_AD_MARK 	20
+#define SKF_AD_QUEUE	24
+#define SKF_AD_HATYPE	28
+#define SKF_AD_RXHASH	32
+#define SKF_AD_CPU	36
+#define SKF_AD_ALU_XOR_X	40
+#define SKF_AD_VLAN_TAG	44
+#define SKF_AD_VLAN_TAG_PRESENT 48
+#define SKF_AD_MAX	52
 #define SKF_NET_OFF   (-0x100000)
 #define SKF_LL_OFF    (-0x200000)
 
@@ -150,6 +158,10 @@ extern unsigned int sk_run_filter(struct sk_buff *skb,
 extern int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
 extern int sk_detach_filter(struct sock *sk);
 extern int sk_chk_filter(struct sock_filter *filter, int flen);
-#endif /* __KERNEL__ */
 
+static inline int bpf_tell_extensions(void)
+{
+	return SKF_AD_MAX;
+}
+#endif /* __KERNEL__ */
 #endif /* __LINUX_FILTER_H__ */

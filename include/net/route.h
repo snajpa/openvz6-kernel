@@ -39,6 +39,9 @@
 #warning This file is not supposed to be used outside of kernel.
 #endif
 
+/* IPv4 datagram length is stored into 16bit field (tot_len) */
+#define IP_MAX_MTU	0xFFF0U
+
 #define RTO_ONLINK	0x01
 
 #define RTO_CONN	0
@@ -46,6 +49,7 @@
  * some modules referring to it. */
 
 #define RT_CONN_FLAGS(sk)   (RT_TOS(inet_sk(sk)->tos) | sock_flag(sk, SOCK_LOCALROUTE))
+#define RT_CONN_FLAGS_TOS(sk,tos)   (RT_TOS(tos) | sock_flag(sk, SOCK_LOCALROUTE))
 
 struct fib_nh;
 struct inet_peer;
@@ -112,6 +116,7 @@ extern int		ip_rt_init(void);
 extern void		ip_rt_redirect(__be32 old_gw, __be32 dst, __be32 new_gw,
 				       __be32 src, struct net_device *dev);
 extern void		rt_cache_flush(struct net *net, int how);
+extern void		rt_cache_flush_batch(void);
 extern int		__ip_route_output_key(struct net *, struct rtable **, const struct flowi *flp);
 extern int		ip_route_output_key(struct net *, struct rtable **, struct flowi *flp);
 extern int		ip_route_output_flow(struct net *, struct rtable **rp, struct flowi *flp, struct sock *sk, int flags);
@@ -128,6 +133,7 @@ extern int		ip_rt_dump(struct sk_buff *skb,  struct netlink_callback *cb);
 
 struct in_ifaddr;
 extern void fib_add_ifaddr(struct in_ifaddr *);
+extern void fib_del_ifaddr(struct in_ifaddr *, struct in_ifaddr *);
 
 static inline void ip_rt_put(struct rtable * rt)
 {
@@ -189,6 +195,8 @@ static inline int ip_route_newports(struct rtable **rp, u8 protocol,
 		fl.fl_ip_sport = sport;
 		fl.fl_ip_dport = dport;
 		fl.proto = protocol;
+		if (inet_sk(sk)->transparent)
+			fl.flags |= FLOWI_FLAG_ANYSRC;
 		ip_rt_put(*rp);
 		*rp = NULL;
 		security_sk_classify_flow(sk, &fl);

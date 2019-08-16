@@ -722,7 +722,7 @@ static const sctp_sm_table_entry_t primitive_event_table[SCTP_NUM_PRIMITIVE_TYPE
 	/* SCTP_STATE_COOKIE_ECHOED */ \
 	TYPE_SCTP_FUNC(sctp_sf_ignore_other), \
 	/* SCTP_STATE_ESTABLISHED */ \
-	TYPE_SCTP_FUNC(sctp_sf_ignore_other), \
+	TYPE_SCTP_FUNC(sctp_sf_do_no_pending_tsn), \
 	/* SCTP_STATE_SHUTDOWN_PENDING */ \
 	TYPE_SCTP_FUNC(sctp_sf_do_9_2_start_shutdown), \
 	/* SCTP_STATE_SHUTDOWN_SENT */ \
@@ -897,7 +897,7 @@ static const sctp_sm_table_entry_t other_event_table[SCTP_NUM_OTHER_TYPES][SCTP_
 	/* SCTP_STATE_ESTABLISHED */ \
 	TYPE_SCTP_FUNC(sctp_sf_timer_ignore), \
 	/* SCTP_STATE_SHUTDOWN_PENDING */ \
-	TYPE_SCTP_FUNC(sctp_sf_timer_ignore), \
+	TYPE_SCTP_FUNC(sctp_sf_t5_timer_expire), \
 	/* SCTP_STATE_SHUTDOWN_SENT */ \
 	TYPE_SCTP_FUNC(sctp_sf_t5_timer_expire), \
 	/* SCTP_STATE_SHUTDOWN_RECEIVED */ \

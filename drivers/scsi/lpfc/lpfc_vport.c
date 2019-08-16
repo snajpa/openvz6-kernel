@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2004-2008 Emulex.  All rights reserved.           *
+ * Copyright (C) 2004-2013 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
  * www.emulex.com                                                  *
  * Portions Copyright (C) 2004-2005 Christoph Hellwig              *
@@ -26,6 +26,7 @@
 #include <linux/interrupt.h>
 #include <linux/kthread.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
 #include <linux/spinlock.h>
 
 #include <scsi/scsi.h>
@@ -79,10 +80,10 @@ inline void lpfc_vport_set_state(struct lpfc_vport *vport,
 	}
 }
 
-static int
+int
 lpfc_alloc_vpi(struct lpfc_hba *phba)
 {
-	int  vpi;
+	unsigned long vpi;
 
 	spin_lock_irq(&phba->hbalock);
 	/* Start at bit 1 because vpi zero is reserved for the physical port */
@@ -123,7 +124,12 @@ lpfc_vport_sparm(struct lpfc_hba *phba, struct lpfc_vport *vport)
 	}
 	mb = &pmb->u.mb;
 
-	lpfc_read_sparam(phba, pmb, vport->vpi);
+	rc = lpfc_read_sparam(phba, pmb, vport->vpi);
+	if (rc) {
+		mempool_free(pmb, phba->mbox_mem_pool);
+		return -ENOMEM;
+	}
+
 	/*
 	 * Grab buffer pointer and clear context1 so we can use
 	 * lpfc_sli_issue_box_wait
@@ -381,6 +387,9 @@ lpfc_vport_create(struct fc_vport *fc_vport, bool disable)
 	/* Create binary sysfs attribute for vport */
 	lpfc_alloc_sysfs_attr(vport);
 
+	/* Set the DFT_LUN_Q_DEPTH accordingly */
+	vport->cfg_lun_queue_depth  = phba->pport->cfg_lun_queue_depth;
+
 	*(struct lpfc_vport **)fc_vport->dd_data = vport;
 	vport->fc_vport = fc_vport;
 
@@ -389,8 +398,8 @@ lpfc_vport_create(struct fc_vport *fc_vport, bool disable)
 	 * by the port.
 	 */
 	if ((phba->sli_rev == LPFC_SLI_REV4) &&
-		(pport->vfi_state & LPFC_VFI_REGISTERED)) {
-		rc = lpfc_sli4_init_vpi(phba, vpi);
+	    (pport->fc_flag & FC_VFI_REGISTERED)) {
+		rc = lpfc_sli4_init_vpi(vport);
 		if (rc) {
 			lpfc_printf_log(phba, KERN_ERR, LOG_VPORT,
 					"1838 Failed to INIT_VPI on vpi %d "
@@ -412,7 +421,7 @@ lpfc_vport_create(struct fc_vport *fc_vport, bool disable)
 
 	if ((phba->link_state < LPFC_LINK_UP) ||
 	    (pport->port_state < LPFC_FABRIC_CFG_LINK) ||
-	    (phba->fc_topology == TOPOLOGY_LOOP)) {
+	    (phba->fc_topology == LPFC_TOPOLOGY_LOOP)) {
 		lpfc_vport_set_state(vport, FC_VPORT_LINKDOWN);
 		rc = VPORT_OK;
 		goto out;
@@ -458,6 +467,7 @@ disable_vport(struct fc_vport *fc_vport)
 	struct lpfc_hba   *phba = vport->phba;
 	struct lpfc_nodelist *ndlp = NULL, *next_ndlp = NULL;
 	long timeout;
+	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 
 	ndlp = lpfc_findnode_did(vport, Fabric_DID);
 	if (ndlp && NLP_CHK_NODE_ACT(ndlp)
@@ -492,6 +502,9 @@ disable_vport(struct fc_vport *fc_vport)
 	 * scsi_host_put() to release the vport.
 	 */
 	lpfc_mbx_unreg_vpi(vport);
+	spin_lock_irq(shost->host_lock);
+	vport->fc_flag |= FC_VPORT_NEEDS_INIT_VPI;
+	spin_unlock_irq(shost->host_lock);
 
 	lpfc_vport_set_state(vport, FC_VPORT_DISABLED);
 	lpfc_printf_vlog(vport, KERN_ERR, LOG_VPORT,
@@ -505,15 +518,18 @@ enable_vport(struct fc_vport *fc_vport)
 	struct lpfc_vport *vport = *(struct lpfc_vport **)fc_vport->dd_data;
 	struct lpfc_hba   *phba = vport->phba;
 	struct lpfc_nodelist *ndlp = NULL;
+	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 
 	if ((phba->link_state < LPFC_LINK_UP) ||
-	    (phba->fc_topology == TOPOLOGY_LOOP)) {
+	    (phba->fc_topology == LPFC_TOPOLOGY_LOOP)) {
 		lpfc_vport_set_state(vport, FC_VPORT_LINKDOWN);
 		return VPORT_OK;
 	}
 
+	spin_lock_irq(shost->host_lock);
 	vport->load_flag |= FC_LOADING;
 	vport->fc_flag |= FC_VPORT_NEEDS_REG_VPI;
+	spin_unlock_irq(shost->host_lock);
 
 	/* Use the Physical nodes Fabric NDLP to determine if the link is
 	 * up and ready to FDISC.
@@ -551,10 +567,11 @@ int
 lpfc_vport_delete(struct fc_vport *fc_vport)
 {
 	struct lpfc_nodelist *ndlp = NULL;
-	struct Scsi_Host *shost = (struct Scsi_Host *) fc_vport->shost;
 	struct lpfc_vport *vport = *(struct lpfc_vport **)fc_vport->dd_data;
+	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 	struct lpfc_hba   *phba = vport->phba;
 	long timeout;
+	bool ns_ndlp_referenced = false;
 
 	if (vport->port_type == LPFC_PHYSICAL_PORT) {
 		lpfc_printf_vlog(vport, KERN_ERR, LOG_VPORT,
@@ -571,7 +588,9 @@ lpfc_vport_delete(struct fc_vport *fc_vport)
 				 "static vport.\n");
 		return VPORT_ERROR;
 	}
-
+	spin_lock_irq(&phba->hbalock);
+	vport->load_flag |= FC_UNLOADING;
+	spin_unlock_irq(&phba->hbalock);
 	/*
 	 * If we are not unloading the driver then prevent the vport_delete
 	 * from happening until after this vport's discovery is finished.
@@ -609,17 +628,25 @@ lpfc_vport_delete(struct fc_vport *fc_vport)
 		scsi_host_put(shost);
 		return VPORT_INVAL;
 	}
-	spin_lock_irq(&phba->hbalock);
-	vport->load_flag |= FC_UNLOADING;
-	spin_unlock_irq(&phba->hbalock);
-
 	lpfc_free_sysfs_attr(vport);
 
 	lpfc_debugfs_terminate(vport);
 
+	/*
+	 * The call to fc_remove_host might release the NameServer ndlp. Since
+	 * we might need to use the ndlp to send the DA_ID CT command,
+	 * increment the reference for the NameServer ndlp to prevent it from
+	 * being released.
+	 */
+	ndlp = lpfc_findnode_did(vport, NameServer_DID);
+	if (ndlp && NLP_CHK_NODE_ACT(ndlp)) {
+		lpfc_nlp_get(ndlp);
+		ns_ndlp_referenced = true;
+	}
+
 	/* Remove FC host and then SCSI host with the vport */
-	fc_remove_host(lpfc_shost_from_vport(vport));
-	scsi_remove_host(lpfc_shost_from_vport(vport));
+	fc_remove_host(shost);
+	scsi_remove_host(shost);
 
 	ndlp = lpfc_findnode_did(phba->pport, Fabric_DID);
 
@@ -658,7 +685,7 @@ lpfc_vport_delete(struct fc_vport *fc_vport)
 	if (ndlp && NLP_CHK_NODE_ACT(ndlp) &&
 	    ndlp->nlp_state == NLP_STE_UNMAPPED_NODE &&
 	    phba->link_state >= LPFC_LINK_UP &&
-	    phba->fc_topology != TOPOLOGY_LOOP) {
+	    phba->fc_topology != LPFC_TOPOLOGY_LOOP) {
 		if (vport->cfg_enable_da_id) {
 			timeout = msecs_to_jiffies(phba->fc_ratov * 2000);
 			if (!lpfc_ns_cmd(vport, SLI_CTNS_DA_ID, 0, 0))
@@ -681,13 +708,14 @@ lpfc_vport_delete(struct fc_vport *fc_vport)
 			/* Indicate free memory when release */
 			NLP_SET_FREE_REQ(ndlp);
 		} else {
-			if (!NLP_CHK_NODE_ACT(ndlp))
+			if (!NLP_CHK_NODE_ACT(ndlp)) {
 				ndlp = lpfc_enable_node(vport, ndlp,
 						NLP_STE_UNUSED_NODE);
 				if (!ndlp)
 					goto skip_logo;
+			}
 
-			/* Remove ndlp from vport npld list */
+			/* Remove ndlp from vport list */
 			lpfc_dequeue_node(vport, ndlp);
 			spin_lock_irq(&phba->ndlp_lock);
 			if (!NLP_CHK_FREE_REQ(ndlp))
@@ -700,6 +728,17 @@ lpfc_vport_delete(struct fc_vport *fc_vport)
 			}
 			spin_unlock_irq(&phba->ndlp_lock);
 		}
+
+		/*
+		 * If the vpi is not registered, then a valid FDISC doesn't
+		 * exist and there is no need for a ELS LOGO.  Just cleanup
+		 * the ndlp.
+		 */
+		if (!(vport->vpi_state & LPFC_VPI_REGISTERED)) {
+			lpfc_nlp_put(ndlp);
+			goto skip_logo;
+		}
+
 		vport->unreg_vpi_cmpl = VPORT_INVAL;
 		timeout = msecs_to_jiffies(phba->fc_ratov * 2000);
 		if (!lpfc_issue_els_npiv_logo(vport, ndlp))
@@ -711,6 +750,16 @@ lpfc_vport_delete(struct fc_vport *fc_vport)
 		lpfc_discovery_wait(vport);
 
 skip_logo:
+
+	/*
+	 * If the NameServer ndlp has been incremented to allow the DA_ID CT
+	 * command to be sent, decrement the ndlp now.
+	 */
+	if (ns_ndlp_referenced) {
+		ndlp = lpfc_findnode_did(vport, NameServer_DID);
+		lpfc_nlp_put(ndlp);
+	}
+
 	lpfc_cleanup(vport);
 	lpfc_sli_host_down(vport);
 
@@ -723,7 +772,8 @@ skip_logo:
 		 * Completion of unreg_vpi (lpfc_mbx_cmpl_unreg_vpi)
 		 * does the scsi_host_put() to release the vport.
 		 */
-		if (lpfc_mbx_unreg_vpi(vport))
+		if (!(vport->vpi_state & LPFC_VPI_REGISTERED) ||
+				lpfc_mbx_unreg_vpi(vport))
 			scsi_host_put(shost);
 	} else
 		scsi_host_put(shost);
@@ -751,8 +801,10 @@ lpfc_create_vport_work_array(struct lpfc_hba *phba)
 		return NULL;
 	spin_lock_irq(&phba->hbalock);
 	list_for_each_entry(port_iterator, &phba->port_list, listentry) {
+		if (port_iterator->load_flag & FC_UNLOADING)
+			continue;
 		if (!scsi_host_get(lpfc_shost_from_vport(port_iterator))) {
-			lpfc_printf_vlog(port_iterator, KERN_WARNING, LOG_VPORT,
+			lpfc_printf_vlog(port_iterator, KERN_ERR, LOG_VPORT,
 					 "1801 Create vport work array FAILED: "
 					 "cannot do scsi_host_get\n");
 			continue;
@@ -769,7 +821,7 @@ lpfc_destroy_vport_work_array(struct lpfc_hba *phba, struct lpfc_vport **vports)
 	int i;
 	if (vports == NULL)
 		return;
-	for (i = 0; vports[i] != NULL && i <= phba->max_vports; i++)
+	for (i = 0; i <= phba->max_vports && vports[i] != NULL; i++)
 		scsi_host_put(lpfc_shost_from_vport(vports[i]));
 	kfree(vports);
 }

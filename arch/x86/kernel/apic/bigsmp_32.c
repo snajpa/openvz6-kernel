@@ -136,10 +136,7 @@ static unsigned int bigsmp_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
 		if (cpumask_test_cpu(cpu, cpu_online_mask))
 			break;
 	}
-	if (cpu < nr_cpu_ids)
-		return bigsmp_cpu_to_logical_apicid(cpu);
-
-	return BAD_APICID;
+	return bigsmp_cpu_to_logical_apicid(cpu);
 }
 
 static int bigsmp_phys_pkg_id(int cpuid_apic, int index_msb)
@@ -260,6 +257,7 @@ struct apic apic_bigsmp = {
 
 	.read				= native_apic_mem_read,
 	.write				= native_apic_mem_write,
+	.eoi_write			= native_apic_mem_write,
 	.icr_read			= native_apic_icr_read,
 	.icr_write			= native_apic_icr_write,
 	.wait_icr_idle			= native_apic_wait_icr_idle,

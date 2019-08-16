@@ -439,7 +439,7 @@ static void sil_host_intr(struct ata_port *ap, u32 bmdma2)
 	u8 status;
 
 	if (unlikely(bmdma2 & SIL_DMA_SATA_IRQ)) {
-		u32 serror;
+		u32 serror = 0xffffffff;
 
 		/* SIEN doesn't mask SATA IRQs on some 3112s.  Those
 		 * controllers continue to assert IRQ as long as
@@ -531,9 +531,6 @@ static irqreturn_t sil_interrupt(int irq, void *dev_instance)
 	for (i = 0; i < host->n_ports; i++) {
 		struct ata_port *ap = host->ports[i];
 		u32 bmdma2 = readl(mmio_base + sil_port[ap->port_no].bmdma2);
-
-		if (unlikely(ap->flags & ATA_FLAG_DISABLED))
-			continue;
 
 		/* turn off SATA_IRQ if not supported */
 		if (ap->flags & SIL_FLAG_NO_SATA_IRQ)

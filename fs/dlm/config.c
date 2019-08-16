@@ -99,6 +99,7 @@ struct dlm_cluster {
 	unsigned int cl_log_debug;
 	unsigned int cl_protocol;
 	unsigned int cl_timewarn_cs;
+	unsigned int cl_waitwarn_us;
 };
 
 enum {
@@ -113,6 +114,7 @@ enum {
 	CLUSTER_ATTR_LOG_DEBUG,
 	CLUSTER_ATTR_PROTOCOL,
 	CLUSTER_ATTR_TIMEWARN_CS,
+	CLUSTER_ATTR_WAITWARN_US,
 };
 
 struct cluster_attribute {
@@ -165,6 +167,7 @@ CLUSTER_ATTR(scan_secs, 1);
 CLUSTER_ATTR(log_debug, 0);
 CLUSTER_ATTR(protocol, 0);
 CLUSTER_ATTR(timewarn_cs, 1);
+CLUSTER_ATTR(waitwarn_us, 0);
 
 static struct configfs_attribute *cluster_attrs[] = {
 	[CLUSTER_ATTR_TCP_PORT] = &cluster_attr_tcp_port.attr,
@@ -178,6 +181,7 @@ static struct configfs_attribute *cluster_attrs[] = {
 	[CLUSTER_ATTR_LOG_DEBUG] = &cluster_attr_log_debug.attr,
 	[CLUSTER_ATTR_PROTOCOL] = &cluster_attr_protocol.attr,
 	[CLUSTER_ATTR_TIMEWARN_CS] = &cluster_attr_timewarn_cs.attr,
+	[CLUSTER_ATTR_WAITWARN_US] = &cluster_attr_waitwarn_us.attr,
 	NULL,
 };
 
@@ -410,10 +414,10 @@ static struct config_group *make_cluster(struct config_group *g,
 	struct dlm_comms *cms = NULL;
 	void *gps = NULL;
 
-	cl = kzalloc(sizeof(struct dlm_cluster), GFP_KERNEL);
-	gps = kcalloc(3, sizeof(struct config_group *), GFP_KERNEL);
-	sps = kzalloc(sizeof(struct dlm_spaces), GFP_KERNEL);
-	cms = kzalloc(sizeof(struct dlm_comms), GFP_KERNEL);
+	cl = kzalloc(sizeof(struct dlm_cluster), GFP_NOFS);
+	gps = kcalloc(3, sizeof(struct config_group *), GFP_NOFS);
+	sps = kzalloc(sizeof(struct dlm_spaces), GFP_NOFS);
+	cms = kzalloc(sizeof(struct dlm_comms), GFP_NOFS);
 
 	if (!cl || !gps || !sps || !cms)
 		goto fail;
@@ -438,6 +442,7 @@ static struct config_group *make_cluster(struct config_group *g,
 	cl->cl_log_debug = dlm_config.ci_log_debug;
 	cl->cl_protocol = dlm_config.ci_protocol;
 	cl->cl_timewarn_cs = dlm_config.ci_timewarn_cs;
+	cl->cl_waitwarn_us = dlm_config.ci_waitwarn_us;
 
 	space_list = &sps->ss_group;
 	comm_list = &cms->cs_group;
@@ -482,9 +487,9 @@ static struct config_group *make_space(struct config_group *g, const char *name)
 	struct dlm_nodes *nds = NULL;
 	void *gps = NULL;
 
-	sp = kzalloc(sizeof(struct dlm_space), GFP_KERNEL);
-	gps = kcalloc(2, sizeof(struct config_group *), GFP_KERNEL);
-	nds = kzalloc(sizeof(struct dlm_nodes), GFP_KERNEL);
+	sp = kzalloc(sizeof(struct dlm_space), GFP_NOFS);
+	gps = kcalloc(2, sizeof(struct config_group *), GFP_NOFS);
+	nds = kzalloc(sizeof(struct dlm_nodes), GFP_NOFS);
 
 	if (!sp || !gps || !nds)
 		goto fail;
@@ -536,7 +541,7 @@ static struct config_item *make_comm(struct config_group *g, const char *name)
 {
 	struct dlm_comm *cm;
 
-	cm = kzalloc(sizeof(struct dlm_comm), GFP_KERNEL);
+	cm = kzalloc(sizeof(struct dlm_comm), GFP_NOFS);
 	if (!cm)
 		return ERR_PTR(-ENOMEM);
 
@@ -569,7 +574,7 @@ static struct config_item *make_node(struct config_group *g, const char *name)
 	struct dlm_space *sp = config_item_to_space(g->cg_item.ci_parent);
 	struct dlm_node *nd;
 
-	nd = kzalloc(sizeof(struct dlm_node), GFP_KERNEL);
+	nd = kzalloc(sizeof(struct dlm_node), GFP_NOFS);
 	if (!nd)
 		return ERR_PTR(-ENOMEM);
 
@@ -698,6 +703,7 @@ static ssize_t comm_local_write(struct dlm_comm *cm, const char *buf,
 static ssize_t comm_addr_write(struct dlm_comm *cm, const char *buf, size_t len)
 {
 	struct sockaddr_storage *addr;
+	int rv;
 
 	if (len != sizeof(struct sockaddr_storage))
 		return -EINVAL;
@@ -705,11 +711,18 @@ static ssize_t comm_addr_write(struct dlm_comm *cm, const char *buf, size_t len)
 	if (cm->addr_count >= DLM_MAX_ADDR_COUNT)
 		return -ENOSPC;
 
-	addr = kzalloc(sizeof(*addr), GFP_KERNEL);
+	addr = kzalloc(sizeof(*addr), GFP_NOFS);
 	if (!addr)
 		return -ENOMEM;
 
 	memcpy(addr, buf, len);
+
+	rv = dlm_lowcomms_addr(cm->nodeid, addr, len);
+	if (rv) {
+		kfree(addr);
+		return rv;
+	}
+
 	cm->addr[cm->addr_count++] = addr;
 	return len;
 }
@@ -779,34 +792,8 @@ static void put_space(struct dlm_space *sp)
 	config_item_put(&sp->group.cg_item);
 }
 
-static int addr_compare(struct sockaddr_storage *x, struct sockaddr_storage *y)
-{
-	switch (x->ss_family) {
-	case AF_INET: {
-		struct sockaddr_in *sinx = (struct sockaddr_in *)x;
-		struct sockaddr_in *siny = (struct sockaddr_in *)y;
-		if (sinx->sin_addr.s_addr != siny->sin_addr.s_addr)
-			return 0;
-		if (sinx->sin_port != siny->sin_port)
-			return 0;
-		break;
-	}
-	case AF_INET6: {
-		struct sockaddr_in6 *sinx = (struct sockaddr_in6 *)x;
-		struct sockaddr_in6 *siny = (struct sockaddr_in6 *)y;
-		if (!ipv6_addr_equal(&sinx->sin6_addr, &siny->sin6_addr))
-			return 0;
-		if (sinx->sin6_port != siny->sin6_port)
-			return 0;
-		break;
-	}
-	default:
-		return 0;
-	}
-	return 1;
-}
-
-static struct dlm_comm *get_comm(int nodeid, struct sockaddr_storage *addr)
+/*
+static struct dlm_comm *get_comm(int nodeid)
 {
 	struct config_item *i;
 	struct dlm_comm *cm = NULL;
@@ -820,19 +807,11 @@ static struct dlm_comm *get_comm(int nodeid, struct sockaddr_storage *addr)
 	list_for_each_entry(i, &comm_list->cg_children, ci_entry) {
 		cm = config_item_to_comm(i);
 
-		if (nodeid) {
-			if (cm->nodeid != nodeid)
-				continue;
-			found = 1;
-			config_item_get(i);
-			break;
-		} else {
-			if (!cm->addr_count || !addr_compare(cm->addr[0], addr))
-				continue;
-			found = 1;
-			config_item_get(i);
-			break;
-		}
+		if (cm->nodeid != nodeid)
+			continue;
+		found = 1;
+		config_item_get(i);
+		break;
 	}
 	mutex_unlock(&clusters_root.subsys.su_mutex);
 
@@ -840,11 +819,14 @@ static struct dlm_comm *get_comm(int nodeid, struct sockaddr_storage *addr)
 		cm = NULL;
 	return cm;
 }
+*/
 
+/*
 static void put_comm(struct dlm_comm *cm)
 {
 	config_item_put(&cm->item);
 }
+*/
 
 /* caller must free mem */
 int dlm_nodeid_list(char *lsname, int **ids_out, int *ids_count_out,
@@ -868,7 +850,7 @@ int dlm_nodeid_list(char *lsname, int **ids_out, int *ids_count_out,
 
 	ids_count = sp->members_count;
 
-	ids = kcalloc(ids_count, sizeof(int), GFP_KERNEL);
+	ids = kcalloc(ids_count, sizeof(int), GFP_NOFS);
 	if (!ids) {
 		rv = -ENOMEM;
 		goto out;
@@ -886,7 +868,7 @@ int dlm_nodeid_list(char *lsname, int **ids_out, int *ids_count_out,
 	if (!new_count)
 		goto out_ids;
 
-	new = kcalloc(new_count, sizeof(int), GFP_KERNEL);
+	new = kcalloc(new_count, sizeof(int), GFP_NOFS);
 	if (!new) {
 		kfree(ids);
 		rv = -ENOMEM;
@@ -935,28 +917,6 @@ int dlm_node_weight(char *lsname, int nodeid)
 	return w;
 }
 
-int dlm_nodeid_to_addr(int nodeid, struct sockaddr_storage *addr)
-{
-	struct dlm_comm *cm = get_comm(nodeid, NULL);
-	if (!cm)
-		return -EEXIST;
-	if (!cm->addr_count)
-		return -ENOENT;
-	memcpy(addr, cm->addr[0], sizeof(*addr));
-	put_comm(cm);
-	return 0;
-}
-
-int dlm_addr_to_nodeid(struct sockaddr_storage *addr, int *nodeid)
-{
-	struct dlm_comm *cm = get_comm(0, addr);
-	if (!cm)
-		return -EEXIST;
-	*nodeid = cm->nodeid;
-	put_comm(cm);
-	return 0;
-}
-
 int dlm_our_nodeid(void)
 {
 	return local_comm ? local_comm->nodeid : 0;
@@ -976,15 +936,16 @@ int dlm_our_addr(struct sockaddr_storage *addr, int num)
 /* Config file defaults */
 #define DEFAULT_TCP_PORT       21064
 #define DEFAULT_BUFFER_SIZE     4096
-#define DEFAULT_RSBTBL_SIZE      256
+#define DEFAULT_RSBTBL_SIZE     1024
 #define DEFAULT_LKBTBL_SIZE     1024
-#define DEFAULT_DIRTBL_SIZE      512
+#define DEFAULT_DIRTBL_SIZE     1024
 #define DEFAULT_RECOVER_TIMER      5
 #define DEFAULT_TOSS_SECS         10
 #define DEFAULT_SCAN_SECS          5
 #define DEFAULT_LOG_DEBUG          0
 #define DEFAULT_PROTOCOL           0
 #define DEFAULT_TIMEWARN_CS      500 /* 5 sec = 500 centiseconds */
+#define DEFAULT_WAITWARN_US	   0
 
 struct dlm_config_info dlm_config = {
 	.ci_tcp_port = DEFAULT_TCP_PORT,
@@ -997,6 +958,7 @@ struct dlm_config_info dlm_config = {
 	.ci_scan_secs = DEFAULT_SCAN_SECS,
 	.ci_log_debug = DEFAULT_LOG_DEBUG,
 	.ci_protocol = DEFAULT_PROTOCOL,
-	.ci_timewarn_cs = DEFAULT_TIMEWARN_CS
+	.ci_timewarn_cs = DEFAULT_TIMEWARN_CS,
+	.ci_waitwarn_us = DEFAULT_WAITWARN_US
 };
 

@@ -13,6 +13,7 @@
 #include <linux/gfp.h>
 #include <linux/bitops.h>
 #include <linux/hardirq.h> /* for in_interrupt() */
+#include <linux/hugetlb_inline.h>
 
 /*
  * Bits in mapping->flags.  The lower __GFP_BITS_SHIFT bits are the page
@@ -23,6 +24,7 @@ enum mapping_flags {
 	AS_ENOSPC	= __GFP_BITS_SHIFT + 1,	/* ENOSPC on async write */
 	AS_MM_ALL_LOCKS	= __GFP_BITS_SHIFT + 2,	/* under mm_take_all_locks() */
 	AS_UNEVICTABLE	= __GFP_BITS_SHIFT + 3,	/* e.g., ramdisk, SHM_LOCK */
+	AS_UNMAPPING	= __GFP_BITS_SHIFT + 6, /* (KABI) unmapping pages */
 };
 
 static inline void mapping_set_error(struct address_space *mapping, int error)
@@ -218,6 +220,12 @@ static inline struct page *page_cache_alloc_cold(struct address_space *x)
 	return __page_cache_alloc(mapping_gfp_mask(x)|__GFP_COLD);
 }
 
+static inline struct page *page_cache_alloc_readahead(struct address_space *x)
+{
+	return __page_cache_alloc(mapping_gfp_mask(x) |
+				  __GFP_COLD | __GFP_NORETRY | __GFP_NOWARN);
+}
+
 typedef int filler_t(void *, struct page *);
 
 extern struct page * find_get_page(struct address_space *mapping,
@@ -248,24 +256,24 @@ static inline struct page *grab_cache_page(struct address_space *mapping,
 extern struct page * grab_cache_page_nowait(struct address_space *mapping,
 				pgoff_t index);
 extern struct page * read_cache_page_async(struct address_space *mapping,
-				pgoff_t index, filler_t *filler,
-				void *data);
+				pgoff_t index, filler_t *filler, void *data);
 extern struct page * read_cache_page(struct address_space *mapping,
-				pgoff_t index, filler_t *filler,
-				void *data);
+				pgoff_t index, filler_t *filler, void *data);
+extern struct page * read_cache_page_gfp(struct address_space *mapping,
+				pgoff_t index, gfp_t gfp_mask);
 extern int read_cache_pages(struct address_space *mapping,
 		struct list_head *pages, filler_t *filler, void *data);
 
 static inline struct page *read_mapping_page_async(
-						struct address_space *mapping,
-						     pgoff_t index, void *data)
+				struct address_space *mapping,
+				pgoff_t index, void *data)
 {
 	filler_t *filler = (filler_t *)mapping->a_ops->readpage;
 	return read_cache_page_async(mapping, index, filler, data);
 }
 
 static inline struct page *read_mapping_page(struct address_space *mapping,
-					     pgoff_t index, void *data)
+				pgoff_t index, void *data)
 {
 	filler_t *filler = (filler_t *)mapping->a_ops->readpage;
 	return read_cache_page(mapping, index, filler, data);
@@ -279,10 +287,16 @@ static inline loff_t page_offset(struct page *page)
 	return ((loff_t)page->index) << PAGE_CACHE_SHIFT;
 }
 
+extern pgoff_t linear_hugepage_index(struct vm_area_struct *vma,
+				     unsigned long address);
+
 static inline pgoff_t linear_page_index(struct vm_area_struct *vma,
 					unsigned long address)
 {
-	pgoff_t pgoff = (address - vma->vm_start) >> PAGE_SHIFT;
+	pgoff_t pgoff;
+	if (unlikely(is_vm_hugetlb_page(vma)))
+		return linear_hugepage_index(vma, address);
+	pgoff = (address - vma->vm_start) >> PAGE_SHIFT;
 	pgoff += vma->vm_pgoff;
 	return pgoff >> (PAGE_CACHE_SHIFT - PAGE_SHIFT);
 }
@@ -290,6 +304,8 @@ static inline pgoff_t linear_page_index(struct vm_area_struct *vma,
 extern void __lock_page(struct page *page);
 extern int __lock_page_killable(struct page *page);
 extern void __lock_page_nosync(struct page *page);
+extern int __lock_page_or_retry(struct page *page, struct mm_struct *mm,
+				unsigned int flags);
 extern void unlock_page(struct page *page);
 
 static inline void __set_page_locked(struct page *page)
@@ -342,10 +358,30 @@ static inline void lock_page_nosync(struct page *page)
 }
 	
 /*
+ * lock_page_or_retry - Lock the page, unless this would block and the
+ * caller indicated that it can handle a retry.
+ */
+static inline int lock_page_or_retry(struct page *page, struct mm_struct *mm,
+				     unsigned int flags)
+{
+	might_sleep();
+	return trylock_page(page) || __lock_page_or_retry(page, mm, flags);
+}
+
+/*
  * This is exported only for wait_on_page_locked/wait_on_page_writeback.
  * Never use this directly!
  */
 extern void wait_on_page_bit(struct page *page, int bit_nr);
+
+extern int wait_on_page_bit_killable(struct page *page, int bit_nr);
+
+static inline int wait_on_page_locked_killable(struct page *page)
+{
+	if (PageLocked(page))
+		return wait_on_page_bit_killable(page, PG_locked);
+	return 0;
+}
 
 /* 
  * Wait for a page to be unlocked.
@@ -370,6 +406,7 @@ static inline void wait_on_page_writeback(struct page *page)
 }
 
 extern void end_page_writeback(struct page *page);
+void wait_for_stable_page(struct page *page);
 
 /*
  * Add an arbitrary waiter to a page's wait queue
@@ -403,7 +440,7 @@ static inline int fault_in_pages_writeable(char __user *uaddr, int size)
 		 */
 		if (((unsigned long)uaddr & PAGE_MASK) !=
 				((unsigned long)end & PAGE_MASK))
-		 	ret = __put_user(0, end);
+			ret = __put_user(0, end);
 	}
 	return ret;
 }
@@ -424,6 +461,66 @@ static inline int fault_in_pages_readable(const char __user *uaddr, int size)
 				((unsigned long)end & PAGE_MASK))
 		 	ret = __get_user(c, end);
 	}
+	return ret;
+}
+
+/*
+ * Multipage variants of the above prefault helpers, useful if more than
+ * PAGE_SIZE of data needs to be prefaulted. These are separate from the above
+ * functions (which only handle up to PAGE_SIZE) to avoid clobbering the
+ * filemap.c hotpaths.
+ */
+static inline int fault_in_multipages_writeable(char __user *uaddr, int size)
+{
+	int ret = 0;
+	char __user *end = uaddr + size - 1;
+
+	if (unlikely(size == 0))
+		return ret;
+
+	/*
+	 * Writing zeroes into userspace here is OK, because we know that if
+	 * the zero gets there, we'll be overwriting it.
+	 */
+	while (uaddr <= end) {
+		ret = __put_user(0, uaddr);
+		if (ret != 0)
+			return ret;
+		uaddr += PAGE_SIZE;
+	}
+
+	/* Check whether the range spilled into the next page. */
+	if (((unsigned long)uaddr & PAGE_MASK) ==
+			((unsigned long)end & PAGE_MASK))
+		ret = __put_user(0, end);
+
+	return ret;
+}
+
+static inline int fault_in_multipages_readable(const char __user *uaddr,
+					       int size)
+{
+	volatile char c;
+	int ret = 0;
+	const char __user *end = uaddr + size - 1;
+
+	if (unlikely(size == 0))
+		return ret;
+
+	while (uaddr <= end) {
+		ret = __get_user(c, uaddr);
+		if (ret != 0)
+			return ret;
+		uaddr += PAGE_SIZE;
+	}
+
+	/* Check whether the range spilled into the next page. */
+	if (((unsigned long)uaddr & PAGE_MASK) ==
+			((unsigned long)end & PAGE_MASK)) {
+		ret = __get_user(c, end);
+		(void)c;
+	}
+
 	return ret;
 }
 

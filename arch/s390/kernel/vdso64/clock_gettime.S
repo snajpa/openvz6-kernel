@@ -22,7 +22,7 @@ __kernel_clock_gettime:
 	larl	%r5,_vdso_data
 	cghi	%r2,CLOCK_REALTIME
 	je	4f
-	cghi	%r2,-2		/* CLOCK_THREAD_CPUTIME_ID for this thread */
+	cghi	%r2,-3		/* Per-thread CPUCLOCK with PID=0, VIRT=1 */
 	je	9f
 	cghi	%r2,CLOCK_MONOTONIC
 	jne	12f
@@ -36,7 +36,7 @@ __kernel_clock_gettime:
 	stck	48(%r15)			/* Store TOD clock */
 	lg	%r1,48(%r15)
 	sg	%r1,__VDSO_XTIME_STAMP(%r5)	/* TOD - cycle_last */
-	mghi	%r1,1000
+	msgf	%r1,__VDSO_NTP_MULT(%r5)	/*  * NTP adjustment */
 	srlg	%r1,%r1,12			/* cyc2ns(clock,cycle_delta) */
 	alg	%r1,__VDSO_XTIME_NSEC(%r5)	/*  + xtime */
 	lg	%r0,__VDSO_XTIME_SEC(%r5)
@@ -64,7 +64,7 @@ __kernel_clock_gettime:
 	stck	48(%r15)			/* Store TOD clock */
 	lg	%r1,48(%r15)
 	sg	%r1,__VDSO_XTIME_STAMP(%r5)	/* TOD - cycle_last */
-	mghi	%r1,1000
+	msgf	%r1,__VDSO_NTP_MULT(%r5)	/*  * NTP adjustment */
 	srlg	%r1,%r1,12			/* cyc2ns(clock,cycle_delta) */
 	alg	%r1,__VDSO_XTIME_NSEC(%r5)	/*  + xtime */
 	lg	%r0,__VDSO_XTIME_SEC(%r5)
@@ -81,7 +81,7 @@ __kernel_clock_gettime:
 8:	lghi	%r2,0
 	br	%r14
 
-	/* CLOCK_THREAD_CPUTIME_ID for this thread */
+	/* CPUCLOCK_VIRT for this thread */
 9:	icm	%r0,15,__VDSO_ECTG_OK(%r5)
 	jz	12f
 	ear	%r2,%a4

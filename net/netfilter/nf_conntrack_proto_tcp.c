@@ -202,7 +202,7 @@ static const u8 tcp_conntracks[2][6][TCP_CONNTRACK_MAX] = {
  *	sES -> sES	:-)
  *	sFW -> sCW	Normal close request answered by ACK.
  *	sCW -> sCW
- *	sLA -> sTW	Last ACK detected.
+ *	sLA -> sTW	Last ACK detected (RFC5961 challenged)
  *	sTW -> sTW	Retransmitted last ACK. Remain in the same state.
  *	sCL -> sCL
  */
@@ -213,7 +213,7 @@ static const u8 tcp_conntracks[2][6][TCP_CONNTRACK_MAX] = {
 	{
 /* REPLY */
 /* 	     sNO, sSS, sSR, sES, sFW, sCW, sLA, sTW, sCL, sS2	*/
-/*syn*/	   { sIV, sS2, sIV, sIV, sIV, sIV, sIV, sIV, sIV, sS2 },
+/*syn*/	   { sIV, sS2, sIV, sIV, sIV, sIV, sIV, sSS, sIV, sS2 },
 /*
  *	sNO -> sIV	Never reached.
  *	sSS -> sS2	Simultaneous open
@@ -223,7 +223,7 @@ static const u8 tcp_conntracks[2][6][TCP_CONNTRACK_MAX] = {
  *	sFW -> sIV
  *	sCW -> sIV
  *	sLA -> sIV
- *	sTW -> sIV	Reopened connection, but server may not do it.
+ *	sTW -> sSS	Reopened connection, but server may have switched role
  *	sCL -> sIV
  */
 /* 	     sNO, sSS, sSR, sES, sFW, sCW, sLA, sTW, sCL, sS2	*/
@@ -261,7 +261,7 @@ static const u8 tcp_conntracks[2][6][TCP_CONNTRACK_MAX] = {
  *	sES -> sES	:-)
  *	sFW -> sCW	Normal close request answered by ACK.
  *	sCW -> sCW
- *	sLA -> sTW	Last ACK detected.
+ *	sLA -> sTW	Last ACK detected (RFC5961 challenged)
  *	sTW -> sTW	Retransmitted last ACK.
  *	sCL -> sCL
  */
@@ -736,27 +736,19 @@ static bool tcp_in_window(const struct nf_conn *ct,
 	return res;
 }
 
-#define	TH_FIN	0x01
-#define	TH_SYN	0x02
-#define	TH_RST	0x04
-#define	TH_PUSH	0x08
-#define	TH_ACK	0x10
-#define	TH_URG	0x20
-#define	TH_ECE	0x40
-#define	TH_CWR	0x80
-
 /* table of valid flag combinations - PUSH, ECE and CWR are always valid */
-static const u8 tcp_valid_flags[(TH_FIN|TH_SYN|TH_RST|TH_ACK|TH_URG) + 1] =
+static const u8 tcp_valid_flags[(TCPHDR_FIN|TCPHDR_SYN|TCPHDR_RST|TCPHDR_ACK|
+				 TCPHDR_URG) + 1] =
 {
-	[TH_SYN]			= 1,
-	[TH_SYN|TH_URG]			= 1,
-	[TH_SYN|TH_ACK]			= 1,
-	[TH_RST]			= 1,
-	[TH_RST|TH_ACK]			= 1,
-	[TH_FIN|TH_ACK]			= 1,
-	[TH_FIN|TH_ACK|TH_URG]		= 1,
-	[TH_ACK]			= 1,
-	[TH_ACK|TH_URG]			= 1,
+	[TCPHDR_SYN]				= 1,
+	[TCPHDR_SYN|TCPHDR_URG]			= 1,
+	[TCPHDR_SYN|TCPHDR_ACK]			= 1,
+	[TCPHDR_RST]				= 1,
+	[TCPHDR_RST|TCPHDR_ACK]			= 1,
+	[TCPHDR_FIN|TCPHDR_ACK]			= 1,
+	[TCPHDR_FIN|TCPHDR_ACK|TCPHDR_URG]	= 1,
+	[TCPHDR_ACK]				= 1,
+	[TCPHDR_ACK|TCPHDR_URG]			= 1,
 };
 
 /* Protect conntrack agaist broken packets. Code taken from ipt_unclean.c.  */
@@ -803,7 +795,7 @@ static int tcp_error(struct net *net,
 	}
 
 	/* Check TCP flags. */
-	tcpflags = (((u_int8_t *)th)[13] & ~(TH_ECE|TH_CWR|TH_PUSH));
+	tcpflags = (tcp_flag_byte(th) & ~(TCPHDR_ECE|TCPHDR_CWR|TCPHDR_PSH));
 	if (!tcp_valid_flags[tcpflags]) {
 		if (LOG_INVALID(net, IPPROTO_TCP))
 			nf_log_packet(pf, 0, skb, NULL, NULL, NULL,
@@ -896,23 +888,64 @@ static int tcp_packet(struct nf_conn *ct,
 			/* b) This SYN/ACK acknowledges a SYN that we earlier
 			 * ignored as invalid. This means that the client and
 			 * the server are both in sync, while the firewall is
-			 * not. We kill this session and block the SYN/ACK so
-			 * that the client cannot but retransmit its SYN and
-			 * thus initiate a clean new session.
+			 * not. We get in sync from the previously annotated
+			 * values.
 			 */
-			spin_unlock_bh(&ct->lock);
-			if (LOG_INVALID(net, IPPROTO_TCP))
-				nf_log_packet(pf, 0, skb, NULL, NULL, NULL,
-					  "nf_ct_tcp: killing out of sync session ");
-			nf_ct_kill(ct);
-			return NF_DROP;
+			old_state = TCP_CONNTRACK_SYN_SENT;
+			new_state = TCP_CONNTRACK_SYN_RECV;
+			ct->proto.tcp.seen[ct->proto.tcp.last_dir].td_end =
+				ct->proto.tcp.last_end;
+			ct->proto.tcp.seen[ct->proto.tcp.last_dir].td_maxend =
+				ct->proto.tcp.last_end;
+			ct->proto.tcp.seen[ct->proto.tcp.last_dir].td_maxwin =
+				ct->proto.tcp.last_win == 0 ?
+					1 : ct->proto.tcp.last_win;
+			ct->proto.tcp.seen[ct->proto.tcp.last_dir].td_scale =
+				ct->proto_ext.last_wscale;
+			ct->proto_ext.last_flags &= ~IP_CT_EXP_CHALLENGE_ACK;
+			ct->proto.tcp.seen[ct->proto.tcp.last_dir].flags =
+				ct->proto_ext.last_flags;
+			memset(&ct->proto.tcp.seen[dir], 0,
+			       sizeof(struct ip_ct_tcp_state));
+			break;
 		}
 		ct->proto.tcp.last_index = index;
 		ct->proto.tcp.last_dir = dir;
 		ct->proto.tcp.last_seq = ntohl(th->seq);
 		ct->proto.tcp.last_end =
 		    segment_seq_plus_len(ntohl(th->seq), skb->len, dataoff, th);
+		ct->proto.tcp.last_win = ntohs(th->window);
 
+		/* a) This is a SYN in ORIGINAL. The client and the server
+		 * may be in sync but we are not. In that case, we annotate
+		 * the TCP options and let the packet go through. If it is a
+		 * valid SYN packet, the server will reply with a SYN/ACK, and
+		 * then we'll get in sync. Otherwise, the server potentially
+		 * responds with a challenge ACK if implementing RFC5961.
+		 */
+		if (index == TCP_SYN_SET && dir == IP_CT_DIR_ORIGINAL) {
+			struct ip_ct_tcp_state seen = {};
+
+			ct->proto_ext.last_flags =
+			ct->proto_ext.last_wscale = 0;
+			tcp_options(skb, dataoff, th, &seen);
+			if (seen.flags & IP_CT_TCP_FLAG_WINDOW_SCALE) {
+				ct->proto_ext.last_flags |=
+					IP_CT_TCP_FLAG_WINDOW_SCALE;
+				ct->proto_ext.last_wscale = seen.td_scale;
+			}
+			if (seen.flags & IP_CT_TCP_FLAG_SACK_PERM) {
+				ct->proto_ext.last_flags |=
+					IP_CT_TCP_FLAG_SACK_PERM;
+			}
+			/* Mark the potential for RFC5961 challenge ACK,
+			 * this pose a special problem for LAST_ACK state
+			 * as ACK is intrepretated as ACKing last FIN.
+			 */
+			if (old_state == TCP_CONNTRACK_LAST_ACK)
+				ct->proto_ext.last_flags |=
+					IP_CT_EXP_CHALLENGE_ACK;
+		}
 		spin_unlock_bh(&ct->lock);
 		if (LOG_INVALID(net, IPPROTO_TCP))
 			nf_log_packet(pf, 0, skb, NULL, NULL, NULL,
@@ -927,6 +960,25 @@ static int tcp_packet(struct nf_conn *ct,
 			nf_log_packet(pf, 0, skb, NULL, NULL, NULL,
 				  "nf_ct_tcp: invalid state ");
 		return -NF_ACCEPT;
+	case TCP_CONNTRACK_TIME_WAIT:
+		/* RFC5961 compliance cause stack to send "challenge-ACK"
+		 * e.g. in response to spurious SYNs.  Conntrack MUST
+		 * not believe this ACK is acking last FIN.
+		 */
+		if (old_state == TCP_CONNTRACK_LAST_ACK &&
+		    index == TCP_ACK_SET &&
+		    ct->proto.tcp.last_dir != dir &&
+		    ct->proto.tcp.last_index == TCP_SYN_SET &&
+		    (ct->proto_ext.last_flags & IP_CT_EXP_CHALLENGE_ACK)) {
+			/* Detected RFC5961 challenge ACK */
+			ct->proto_ext.last_flags &= ~IP_CT_EXP_CHALLENGE_ACK;
+			spin_unlock_bh(&ct->lock);
+			if (LOG_INVALID(net, IPPROTO_TCP))
+				nf_log_packet(pf, 0, skb, NULL, NULL, NULL,
+				      "nf_ct_tcp: challenge-ACK ignored ");
+			return NF_ACCEPT; /* Don't change state */
+		}
+		break;
 	case TCP_CONNTRACK_CLOSE:
 		if (index == TCP_RST_SET
 		    && (ct->proto.tcp.seen[!dir].flags & IP_CT_TCP_FLAG_MAXACK_SET)
@@ -1006,6 +1058,12 @@ static int tcp_packet(struct nf_conn *ct,
 			nf_ct_kill_acct(ct, ctinfo, skb);
 			return NF_ACCEPT;
 		}
+		/* ESTABLISHED without SEEN_REPLY, i.e. mid-connection
+		 * pickup with loose=1. Avoid large ESTABLISHED timeout.
+		 */
+		if (new_state == TCP_CONNTRACK_ESTABLISHED &&
+		    timeout > nf_ct_tcp_timeout_unacknowledged)
+			timeout = nf_ct_tcp_timeout_unacknowledged;
 	} else if (!test_bit(IPS_ASSURED_BIT, &ct->status)
 		   && (old_state == TCP_CONNTRACK_SYN_RECV
 		       || old_state == TCP_CONNTRACK_ESTABLISHED)

@@ -5,31 +5,27 @@
 
 #define USB_VID_NATIVEINSTRUMENTS 0x17cc
 
-#define USB_PID_RIGKONTROL2	0x1969
-#define USB_PID_RIGKONTROL3	0x1940
-#define USB_PID_KORECONTROLLER	0x4711
-#define USB_PID_KORECONTROLLER2	0x4712
-#define USB_PID_AK1		0x0815
-#define USB_PID_AUDIO2DJ	0x041c
-#define USB_PID_AUDIO4DJ	0x0839
-#define USB_PID_AUDIO8DJ	0x1978
-#define USB_PID_SESSIONIO	0x1915
-#define USB_PID_GUITARRIGMOBILE	0x0d8d
+#define USB_PID_RIGKONTROL2		0x1969
+#define USB_PID_RIGKONTROL3		0x1940
+#define USB_PID_KORECONTROLLER		0x4711
+#define USB_PID_KORECONTROLLER2		0x4712
+#define USB_PID_AK1			0x0815
+#define USB_PID_AUDIO2DJ		0x041c
+#define USB_PID_AUDIO4DJ		0x0839
+#define USB_PID_AUDIO8DJ		0x1978
+#define USB_PID_SESSIONIO		0x1915
+#define USB_PID_GUITARRIGMOBILE		0x0d8d
+#define USB_PID_TRAKTORKONTROLX1	0x2305
+#define USB_PID_TRAKTORKONTROLS4	0xbaff
+#define USB_PID_TRAKTORAUDIO2		0x041d
+#define USB_PID_MASCHINECONTROLLER  0x0808
 
 #define EP1_BUFSIZE 64
+#define EP4_BUFSIZE 512
 #define CAIAQ_USB_STR_LEN 0xff
 #define MAX_STREAMS 32
 
-//#define	SND_USB_CAIAQ_DEBUG
-
 #define MODNAME "snd-usb-caiaq"
-#define log(x...) snd_printk(KERN_WARNING MODNAME" log: " x)
-
-#ifdef SND_USB_CAIAQ_DEBUG
-#define debug(x...) snd_printk(KERN_WARNING MODNAME " debug: " x)
-#else
-#define debug(x...) do { } while(0)
-#endif
 
 #define EP1_CMD_GET_DEVICE_INFO	0x1
 #define EP1_CMD_READ_ERP	0x2
@@ -92,18 +88,22 @@ struct snd_usb_caiaqdev {
 	int input_panic, output_panic, warned;
 	char *audio_in_buf, *audio_out_buf;
 	unsigned int samplerates, bpp;
+	unsigned long outurb_active_mask;
 
 	struct snd_pcm_substream *sub_playback[MAX_STREAMS];
 	struct snd_pcm_substream *sub_capture[MAX_STREAMS];
 
 	/* Controls */
-	unsigned char control_state[64];
+	unsigned char control_state[256];
+	unsigned char ep8_out_buf[2];
 
 	/* Linux input */
 #ifdef CONFIG_SND_USB_CAIAQ_INPUT
 	struct input_dev *input_dev;
 	char phys[64];			/* physical device path */
-	unsigned short keycode[64];
+	unsigned short keycode[128];
+	struct urb *ep4_in_urb;
+	unsigned char ep4_in_buf[EP4_BUFSIZE];
 #endif
 
 	/* ALSA */
@@ -115,16 +115,22 @@ struct snd_usb_caiaqdev {
 };
 
 struct snd_usb_caiaq_cb_info {
-	struct snd_usb_caiaqdev *dev;
+	struct snd_usb_caiaqdev *cdev;
 	int index;
 };
 
 #define caiaqdev(c) ((struct snd_usb_caiaqdev*)(c)->private_data)
+#define caiaqdev_to_dev(d)	(d->chip.card->dev)
 
-int snd_usb_caiaq_set_audio_params (struct snd_usb_caiaqdev *dev, int rate, int depth, int bbp);
-int snd_usb_caiaq_set_auto_msg (struct snd_usb_caiaqdev *dev, int digital, int analog, int erp);
-int snd_usb_caiaq_send_command(struct snd_usb_caiaqdev *dev,
+int snd_usb_caiaq_set_audio_params (struct snd_usb_caiaqdev *cdev, int rate, int depth, int bbp);
+int snd_usb_caiaq_set_auto_msg (struct snd_usb_caiaqdev *cdev, int digital, int analog, int erp);
+int snd_usb_caiaq_send_command(struct snd_usb_caiaqdev *cdev,
 			       unsigned char command,
+			       const unsigned char *buffer,
+			       int len);
+int snd_usb_caiaq_send_command_bank(struct snd_usb_caiaqdev *cdev,
+			       unsigned char command,
+			       unsigned char bank,
 			       const unsigned char *buffer,
 			       int len);
 

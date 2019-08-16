@@ -38,14 +38,15 @@
 
 #include "mlx4.h"
 
-static int mlx4_SENSE_PORT(struct mlx4_dev *dev, int port,
-			   enum mlx4_port_type *type)
+int mlx4_SENSE_PORT(struct mlx4_dev *dev, int port,
+		    enum mlx4_port_type *type)
 {
 	u64 out_param;
 	int err = 0;
 
 	err = mlx4_cmd_imm(dev, 0, &out_param, port, 0,
-			   MLX4_CMD_SENSE_PORT, MLX4_CMD_TIME_CLASS_B);
+			   MLX4_CMD_SENSE_PORT, MLX4_CMD_TIME_CLASS_B,
+			   MLX4_CMD_WRAPPED);
 	if (err) {
 		mlx4_err(dev, "Sense command failed for port: %d\n", port);
 		return err;
@@ -53,7 +54,7 @@ static int mlx4_SENSE_PORT(struct mlx4_dev *dev, int port,
 
 	if (out_param > 2) {
 		mlx4_err(dev, "Sense returned illegal value: 0x%llx\n", out_param);
-		return EINVAL;
+		return -EINVAL;
 	}
 
 	*type = out_param;
@@ -77,20 +78,6 @@ void mlx4_do_sense_ports(struct mlx4_dev *dev,
 				stype[i - 1] = defaults[i - 1];
 		} else
 			stype[i - 1] = defaults[i - 1];
-	}
-
-	/*
-	 * Adjust port configuration:
-	 * If port 1 sensed nothing and port 2 is IB, set both as IB
-	 * If port 2 sensed nothing and port 1 is Eth, set both as Eth
-	 */
-	if (stype[0] == MLX4_PORT_TYPE_ETH) {
-		for (i = 1; i < dev->caps.num_ports; i++)
-			stype[i] = stype[i] ? stype[i] : MLX4_PORT_TYPE_ETH;
-	}
-	if (stype[dev->caps.num_ports - 1] == MLX4_PORT_TYPE_IB) {
-		for (i = 0; i < dev->caps.num_ports - 1; i++)
-			stype[i] = stype[i] ? stype[i] : MLX4_PORT_TYPE_IB;
 	}
 
 	/*

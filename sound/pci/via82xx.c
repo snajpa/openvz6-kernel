@@ -1791,6 +1791,12 @@ static struct ac97_quirk ac97_quirks[] = {
 		.type = AC97_TUNE_HP_ONLY
 	},
 	{
+		.subvendor = 0x110a,
+		.subdevice = 0x0079,
+		.name = "Fujitsu Siemens D1289",
+		.type = AC97_TUNE_HP_ONLY
+	},
+	{
 		.subvendor = 0x1019,
 		.subdevice = 0x0a81,
 		.name = "ECS K7VTA3",
@@ -2391,8 +2397,6 @@ static int __devinit snd_via82xx_create(struct snd_card *card,
 	 * We call pci_set_master here because it does not hurt. */
 	pci_set_master(pci);
 
-	snd_card_set_dev(card, &pci->dev);
-
 	*r_via = chip;
 	return 0;
 }
@@ -2467,7 +2471,7 @@ static int __devinit check_dxs_list(struct pci_dev *pci, int revision)
 	w = snd_pci_quirk_lookup(pci, dxs_whitelist);
 	if (w) {
 		snd_printdd(KERN_INFO "via82xx: DXS white list for %s found\n",
-			    w->name);
+			    snd_pci_quirk_name(w));
 		return w->value;
 	}
 
@@ -2494,7 +2498,7 @@ static int __devinit snd_via82xx_probe(struct pci_dev *pci,
 	unsigned int i;
 	int err;
 
-	err = snd_card_create(index, id, THIS_MODULE, 0, &card);
+	err = snd_card_new(&pci->dev, index, id, THIS_MODULE, 0, &card);
 	if (err < 0)
 		return err;
 

@@ -226,6 +226,13 @@ ssize_t part_alignment_offset_show(struct device *dev,
 	return sprintf(buf, "%llu\n", (unsigned long long)p->alignment_offset);
 }
 
+ssize_t part_discard_alignment_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct hd_struct *p = dev_to_part(dev);
+	return sprintf(buf, "%u\n", p->discard_alignment);
+}
+
 ssize_t part_stat_show(struct device *dev,
 		       struct device_attribute *attr, char *buf)
 {
@@ -258,7 +265,8 @@ ssize_t part_inflight_show(struct device *dev,
 {
 	struct hd_struct *p = dev_to_part(dev);
 
-	return sprintf(buf, "%8u %8u\n", p->in_flight[0], p->in_flight[1]);
+	return sprintf(buf, "%8u %8u\n", atomic_read(&p->in_flight[0]),
+		atomic_read(&p->in_flight[1]));
 }
 
 #ifdef CONFIG_FAIL_MAKE_REQUEST
@@ -288,6 +296,8 @@ static DEVICE_ATTR(partition, S_IRUGO, part_partition_show, NULL);
 static DEVICE_ATTR(start, S_IRUGO, part_start_show, NULL);
 static DEVICE_ATTR(size, S_IRUGO, part_size_show, NULL);
 static DEVICE_ATTR(alignment_offset, S_IRUGO, part_alignment_offset_show, NULL);
+static DEVICE_ATTR(discard_alignment, S_IRUGO, part_discard_alignment_show,
+		   NULL);
 static DEVICE_ATTR(stat, S_IRUGO, part_stat_show, NULL);
 static DEVICE_ATTR(inflight, S_IRUGO, part_inflight_show, NULL);
 #ifdef CONFIG_FAIL_MAKE_REQUEST
@@ -300,6 +310,7 @@ static struct attribute *part_attrs[] = {
 	&dev_attr_start.attr,
 	&dev_attr_size.attr,
 	&dev_attr_alignment_offset.attr,
+	&dev_attr_discard_alignment.attr,
 	&dev_attr_stat.attr,
 	&dev_attr_inflight.attr,
 #ifdef CONFIG_FAIL_MAKE_REQUEST
@@ -323,6 +334,7 @@ static const struct attribute_group *part_attr_groups[] = {
 static void part_release(struct device *dev)
 {
 	struct hd_struct *p = dev_to_part(dev);
+	blk_free_devt(dev->devt);
 	free_part_stats(p);
 	kfree(p);
 }
@@ -343,6 +355,11 @@ static void delete_partition_rcu_cb(struct rcu_head *head)
 	put_device(part_to_dev(part));
 }
 
+void __delete_partition(struct hd_struct *part)
+{
+	call_rcu(&part->rcu_head, delete_partition_rcu_cb);
+}
+
 void delete_partition(struct gendisk *disk, int partno)
 {
 	struct disk_part_tbl *ptbl = disk->part_tbl;
@@ -355,13 +372,12 @@ void delete_partition(struct gendisk *disk, int partno)
 	if (!part)
 		return;
 
-	blk_free_devt(part_devt(part));
 	rcu_assign_pointer(ptbl->part[partno], NULL);
 	rcu_assign_pointer(ptbl->last_lookup, NULL);
 	kobject_put(part->holder_dir);
 	device_del(part_to_dev(part));
 
-	call_rcu(&part->rcu_head, delete_partition_rcu_cb);
+	hd_struct_put(part);
 }
 
 static ssize_t whole_disk_show(struct device *dev,
@@ -391,7 +407,7 @@ struct hd_struct *add_partition(struct gendisk *disk, int partno,
 	if (ptbl->part[partno])
 		return ERR_PTR(-EBUSY);
 
-	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	p = kzalloc(sizeof(struct hd_struct_with_aux), GFP_KERNEL);
 	if (!p)
 		return ERR_PTR(-EBUSY);
 
@@ -402,7 +418,10 @@ struct hd_struct *add_partition(struct gendisk *disk, int partno,
 	pdev = part_to_dev(p);
 
 	p->start_sect = start;
-	p->alignment_offset = queue_sector_alignment_offset(disk->queue, start);
+	p->alignment_offset =
+		queue_limit_alignment_offset(&disk->queue->limits, start);
+	p->discard_alignment =
+		queue_limit_discard_alignment(&disk->queue->limits, start);
 	p->nr_sects = len;
 	p->partno = partno;
 	p->policy = get_disk_ro(disk);
@@ -449,6 +468,7 @@ struct hd_struct *add_partition(struct gendisk *disk, int partno,
 	if (!dev_get_uevent_suppress(ddev))
 		kobject_uevent(&pdev->kobj, KOBJ_ADD);
 
+	hd_ref_init(p);
 	return p;
 
 out_free_stats:
@@ -476,7 +496,7 @@ void register_disk(struct gendisk *disk)
 
 	ddev->parent = disk->driverfs_dev;
 
-	dev_set_name(ddev, disk->disk_name);
+	dev_set_name(ddev, "%s", disk->disk_name);
 
 	/* delay uevents, until we scanned partition table */
 	dev_set_uevent_suppress(ddev, 1);
@@ -506,7 +526,7 @@ void register_disk(struct gendisk *disk)
 	if (!bdev)
 		goto exit;
 
-	bdev->bd_invalidated = 1;
+	disk->flags |= GENHD_FL_INVALIDATED;
 	err = blkdev_get(bdev, FMODE_READ);
 	if (err < 0)
 		goto exit;
@@ -531,7 +551,7 @@ int rescan_partitions(struct gendisk *disk, struct block_device *bdev)
 	struct parsed_partitions *state;
 	int p, highest, res;
 
-	if (bdev->bd_part_count)
+	if (bdev->bd_part_count || bdev->bd_super)
 		return -EBUSY;
 	res = invalidate_partition(disk, 0);
 	if (res)
@@ -545,7 +565,7 @@ int rescan_partitions(struct gendisk *disk, struct block_device *bdev)
 	if (disk->fops->revalidate_disk)
 		disk->fops->revalidate_disk(disk);
 	check_disk_size_change(disk, bdev);
-	bdev->bd_invalidated = 0;
+	bdev->bd_disk->flags &= ~GENHD_FL_INVALIDATED;
 	if (!get_capacity(disk) || !(state = check_partition(disk, bdev)))
 		return 0;
 	if (IS_ERR(state))	/* I/O error reading the partition table */
@@ -596,7 +616,7 @@ try_scan:
 				if (capacity > get_capacity(disk)) {
 					set_capacity(disk, capacity);
 					check_disk_size_change(disk, bdev);
-					bdev->bd_invalidated = 0;
+					bdev->bd_disk->flags &= ~GENHD_FL_INVALIDATED;
 				}
 				goto try_scan;
 			} else {
@@ -662,7 +682,6 @@ void del_gendisk(struct gendisk *disk)
 	disk_part_iter_exit(&piter);
 
 	invalidate_partition(disk, 0);
-	blk_free_devt(disk_to_dev(disk)->devt);
 	set_capacity(disk, 0);
 	disk->flags &= ~GENHD_FL_UP;
 	unlink_gendisk(disk);

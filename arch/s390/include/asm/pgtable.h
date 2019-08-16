@@ -46,11 +46,19 @@ extern void vmem_map_init(void);
 #define update_mmu_cache(vma, address, pte)     do { } while (0)
 
 /*
- * ZERO_PAGE is a global shared page that is always zero: used
+ * ZERO_PAGE is a global shared page that is always zero; used
  * for zero-mapped memory areas etc..
  */
-extern char empty_zero_page[PAGE_SIZE];
-#define ZERO_PAGE(vaddr) (virt_to_page(empty_zero_page))
+
+extern unsigned long empty_zero_page;
+extern unsigned long zero_page_mask;
+
+#define ZERO_PAGE(vaddr) \
+	(virt_to_page((void *)(empty_zero_page + \
+	 (((unsigned long)(vaddr)) &zero_page_mask))))
+
+#define __HAVE_COLOR_ZERO_PAGE
+
 #endif /* !__ASSEMBLY__ */
 
 /*
@@ -105,35 +113,18 @@ extern char empty_zero_page[PAGE_SIZE];
 #ifndef __ASSEMBLY__
 /*
  * The vmalloc area will always be on the topmost area of the kernel
- * mapping. We reserve 96MB (31bit) / 1GB (64bit) for vmalloc,
+ * mapping. We reserve 96MB (31bit) / 128GB (64bit) for vmalloc,
  * which should be enough for any sane case.
  * By putting vmalloc at the top, we maximise the gap between physical
  * memory and vmalloc to catch misplaced memory accesses. As a side
  * effect, this also makes sure that 64 bit module code cannot be used
  * as system call address.
  */
-
 extern unsigned long VMALLOC_START;
+extern unsigned long VMALLOC_END;
+extern struct page *vmemmap;
 
-#ifndef __s390x__
-#define VMALLOC_SIZE	(96UL << 20)
-#define VMALLOC_END	0x7e000000UL
-#define VMEM_MAP_END	0x80000000UL
-#else /* __s390x__ */
-#define VMALLOC_SIZE	(1UL << 30)
-#define VMALLOC_END	0x3e040000000UL
-#define VMEM_MAP_END	0x40000000000UL
-#endif /* __s390x__ */
-
-/*
- * VMEM_MAX_PHYS is the highest physical address that can be added to the 1:1
- * mapping. This needs to be calculated at compile time since the size of the
- * VMEM_MAP is static but the size of struct page can change.
- */
-#define VMEM_MAX_PAGES	((VMEM_MAP_END - VMALLOC_END) / sizeof(struct page))
-#define VMEM_MAX_PFN	min(VMALLOC_START >> PAGE_SHIFT, VMEM_MAX_PAGES)
-#define VMEM_MAX_PHYS	((VMEM_MAX_PFN << PAGE_SHIFT) & ~((16 << 20) - 1))
-#define vmemmap		((struct page *) VMALLOC_END)
+#define VMEM_MAX_PHYS ((unsigned long) vmemmap)
 
 /*
  * A 31 bit pagetable entry of S390 has following format:
@@ -878,7 +869,8 @@ static inline void ptep_invalidate(struct mm_struct *mm,
 #define ptep_get_and_clear(__mm, __address, __ptep)			\
 ({									\
 	pte_t __pte = *(__ptep);					\
-	if (atomic_read(&(__mm)->mm_users) > 1 ||			\
+	(__mm)->context.flush_mm = 1;					\
+	if (atomic_read(&(__mm)->context.attach_count) > 1 ||		\
 	    (__mm) != current->active_mm)				\
 		ptep_invalidate(__mm, __address, __ptep);		\
 	else								\
@@ -921,7 +913,8 @@ static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
 ({									\
 	pte_t __pte = *(__ptep);					\
 	if (pte_write(__pte)) {						\
-		if (atomic_read(&(__mm)->mm_users) > 1 ||		\
+		(__mm)->context.flush_mm = 1;				\
+		if (atomic_read(&(__mm)->context.attach_count) > 1 ||	\
 		    (__mm) != current->active_mm)			\
 			ptep_invalidate(__mm, __addr, __ptep);		\
 		set_pte_at(__mm, __addr, __ptep, pte_wrprotect(__pte));	\
@@ -1117,6 +1110,10 @@ static inline pte_t mk_swap_pte(unsigned long type, unsigned long offset)
 	((pte_t) { ((((__off) & 0x7f) << 1) + (((__off) >> 7) << 12)) \
 		   | _PAGE_TYPE_FILE })
 
+/* TODO: s390 cannot support io_remap_pfn_range... */
+#define io_remap_pfn_range(vma, vaddr, pfn, size, prot) 	       \
+	remap_pfn_range(vma, vaddr, pfn, size, prot)
+
 #endif /* !__ASSEMBLY__ */
 
 #define kern_addr_valid(addr)   (1)
@@ -1124,6 +1121,10 @@ static inline pte_t mk_swap_pte(unsigned long type, unsigned long offset)
 extern int vmem_add_mapping(unsigned long start, unsigned long size);
 extern int vmem_remove_mapping(unsigned long start, unsigned long size);
 extern int s390_enable_sie(void);
+
+/* s390 has a private copy of get unmapped area to deal with cache synonyms */
+#define HAVE_ARCH_UNMAPPED_AREA
+#define HAVE_ARCH_UNMAPPED_AREA_TOPDOWN
 
 /*
  * No page table caches to initialise

@@ -6,6 +6,7 @@
 #include <linux/interrupt.h>
 #include <linux/module.h>
 
+#include <asm/desc.h>
 #include <asm/tlbflush.h>
 #include <asm/mmu_context.h>
 #include <asm/apic.h>
@@ -130,6 +131,12 @@ void smp_invalidate_interrupt(struct pt_regs *regs)
 	union smp_flush_state *f;
 
 	cpu = smp_processor_id();
+
+#ifdef CONFIG_X86_32
+	if (current->active_mm)
+		load_user_cs_desc(cpu, current->active_mm);
+#endif
+
 	/*
 	 * orig_rax contains the negated interrupt vector.
 	 * Use that to determine where the sender put the data.
@@ -234,6 +241,7 @@ void flush_tlb_current_task(void)
 
 	preempt_disable();
 
+	/* This is an implicit full barrier that synchronizes with switch_mm. */
 	local_flush_tlb();
 	if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)
 		flush_tlb_others(mm_cpumask(mm), mm, TLB_FLUSH_ALL);
@@ -245,10 +253,18 @@ void flush_tlb_mm(struct mm_struct *mm)
 	preempt_disable();
 
 	if (current->active_mm == mm) {
-		if (current->mm)
+		if (current->mm) {
+			/*
+			 * This is an implicit full barrier that synchronizes
+			 * with switch_mm.
+			 */
 			local_flush_tlb();
-		else
+		} else {
 			leave_mm(smp_processor_id());
+
+			/* Synchronize with switch_mm. */
+			smp_mb();
+		}
 	}
 	if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)
 		flush_tlb_others(mm_cpumask(mm), mm, TLB_FLUSH_ALL);
@@ -263,10 +279,18 @@ void flush_tlb_page(struct vm_area_struct *vma, unsigned long va)
 	preempt_disable();
 
 	if (current->active_mm == mm) {
-		if (current->mm)
+		if (current->mm) {
+			/*
+			 * Implicit full barrier (INVLPG) that synchronizes
+			 * with switch_mm.
+			 */
 			__flush_tlb_one(va);
-		else
+		} else {
 			leave_mm(smp_processor_id());
+
+			/* Synchronize with switch_mm. */
+			smp_mb();
+		}
 	}
 
 	if (cpumask_any_but(mm_cpumask(mm), smp_processor_id()) < nr_cpu_ids)

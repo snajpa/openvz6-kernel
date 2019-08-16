@@ -50,16 +50,12 @@ static void *lib80211_wep_init(int keyidx)
 
 	priv->tx_tfm = crypto_alloc_blkcipher("ecb(arc4)", 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(priv->tx_tfm)) {
-		printk(KERN_DEBUG "lib80211_crypt_wep: could not allocate "
-		       "crypto API arc4\n");
 		priv->tx_tfm = NULL;
 		goto fail;
 	}
 
 	priv->rx_tfm = crypto_alloc_blkcipher("ecb(arc4)", 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(priv->rx_tfm)) {
-		printk(KERN_DEBUG "lib80211_crypt_wep: could not allocate "
-		       "crypto API arc4\n");
 		priv->rx_tfm = NULL;
 		goto fail;
 	}
@@ -96,13 +92,12 @@ static int lib80211_wep_build_iv(struct sk_buff *skb, int hdr_len,
 			       u8 *key, int keylen, void *priv)
 {
 	struct lib80211_wep_data *wep = priv;
-	u32 klen, len;
+	u32 klen;
 	u8 *pos;
 
 	if (skb_headroom(skb) < 4 || skb->len < hdr_len)
 		return -1;
 
-	len = skb->len - hdr_len;
 	pos = skb_push(skb, 4);
 	memmove(pos, pos + 4, hdr_len);
 	pos += hdr_len;
@@ -258,18 +253,16 @@ static int lib80211_wep_get_key(void *key, int len, u8 * seq, void *priv)
 	return wep->key_len;
 }
 
-static char *lib80211_wep_print_stats(char *p, void *priv)
+static void lib80211_wep_print_stats(struct seq_file *m, void *priv)
 {
 	struct lib80211_wep_data *wep = priv;
-	p += sprintf(p, "key[%d] alg=WEP len=%d\n", wep->key_idx, wep->key_len);
-	return p;
+	seq_printf(m, "key[%d] alg=WEP len=%d\n", wep->key_idx, wep->key_len);
 }
 
 static struct lib80211_crypto_ops lib80211_crypt_wep = {
 	.name = "WEP",
 	.init = lib80211_wep_init,
 	.deinit = lib80211_wep_deinit,
-	.build_iv = lib80211_wep_build_iv,
 	.encrypt_mpdu = lib80211_wep_encrypt,
 	.decrypt_mpdu = lib80211_wep_decrypt,
 	.encrypt_msdu = NULL,

@@ -27,6 +27,26 @@ config MFD_SM501_GPIO
 	 lines on the SM501. The platform data is used to supply the
 	 base number for the first GPIO line to register.
 
+config MFD_RTSX_PCI
+	tristate "Support for Realtek PCI-E card reader"
+	depends on PCI
+	help
+	  This supports for Realtek PCI-Express card reader including rts5209,
+	  rts5227, rts522A, rts5229, rts5249, rts524A, rts525A, rtl8411, etc.
+	  Realtek card reader supports access to many types of memory cards,
+	  such as Memory Stick, Memory Stick Pro, Secure Digital and
+	  MultiMediaCard.
+
+config MFD_RTSX_USB
+	tristate "Realtek USB card reader"
+	depends on USB
+	select MFD_CORE
+	help
+	  Select this option to get support for Realtek USB 2.0 card readers
+	  including RTS5129, RTS5139, RTS5179 and RTS5170.
+	  Realtek card reader supports access to many types of memory cards,
+	  such as Memory Stick Pro, Secure Digital and MultiMediaCard.
+
 config MFD_ASIC3
 	bool "Support for Compaq ASIC3"
 	depends on GENERIC_HARDIRQS && GPIOLIB && ARM
@@ -234,6 +254,18 @@ config MFD_WM8352_CONFIG_MODE_3
 config MFD_WM8350_I2C
 	tristate "Support Wolfson Microelectronics WM8350 with I2C"
 	select MFD_WM8350
+	select MFD_WM8350_CONFIG_MODE_0
+	select MFD_WM8350_CONFIG_MODE_1
+	select MFD_WM8350_CONFIG_MODE_2
+	select MFD_WM8350_CONFIG_MODE_3
+	select MFD_WM8351_CONFIG_MODE_0
+	select MFD_WM8351_CONFIG_MODE_1
+	select MFD_WM8351_CONFIG_MODE_2
+	select MFD_WM8351_CONFIG_MODE_3
+	select MFD_WM8352_CONFIG_MODE_0
+	select MFD_WM8352_CONFIG_MODE_1
+	select MFD_WM8352_CONFIG_MODE_2
+	select MFD_WM8352_CONFIG_MODE_3
 	depends on I2C
 	help
 	  The WM8350 is an integrated audio and power management
@@ -304,6 +336,24 @@ config EZX_PCAP
 	help
 	  This enables the PCAP ASIC present on EZX Phones. This is
 	  needed for MMC, TouchScreen, Sound, USB, etc..
+
+config LPC_SCH
+	tristate "Intel SCH LPC"
+	depends on PCI
+	select MFD_CORE
+	help
+	  LPC bridge function of the Intel SCH provides support for
+	  System Management Bus and General Purpose I/O.
+
+config LPC_ICH
+	tristate "Intel ICH LPC"
+	depends on PCI
+	select MFD_CORE
+	help
+	  The LPC bridge function of the Intel ICH provides support for
+	  many functional units. This driver provides needed support for
+	  other drivers to control these functions, currently GPIO and
+	  watchdog.
 
 endmenu
 

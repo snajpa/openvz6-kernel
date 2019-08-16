@@ -14,26 +14,43 @@ struct cpuid_bit {
 	u8 reg;
 	u8 bit;
 	u32 level;
+	u32 sub_leaf;
 };
 
-enum cpuid_regs {
-	CR_EAX = 0,
-	CR_ECX,
-	CR_EDX,
-	CR_EBX
+/* Please keep the leaf sorted by cpuid_bit.level for faster search. */
+static const struct cpuid_bit cpuid_bits[] = {
+	{ X86_FEATURE_DTHERM,		CPUID_EAX, 0, 0x00000006, 0 },
+	{ X86_FEATURE_IDA,		CPUID_EAX, 1, 0x00000006, 0 },
+	{ X86_FEATURE_ARAT,		CPUID_EAX, 2, 0x00000006, 0 },
+	{ X86_FEATURE_PLN,		CPUID_EAX, 4, 0x00000006, 0 },
+	{ X86_FEATURE_PTS,		CPUID_EAX, 6, 0x00000006, 0 },
+	{ X86_FEATURE_HWP,		CPUID_EAX, 7, 0x00000006, 0 },
+	{ X86_FEATURE_HWP_NOITFY,	CPUID_EAX, 8, 0x00000006, 0 },
+	{ X86_FEATURE_HWP_ACT_WINDOW,	CPUID_EAX, 9, 0x00000006, 0 },
+	{ X86_FEATURE_HWP_EPP,		CPUID_EAX,10, 0x00000006, 0 },
+	{ X86_FEATURE_HWP_PKG_REQ,	CPUID_EAX,11, 0x00000006, 0 },
+	{ X86_FEATURE_APERFMPERF,	CPUID_ECX, 0, 0x00000006, 0 },
+	{ X86_FEATURE_EPB,		CPUID_ECX, 3, 0x00000006, 0 },
+	{ X86_FEATURE_XSAVEOPT,		CPUID_EAX, 0, 0x0000000d, 1 },
+	{ X86_FEATURE_CPB,		CPUID_EDX, 9, 0x80000007, 0 },
+	{ X86_FEATURE_NPT,		CPUID_EDX, 0, 0x8000000a, 0 },
+	{ X86_FEATURE_LBRV,		CPUID_EDX, 1, 0x8000000a, 0 },
+	{ X86_FEATURE_SVML,		CPUID_EDX, 2, 0x8000000a, 0 },
+	{ X86_FEATURE_NRIPS,		CPUID_EDX, 3, 0x8000000a, 0 },
+	{ X86_FEATURE_TSCRATEMSR,	CPUID_EDX, 4, 0x8000000a, 0 },
+	{ X86_FEATURE_VMCBCLEAN,	CPUID_EDX, 5, 0x8000000a, 0 },
+	{ X86_FEATURE_FLUSHBYASID,	CPUID_EDX, 6, 0x8000000a, 0 },
+	{ X86_FEATURE_DECODEASSISTS,	CPUID_EDX, 7, 0x8000000a, 0 },
+	{ X86_FEATURE_PAUSEFILTER,	CPUID_EDX,10, 0x8000000a, 0 },
+	{ X86_FEATURE_PFTHRESHOLD,	CPUID_EDX,12, 0x8000000a, 0 },
+	{ 0, 0, 0, 0, 0 }
 };
 
-void __cpuinit init_scattered_cpuid_features(struct cpuinfo_x86 *c)
+void init_scattered_cpuid_features(struct cpuinfo_x86 *c)
 {
 	u32 max_level;
 	u32 regs[4];
 	const struct cpuid_bit *cb;
-
-	static const struct cpuid_bit __cpuinitconst cpuid_bits[] = {
-		{ X86_FEATURE_IDA, CR_EAX, 1, 0x00000006 },
-		{ X86_FEATURE_ARAT, CR_EAX, 2, 0x00000006 },
-		{ 0, 0, 0, 0 }
-	};
 
 	for (cb = cpuid_bits; cb->feature; cb++) {
 
@@ -43,13 +60,47 @@ void __cpuinit init_scattered_cpuid_features(struct cpuinfo_x86 *c)
 		    max_level > (cb->level | 0xffff))
 			continue;
 
-		cpuid(cb->level, &regs[CR_EAX], &regs[CR_EBX],
-			&regs[CR_ECX], &regs[CR_EDX]);
+		cpuid_count(cb->level, cb->sub_leaf, &regs[CPUID_EAX],
+			    &regs[CPUID_EBX], &regs[CPUID_ECX],
+			    &regs[CPUID_EDX]);
 
 		if (regs[cb->reg] & (1 << cb->bit))
 			set_cpu_cap(c, cb->feature);
 	}
+
+	/*
+	 * common AMD/Intel features
+	 */
+	if (c->cpuid_level >= 6) {
+		if (cpuid_ecx(6) & 0x1)
+			set_cpu_cap(c, X86_FEATURE_APERFMPERF);
+	}
 }
+
+u32 get_scattered_cpuid_leaf(unsigned int level, unsigned int sub_leaf,
+			     enum cpuid_regs_idx reg)
+{
+	const struct cpuid_bit *cb;
+	u32 cpuid_val = 0;
+
+	for (cb = cpuid_bits; cb->feature; cb++) {
+
+		if (level > cb->level)
+			continue;
+
+		if (level < cb->level)
+			break;
+
+		if (reg == cb->reg && sub_leaf == cb->sub_leaf) {
+			if (cpu_has(&boot_cpu_data, cb->feature))
+				cpuid_val |= BIT(cb->bit);
+		}
+	}
+
+	return cpuid_val;
+}
+
+EXPORT_SYMBOL_GPL(get_scattered_cpuid_leaf);
 
 /* leaf 0xb SMT level */
 #define SMT_LEVEL	0
@@ -74,6 +125,7 @@ void __cpuinit detect_extended_topology(struct cpuinfo_x86 *c)
 	unsigned int eax, ebx, ecx, edx, sub_index;
 	unsigned int ht_mask_width, core_plus_mask_width;
 	unsigned int core_select_mask, core_level_siblings;
+	static bool printed;
 
 	if (c->cpuid_level < 0xb)
 		return;
@@ -127,12 +179,14 @@ void __cpuinit detect_extended_topology(struct cpuinfo_x86 *c)
 
 	c->x86_max_cores = (core_level_siblings / smp_num_siblings);
 
-
-	printk(KERN_INFO  "CPU: Physical Processor ID: %d\n",
-	       c->phys_proc_id);
-	if (c->x86_max_cores > 1)
-		printk(KERN_INFO  "CPU: Processor Core ID: %d\n",
-		       c->cpu_core_id);
+	if (!printed) {
+		printk(KERN_INFO  "CPU: Physical Processor ID: %d\n",
+		       c->phys_proc_id);
+		if (c->x86_max_cores > 1)
+			printk(KERN_INFO  "CPU: Processor Core ID: %d\n",
+			       c->cpu_core_id);
+		printed = 1;
+	}
 	return;
 #endif
 }

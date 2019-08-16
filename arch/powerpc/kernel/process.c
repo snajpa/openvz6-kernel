@@ -402,7 +402,6 @@ struct task_struct *__switch_to(struct task_struct *prev,
 
 	account_system_vtime(current);
 	account_process_vtime(current);
-	calculate_steal_time();
 
 	/*
 	 * We can't take a PMU exception inside _switch() since there is a
@@ -554,18 +553,6 @@ void exit_thread(void)
 
 void flush_thread(void)
 {
-#ifdef CONFIG_PPC64
-	struct thread_info *t = current_thread_info();
-
-	if (test_ti_thread_flag(t, TIF_ABI_PENDING)) {
-		clear_ti_thread_flag(t, TIF_ABI_PENDING);
-		if (test_ti_thread_flag(t, TIF_32BIT))
-			clear_ti_thread_flag(t, TIF_32BIT);
-		else
-			set_ti_thread_flag(t, TIF_32BIT);
-	}
-#endif
-
 	discard_lazy_cpu_state();
 
 	if (current->thread.dabr) {
@@ -922,7 +909,7 @@ int sys_execve(unsigned long a0, unsigned long a1, unsigned long a2,
 	       struct pt_regs *regs)
 {
 	int error;
-	char *filename;
+	struct filename *filename;
 
 	filename = getname((char __user *) a0);
 	error = PTR_ERR(filename);
@@ -931,7 +918,7 @@ int sys_execve(unsigned long a0, unsigned long a1, unsigned long a2,
 	flush_fp_to_thread(current);
 	flush_altivec_to_thread(current);
 	flush_spe_to_thread(current);
-	error = do_execve(filename, (char __user * __user *) a1,
+	error = do_execve(filename->name, (char __user * __user *) a1,
 			  (char __user * __user *) a2, regs);
 	putname(filename);
 out:
@@ -1120,11 +1107,11 @@ void ppc64_runlatch_off(void)
 
 static struct kmem_cache *thread_info_cache;
 
-struct thread_info *alloc_thread_info(struct task_struct *tsk)
+struct thread_info *alloc_thread_info_node(struct task_struct *tsk, int node)
 {
 	struct thread_info *ti;
 
-	ti = kmem_cache_alloc(thread_info_cache, GFP_KERNEL);
+	ti = kmem_cache_alloc_node(thread_info_cache, GFP_KERNEL, node);
 	if (unlikely(ti == NULL))
 		return NULL;
 #ifdef CONFIG_DEBUG_STACK_USAGE
@@ -1201,3 +1188,14 @@ unsigned long randomize_et_dyn(unsigned long base)
 
 	return ret;
 }
+
+#ifdef CONFIG_SMP
+int arch_sd_sibling_asym_packing(void)
+{
+	if (cpu_has_feature(CPU_FTR_ASYM_SMT)) {
+		printk_once(KERN_INFO "Enabling Asymmetric SMT scheduling\n");
+		return SD_ASYM_PACKING;
+	}
+	return 0;
+}
+#endif

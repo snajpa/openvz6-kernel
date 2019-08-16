@@ -1,26 +1,28 @@
-/**************************************************************************/
-/*                                                                        */
-/* IBM eServer i/[Series Virtual Ethernet Device Driver                   */
-/* Copyright (C) 2003 IBM Corp.                                           */
-/*  Dave Larson (larson1@us.ibm.com)                                      */
-/*  Santiago Leon (santil@us.ibm.com)                                     */
-/*                                                                        */
-/*  This program is free software; you can redistribute it and/or modify  */
-/*  it under the terms of the GNU General Public License as published by  */
-/*  the Free Software Foundation; either version 2 of the License, or     */
-/*  (at your option) any later version.                                   */
-/*                                                                        */
-/*  This program is distributed in the hope that it will be useful,       */
-/*  but WITHOUT ANY WARRANTY; without even the implied warranty of        */
-/*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         */
-/*  GNU General Public License for more details.                          */
-/*                                                                        */
-/*  You should have received a copy of the GNU General Public License     */
-/*  along with this program; if not, write to the Free Software           */
-/*  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  */
-/*                                                                   USA  */
-/*                                                                        */
-/**************************************************************************/
+/*
+ * IBM Power Virtual Ethernet Device Driver
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+ *
+ * Copyright (C) IBM Corporation, 2003, 2010
+ *
+ * Authors: Dave Larson <larson1@us.ibm.com>
+ *	    Santiago Leon <santil@linux.vnet.ibm.com>
+ *	    Brian King <brking@linux.vnet.ibm.com>
+ *	    Robert Jennings <rcj@linux.vnet.ibm.com>
+ *	    Anton Blanchard <anton@au.ibm.com>
+ */
 
 #ifndef _IBMVETH_H
 #define _IBMVETH_H
@@ -39,6 +41,8 @@
 #define IbmVethMcastRemoveFilter     0x2UL
 #define IbmVethMcastClearFilterTable 0x3UL
 
+#define IBMVETH_ILLAN_LRG_SR_ENABLED	0x0000000000010000UL
+#define IBMVETH_ILLAN_LRG_SND_SUPPORT	0x0000000000008000UL
 #define IBMVETH_ILLAN_PADDED_PKT_CSUM	0x0000000000002000UL
 #define IBMVETH_ILLAN_TRUNK_PRI_MASK	0x0000000000000F00UL
 #define IBMVETH_ILLAN_IPV6_TCP_CSUM		0x0000000000000004UL
@@ -58,13 +62,20 @@
 static inline long h_send_logical_lan(unsigned long unit_address,
 		unsigned long desc1, unsigned long desc2, unsigned long desc3,
 		unsigned long desc4, unsigned long desc5, unsigned long desc6,
-		unsigned long corellator_in, unsigned long *corellator_out)
+		unsigned long corellator_in, unsigned long *corellator_out,
+		unsigned long mss, unsigned long large_send_support)
 {
 	long rc;
 	unsigned long retbuf[PLPAR_HCALL9_BUFSIZE];
 
-	rc = plpar_hcall9(H_SEND_LOGICAL_LAN, retbuf, unit_address, desc1,
-			desc2, desc3, desc4, desc5, desc6, corellator_in);
+	if (large_send_support)
+		rc = plpar_hcall9(H_SEND_LOGICAL_LAN, retbuf, unit_address,
+				  desc1, desc2, desc3, desc4, desc5, desc6,
+				  corellator_in, mss);
+	else
+		rc = plpar_hcall9(H_SEND_LOGICAL_LAN, retbuf, unit_address,
+				  desc1, desc2, desc3, desc4, desc5, desc6,
+				  corellator_in);
 
 	*corellator_out = retbuf[0];
 
@@ -92,18 +103,19 @@ static inline long h_illan_attributes(unsigned long unit_address,
 #define h_change_logical_lan_mac(ua, mac) \
   plpar_hcall_norets(H_CHANGE_LOGICAL_LAN_MAC, ua, mac)
 
-#define IbmVethNumBufferPools 5
+#define IBMVETH_NUM_BUFF_POOLS 5
 #define IBMVETH_IO_ENTITLEMENT_DEFAULT 4243456 /* MTU of 1500 needs 4.2Mb */
 #define IBMVETH_BUFF_OH 22 /* Overhead: 14 ethernet header + 8 opaque handle */
-#define IBMVETH_MAX_MTU 68
+#define IBMVETH_MIN_MTU 68
 #define IBMVETH_MAX_POOL_COUNT 4096
 #define IBMVETH_BUFF_LIST_SIZE 4096
 #define IBMVETH_FILT_LIST_SIZE 4096
 #define IBMVETH_MAX_BUF_SIZE (1024 * 128)
 
 static int pool_size[] = { 512, 1024 * 2, 1024 * 16, 1024 * 32, 1024 * 64 };
-static int pool_count[] = { 256, 768, 256, 256, 256 };
-static int pool_active[] = { 1, 1, 0, 0, 0};
+static int pool_count[] = { 256, 512, 256, 256, 256 };
+static int pool_count_cmo[] = { 256, 512, 256, 256, 64 };
+static int pool_active[] = { 1, 1, 0, 0, 1};
 
 #define IBM_VETH_INVALID_MAP ((u16)0xffff)
 
@@ -137,18 +149,21 @@ struct ibmveth_adapter {
     struct napi_struct napi;
     struct net_device_stats stats;
     unsigned int mcastFilterSize;
-    unsigned long mac_addr;
     void * buffer_list_addr;
     void * filter_list_addr;
     dma_addr_t buffer_list_dma;
     dma_addr_t filter_list_dma;
-    struct ibmveth_buff_pool rx_buff_pool[IbmVethNumBufferPools];
+    struct ibmveth_buff_pool rx_buff_pool[IBMVETH_NUM_BUFF_POOLS];
     struct ibmveth_rx_q rx_queue;
     int pool_config;
     int rx_csum;
+    int large_send;
     void *bounce_buffer;
     dma_addr_t bounce_buffer_dma;
 
+    u64 fw_ipv6_csum_support;
+    u64 fw_ipv4_csum_support;
+    u64 fw_large_send_support;
     /* adapter specific stats */
     u64 replenish_task_cycles;
     u64 replenish_no_mem;
@@ -158,13 +173,15 @@ struct ibmveth_adapter {
     u64 rx_no_buffer;
     u64 tx_map_failed;
     u64 tx_send_failed;
-    spinlock_t stats_lock;
+    u64 tx_large_packets;
+    u64 rx_large_packets;
 };
 
 struct ibmveth_buf_desc_fields {
 	u32 flags_len;
 #define IBMVETH_BUF_VALID	0x80000000
 #define IBMVETH_BUF_TOGGLE	0x40000000
+#define IBMVETH_BUF_LRG_SND     0x04000000
 #define IBMVETH_BUF_NO_CSUM	0x02000000
 #define IBMVETH_BUF_CSUM_GOOD	0x01000000
 #define IBMVETH_BUF_LEN_MASK	0x00FFFFFF

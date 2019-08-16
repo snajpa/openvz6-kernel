@@ -15,6 +15,7 @@
 #include <linux/compiler.h>
 #include <linux/errno.h>
 #include <linux/list.h>
+#include <linux/lockdep.h>
 #include <asm/atomic.h>
 
 struct kobject;
@@ -29,7 +30,22 @@ struct attribute {
 	const char		*name;
 	struct module		*owner;
 	mode_t			mode;
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	struct lock_class_key	*key;
+	struct lock_class_key	skey;
+#endif
 };
+
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+#define sysfs_attr_init(attr)				\
+do {							\
+	static struct lock_class_key __key;		\
+							\
+	(attr)->key = &__key;				\
+} while(0)
+#else
+#define sysfs_attr_init(attr) do {} while(0)
+#endif
 
 struct attribute_group {
 	const char		*name;
@@ -56,23 +72,33 @@ struct attribute_group {
 	.show	= _name##_show,					\
 }
 
+#define __ATTR_WO(_name) {						\
+	.attr	= { .name = __stringify(_name), .mode = S_IWUSR },	\
+	.store	= _name##_store,					\
+}
+
+#define __ATTR_RW(_name) __ATTR(_name, 0644, _name##_show, _name##_store)
+
 #define __ATTR_NULL { .attr = { .name = NULL } }
 
 #define attr_name(_attr) (_attr).attr.name
 
+struct file;
 struct vm_area_struct;
 
 struct bin_attribute {
 	struct attribute	attr;
 	size_t			size;
 	void			*private;
-	ssize_t (*read)(struct kobject *, struct bin_attribute *,
+	ssize_t (*read)(struct file *, struct kobject *, struct bin_attribute *,
 			char *, loff_t, size_t);
-	ssize_t (*write)(struct kobject *, struct bin_attribute *,
+	ssize_t (*write)(struct file *,struct kobject *, struct bin_attribute *,
 			 char *, loff_t, size_t);
-	int (*mmap)(struct kobject *, struct bin_attribute *attr,
+	int (*mmap)(struct file *, struct kobject *, struct bin_attribute *attr,
 		    struct vm_area_struct *vma);
 };
+
+#define sysfs_bin_attr_init(bin_attr) sysfs_attr_init(&bin_attr->attr)
 
 struct sysfs_ops {
 	ssize_t	(*show)(struct kobject *, struct attribute *,char *);
@@ -94,9 +120,12 @@ int __must_check sysfs_move_dir(struct kobject *kobj,
 
 int __must_check sysfs_create_file(struct kobject *kobj,
 				   const struct attribute *attr);
+int __must_check sysfs_create_files(struct kobject *kobj,
+				   const struct attribute **attr);
 int __must_check sysfs_chmod_file(struct kobject *kobj, struct attribute *attr,
 				  mode_t mode);
 void sysfs_remove_file(struct kobject *kobj, const struct attribute *attr);
+void sysfs_remove_files(struct kobject *kobj, const struct attribute **attr);
 
 int __must_check sysfs_create_bin_file(struct kobject *kobj,
 				       struct bin_attribute *attr);
@@ -111,14 +140,22 @@ void sysfs_remove_link(struct kobject *kobj, const char *name);
 
 int __must_check sysfs_create_group(struct kobject *kobj,
 				    const struct attribute_group *grp);
+int __must_check sysfs_create_groups(struct kobject *kobj,
+				     const struct attribute_group **groups);
 int sysfs_update_group(struct kobject *kobj,
 		       const struct attribute_group *grp);
 void sysfs_remove_group(struct kobject *kobj,
 			const struct attribute_group *grp);
+void sysfs_remove_groups(struct kobject *kobj,
+			 const struct attribute_group **groups);
 int sysfs_add_file_to_group(struct kobject *kobj,
 			const struct attribute *attr, const char *group);
 void sysfs_remove_file_from_group(struct kobject *kobj,
 			const struct attribute *attr, const char *group);
+int sysfs_merge_group(struct kobject *kobj,
+		       const struct attribute_group *grp);
+void sysfs_unmerge_group(struct kobject *kobj,
+		       const struct attribute_group *grp);
 
 void sysfs_notify(struct kobject *kobj, const char *dir, const char *attr);
 void sysfs_notify_dirent(struct sysfs_dirent *sd);
@@ -163,6 +200,12 @@ static inline int sysfs_create_file(struct kobject *kobj,
 	return 0;
 }
 
+static inline int sysfs_create_files(struct kobject *kobj,
+				    const struct attribute **attr)
+{
+	return 0;
+}
+
 static inline int sysfs_chmod_file(struct kobject *kobj,
 				   struct attribute *attr, mode_t mode)
 {
@@ -171,6 +214,11 @@ static inline int sysfs_chmod_file(struct kobject *kobj,
 
 static inline void sysfs_remove_file(struct kobject *kobj,
 				     const struct attribute *attr)
+{
+}
+
+static inline void sysfs_remove_files(struct kobject *kobj,
+				     const struct attribute **attr)
 {
 }
 
@@ -208,6 +256,12 @@ static inline int sysfs_create_group(struct kobject *kobj,
 	return 0;
 }
 
+static inline int sysfs_create_groups(struct kobject *kobj,
+				      const struct attribute_group **groups)
+{
+	return 0;
+}
+
 static inline int sysfs_update_group(struct kobject *kobj,
 				const struct attribute_group *grp)
 {
@@ -219,6 +273,11 @@ static inline void sysfs_remove_group(struct kobject *kobj,
 {
 }
 
+static inline void sysfs_remove_groups(struct kobject *kobj,
+				       const struct attribute_group **groups)
+{
+}
+
 static inline int sysfs_add_file_to_group(struct kobject *kobj,
 		const struct attribute *attr, const char *group)
 {
@@ -227,6 +286,17 @@ static inline int sysfs_add_file_to_group(struct kobject *kobj,
 
 static inline void sysfs_remove_file_from_group(struct kobject *kobj,
 		const struct attribute *attr, const char *group)
+{
+}
+
+static inline int sysfs_merge_group(struct kobject *kobj,
+		       const struct attribute_group *grp)
+{
+	return 0;
+}
+
+static inline void sysfs_unmerge_group(struct kobject *kobj,
+		       const struct attribute_group *grp)
 {
 }
 

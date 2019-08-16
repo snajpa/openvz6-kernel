@@ -12,7 +12,7 @@
 
 # include <linux/types.h>
 #ifdef __KERNEL__
-# include <linux/in.h>
+# include <linux/nfsd/nfsfh.h>
 #endif
 
 /*
@@ -31,7 +31,8 @@
 #define NFSEXP_ALLSQUASH	0x0008
 #define NFSEXP_ASYNC		0x0010
 #define NFSEXP_GATHERED_WRITES	0x0020
-/* 40 80 100 currently unused */
+#define NFSEXP_NOREADDIRPLUS    0x0040
+/* 80 100 currently unused */
 #define NFSEXP_NOHIDE		0x0200
 #define NFSEXP_NOSUBTREECHECK	0x0400
 #define	NFSEXP_NOAUTHNLM	0x0800		/* Don't authenticate NLM requests - just trust */
@@ -39,11 +40,23 @@
 #define NFSEXP_FSID		0x2000
 #define	NFSEXP_CROSSMOUNT	0x4000
 #define	NFSEXP_NOACL		0x8000	/* reserved for possible ACL related use */
-#define NFSEXP_ALLFLAGS		0xFE3F
+/*
+ * The NFSEXP_V4ROOT flag causes the kernel to give access only to NFSv4
+ * clients, and only to the single directory that is the root of the
+ * export; further lookup and readdir operations are treated as if every
+ * subdirectory was a mountpoint, and ignored if they are not themselves
+ * exported.  This is used by nfsd and mountd to construct the NFSv4
+ * pseudofilesystem, which provides access only to paths leading to each
+ * exported filesystem.
+ */
+#define	NFSEXP_V4ROOT		0x10000
+/* All flags that we claim to support.  (Note we don't support NOACL.) */
+#define NFSEXP_ALLFLAGS		0x17E7F
 
 /* The flags that may vary depending on security flavor: */
 #define NFSEXP_SECINFO_FLAGS	(NFSEXP_READONLY | NFSEXP_ROOTSQUASH \
-					| NFSEXP_ALLSQUASH)
+					| NFSEXP_ALLSQUASH \
+					| NFSEXP_INSECURE_PORT)
 
 #ifdef __KERNEL__
 
@@ -108,7 +121,6 @@ struct svc_expkey {
 	struct path		ek_path;
 };
 
-#define EX_SECURE(exp)		(!((exp)->ex_flags & NFSEXP_INSECURE_PORT))
 #define EX_ISSYNC(exp)		(!((exp)->ex_flags & NFSEXP_ASYNC))
 #define EX_NOHIDE(exp)		((exp)->ex_flags & NFSEXP_NOHIDE)
 #define EX_WGATHER(exp)		((exp)->ex_flags & NFSEXP_GATHERED_WRITES)

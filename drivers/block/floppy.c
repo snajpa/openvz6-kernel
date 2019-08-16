@@ -3080,12 +3080,6 @@ static inline int fd_copyin(void __user *param, void *address, unsigned long siz
 	return copy_from_user(address, param, size) ? -EFAULT : 0;
 }
 
-#define _COPYOUT(x) (copy_to_user((void __user *)param, &(x), sizeof(x)) ? -EFAULT : 0)
-#define _COPYIN(x) (copy_from_user(&(x), (void __user *)param, sizeof(x)) ? -EFAULT : 0)
-
-#define COPYOUT(x) ECALL(_COPYOUT(x))
-#define COPYIN(x) ECALL(_COPYIN(x))
-
 static inline const char *drive_name(int type, int drive)
 {
 	struct floppy_struct *floppy;
@@ -3162,7 +3156,12 @@ static inline int raw_cmd_copyout(int cmd, char __user *param,
 	int ret;
 
 	while (ptr) {
-		COPYOUT(*ptr);
+		struct floppy_raw_cmd cmd = *ptr;
+		cmd.next = NULL;
+		cmd.kernel_data = NULL;
+		ret = copy_to_user(param, &cmd, sizeof(cmd));
+		if (ret)
+			return -EFAULT;
 		param += sizeof(struct floppy_raw_cmd);
 		if ((ptr->flags & FD_RAW_READ) && ptr->buffer_length) {
 			if (ptr->length >= 0
@@ -3209,9 +3208,12 @@ static inline int raw_cmd_copyin(int cmd, char __user *param,
 		if (!ptr)
 			return -ENOMEM;
 		*rcmd = ptr;
-		COPYIN(*ptr);
+		ret = copy_from_user(ptr, param, sizeof(*ptr));
 		ptr->next = NULL;
 		ptr->buffer_length = 0;
+		ptr->kernel_data = NULL;
+		if (ret)
+			return -EFAULT;
 		param += sizeof(struct floppy_raw_cmd);
 		if (ptr->cmd_count > 33)
 			/* the command may now also take up the space
@@ -3227,7 +3229,6 @@ static inline int raw_cmd_copyin(int cmd, char __user *param,
 		for (i = 0; i < 16; i++)
 			ptr->reply[i] = 0;
 		ptr->resultcode = 0;
-		ptr->kernel_data = NULL;
 
 		if (ptr->flags & (FD_RAW_READ | FD_RAW_WRITE)) {
 			if (ptr->length <= 0)
@@ -3341,7 +3342,7 @@ static inline int set_geometry(unsigned int cmd, struct floppy_struct *g,
 			struct block_device *bdev = opened_bdev[cnt];
 			if (!bdev || ITYPE(drive_state[cnt].fd_device) != type)
 				continue;
-			__invalidate_device(bdev);
+			__invalidate_device(bdev, true);
 		}
 		mutex_unlock(&open_lock);
 	} else {
@@ -4231,7 +4232,7 @@ static int __init floppy_init(void)
 		err = -ENOMEM;
 		goto out_unreg_driver;
 	}
-	blk_queue_max_sectors(floppy_queue, 64);
+	blk_queue_max_hw_sectors(floppy_queue, 64);
 
 	blk_register_region(MKDEV(FLOPPY_MAJOR, 0), 256, THIS_MODULE,
 			    floppy_find, NULL, NULL);
@@ -4383,6 +4384,12 @@ out_unreg_blkdev:
 out_put_disk:
 	while (dr--) {
 		del_timer(&motor_off_timer[dr]);
+		if (disks[dr]->queue)
+			/*
+			 * put_disk() is not paired with add_disk() and
+			 * will put queue reference one extra time. fix it.
+			 */
+			disks[dr]->queue = NULL;
 		put_disk(disks[dr]);
 	}
 	return err;
@@ -4609,6 +4616,15 @@ static void __exit floppy_module_exit(void)
 			device_remove_file(&floppy_device[drive].dev, &dev_attr_cmos);
 			platform_device_unregister(&floppy_device[drive]);
 		}
+
+		/*
+		 * These disks have not called add_disk().  Don't put down
+		 * queue reference in put_disk().
+		 */
+		if (!(allowed_drive_mask & (1 << drive)) ||
+		    fdc_state[FDC(drive)].version == FDC_NONE)
+			disks[drive]->queue = NULL;
+
 		put_disk(disks[drive]);
 	}
 
@@ -4636,7 +4652,7 @@ static const struct pnp_device_id floppy_pnpids[] = {
 	{ "PNP0700", 0 },
 	{ }
 };
-MODULE_DEVICE_TABLE(pnp, floppy_pnpids);
+/* MODULE_DEVICE_TABLE(pnp, floppy_pnpids); */
 
 #else
 

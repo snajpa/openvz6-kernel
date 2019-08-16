@@ -68,6 +68,17 @@ struct tty_buffer {
 	unsigned long data[0];
 };
 
+/*
+ * We default to dicing tty buffer allocations to this many characters
+ * in order to avoid multiple page allocations. We know the size of
+ * tty_buffer itself but it must also be taken into account that the
+ * the buffer is 256 byte aligned. See tty_buffer_find for the allocation
+ * logic this must match
+ */
+
+#define TTY_BUFFER_PAGE	(((PAGE_SIZE - sizeof(struct tty_buffer)) / 2) & ~0xFF)
+
+
 struct tty_bufhead {
 	struct delayed_work work;
 	spinlock_t lock;
@@ -277,6 +288,9 @@ struct tty_struct {
 	unsigned char lnext:1, erasing:1, raw:1, real_raw:1, icanon:1;
 	unsigned char closing:1;
 	unsigned char echo_overrun:1;
+#ifndef __GENKSYMS__
+	char flow_change;
+#endif
 	unsigned short minimum_to_wake;
 	unsigned long overrun_time;
 	int num_overrun;
@@ -333,8 +347,24 @@ struct tty_struct {
 #define TTY_HUPPED 		18	/* Post driver->hangup() */
 #define TTY_FLUSHING		19	/* Flushing to ldisc in progress */
 #define TTY_FLUSHPENDING	20	/* Queued buffer flush pending */
+#define TTY_HUPPING 		21	/* ->hangup() in progress */
 
 #define TTY_WRITE_FLUSH(tty) tty_write_flush((tty))
+
+/* Values for tty->flow_change */
+#define TTY_THROTTLE_SAFE 1
+#define TTY_UNTHROTTLE_SAFE 2
+
+static inline void __tty_set_flow_change(struct tty_struct *tty, int val)
+{
+	tty->flow_change = val;
+}
+
+static inline void tty_set_flow_change(struct tty_struct *tty, int val)
+{
+	tty->flow_change = val;
+	smp_mb();
+}
 
 extern void tty_write_flush(struct tty_struct *);
 
@@ -385,6 +415,8 @@ extern int tty_write_room(struct tty_struct *tty);
 extern void tty_driver_flush_buffer(struct tty_struct *tty);
 extern void tty_throttle(struct tty_struct *tty);
 extern void tty_unthrottle(struct tty_struct *tty);
+extern int tty_throttle_safe(struct tty_struct *tty);
+extern int tty_unthrottle_safe(struct tty_struct *tty);
 extern int tty_do_resize(struct tty_struct *tty, struct winsize *ws);
 extern void tty_shutdown(struct tty_struct *tty);
 extern void tty_free_termios(struct tty_struct *tty);
@@ -494,8 +526,8 @@ extern void tty_audit_exit(void);
 extern void tty_audit_fork(struct signal_struct *sig);
 extern void tty_audit_tiocsti(struct tty_struct *tty, char ch);
 extern void tty_audit_push(struct tty_struct *tty);
-extern void tty_audit_push_task(struct task_struct *tsk,
-					uid_t loginuid, u32 sessionid);
+extern int tty_audit_push_task(struct task_struct *tsk,
+			       uid_t loginuid, u32 sessionid);
 #else
 static inline void tty_audit_add_data(struct tty_struct *tty,
 				      unsigned char *data, size_t size)
@@ -513,9 +545,10 @@ static inline void tty_audit_fork(struct signal_struct *sig)
 static inline void tty_audit_push(struct tty_struct *tty)
 {
 }
-static inline void tty_audit_push_task(struct task_struct *tsk,
-					uid_t loginuid, u32 sessionid)
+static inline int tty_audit_push_task(struct task_struct *tsk,
+				      uid_t loginuid, u32 sessionid)
 {
+	return 0;
 }
 #endif
 

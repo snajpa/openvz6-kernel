@@ -29,7 +29,7 @@
 #define SO_PRIORITY	12
 #define SO_LINGER	13
 #define SO_BSDCOMPAT	14
-/* To add :#define SO_REUSEPORT 15 */
+#define SO_REUSEPORT	15
 #define SO_RCVLOWAT	16
 #define SO_SNDLOWAT	17
 #define SO_RCVTIMEO	18
@@ -66,5 +66,10 @@
 
 #define SO_PROTOCOL		38
 #define SO_DOMAIN		39
+
+#define SO_RXQ_OVFL		40
+
+#define SO_BUSY_POLL		46
+#define SO_BPF_EXTENSIONS	48
 
 #endif	/* _ASM_POWERPC_SOCKET_H */

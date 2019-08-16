@@ -114,7 +114,7 @@ MODULE_PARM_DESC(enable, "Enable the EMU10K1X soundcard.");
 						 */
 #define PLAYBACK_LIST_SIZE	0x01		/* Size of list in bytes << 16. E.g. 8 periods -> 0x00380000  */
 #define PLAYBACK_LIST_PTR	0x02		/* Pointer to the current period being played */
-#define PLAYBACK_DMA_ADDR	0x04		/* Playback DMA addresss */
+#define PLAYBACK_DMA_ADDR	0x04		/* Playback DMA address */
 #define PLAYBACK_PERIOD_SIZE	0x05		/* Playback period size */
 #define PLAYBACK_POINTER	0x06		/* Playback period pointer. Sample currently in DAC */
 #define PLAYBACK_UNKNOWN1       0x07
@@ -1543,7 +1543,8 @@ static int __devinit snd_emu10k1x_probe(struct pci_dev *pci,
 		return -ENOENT;
 	}
 
-	err = snd_card_create(index[dev], id[dev], THIS_MODULE, 0, &card);
+	err = snd_card_new(&pci->dev, index[dev], id[dev], THIS_MODULE,
+			   0, &card);
 	if (err < 0)
 		return err;
 
@@ -1586,8 +1587,6 @@ static int __devinit snd_emu10k1x_probe(struct pci_dev *pci,
 	strcpy(card->shortname, "Dell Sound Blaster Live!");
 	sprintf(card->longname, "%s at 0x%lx irq %i",
 		card->shortname, chip->port, chip->irq);
-
-	snd_card_set_dev(card, &pci->dev);
 
 	if ((err = snd_card_register(card)) < 0) {
 		snd_card_free(card);

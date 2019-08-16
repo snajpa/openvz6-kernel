@@ -29,27 +29,42 @@
  *    Gareth Hughes <gareth@valinux.com>
  */
 
-#include "drmP.h"
-#include "drm.h"
-#include "mga_drm.h"
+#include <linux/module.h>
+
+#include <drm/drmP.h>
+#include <drm/mga_drm.h>
 #include "mga_drv.h"
 
-#include "drm_pciids.h"
+#include <drm/drm_pciids.h>
 
-static int mga_driver_device_is_agp(struct drm_device * dev);
+static int mga_driver_device_is_agp(struct drm_device *dev);
 
 static struct pci_device_id pciidlist[] = {
 	mga_PCI_IDS
 };
 
+static const struct file_operations mga_driver_fops = {
+	.owner = THIS_MODULE,
+	.open = drm_open,
+	.release = drm_release,
+	.unlocked_ioctl = drm_ioctl,
+	.mmap = drm_legacy_mmap,
+	.poll = drm_poll,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = mga_compat_ioctl,
+#endif
+	.llseek = noop_llseek,
+};
+
 static struct drm_driver driver = {
 	.driver_features =
-	    DRIVER_USE_AGP | DRIVER_USE_MTRR | DRIVER_PCI_DMA |
+	    DRIVER_USE_AGP | DRIVER_PCI_DMA |
 	    DRIVER_HAVE_DMA | DRIVER_HAVE_IRQ | DRIVER_IRQ_SHARED,
 	.dev_priv_size = sizeof(drm_mga_buf_priv_t),
 	.load = mga_driver_load,
 	.unload = mga_driver_unload,
 	.lastclose = mga_driver_lastclose,
+	.set_busid = drm_pci_set_busid,
 	.dma_quiescent = mga_driver_dma_quiescent,
 	.device_is_agp = mga_driver_device_is_agp,
 	.get_vblank_counter = mga_get_vblank_counter,
@@ -59,28 +74,9 @@ static struct drm_driver driver = {
 	.irq_postinstall = mga_driver_irq_postinstall,
 	.irq_uninstall = mga_driver_irq_uninstall,
 	.irq_handler = mga_driver_irq_handler,
-	.reclaim_buffers = drm_core_reclaim_buffers,
-	.get_map_ofs = drm_core_get_map_ofs,
-	.get_reg_ofs = drm_core_get_reg_ofs,
 	.ioctls = mga_ioctls,
 	.dma_ioctl = mga_dma_buffers,
-	.fops = {
-		.owner = THIS_MODULE,
-		.open = drm_open,
-		.release = drm_release,
-		.ioctl = drm_ioctl,
-		.mmap = drm_mmap,
-		.poll = drm_poll,
-		.fasync = drm_fasync,
-#ifdef CONFIG_COMPAT
-		.compat_ioctl = mga_compat_ioctl,
-#endif
-	},
-	.pci_driver = {
-		.name = DRIVER_NAME,
-		.id_table = pciidlist,
-	},
-
+	.fops = &mga_driver_fops,
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,
 	.date = DRIVER_DATE,
@@ -89,15 +85,20 @@ static struct drm_driver driver = {
 	.patchlevel = DRIVER_PATCHLEVEL,
 };
 
+static struct pci_driver mga_pci_driver = {
+	.name = DRIVER_NAME,
+	.id_table = pciidlist,
+};
+
 static int __init mga_init(void)
 {
 	driver.num_ioctls = mga_max_ioctl;
-	return drm_init(&driver);
+	return drm_pci_init(&driver, &mga_pci_driver);
 }
 
 static void __exit mga_exit(void)
 {
-	drm_exit(&driver);
+	drm_pci_exit(&driver, &mga_pci_driver);
 }
 
 module_init(mga_init);
@@ -119,7 +120,7 @@ MODULE_LICENSE("GPL and additional rights");
  * \returns
  * If the device is a PCI G450, zero is returned.  Otherwise 2 is returned.
  */
-static int mga_driver_device_is_agp(struct drm_device * dev)
+static int mga_driver_device_is_agp(struct drm_device *dev)
 {
 	const struct pci_dev *const pdev = dev->pdev;
 

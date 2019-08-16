@@ -6,6 +6,14 @@
 
 #define PGALLOC_GFP GFP_KERNEL | __GFP_NOTRACK | __GFP_REPEAT | __GFP_ZERO
 
+#ifdef CONFIG_HIGHPTE
+#define PGALLOC_USER_GFP __GFP_HIGHMEM
+#else
+#define PGALLOC_USER_GFP 0
+#endif
+
+gfp_t __userpte_alloc_gfp = PGALLOC_GFP | PGALLOC_USER_GFP;
+
 pte_t *pte_alloc_one_kernel(struct mm_struct *mm, unsigned long address)
 {
 	return (pte_t *)__get_free_page(PGALLOC_GFP);
@@ -15,15 +23,28 @@ pgtable_t pte_alloc_one(struct mm_struct *mm, unsigned long address)
 {
 	struct page *pte;
 
-#ifdef CONFIG_HIGHPTE
-	pte = alloc_pages(PGALLOC_GFP | __GFP_HIGHMEM, 0);
-#else
-	pte = alloc_pages(PGALLOC_GFP, 0);
-#endif
+	pte = alloc_pages(__userpte_alloc_gfp, 0);
 	if (pte)
 		pgtable_page_ctor(pte);
 	return pte;
 }
+
+static int __init setup_userpte(char *arg)
+{
+	if (!arg)
+		return -EINVAL;
+
+	/*
+	 * "userpte=nohigh" disables allocation of user pagetables in
+	 * high memory.
+	 */
+	if (strcmp(arg, "nohigh") == 0)
+		__userpte_alloc_gfp &= ~__GFP_HIGHMEM;
+	else
+		return -EINVAL;
+	return 0;
+}
+early_param("userpte", setup_userpte);
 
 void ___pte_free_tlb(struct mmu_gather *tlb, struct page *pte)
 {
@@ -65,7 +86,19 @@ static inline void pgd_list_del(pgd_t *pgd)
 #define UNSHARED_PTRS_PER_PGD				\
 	(SHARED_KERNEL_PMD ? KERNEL_PGD_BOUNDARY : PTRS_PER_PGD)
 
-static void pgd_ctor(pgd_t *pgd)
+
+static void pgd_set_mm(pgd_t *pgd, struct mm_struct *mm)
+{
+	BUILD_BUG_ON(sizeof(virt_to_page(pgd)->index) < sizeof(mm));
+	virt_to_page(pgd)->index = (pgoff_t)mm;
+}
+
+struct mm_struct *pgd_page_get_mm(struct page *page)
+{
+	return (struct mm_struct *)page->index;
+}
+
+static void pgd_ctor(struct mm_struct *mm, pgd_t *pgd)
 {
 	/* If the pgd points to a shared pagetable level (either the
 	   ptes in non-PAE, or shared PMD in PAE), then just copy the
@@ -83,20 +116,20 @@ static void pgd_ctor(pgd_t *pgd)
 	}
 
 	/* list required to sync kernel mapping updates */
-	if (!SHARED_KERNEL_PMD)
+	if (!SHARED_KERNEL_PMD) {
+		pgd_set_mm(pgd, mm);
 		pgd_list_add(pgd);
+	}
 }
 
 static void pgd_dtor(pgd_t *pgd)
 {
-	unsigned long flags; /* can be called from interrupt context */
-
 	if (SHARED_KERNEL_PMD)
 		return;
 
-	spin_lock_irqsave(&pgd_lock, flags);
+	spin_lock(&pgd_lock);
 	pgd_list_del(pgd);
-	spin_unlock_irqrestore(&pgd_lock, flags);
+	spin_unlock(&pgd_lock);
 }
 
 /*
@@ -138,8 +171,7 @@ void pud_populate(struct mm_struct *mm, pud_t *pudp, pmd_t *pmd)
 	 * section 8.1: in PAE mode we explicitly have to flush the
 	 * TLB via cr3 if the top-level pgd is changed...
 	 */
-	if (mm == current->active_mm)
-		write_cr3(read_cr3());
+	flush_tlb_mm(mm);
 }
 #else  /* !CONFIG_X86_PAE */
 
@@ -224,13 +256,23 @@ static void pgd_prepopulate_pmd(struct mm_struct *mm, pgd_t *pgd, pmd_t *pmds[])
 	}
 }
 
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+/*
+ * Instead of one pgd, we aquire two pgds.  Being order-1, it is
+ * both 8k in size and 8k-aligned.  That lets us just flip bit 12
+ * in a pointer to swap between the two 4k halves.
+ */
+#define PGD_ALLOCATION_ORDER 1
+#else
+#define PGD_ALLOCATION_ORDER 0
+#endif
+
 pgd_t *pgd_alloc(struct mm_struct *mm)
 {
 	pgd_t *pgd;
 	pmd_t *pmds[PREALLOCATED_PMDS];
-	unsigned long flags;
 
-	pgd = (pgd_t *)__get_free_page(PGALLOC_GFP);
+	pgd = (pgd_t *)__get_free_pages(PGALLOC_GFP, PGD_ALLOCATION_ORDER);
 
 	if (pgd == NULL)
 		goto out;
@@ -248,19 +290,19 @@ pgd_t *pgd_alloc(struct mm_struct *mm)
 	 * respect to anything walking the pgd_list, so that they
 	 * never see a partially populated pgd.
 	 */
-	spin_lock_irqsave(&pgd_lock, flags);
+	spin_lock(&pgd_lock);
 
-	pgd_ctor(pgd);
+	pgd_ctor(mm, pgd);
 	pgd_prepopulate_pmd(mm, pgd, pmds);
 
-	spin_unlock_irqrestore(&pgd_lock, flags);
+	spin_unlock(&pgd_lock);
 
 	return pgd;
 
 out_free_pmds:
 	free_pmds(pmds);
 out_free_pgd:
-	free_page((unsigned long)pgd);
+	free_pages((unsigned long)pgd, PGD_ALLOCATION_ORDER);
 out:
 	return NULL;
 }
@@ -270,7 +312,7 @@ void pgd_free(struct mm_struct *mm, pgd_t *pgd)
 	pgd_mop_up_pmds(mm, pgd);
 	pgd_dtor(pgd);
 	paravirt_pgd_free(mm, pgd);
-	free_page((unsigned long)pgd);
+	free_pages((unsigned long)pgd, PGD_ALLOCATION_ORDER);
 }
 
 int ptep_set_access_flags(struct vm_area_struct *vma,
@@ -288,6 +330,25 @@ int ptep_set_access_flags(struct vm_area_struct *vma,
 	return changed;
 }
 
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+int pmdp_set_access_flags(struct vm_area_struct *vma,
+			  unsigned long address, pmd_t *pmdp,
+			  pmd_t entry, int dirty)
+{
+	int changed = !pmd_same(*pmdp, entry);
+
+	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+
+	if (changed && dirty) {
+		*pmdp = entry;
+		pmd_update_defer(vma->vm_mm, address, pmdp);
+		flush_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
+	}
+
+	return changed;
+}
+#endif
+
 int ptep_test_and_clear_young(struct vm_area_struct *vma,
 			      unsigned long addr, pte_t *ptep)
 {
@@ -303,6 +364,23 @@ int ptep_test_and_clear_young(struct vm_area_struct *vma,
 	return ret;
 }
 
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+int pmdp_test_and_clear_young(struct vm_area_struct *vma,
+			      unsigned long addr, pmd_t *pmdp)
+{
+	int ret = 0;
+
+	if (pmd_young(*pmdp))
+		ret = test_and_clear_bit(_PAGE_BIT_ACCESSED,
+					 (unsigned long *) &pmdp->pmd);
+
+	if (ret)
+		pmd_update(vma->vm_mm, addr, pmdp);
+
+	return ret;
+}
+#endif
+
 int ptep_clear_flush_young(struct vm_area_struct *vma,
 			   unsigned long address, pte_t *ptep)
 {
@@ -314,6 +392,36 @@ int ptep_clear_flush_young(struct vm_area_struct *vma,
 
 	return young;
 }
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+int pmdp_clear_flush_young(struct vm_area_struct *vma,
+			   unsigned long address, pmd_t *pmdp)
+{
+	int young;
+
+	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+
+	young = pmdp_test_and_clear_young(vma, address, pmdp);
+	if (young)
+		flush_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
+
+	return young;
+}
+
+void pmdp_splitting_flush(struct vm_area_struct *vma,
+			  unsigned long address, pmd_t *pmdp)
+{
+	int set;
+	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+	set = !test_and_set_bit(_PAGE_BIT_SPLITTING,
+				(unsigned long *)&pmdp->pmd);
+	if (set) {
+		pmd_update(vma->vm_mm, address, pmdp);
+		/* need tlb flush only to serialize against gup-fast */
+		flush_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
+	}
+}
+#endif
 
 /**
  * reserve_top_address - reserves a hole in the top of kernel address space

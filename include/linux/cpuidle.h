@@ -17,7 +17,7 @@
 #include <linux/kobject.h>
 #include <linux/completion.h>
 
-#define CPUIDLE_STATE_MAX	8
+#define CPUIDLE_STATE_MAX	10
 #define CPUIDLE_NAME_LEN	16
 #define CPUIDLE_DESC_LEN	32
 
@@ -28,21 +28,24 @@ struct cpuidle_device;
  * CPUIDLE DEVICE INTERFACE *
  ****************************/
 
+struct cpuidle_state_usage {
+	void		*driver_data;
+
+	unsigned long long	usage;
+	unsigned long long	time; /* in US */
+};
+
 struct cpuidle_state {
 	char		name[CPUIDLE_NAME_LEN];
 	char		desc[CPUIDLE_DESC_LEN];
-	void		*driver_data;
 
 	unsigned int	flags;
 	unsigned int	exit_latency; /* in US */
 	unsigned int	power_usage; /* in mW */
 	unsigned int	target_residency; /* in US */
 
-	unsigned long long	usage;
-	unsigned long long	time; /* in US */
-
 	int (*enter)	(struct cpuidle_device *dev,
-			 struct cpuidle_state *state);
+			int index);
 };
 
 /* Idle State Flags */
@@ -57,26 +60,27 @@ struct cpuidle_state {
 
 /**
  * cpuidle_get_statedata - retrieves private driver state data
- * @state: the state
+ * @st_usage: the state usage statistics
  */
-static inline void * cpuidle_get_statedata(struct cpuidle_state *state)
+static inline void *cpuidle_get_statedata(struct cpuidle_state_usage *st_usage)
 {
-	return state->driver_data;
+	return st_usage->driver_data;
 }
 
 /**
  * cpuidle_set_statedata - stores private driver state data
- * @state: the state
+ * @st_usage: the state usage statistics
  * @data: the private data
  */
 static inline void
-cpuidle_set_statedata(struct cpuidle_state *state, void *data)
+cpuidle_set_statedata(struct cpuidle_state_usage *st_usage, void *data)
 {
-	state->driver_data = data;
+	st_usage->driver_data = data;
 }
 
 struct cpuidle_state_kobj {
 	struct cpuidle_state *state;
+	struct cpuidle_state_usage *state_usage;
 	struct completion kobj_unregister;
 	struct kobject kobj;
 };
@@ -89,14 +93,16 @@ struct cpuidle_device {
 	int			last_residency;
 	int			state_count;
 	struct cpuidle_state	states[CPUIDLE_STATE_MAX];
+	struct cpuidle_state_usage	states_usage[CPUIDLE_STATE_MAX];
 	struct cpuidle_state_kobj *kobjs[CPUIDLE_STATE_MAX];
-	struct cpuidle_state	*last_state;
 
 	struct list_head 	device_list;
 	struct kobject		kobj;
 	struct completion	kobj_unregister;
 	void			*governor_data;
-	struct cpuidle_state	*safe_state;
+	int			safe_state_index;
+
+	int (*prepare)		(struct cpuidle_device *dev);
 };
 
 DECLARE_PER_CPU(struct cpuidle_device *, cpuidle_devices);
@@ -125,6 +131,7 @@ struct cpuidle_driver {
 #ifdef CONFIG_CPU_IDLE
 
 extern int cpuidle_register_driver(struct cpuidle_driver *drv);
+struct cpuidle_driver *cpuidle_get_driver(void);
 extern void cpuidle_unregister_driver(struct cpuidle_driver *drv);
 extern int cpuidle_register_device(struct cpuidle_device *dev);
 extern void cpuidle_unregister_device(struct cpuidle_device *dev);
@@ -138,6 +145,7 @@ extern void cpuidle_disable_device(struct cpuidle_device *dev);
 
 static inline int cpuidle_register_driver(struct cpuidle_driver *drv)
 {return 0;}
+static inline struct cpuidle_driver *cpuidle_get_driver(void) {return NULL; }
 static inline void cpuidle_unregister_driver(struct cpuidle_driver *drv) { }
 static inline int cpuidle_register_device(struct cpuidle_device *dev)
 {return 0;}
@@ -164,7 +172,7 @@ struct cpuidle_governor {
 	void (*disable)		(struct cpuidle_device *dev);
 
 	int  (*select)		(struct cpuidle_device *dev);
-	void (*reflect)		(struct cpuidle_device *dev);
+	void (*reflect)		(struct cpuidle_device *dev, int index);
 
 	struct module 		*owner;
 };

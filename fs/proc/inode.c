@@ -7,6 +7,7 @@
 #include <linux/time.h>
 #include <linux/proc_fs.h>
 #include <linux/kernel.h>
+#include <linux/pid_namespace.h>
 #include <linux/mm.h>
 #include <linux/string.h>
 #include <linux/stat.h>
@@ -18,6 +19,8 @@
 #include <linux/module.h>
 #include <linux/smp_lock.h>
 #include <linux/sysctl.h>
+#include <linux/seq_file.h>
+#include <linux/mount.h>
 
 #include <asm/system.h>
 #include <asm/uaccess.h>
@@ -50,6 +53,8 @@ void de_put(struct proc_dir_entry *de)
 static void proc_delete_inode(struct inode *inode)
 {
 	struct proc_dir_entry *de;
+	const struct proc_ns_operations *ns_ops;
+	void *ns;
 
 	truncate_inode_pages(&inode->i_data, 0);
 
@@ -63,6 +68,11 @@ static void proc_delete_inode(struct inode *inode)
 	if (PROC_I(inode)->sysctl)
 		sysctl_head_put(PROC_I(inode)->sysctl);
 	clear_inode(inode);
+	/* Release any associated namespace */
+	ns_ops = PROC_I(inode)->ns_ops;
+	ns = PROC_I(inode)->ns;
+	if (ns_ops && ns)
+		ns_ops->put(ns);
 }
 
 struct vfsmount *proc_mnt;
@@ -83,6 +93,8 @@ static struct inode *proc_alloc_inode(struct super_block *sb)
 	ei->pde = NULL;
 	ei->sysctl = NULL;
 	ei->sysctl_entry = NULL;
+	ei->ns = NULL;
+	ei->ns_ops = NULL;
 	inode = &ei->vfs_inode;
 	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
 	return inode;
@@ -109,12 +121,26 @@ void __init proc_init_inodecache(void)
 					     init_once);
 }
 
+static int proc_show_options(struct seq_file *seq, struct vfsmount *mnt)
+{
+	struct pid_namespace *pid = mnt->mnt_sb->s_fs_info;
+
+	if (pid->pid_gid)
+		seq_printf(seq, ",gid=%lu", (unsigned long)pid->pid_gid);
+	if (pid->hide_pid != 0)
+		seq_printf(seq, ",hidepid=%u", pid->hide_pid);
+
+	return 0;
+}
+
 static const struct super_operations proc_sops = {
 	.alloc_inode	= proc_alloc_inode,
 	.destroy_inode	= proc_destroy_inode,
 	.drop_inode	= generic_delete_inode,
 	.delete_inode	= proc_delete_inode,
 	.statfs		= simple_statfs,
+	.remount_fs	= proc_remount,
+	.show_options	= proc_show_options,
 };
 
 static void __pde_users_dec(struct proc_dir_entry *pde)
@@ -335,7 +361,7 @@ static int proc_reg_open(struct inode *inode, struct file *file)
 	if (!pde->proc_fops) {
 		spin_unlock(&pde->pde_unload_lock);
 		kfree(pdeo);
-		return -EINVAL;
+		return -ENOENT;
 	}
 	pde->pde_users++;
 	open = pde->proc_fops->open;

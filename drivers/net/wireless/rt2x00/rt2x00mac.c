@@ -1,5 +1,5 @@
 /*
-	Copyright (C) 2004 - 2009 rt2x00 SourceForge Project
+	Copyright (C) 2004 - 2009 Ivo van Doorn <IvDoorn@gmail.com>
 	<http://rt2x00.serialmonkey.com>
 
 	This program is free software; you can redistribute it and/or modify
@@ -13,9 +13,7 @@
 	GNU General Public License for more details.
 
 	You should have received a copy of the GNU General Public License
-	along with this program; if not, write to the
-	Free Software Foundation, Inc.,
-	59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+	along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
 /*
@@ -46,7 +44,7 @@ static int rt2x00mac_tx_rts_cts(struct rt2x00_dev *rt2x00dev,
 
 	skb = dev_alloc_skb(data_length + rt2x00dev->hw->extra_tx_headroom);
 	if (unlikely(!skb)) {
-		WARNING(rt2x00dev, "Failed to create RTS/CTS frame.\n");
+		rt2x00_warn(rt2x00dev, "Failed to create RTS/CTS frame\n");
 		return -ENOMEM;
 	}
 
@@ -66,7 +64,6 @@ static int rt2x00mac_tx_rts_cts(struct rt2x00_dev *rt2x00dev,
 	rts_info = IEEE80211_SKB_CB(skb);
 	rts_info->control.rates[0].flags &= ~IEEE80211_TX_RC_USE_RTS_CTS;
 	rts_info->control.rates[0].flags &= ~IEEE80211_TX_RC_USE_CTS_PROTECT;
-	rts_info->flags &= ~IEEE80211_TX_CTL_REQ_TX_STATUS;
 
 	if (tx_info->control.rates[0].flags & IEEE80211_TX_RC_USE_CTS_PROTECT)
 		rts_info->flags |= IEEE80211_TX_CTL_NO_ACK;
@@ -91,23 +88,23 @@ static int rt2x00mac_tx_rts_cts(struct rt2x00_dev *rt2x00dev,
 				  frag_skb->data, data_length, tx_info,
 				  (struct ieee80211_rts *)(skb->data));
 
-	retval = rt2x00queue_write_tx_frame(queue, skb);
+	retval = rt2x00queue_write_tx_frame(queue, skb, NULL, true);
 	if (retval) {
 		dev_kfree_skb_any(skb);
-		WARNING(rt2x00dev, "Failed to send RTS/CTS frame.\n");
+		rt2x00_warn(rt2x00dev, "Failed to send RTS/CTS frame\n");
 	}
 
 	return retval;
 }
 
-int rt2x00mac_tx(struct ieee80211_hw *hw, struct sk_buff *skb)
+void rt2x00mac_tx(struct ieee80211_hw *hw,
+		  struct ieee80211_tx_control *control,
+		  struct sk_buff *skb)
 {
 	struct rt2x00_dev *rt2x00dev = hw->priv;
 	struct ieee80211_tx_info *tx_info = IEEE80211_SKB_CB(skb);
-	struct ieee80211_hdr *ieee80211hdr = (struct ieee80211_hdr *)skb->data;
 	enum data_queue_qid qid = skb_get_queue_mapping(skb);
-	struct data_queue *queue;
-	u16 frame_control;
+	struct data_queue *queue = NULL;
 
 	/*
 	 * Mac80211 might be calling this function while we are trying
@@ -116,21 +113,21 @@ int rt2x00mac_tx(struct ieee80211_hw *hw, struct sk_buff *skb)
 	 * due to possible race conditions in mac80211.
 	 */
 	if (!test_bit(DEVICE_STATE_PRESENT, &rt2x00dev->flags))
-		goto exit_fail;
+		goto exit_free_skb;
 
 	/*
-	 * Determine which queue to put packet on.
+	 * Use the ATIM queue if appropriate and present.
 	 */
 	if (tx_info->flags & IEEE80211_TX_CTL_SEND_AFTER_DTIM &&
-	    test_bit(DRIVER_REQUIRE_ATIM_QUEUE, &rt2x00dev->flags))
-		queue = rt2x00queue_get_queue(rt2x00dev, QID_ATIM);
-	else
-		queue = rt2x00queue_get_queue(rt2x00dev, qid);
+	    rt2x00_has_cap_flag(rt2x00dev, REQUIRE_ATIM_QUEUE))
+		qid = QID_ATIM;
+
+	queue = rt2x00queue_get_tx_queue(rt2x00dev, qid);
 	if (unlikely(!queue)) {
-		ERROR(rt2x00dev,
-		      "Attempt to send packet over invalid queue %d.\n"
-		      "Please file bug report to %s.\n", qid, DRV_PROJECT);
-		goto exit_fail;
+		rt2x00_err(rt2x00dev,
+			   "Attempt to send packet over invalid queue %d\n"
+			   "Please file bug report to %s\n", qid, DRV_PROJECT);
+		goto exit_free_skb;
 	}
 
 	/*
@@ -142,10 +139,9 @@ int rt2x00mac_tx(struct ieee80211_hw *hw, struct sk_buff *skb)
 	 * either RTS or CTS-to-self frame and handles everything
 	 * inside the hardware.
 	 */
-	frame_control = le16_to_cpu(ieee80211hdr->frame_control);
-	if ((tx_info->control.rates[0].flags & (IEEE80211_TX_RC_USE_RTS_CTS |
-						IEEE80211_TX_RC_USE_CTS_PROTECT)) &&
-	    !rt2x00dev->ops->hw->set_rts_threshold) {
+	if (!rt2x00dev->ops->hw->set_rts_threshold &&
+	    (tx_info->control.rates[0].flags & (IEEE80211_TX_RC_USE_RTS_CTS |
+						IEEE80211_TX_RC_USE_CTS_PROTECT))) {
 		if (rt2x00queue_available(queue) <= 1)
 			goto exit_fail;
 
@@ -153,18 +149,27 @@ int rt2x00mac_tx(struct ieee80211_hw *hw, struct sk_buff *skb)
 			goto exit_fail;
 	}
 
-	if (rt2x00queue_write_tx_frame(queue, skb))
+	if (unlikely(rt2x00queue_write_tx_frame(queue, skb, control->sta, false)))
 		goto exit_fail;
 
+	/*
+	 * Pausing queue has to be serialized with rt2x00lib_txdone(). Note
+	 * we should not use spin_lock_bh variant as bottom halve was already
+	 * disabled before ieee80211_xmit() call.
+	 */
+	spin_lock(&queue->tx_lock);
 	if (rt2x00queue_threshold(queue))
-		ieee80211_stop_queue(rt2x00dev->hw, qid);
+		rt2x00queue_pause_queue(queue);
+	spin_unlock(&queue->tx_lock);
 
-	return NETDEV_TX_OK;
+	return;
 
  exit_fail:
-	ieee80211_stop_queue(rt2x00dev->hw, qid);
-	dev_kfree_skb_any(skb);
-	return NETDEV_TX_OK;
+	spin_lock(&queue->tx_lock);
+	rt2x00queue_pause_queue(queue);
+	spin_unlock(&queue->tx_lock);
+ exit_free_skb:
+	ieee80211_free_txskb(hw, skb);
 }
 EXPORT_SYMBOL_GPL(rt2x00mac_tx);
 
@@ -191,11 +196,11 @@ void rt2x00mac_stop(struct ieee80211_hw *hw)
 EXPORT_SYMBOL_GPL(rt2x00mac_stop);
 
 int rt2x00mac_add_interface(struct ieee80211_hw *hw,
-			    struct ieee80211_if_init_conf *conf)
+			    struct ieee80211_vif *vif)
 {
 	struct rt2x00_dev *rt2x00dev = hw->priv;
-	struct rt2x00_intf *intf = vif_to_intf(conf->vif);
-	struct data_queue *queue = rt2x00queue_get_queue(rt2x00dev, QID_BEACON);
+	struct rt2x00_intf *intf = vif_to_intf(vif);
+	struct data_queue *queue = rt2x00dev->bcn;
 	struct queue_entry *entry = NULL;
 	unsigned int i;
 
@@ -206,46 +211,6 @@ int rt2x00mac_add_interface(struct ieee80211_hw *hw,
 	if (!test_bit(DEVICE_STATE_PRESENT, &rt2x00dev->flags) ||
 	    !test_bit(DEVICE_STATE_STARTED, &rt2x00dev->flags))
 		return -ENODEV;
-
-	switch (conf->type) {
-	case NL80211_IFTYPE_AP:
-		/*
-		 * We don't support mixed combinations of
-		 * sta and ap interfaces.
-		 */
-		if (rt2x00dev->intf_sta_count)
-			return -ENOBUFS;
-
-		/*
-		 * Check if we exceeded the maximum amount
-		 * of supported interfaces.
-		 */
-		if (rt2x00dev->intf_ap_count >= rt2x00dev->ops->max_ap_intf)
-			return -ENOBUFS;
-
-		break;
-	case NL80211_IFTYPE_STATION:
-	case NL80211_IFTYPE_ADHOC:
-	case NL80211_IFTYPE_MESH_POINT:
-	case NL80211_IFTYPE_WDS:
-		/*
-		 * We don't support mixed combinations of
-		 * sta and ap interfaces.
-		 */
-		if (rt2x00dev->intf_ap_count)
-			return -ENOBUFS;
-
-		/*
-		 * Check if we exceeded the maximum amount
-		 * of supported interfaces.
-		 */
-		if (rt2x00dev->intf_sta_count >= rt2x00dev->ops->max_sta_intf)
-			return -ENOBUFS;
-
-		break;
-	default:
-		return -EINVAL;
-	}
 
 	/*
 	 * Loop through all beacon queues to find a free
@@ -267,26 +232,25 @@ int rt2x00mac_add_interface(struct ieee80211_hw *hw,
 	 * increase interface count and start initialization.
 	 */
 
-	if (conf->type == NL80211_IFTYPE_AP)
+	if (vif->type == NL80211_IFTYPE_AP)
 		rt2x00dev->intf_ap_count++;
 	else
 		rt2x00dev->intf_sta_count++;
 
-	spin_lock_init(&intf->lock);
-	spin_lock_init(&intf->seqlock);
 	mutex_init(&intf->beacon_skb_mutex);
 	intf->beacon = entry;
 
-	if (conf->type == NL80211_IFTYPE_AP)
-		memcpy(&intf->bssid, conf->mac_addr, ETH_ALEN);
-	memcpy(&intf->mac, conf->mac_addr, ETH_ALEN);
-
 	/*
-	 * The MAC adddress must be configured after the device
+	 * The MAC address must be configured after the device
 	 * has been initialized. Otherwise the device can reset
 	 * the MAC registers.
+	 * The BSSID address must only be configured in AP mode,
+	 * however we should not send an empty BSSID address for
+	 * STA interfaces at this time, since this can cause
+	 * invalid behavior in the device.
 	 */
-	rt2x00lib_config_intf(rt2x00dev, intf, conf->type, intf->mac, NULL);
+	rt2x00lib_config_intf(rt2x00dev, intf, vif->type,
+			      vif->addr, NULL);
 
 	/*
 	 * Some filters depend on the current working mode. We can force
@@ -300,10 +264,10 @@ int rt2x00mac_add_interface(struct ieee80211_hw *hw,
 EXPORT_SYMBOL_GPL(rt2x00mac_add_interface);
 
 void rt2x00mac_remove_interface(struct ieee80211_hw *hw,
-				struct ieee80211_if_init_conf *conf)
+				struct ieee80211_vif *vif)
 {
 	struct rt2x00_dev *rt2x00dev = hw->priv;
-	struct rt2x00_intf *intf = vif_to_intf(conf->vif);
+	struct rt2x00_intf *intf = vif_to_intf(vif);
 
 	/*
 	 * Don't allow interfaces to be remove while
@@ -311,11 +275,11 @@ void rt2x00mac_remove_interface(struct ieee80211_hw *hw,
 	 * no interface is present.
 	 */
 	if (!test_bit(DEVICE_STATE_PRESENT, &rt2x00dev->flags) ||
-	    (conf->type == NL80211_IFTYPE_AP && !rt2x00dev->intf_ap_count) ||
-	    (conf->type != NL80211_IFTYPE_AP && !rt2x00dev->intf_sta_count))
+	    (vif->type == NL80211_IFTYPE_AP && !rt2x00dev->intf_ap_count) ||
+	    (vif->type != NL80211_IFTYPE_AP && !rt2x00dev->intf_sta_count))
 		return;
 
-	if (conf->type == NL80211_IFTYPE_AP)
+	if (vif->type == NL80211_IFTYPE_AP)
 		rt2x00dev->intf_ap_count--;
 	else
 		rt2x00dev->intf_sta_count--;
@@ -350,9 +314,11 @@ int rt2x00mac_config(struct ieee80211_hw *hw, u32 changed)
 	/*
 	 * Some configuration parameters (e.g. channel and antenna values) can
 	 * only be set when the radio is enabled, but do require the RX to
-	 * be off.
+	 * be off. During this period we should keep link tuning enabled,
+	 * if for any reason the link tuner must be reset, this will be
+	 * handled by rt2x00lib_config().
 	 */
-	rt2x00lib_toggle_rx(rt2x00dev, STATE_RADIO_RX_OFF);
+	rt2x00queue_stop_queue(rt2x00dev->rx);
 
 	/*
 	 * When we've just turned on the radio, we want to reprogram
@@ -370,7 +336,7 @@ int rt2x00mac_config(struct ieee80211_hw *hw, u32 changed)
 	rt2x00lib_config_antenna(rt2x00dev, rt2x00dev->default_ant);
 
 	/* Turn RX back on */
-	rt2x00lib_toggle_rx(rt2x00dev, STATE_RADIO_RX_ON);
+	rt2x00queue_start_queue(rt2x00dev->rx);
 
 	return 0;
 }
@@ -393,8 +359,7 @@ void rt2x00mac_configure_filter(struct ieee80211_hw *hw,
 	    FIF_PLCPFAIL |
 	    FIF_CONTROL |
 	    FIF_PSPOLL |
-	    FIF_OTHER_BSS |
-	    FIF_PROMISC_IN_BSS;
+	    FIF_OTHER_BSS;
 
 	/*
 	 * Apply some rules to the filters:
@@ -403,9 +368,6 @@ void rt2x00mac_configure_filter(struct ieee80211_hw *hw,
 	 * - Multicast filter seems to kill broadcast traffic so never use it.
 	 */
 	*total_flags |= FIF_ALLMULTI;
-	if (*total_flags & FIF_OTHER_BSS ||
-	    *total_flags & FIF_PROMISC_IN_BSS)
-		*total_flags |= FIF_PROMISC_IN_BSS | FIF_OTHER_BSS;
 
 	/*
 	 * If the device has a single filter for all control frames,
@@ -414,11 +376,11 @@ void rt2x00mac_configure_filter(struct ieee80211_hw *hw,
 	 * of different types, but has no a separate filter for PS Poll frames,
 	 * FIF_CONTROL flag implies FIF_PSPOLL.
 	 */
-	if (!test_bit(DRIVER_SUPPORT_CONTROL_FILTERS, &rt2x00dev->flags)) {
+	if (!rt2x00_has_cap_control_filters(rt2x00dev)) {
 		if (*total_flags & FIF_CONTROL || *total_flags & FIF_PSPOLL)
 			*total_flags |= FIF_CONTROL | FIF_PSPOLL;
 	}
-	if (!test_bit(DRIVER_SUPPORT_CONTROL_FILTER_PSPOLL, &rt2x00dev->flags)) {
+	if (!rt2x00_has_cap_control_filter_pspoll(rt2x00dev)) {
 		if (*total_flags & FIF_CONTROL)
 			*total_flags |= FIF_PSPOLL;
 	}
@@ -434,12 +396,34 @@ void rt2x00mac_configure_filter(struct ieee80211_hw *hw,
 }
 EXPORT_SYMBOL_GPL(rt2x00mac_configure_filter);
 
+static void rt2x00mac_set_tim_iter(void *data, u8 *mac,
+				   struct ieee80211_vif *vif)
+{
+	struct rt2x00_intf *intf = vif_to_intf(vif);
+
+	if (vif->type != NL80211_IFTYPE_AP &&
+	    vif->type != NL80211_IFTYPE_ADHOC &&
+	    vif->type != NL80211_IFTYPE_MESH_POINT &&
+	    vif->type != NL80211_IFTYPE_WDS)
+		return;
+
+	set_bit(DELAYED_UPDATE_BEACON, &intf->delayed_flags);
+}
+
 int rt2x00mac_set_tim(struct ieee80211_hw *hw, struct ieee80211_sta *sta,
 		      bool set)
 {
 	struct rt2x00_dev *rt2x00dev = hw->priv;
 
-	rt2x00lib_beacondone(rt2x00dev);
+	if (!test_bit(DEVICE_STATE_ENABLED_RADIO, &rt2x00dev->flags))
+		return 0;
+
+	ieee80211_iterate_active_interfaces_atomic(
+		rt2x00dev->hw, IEEE80211_IFACE_ITER_RESUME_ALL,
+		rt2x00mac_set_tim_iter, rt2x00dev);
+
+	/* queue work to upodate the beacon template */
+	ieee80211_queue_work(rt2x00dev->hw, &rt2x00dev->intf_work);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(rt2x00mac_set_tim);
@@ -448,17 +432,17 @@ EXPORT_SYMBOL_GPL(rt2x00mac_set_tim);
 static void memcpy_tkip(struct rt2x00lib_crypto *crypto, u8 *key, u8 key_len)
 {
 	if (key_len > NL80211_TKIP_DATA_OFFSET_ENCR_KEY)
-		memcpy(&crypto->key,
+		memcpy(crypto->key,
 		       &key[NL80211_TKIP_DATA_OFFSET_ENCR_KEY],
 		       sizeof(crypto->key));
 
 	if (key_len > NL80211_TKIP_DATA_OFFSET_TX_MIC_KEY)
-		memcpy(&crypto->tx_mic,
+		memcpy(crypto->tx_mic,
 		       &key[NL80211_TKIP_DATA_OFFSET_TX_MIC_KEY],
 		       sizeof(crypto->tx_mic));
 
 	if (key_len > NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY)
-		memcpy(&crypto->rx_mic,
+		memcpy(crypto->rx_mic,
 		       &key[NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY],
 		       sizeof(crypto->rx_mic));
 }
@@ -468,49 +452,53 @@ int rt2x00mac_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 		      struct ieee80211_key_conf *key)
 {
 	struct rt2x00_dev *rt2x00dev = hw->priv;
-	struct rt2x00_intf *intf = vif_to_intf(vif);
 	int (*set_key) (struct rt2x00_dev *rt2x00dev,
 			struct rt2x00lib_crypto *crypto,
 			struct ieee80211_key_conf *key);
 	struct rt2x00lib_crypto crypto;
 	static const u8 bcast_addr[ETH_ALEN] =
 		{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, };
+	struct rt2x00_sta *sta_priv = NULL;
 
 	if (!test_bit(DEVICE_STATE_PRESENT, &rt2x00dev->flags))
 		return 0;
-	else if (!test_bit(CONFIG_SUPPORT_HW_CRYPTO, &rt2x00dev->flags))
+
+	if (!rt2x00_has_cap_hw_crypto(rt2x00dev))
 		return -EOPNOTSUPP;
-	else if (key->keylen > 32)
+
+	/*
+	 * To support IBSS RSN, don't program group keys in IBSS, the
+	 * hardware will then not attempt to decrypt the frames.
+	 */
+	if (vif->type == NL80211_IFTYPE_ADHOC &&
+	    !(key->flags & IEEE80211_KEY_FLAG_PAIRWISE))
+		return -EOPNOTSUPP;
+
+	if (key->keylen > 32)
 		return -ENOSPC;
 
 	memset(&crypto, 0, sizeof(crypto));
 
-	/*
-	 * When in STA mode, bssidx is always 0 otherwise local_address[5]
-	 * contains the bss number, see BSS_ID_MASK comments for details.
-	 */
-	if (rt2x00dev->intf_sta_count)
-		crypto.bssidx = 0;
-	else
-		crypto.bssidx = intf->mac[5] & (rt2x00dev->ops->max_ap_intf - 1);
-
+	crypto.bssidx = rt2x00lib_get_bssidx(rt2x00dev, vif);
 	crypto.cipher = rt2x00crypto_key_to_cipher(key);
 	if (crypto.cipher == CIPHER_NONE)
+		return -EOPNOTSUPP;
+	if (crypto.cipher == CIPHER_TKIP && rt2x00_is_usb(rt2x00dev))
 		return -EOPNOTSUPP;
 
 	crypto.cmd = cmd;
 
 	if (sta) {
-		/* some drivers need the AID */
-		crypto.aid = sta->aid;
 		crypto.address = sta->addr;
+		sta_priv = sta_to_rt2x00_sta(sta);
+		crypto.wcid = sta_priv->wcid;
 	} else
 		crypto.address = bcast_addr;
 
 	if (crypto.cipher == CIPHER_TKIP)
 		memcpy_tkip(&crypto, &key->key[0], key->keylen);
 	else
-		memcpy(&crypto.key, &key->key[0], key->keylen);
+		memcpy(crypto.key, &key->key[0], key->keylen);
 	/*
 	 * Each BSS has a maximum of 4 shared keys.
 	 * Shared key index values:
@@ -543,6 +531,44 @@ int rt2x00mac_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 EXPORT_SYMBOL_GPL(rt2x00mac_set_key);
 #endif /* CONFIG_RT2X00_LIB_CRYPTO */
 
+int rt2x00mac_sta_add(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+		      struct ieee80211_sta *sta)
+{
+	struct rt2x00_dev *rt2x00dev = hw->priv;
+
+	return rt2x00dev->ops->lib->sta_add(rt2x00dev, vif, sta);
+}
+EXPORT_SYMBOL_GPL(rt2x00mac_sta_add);
+
+int rt2x00mac_sta_remove(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+			 struct ieee80211_sta *sta)
+{
+	struct rt2x00_dev *rt2x00dev = hw->priv;
+	struct rt2x00_sta *sta_priv = sta_to_rt2x00_sta(sta);
+
+	return rt2x00dev->ops->lib->sta_remove(rt2x00dev, sta_priv->wcid);
+}
+EXPORT_SYMBOL_GPL(rt2x00mac_sta_remove);
+
+void rt2x00mac_sw_scan_start(struct ieee80211_hw *hw,
+			     struct ieee80211_vif *vif,
+			     const u8 *mac_addr)
+{
+	struct rt2x00_dev *rt2x00dev = hw->priv;
+	set_bit(DEVICE_STATE_SCANNING, &rt2x00dev->flags);
+	rt2x00link_stop_tuner(rt2x00dev);
+}
+EXPORT_SYMBOL_GPL(rt2x00mac_sw_scan_start);
+
+void rt2x00mac_sw_scan_complete(struct ieee80211_hw *hw,
+				struct ieee80211_vif *vif)
+{
+	struct rt2x00_dev *rt2x00dev = hw->priv;
+	clear_bit(DEVICE_STATE_SCANNING, &rt2x00dev->flags);
+	rt2x00link_start_tuner(rt2x00dev);
+}
+EXPORT_SYMBOL_GPL(rt2x00mac_sw_scan_complete);
+
 int rt2x00mac_get_stats(struct ieee80211_hw *hw,
 			struct ieee80211_low_level_stats *stats)
 {
@@ -559,22 +585,6 @@ int rt2x00mac_get_stats(struct ieee80211_hw *hw,
 }
 EXPORT_SYMBOL_GPL(rt2x00mac_get_stats);
 
-int rt2x00mac_get_tx_stats(struct ieee80211_hw *hw,
-			   struct ieee80211_tx_queue_stats *stats)
-{
-	struct rt2x00_dev *rt2x00dev = hw->priv;
-	unsigned int i;
-
-	for (i = 0; i < rt2x00dev->ops->tx_queues; i++) {
-		stats[i].len = rt2x00dev->tx[i].length;
-		stats[i].limit = rt2x00dev->tx[i].limit;
-		stats[i].count = rt2x00dev->tx[i].count;
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(rt2x00mac_get_tx_stats);
-
 void rt2x00mac_bss_info_changed(struct ieee80211_hw *hw,
 				struct ieee80211_vif *vif,
 				struct ieee80211_bss_conf *bss_conf,
@@ -582,7 +592,6 @@ void rt2x00mac_bss_info_changed(struct ieee80211_hw *hw,
 {
 	struct rt2x00_dev *rt2x00dev = hw->priv;
 	struct rt2x00_intf *intf = vif_to_intf(vif);
-	int update_bssid = 0;
 
 	/*
 	 * mac80211 might be calling this function while we are trying
@@ -591,35 +600,55 @@ void rt2x00mac_bss_info_changed(struct ieee80211_hw *hw,
 	if (!test_bit(DEVICE_STATE_PRESENT, &rt2x00dev->flags))
 		return;
 
-	spin_lock(&intf->lock);
-
 	/*
-	 * conf->bssid can be NULL if coming from the internal
-	 * beacon update routine.
-	 */
-	if (changes & BSS_CHANGED_BSSID) {
-		update_bssid = 1;
-		memcpy(&intf->bssid, bss_conf->bssid, ETH_ALEN);
-	}
-
-	spin_unlock(&intf->lock);
-
-	/*
-	 * Call rt2x00_config_intf() outside of the spinlock context since
-	 * the call will sleep for USB drivers. By using the ieee80211_if_conf
-	 * values as arguments we make keep access to rt2x00_intf thread safe
-	 * even without the lock.
+	 * Update the BSSID.
 	 */
 	if (changes & BSS_CHANGED_BSSID)
 		rt2x00lib_config_intf(rt2x00dev, intf, vif->type, NULL,
-				      update_bssid ? bss_conf->bssid : NULL);
+				      bss_conf->bssid);
 
 	/*
-	 * Update the beacon.
+	 * Start/stop beaconing.
 	 */
-	if (changes & (BSS_CHANGED_BEACON | BSS_CHANGED_BEACON_ENABLED))
-		rt2x00queue_update_beacon(rt2x00dev, vif,
-					  bss_conf->enable_beacon);
+	if (changes & BSS_CHANGED_BEACON_ENABLED) {
+		mutex_lock(&intf->beacon_skb_mutex);
+		if (!bss_conf->enable_beacon && intf->enable_beacon) {
+			rt2x00dev->intf_beaconing--;
+			intf->enable_beacon = false;
+
+			if (rt2x00dev->intf_beaconing == 0) {
+				/*
+				 * Last beaconing interface disabled
+				 * -> stop beacon queue.
+				 */
+				rt2x00queue_stop_queue(rt2x00dev->bcn);
+			}
+			/*
+			 * Clear beacon in the H/W for this vif. This is needed
+			 * to disable beaconing on this particular interface
+			 * and keep it running on other interfaces.
+			 */
+			rt2x00queue_clear_beacon(rt2x00dev, vif);
+		} else if (bss_conf->enable_beacon && !intf->enable_beacon) {
+			rt2x00dev->intf_beaconing++;
+			intf->enable_beacon = true;
+			/*
+			 * Upload beacon to the H/W. This is only required on
+			 * USB devices. PCI devices fetch beacons periodically.
+			 */
+			if (rt2x00_is_usb(rt2x00dev))
+				rt2x00queue_update_beacon(rt2x00dev, vif);
+
+			if (rt2x00dev->intf_beaconing == 1) {
+				/*
+				 * First beaconing interface enabled
+				 * -> start beacon queue.
+				 */
+				rt2x00queue_start_queue(rt2x00dev->bcn);
+			}
+		}
+		mutex_unlock(&intf->beacon_skb_mutex);
+	}
 
 	/*
 	 * When the association status has changed we must reset the link
@@ -636,24 +665,37 @@ void rt2x00mac_bss_info_changed(struct ieee80211_hw *hw,
 			rt2x00dev->intf_associated--;
 
 		rt2x00leds_led_assoc(rt2x00dev, !!rt2x00dev->intf_associated);
+
+		clear_bit(CONFIG_QOS_DISABLED, &rt2x00dev->flags);
 	}
+
+	/*
+	 * Check for access point which do not support 802.11e . We have to
+	 * generate data frames sequence number in S/W for such AP, because
+	 * of H/W bug.
+	 */
+	if (changes & BSS_CHANGED_QOS && !bss_conf->qos)
+		set_bit(CONFIG_QOS_DISABLED, &rt2x00dev->flags);
 
 	/*
 	 * When the erp information has changed, we should perform
 	 * additional configuration steps. For all other changes we are done.
 	 */
-	if (changes & ~(BSS_CHANGED_ASSOC | BSS_CHANGED_HT))
-		rt2x00lib_config_erp(rt2x00dev, intf, bss_conf);
+	if (changes & (BSS_CHANGED_ERP_CTS_PROT | BSS_CHANGED_ERP_PREAMBLE |
+		       BSS_CHANGED_ERP_SLOT | BSS_CHANGED_BASIC_RATES |
+		       BSS_CHANGED_BEACON_INT | BSS_CHANGED_HT))
+		rt2x00lib_config_erp(rt2x00dev, intf, bss_conf, changes);
 }
 EXPORT_SYMBOL_GPL(rt2x00mac_bss_info_changed);
 
-int rt2x00mac_conf_tx(struct ieee80211_hw *hw, u16 queue_idx,
+int rt2x00mac_conf_tx(struct ieee80211_hw *hw,
+		      struct ieee80211_vif *vif, u16 queue_idx,
 		      const struct ieee80211_tx_queue_params *params)
 {
 	struct rt2x00_dev *rt2x00dev = hw->priv;
 	struct data_queue *queue;
 
-	queue = rt2x00queue_get_queue(rt2x00dev, queue_idx);
+	queue = rt2x00queue_get_tx_queue(rt2x00dev, queue_idx);
 	if (unlikely(!queue))
 		return -EINVAL;
 
@@ -674,9 +716,10 @@ int rt2x00mac_conf_tx(struct ieee80211_hw *hw, u16 queue_idx,
 	queue->aifs = params->aifs;
 	queue->txop = params->txop;
 
-	INFO(rt2x00dev,
-	     "Configured TX queue %d - CWmin: %d, CWmax: %d, Aifs: %d, TXop: %d.\n",
-	     queue_idx, queue->cw_min, queue->cw_max, queue->aifs, queue->txop);
+	rt2x00_dbg(rt2x00dev,
+		   "Configured TX queue %d - CWmin: %d, CWmax: %d, Aifs: %d, TXop: %d\n",
+		   queue_idx, queue->cw_min, queue->cw_max, queue->aifs,
+		   queue->txop);
 
 	return 0;
 }
@@ -690,3 +733,114 @@ void rt2x00mac_rfkill_poll(struct ieee80211_hw *hw)
 	wiphy_rfkill_set_hw_state(hw->wiphy, !active);
 }
 EXPORT_SYMBOL_GPL(rt2x00mac_rfkill_poll);
+
+void rt2x00mac_flush(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+		     u32 queues, bool drop)
+{
+	struct rt2x00_dev *rt2x00dev = hw->priv;
+	struct data_queue *queue;
+
+	if (!test_bit(DEVICE_STATE_PRESENT, &rt2x00dev->flags))
+		return;
+
+	tx_queue_for_each(rt2x00dev, queue)
+		rt2x00queue_flush_queue(queue, drop);
+}
+EXPORT_SYMBOL_GPL(rt2x00mac_flush);
+
+int rt2x00mac_set_antenna(struct ieee80211_hw *hw, u32 tx_ant, u32 rx_ant)
+{
+	struct rt2x00_dev *rt2x00dev = hw->priv;
+	struct link_ant *ant = &rt2x00dev->link.ant;
+	struct antenna_setup *def = &rt2x00dev->default_ant;
+	struct antenna_setup setup;
+
+	// The antenna value is not supposed to be 0,
+	// or exceed the maximum number of antenna's.
+	if (!tx_ant || (tx_ant & ~3) || !rx_ant || (rx_ant & ~3))
+		return -EINVAL;
+
+	// When the client tried to configure the antenna to or from
+	// diversity mode, we must reset the default antenna as well
+	// as that controls the diversity switch.
+	if (ant->flags & ANTENNA_TX_DIVERSITY && tx_ant != 3)
+		ant->flags &= ~ANTENNA_TX_DIVERSITY;
+	if (ant->flags & ANTENNA_RX_DIVERSITY && rx_ant != 3)
+		ant->flags &= ~ANTENNA_RX_DIVERSITY;
+
+	// If diversity is being enabled, check if we need hardware
+	// or software diversity. In the latter case, reset the value,
+	// and make sure we update the antenna flags to have the
+	// link tuner pick up the diversity tuning.
+	if (tx_ant == 3 && def->tx == ANTENNA_SW_DIVERSITY) {
+		tx_ant = ANTENNA_SW_DIVERSITY;
+		ant->flags |= ANTENNA_TX_DIVERSITY;
+	}
+
+	if (rx_ant == 3 && def->rx == ANTENNA_SW_DIVERSITY) {
+		rx_ant = ANTENNA_SW_DIVERSITY;
+		ant->flags |= ANTENNA_RX_DIVERSITY;
+	}
+
+	setup.tx = tx_ant;
+	setup.rx = rx_ant;
+	setup.rx_chain_num = 0;
+	setup.tx_chain_num = 0;
+
+	rt2x00lib_config_antenna(rt2x00dev, setup);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rt2x00mac_set_antenna);
+
+int rt2x00mac_get_antenna(struct ieee80211_hw *hw, u32 *tx_ant, u32 *rx_ant)
+{
+	struct rt2x00_dev *rt2x00dev = hw->priv;
+	struct link_ant *ant = &rt2x00dev->link.ant;
+	struct antenna_setup *active = &rt2x00dev->link.ant.active;
+
+	// When software diversity is active, we must report this to the
+	// client and not the current active antenna state.
+	if (ant->flags & ANTENNA_TX_DIVERSITY)
+		*tx_ant = ANTENNA_HW_DIVERSITY;
+	else
+		*tx_ant = active->tx;
+
+	if (ant->flags & ANTENNA_RX_DIVERSITY)
+		*rx_ant = ANTENNA_HW_DIVERSITY;
+	else
+		*rx_ant = active->rx;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rt2x00mac_get_antenna);
+
+void rt2x00mac_get_ringparam(struct ieee80211_hw *hw,
+			     u32 *tx, u32 *tx_max, u32 *rx, u32 *rx_max)
+{
+	struct rt2x00_dev *rt2x00dev = hw->priv;
+	struct data_queue *queue;
+
+	tx_queue_for_each(rt2x00dev, queue) {
+		*tx += queue->length;
+		*tx_max += queue->limit;
+	}
+
+	*rx = rt2x00dev->rx->length;
+	*rx_max = rt2x00dev->rx->limit;
+}
+EXPORT_SYMBOL_GPL(rt2x00mac_get_ringparam);
+
+bool rt2x00mac_tx_frames_pending(struct ieee80211_hw *hw)
+{
+	struct rt2x00_dev *rt2x00dev = hw->priv;
+	struct data_queue *queue;
+
+	tx_queue_for_each(rt2x00dev, queue) {
+		if (!rt2x00queue_empty(queue))
+			return true;
+	}
+
+	return false;
+}
+EXPORT_SYMBOL_GPL(rt2x00mac_tx_frames_pending);

@@ -1,12 +1,13 @@
 #include <linux/usb.h>
 #include <linux/usb/ch9.h>
+#include <linux/usb/hcd.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/device.h>
 #include <asm/byteorder.h>
 #include "usb.h"
-#include "hcd.h"
+
 
 #define USB_MAXALTSETTING		128	/* Hard limit */
 #define USB_MAXENDPOINTS		30	/* Hard limit */
@@ -151,22 +152,23 @@ static int usb_parse_ss_endpoint_companion(struct device *ddev, int cfgno,
 		desc->bmAttributes = 2;
 	}
 	if (usb_endpoint_xfer_isoc(&ep->desc)) {
-		max_tx = ep->desc.wMaxPacketSize * (desc->bMaxBurst + 1) *
-			(desc->bmAttributes + 1);
+		max_tx = (desc->bMaxBurst + 1) * (desc->bmAttributes + 1) *
+			le16_to_cpu(ep->desc.wMaxPacketSize);
 	} else if (usb_endpoint_xfer_int(&ep->desc)) {
-		max_tx = ep->desc.wMaxPacketSize * (desc->bMaxBurst + 1);
+		max_tx = le16_to_cpu(ep->desc.wMaxPacketSize) *
+			(desc->bMaxBurst + 1);
 	} else {
 		goto valid;
 	}
-	if (desc->wBytesPerInterval > max_tx) {
+	if (le16_to_cpu(desc->wBytesPerInterval) > max_tx) {
 		dev_warn(ddev, "%s endpoint with wBytesPerInterval of %d in "
 				"config %d interface %d altsetting %d ep %d: "
 				"setting to %d\n",
 				usb_endpoint_xfer_isoc(&ep->desc) ? "Isoc" : "Int",
-				desc->wBytesPerInterval,
+				le16_to_cpu(desc->wBytesPerInterval),
 				cfgno, inum, asnum, ep->desc.bEndpointAddress,
 				max_tx);
-		desc->wBytesPerInterval = max_tx;
+		desc->wBytesPerInterval = cpu_to_le16(max_tx);
 	}
 valid:
 	return retval;
@@ -765,6 +767,8 @@ int usb_get_configuration(struct usb_device *dev)
 		if (result < 0) {
 			dev_err(ddev, "unable to read config index %d "
 			    "descriptor/%s: %d\n", cfgno, "start", result);
+			if (result != -EPIPE)
+				goto err;
 			dev_err(ddev, "chopping to %d config(s)\n", cfgno);
 			dev->descriptor.bNumConfigurations = cfgno;
 			break;
@@ -817,4 +821,115 @@ err2:
 	if (result == -ENOMEM)
 		dev_err(ddev, "out of memory\n");
 	return result;
+}
+
+void usb_release_bos_descriptor(struct usb_device *dev)
+{
+	/* RedHat KABI - was this allocated */
+	if (!dev->bos_kabi_bit)
+		return;
+
+	if (dev->bos) {
+		kfree(dev->bos->desc);
+		kfree(dev->bos);
+		dev->bos = NULL;
+	}
+}
+
+/* Get BOS descriptor set */
+int usb_get_bos_descriptor(struct usb_device *dev)
+{
+	struct device *ddev = &dev->dev;
+	struct usb_bos_descriptor *bos;
+	struct usb_dev_cap_header *cap;
+	unsigned char *buffer;
+	int length, total_len, num, i;
+	int ret;
+
+	/* RedHat KABI - check to see if it was allocated */
+	if (!dev->bos_kabi_bit)
+		return -ENOMEM;
+
+	bos = kzalloc(sizeof(struct usb_bos_descriptor), GFP_KERNEL);
+	if (!bos)
+		return -ENOMEM;
+
+	/* Get BOS descriptor */
+	ret = usb_get_descriptor(dev, USB_DT_BOS, 0, bos, USB_DT_BOS_SIZE);
+	if (ret < USB_DT_BOS_SIZE) {
+		dev_err(ddev, "unable to get BOS descriptor\n");
+		if (ret >= 0)
+			ret = -ENOMSG;
+		kfree(bos);
+		return ret;
+	}
+
+	length = bos->bLength;
+	total_len = le16_to_cpu(bos->wTotalLength);
+	num = bos->bNumDeviceCaps;
+	kfree(bos);
+	if (total_len < length)
+		return -EINVAL;
+
+	dev->bos = kzalloc(sizeof(struct usb_host_bos), GFP_KERNEL);
+	if (!dev->bos)
+		return -ENOMEM;
+
+	/* Now let's get the whole BOS descriptor set */
+	buffer = kzalloc(total_len, GFP_KERNEL);
+	if (!buffer) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	dev->bos->desc = (struct usb_bos_descriptor *)buffer;
+
+	ret = usb_get_descriptor(dev, USB_DT_BOS, 0, buffer, total_len);
+	if (ret < total_len) {
+		dev_err(ddev, "unable to get BOS descriptor set\n");
+		if (ret >= 0)
+			ret = -ENOMSG;
+		goto err;
+	}
+	total_len -= length;
+
+	for (i = 0; i < num; i++) {
+		buffer += length;
+		cap = (struct usb_dev_cap_header *)buffer;
+		length = cap->bLength;
+
+		if (total_len < length)
+			break;
+		total_len -= length;
+
+		if (cap->bDescriptorType != USB_DT_DEVICE_CAPABILITY) {
+			dev_warn(ddev, "descriptor type invalid, skip\n");
+			continue;
+		}
+
+		switch (cap->bDevCapabilityType) {
+		case USB_CAP_TYPE_WIRELESS_USB:
+			/* Wireless USB cap descriptor is handled by wusb */
+			break;
+		case USB_CAP_TYPE_EXT:
+			dev->bos->ext_cap =
+				(struct usb_ext_cap_descriptor *)buffer;
+			break;
+		case USB_SS_CAP_TYPE:
+			dev->bos->ss_cap =
+				(struct usb_ss_cap_descriptor *)buffer;
+			break;
+		case CONTAINER_ID_TYPE:
+			dev->bos->ss_id =
+				(struct usb_ss_container_id_descriptor *)buffer;
+			break;
+		default:
+			break;
+		}
+	}
+
+	return 0;
+
+err:
+	usb_release_bos_descriptor(dev);
+	return ret;
 }

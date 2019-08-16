@@ -98,7 +98,7 @@ static int slice_area_is_free(struct mm_struct *mm, unsigned long addr,
 	if ((mm->task_size - len) < addr)
 		return 0;
 	vma = find_vma(mm, addr);
-	return (!vma || (addr + len) <= vma->vm_start);
+	return (!vma || (addr + len) <= vm_start_gap(vma));
 }
 
 static int slice_low_has_vma(struct mm_struct *mm, unsigned long slice)
@@ -230,9 +230,10 @@ static unsigned long slice_find_area_bottomup(struct mm_struct *mm,
 	unsigned long start_addr, addr;
 	struct slice_mask mask;
 	int pshift = max_t(int, mmu_psize_defs[psize].shift, PAGE_SHIFT);
+	unsigned int unmap_factor = sysctl_unmap_area_factor;
 
 	if (use_cache) {
-		if (len <= mm->cached_hole_size) {
+		if (len <= mm->cached_hole_size && !unmap_factor) {
 			start_addr = addr = TASK_UNMAPPED_BASE;
 			mm->cached_hole_size = 0;
 		} else
@@ -264,7 +265,9 @@ full_search:
 				mm->free_area_cache = addr + len;
 			return addr;
 		}
-		if (use_cache && (addr + mm->cached_hole_size) < vma->vm_start)
+
+		if (use_cache && !unmap_factor &&
+			    (addr + mm->cached_hole_size) < vma->vm_start)
 		        mm->cached_hole_size = vma->vm_start - addr;
 		addr = vma->vm_end;
 	}
@@ -272,7 +275,8 @@ full_search:
 	/* Make sure we didn't miss any holes */
 	if (use_cache && start_addr != TASK_UNMAPPED_BASE) {
 		start_addr = addr = TASK_UNMAPPED_BASE;
-		mm->cached_hole_size = 0;
+		if (likely(!unmap_factor))
+			mm->cached_hole_size = 0;
 		goto full_search;
 	}
 	return -ENOMEM;
@@ -287,10 +291,13 @@ static unsigned long slice_find_area_topdown(struct mm_struct *mm,
 	unsigned long addr;
 	struct slice_mask mask;
 	int pshift = max_t(int, mmu_psize_defs[psize].shift, PAGE_SHIFT);
+	unsigned int unmap_factor = sysctl_unmap_area_factor;
+	int firsttime = 1;
 
+ again:
 	/* check if free_area_cache is useful for us */
 	if (use_cache) {
-		if (len <= mm->cached_hole_size) {
+		if (len <= mm->cached_hole_size && !unmap_factor) {
 			mm->cached_hole_size = 0;
 			mm->free_area_cache = mm->mmap_base;
 		}
@@ -344,11 +351,24 @@ static unsigned long slice_find_area_topdown(struct mm_struct *mm,
 		}
 
 		/* remember the largest hole we saw so far */
-		if (use_cache && (addr + mm->cached_hole_size) < vma->vm_start)
+		if (use_cache && !unmap_factor &&
+			    (addr + mm->cached_hole_size) < vma->vm_start)
 		        mm->cached_hole_size = vma->vm_start - addr;
 
 		/* try just below the current vma->vm_start */
 		addr = vma->vm_start;
+	}
+
+	/*
+	 * Using the next-fit algorithm, it is possible we started
+	 * searching below usable address space holes. Go back to the
+	 * top and start over.
+	 */
+	if (unmap_factor && firsttime) {
+		mm->free_area_cache = mm->mmap_base;
+		mm->cached_hole_size = 0;
+		firsttime = 0;
+		goto again;
 	}
 
 	/*
@@ -364,7 +384,8 @@ static unsigned long slice_find_area_topdown(struct mm_struct *mm,
 	 */
 	if (use_cache) {
 		mm->free_area_cache = mm->mmap_base;
-		mm->cached_hole_size = ~0UL;
+		if (likely(!unmap_factor))
+			mm->cached_hole_size = ~0UL;
 	}
 
 	return addr;
@@ -424,7 +445,7 @@ unsigned long slice_get_unmapped_area(unsigned long addr, unsigned long len,
 	if (fixed && (addr & ((1ul << pshift) - 1)))
 		return -EINVAL;
 	if (fixed && addr > (mm->task_size - len))
-		return -EINVAL;
+		return -ENOMEM;
 
 	/* If hint, make sure it matches our alignment restrictions */
 	if (!fixed && addr) {

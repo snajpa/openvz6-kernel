@@ -23,24 +23,15 @@
 #include "xfs_trans.h"
 #include "xfs_sb.h"
 #include "xfs_ag.h"
-#include "xfs_dir2.h"
 #include "xfs_alloc.h"
-#include "xfs_dmapi.h"
 #include "xfs_mount.h"
 #include "xfs_bmap_btree.h"
-#include "xfs_alloc_btree.h"
-#include "xfs_ialloc_btree.h"
-#include "xfs_attr_sf.h"
-#include "xfs_dir2_sf.h"
 #include "xfs_dinode.h"
 #include "xfs_inode.h"
 #include "xfs_ioctl.h"
-#include "xfs_btree.h"
-#include "xfs_ialloc.h"
 #include "xfs_rtalloc.h"
 #include "xfs_itable.h"
 #include "xfs_error.h"
-#include "xfs_rw.h"
 #include "xfs_attr.h"
 #include "xfs_bmap.h"
 #include "xfs_buf_item.h"
@@ -48,15 +39,19 @@
 #include "xfs_dfrag.h"
 #include "xfs_fsops.h"
 #include "xfs_vnodeops.h"
+#include "xfs_discard.h"
 #include "xfs_quota.h"
 #include "xfs_inode_item.h"
 #include "xfs_export.h"
+#include "xfs_trace.h"
+#include "xfs_sync.h"
 
 #include <linux/capability.h>
 #include <linux/dcache.h>
 #include <linux/mount.h>
 #include <linux/namei.h>
 #include <linux/pagemap.h>
+#include <linux/slab.h>
 #include <linux/exportfs.h>
 
 /*
@@ -215,6 +210,7 @@ xfs_open_by_handle(
 	struct file		*filp;
 	struct inode		*inode;
 	struct dentry		*dentry;
+	fmode_t			fmode;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -XFS_ERROR(EPERM);
@@ -234,26 +230,21 @@ xfs_open_by_handle(
 	hreq->oflags |= O_LARGEFILE;
 #endif
 
-	/* Put open permission in namei format. */
 	permflag = hreq->oflags;
-	if ((permflag+1) & O_ACCMODE)
-		permflag++;
-	if (permflag & O_TRUNC)
-		permflag |= 2;
-
+	fmode = OPEN_FMODE(permflag);
 	if ((!(permflag & O_APPEND) || (permflag & O_TRUNC)) &&
-	    (permflag & FMODE_WRITE) && IS_APPEND(inode)) {
+	    (fmode & FMODE_WRITE) && IS_APPEND(inode)) {
 		error = -XFS_ERROR(EPERM);
 		goto out_dput;
 	}
 
-	if ((permflag & FMODE_WRITE) && IS_IMMUTABLE(inode)) {
+	if ((fmode & FMODE_WRITE) && IS_IMMUTABLE(inode)) {
 		error = -XFS_ERROR(EACCES);
 		goto out_dput;
 	}
 
 	/* Can't write directories. */
-	if (S_ISDIR(inode->i_mode) && (permflag & FMODE_WRITE)) {
+	if (S_ISDIR(inode->i_mode) && (fmode & FMODE_WRITE)) {
 		error = -XFS_ERROR(EISDIR);
 		goto out_dput;
 	}
@@ -373,9 +364,15 @@ xfs_fssetdm_by_handle(
 	if (copy_from_user(&dmhreq, arg, sizeof(xfs_fsop_setdm_handlereq_t)))
 		return -XFS_ERROR(EFAULT);
 
+	error = mnt_want_write_file(parfilp);
+	if (error)
+		return error;
+
 	dentry = xfs_handlereq_to_dentry(parfilp, &dmhreq.hreq);
-	if (IS_ERR(dentry))
+	if (IS_ERR(dentry)) {
+		mnt_drop_write_file(parfilp);
 		return PTR_ERR(dentry);
+	}
 
 	if (IS_IMMUTABLE(dentry->d_inode) || IS_APPEND(dentry->d_inode)) {
 		error = -XFS_ERROR(EPERM);
@@ -391,6 +388,7 @@ xfs_fssetdm_by_handle(
 				 fsd.fsd_dmstate);
 
  out:
+	mnt_drop_write_file(parfilp);
 	dput(dentry);
 	return error;
 }
@@ -423,9 +421,12 @@ xfs_attrlist_by_handle(
 	if (IS_ERR(dentry))
 		return PTR_ERR(dentry);
 
-	kbuf = kmalloc(al_hreq.buflen, GFP_KERNEL);
-	if (!kbuf)
-		goto out_dput;
+	kbuf = kmem_zalloc(al_hreq.buflen, KM_SLEEP | KM_MAYFAIL);
+	if (!kbuf) {
+		kbuf = kmem_zalloc_large(al_hreq.buflen);
+		if (!kbuf)
+			goto out_dput;
+	}
 
 	cursor = (attrlist_cursor_kern_t *)&al_hreq.pos;
 	error = -xfs_attr_list(XFS_I(dentry->d_inode), kbuf, al_hreq.buflen,
@@ -437,7 +438,10 @@ xfs_attrlist_by_handle(
 		error = -EFAULT;
 
  out_kfree:
-	kfree(kbuf);
+	if (is_vmalloc_addr(kbuf))
+		kmem_free_large(kbuf);
+	else
+		kmem_free(kbuf);
  out_dput:
 	dput(dentry);
 	return error;
@@ -446,19 +450,22 @@ xfs_attrlist_by_handle(
 int
 xfs_attrmulti_attr_get(
 	struct inode		*inode,
-	char			*name,
-	char			__user *ubuf,
+	unsigned char		*name,
+	unsigned char		__user *ubuf,
 	__uint32_t		*len,
 	__uint32_t		flags)
 {
-	char			*kbuf;
+	unsigned char		*kbuf;
 	int			error = EFAULT;
 
 	if (*len > XATTR_SIZE_MAX)
 		return EINVAL;
-	kbuf = kmalloc(*len, GFP_KERNEL);
-	if (!kbuf)
-		return ENOMEM;
+	kbuf = kmem_zalloc(*len, KM_SLEEP | KM_MAYFAIL);
+	if (!kbuf) {
+		kbuf = kmem_zalloc_large(*len);
+		if (!kbuf)
+			return ENOMEM;
+	}
 
 	error = xfs_attr_get(XFS_I(inode), name, kbuf, (int *)len, flags);
 	if (error)
@@ -468,19 +475,22 @@ xfs_attrmulti_attr_get(
 		error = EFAULT;
 
  out_kfree:
-	kfree(kbuf);
+	if (is_vmalloc_addr(kbuf))
+		kmem_free_large(kbuf);
+	else
+		kmem_free(kbuf);
 	return error;
 }
 
 int
 xfs_attrmulti_attr_set(
 	struct inode		*inode,
-	char			*name,
-	const char		__user *ubuf,
+	unsigned char		*name,
+	const unsigned char	__user *ubuf,
 	__uint32_t		len,
 	__uint32_t		flags)
 {
-	char			*kbuf;
+	unsigned char		*kbuf;
 	int			error = EFAULT;
 
 	if (IS_IMMUTABLE(inode) || IS_APPEND(inode))
@@ -500,7 +510,7 @@ xfs_attrmulti_attr_set(
 int
 xfs_attrmulti_attr_remove(
 	struct inode		*inode,
-	char			*name,
+	unsigned char		*name,
 	__uint32_t		flags)
 {
 	if (IS_IMMUTABLE(inode) || IS_APPEND(inode))
@@ -518,12 +528,16 @@ xfs_attrmulti_by_handle(
 	xfs_fsop_attrmulti_handlereq_t am_hreq;
 	struct dentry		*dentry;
 	unsigned int		i, size;
-	char			*attr_name;
+	unsigned char		*attr_name;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -XFS_ERROR(EPERM);
 	if (copy_from_user(&am_hreq, arg, sizeof(xfs_fsop_attrmulti_handlereq_t)))
 		return -XFS_ERROR(EFAULT);
+
+	/* overflow check */
+	if (am_hreq.opcount >= INT_MAX / sizeof(xfs_attr_multiop_t))
+		return -E2BIG;
 
 	dentry = xfs_handlereq_to_dentry(parfilp, &am_hreq.hreq);
 	if (IS_ERR(dentry))
@@ -546,7 +560,7 @@ xfs_attrmulti_by_handle(
 
 	error = 0;
 	for (i = 0; i < am_hreq.opcount; i++) {
-		ops[i].am_error = strncpy_from_user(attr_name,
+		ops[i].am_error = strncpy_from_user((char *)attr_name,
 				ops[i].am_attrname, MAXNAMELEN);
 		if (ops[i].am_error == 0 || ops[i].am_error == MAXNAMELEN)
 			error = -ERANGE;
@@ -626,10 +640,18 @@ xfs_ioc_space(
 
 	if (filp->f_flags & (O_NDELAY|O_NONBLOCK))
 		attr_flags |= XFS_ATTR_NONBLOCK;
+
+	if (filp->f_flags & O_SYNC)
+		attr_flags |= XFS_ATTR_SYNC;
+
 	if (ioflags & IO_INVIS)
 		attr_flags |= XFS_ATTR_DMI;
 
+	error = mnt_want_write_file(filp);
+	if (error)
+		return error;
 	error = xfs_change_file_space(ip, cmd, bf, filp->f_pos, attr_flags);
+	mnt_drop_write_file(filp);
 	return -error;
 }
 
@@ -673,10 +695,9 @@ xfs_ioc_bulkstat(
 		error = xfs_bulkstat_single(mp, &inlast,
 						bulkreq.ubuffer, &done);
 	else	/* XFS_IOC_FSBULKSTAT */
-		error = xfs_bulkstat(mp, &inlast, &count,
-			(bulkstat_one_pf)xfs_bulkstat_one, NULL,
-			sizeof(xfs_bstat_t), bulkreq.ubuffer,
-			BULKSTAT_FG_QUICK, &done);
+		error = xfs_bulkstat(mp, &inlast, &count, xfs_bulkstat_one,
+				     sizeof(xfs_bstat_t), bulkreq.ubuffer,
+				     &done);
 
 	if (error)
 		return -error;
@@ -698,14 +719,19 @@ xfs_ioc_fsgeometry_v1(
 	xfs_mount_t		*mp,
 	void			__user *arg)
 {
-	xfs_fsop_geom_v1_t	fsgeo;
+	xfs_fsop_geom_t         fsgeo;
 	int			error;
 
-	error = xfs_fs_geometry(mp, (xfs_fsop_geom_t *)&fsgeo, 3);
+	error = xfs_fs_geometry(mp, &fsgeo, 3);
 	if (error)
 		return -error;
 
-	if (copy_to_user(arg, &fsgeo, sizeof(fsgeo)))
+	/*
+	 * Caller should have passed an argument of type
+	 * xfs_fsop_geom_v1_t.  This is a proper subset of the
+	 * xfs_fsop_geom_t that xfs_fs_geometry() fills in.
+	 */
+	if (copy_to_user(arg, &fsgeo, sizeof(xfs_fsop_geom_v1_t)))
 		return -XFS_ERROR(EFAULT);
 	return 0;
 }
@@ -789,10 +815,12 @@ xfs_ioc_fsgetxattr(
 {
 	struct fsxattr		fa;
 
+	memset(&fa, 0, sizeof(struct fsxattr));
+
 	xfs_ilock(ip, XFS_ILOCK_SHARED);
 	fa.fsx_xflags = xfs_ip2xflags(ip);
 	fa.fsx_extsize = ip->i_d.di_extsize << ip->i_mount->m_sb.sb_blocklog;
-	fa.fsx_projid = ip->i_d.di_projid;
+	fa.fsx_projid = xfs_get_projid(ip);
 
 	if (attr) {
 		if (ip->i_afp) {
@@ -903,12 +931,19 @@ xfs_ioctl_setattr(
 	struct xfs_dquot	*olddquot = NULL;
 	int			code;
 
-	xfs_itrace_entry(ip);
+	trace_xfs_ioctl_setattr(ip);
 
 	if (mp->m_flags & XFS_MOUNT_RDONLY)
 		return XFS_ERROR(EROFS);
 	if (XFS_FORCED_SHUTDOWN(mp))
 		return XFS_ERROR(EIO);
+
+	/*
+	 * Disallow 32bit project ids when projid32bit feature is not enabled.
+	 */
+	if ((mask & FSX_PROJID) && (fa->fsx_projid > (__uint16_t)-1) &&
+			!xfs_sb_version_hasprojid32bit(&ip->i_mount->m_sb))
+		return XFS_ERROR(EINVAL);
 
 	/*
 	 * If disk quotas is on, we make sure that the dquots do exist on disk,
@@ -956,7 +991,7 @@ xfs_ioctl_setattr(
 	if (mask & FSX_PROJID) {
 		if (XFS_IS_QUOTA_RUNNING(mp) &&
 		    XFS_IS_PQUOTA_ON(mp) &&
-		    ip->i_d.di_projid != fa->fsx_projid) {
+		    xfs_get_projid(ip) != fa->fsx_projid) {
 			ASSERT(tp);
 			code = xfs_qm_vop_chown_reserve(tp, ip, udqp, gdqp,
 						capable(CAP_FOWNER) ?
@@ -966,23 +1001,49 @@ xfs_ioctl_setattr(
 		}
 	}
 
+	/*
+	 * extent size hint validation is somewhat cumbersome. Rules are:
+	 *
+	 * 1. extent size hint is only valid for directories and regular files
+	 * 2. XFS_XFLAG_EXTSIZE is only valid for regular files
+	 * 3. XFS_XFLAG_EXTSZINHERIT is only valid for directories.
+	 * 4. can only be changed on regular files if no extents are allocated
+	 * 5. can be changed on directories at any time
+	 * 6. extsize hint of 0 turns off hints, clears inode flags.
+	 * 7. Extent size must be a multiple of the appropriate block size.
+	 * 8. for non-realtime files, the extent size hint must be limited
+	 *    to half the AG size to avoid alignment extending the extent beyond the
+	 *    limits of the AG.
+	 */
 	if (mask & FSX_EXTSIZE) {
-		/*
-		 * Can't change extent size if any extents are allocated.
-		 */
-		if (ip->i_d.di_nextents &&
+		if ((fa->fsx_xflags & XFS_XFLAG_EXTSIZE) &&
+			!S_ISREG(ip->i_d.di_mode)) {
+			code = XFS_ERROR(EINVAL);
+			goto error_return;
+		}
+
+		if ((fa->fsx_xflags & XFS_XFLAG_EXTSZINHERIT) &&
+			!S_ISDIR(ip->i_d.di_mode)) {
+			code = XFS_ERROR(EINVAL);
+			goto error_return;
+		}
+
+		if (S_ISREG(ip->i_d.di_mode) && ip->i_d.di_nextents &&
 		    ((ip->i_d.di_extsize << mp->m_sb.sb_blocklog) !=
 		     fa->fsx_extsize)) {
 			code = XFS_ERROR(EINVAL);	/* EFBIG? */
 			goto error_return;
 		}
 
-		/*
-		 * Extent size must be a multiple of the appropriate block
-		 * size, if set at all.
-		 */
 		if (fa->fsx_extsize != 0) {
-			xfs_extlen_t	size;
+			xfs_extlen_t    size;
+			xfs_fsblock_t   extsize_fsb;
+
+			extsize_fsb = XFS_B_TO_FSB(mp, fa->fsx_extsize);
+			if (extsize_fsb > MAXEXTLEN) {
+				code = XFS_ERROR(EINVAL);
+				goto error_return;
+			}
 
 			if (XFS_IS_REALTIME_INODE(ip) ||
 			    ((mask & FSX_XFLAGS) &&
@@ -991,12 +1052,18 @@ xfs_ioctl_setattr(
 				       mp->m_sb.sb_blocklog;
 			} else {
 				size = mp->m_sb.sb_blocksize;
+				if (extsize_fsb > mp->m_sb.sb_agblocks / 2) {
+					code = XFS_ERROR(EINVAL);
+					goto error_return;
+				}
 			}
 
 			if (fa->fsx_extsize % size) {
 				code = XFS_ERROR(EINVAL);
 				goto error_return;
 			}
+		} else {
+			fa->fsx_xflags &= ~(XFS_XFLAG_EXTSIZE | XFS_XFLAG_EXTSZINHERIT);
 		}
 	}
 
@@ -1038,8 +1105,7 @@ xfs_ioctl_setattr(
 		}
 	}
 
-	xfs_trans_ijoin(tp, ip, lock_flags);
-	xfs_trans_ihold(tp, ip);
+	xfs_trans_ijoin(tp, ip);
 
 	/*
 	 * Change file ownership.  Must be the owner or privileged.
@@ -1059,12 +1125,12 @@ xfs_ioctl_setattr(
 		 * Change the ownerships and register quota modifications
 		 * in the transaction.
 		 */
-		if (ip->i_d.di_projid != fa->fsx_projid) {
+		if (xfs_get_projid(ip) != fa->fsx_projid) {
 			if (XFS_IS_QUOTA_RUNNING(mp) && XFS_IS_PQUOTA_ON(mp)) {
 				olddquot = xfs_qm_vop_chown(tp, ip,
 							&ip->i_gdquot, gdqp);
 			}
-			ip->i_d.di_projid = fa->fsx_projid;
+			xfs_set_projid(ip, fa->fsx_projid);
 
 			/*
 			 * We may have to rev the inode as well as
@@ -1084,10 +1150,10 @@ xfs_ioctl_setattr(
 		xfs_diflags_to_linux(ip);
 	}
 
+	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
-	xfs_ichgtime(ip, XFS_ICHGTIME_CHG);
 
-	XFS_STATS_INC(xs_ig_attrchg);
+	XFS_STATS_INC(mp, xs_ig_attrchg);
 
 	/*
 	 * If this is a synchronous mount, make sure that the
@@ -1111,16 +1177,7 @@ xfs_ioctl_setattr(
 	xfs_qm_dqrele(udqp);
 	xfs_qm_dqrele(gdqp);
 
-	if (code)
-		return code;
-
-	if (DM_EVENT_ENABLED(ip, DM_EVENT_ATTRIBUTE)) {
-		XFS_SEND_NAMESP(mp, DM_EVENT_ATTRIBUTE, ip, DM_RIGHT_NULL,
-				NULL, DM_RIGHT_NULL, NULL, NULL, 0, 0,
-				(mask & FSX_NONBLOCK) ? DM_FLAGS_NDELAY : 0);
-	}
-
-	return 0;
+	return code;
 
  error_return:
 	xfs_qm_dqrele(udqp);
@@ -1139,6 +1196,7 @@ xfs_ioc_fssetxattr(
 {
 	struct fsxattr		fa;
 	unsigned int		mask;
+	int error;
 
 	if (copy_from_user(&fa, arg, sizeof(fa)))
 		return -EFAULT;
@@ -1147,7 +1205,12 @@ xfs_ioc_fssetxattr(
 	if (filp->f_flags & (O_NDELAY|O_NONBLOCK))
 		mask |= FSX_NONBLOCK;
 
-	return -xfs_ioctl_setattr(ip, &fa, mask);
+	error = mnt_want_write_file(filp);
+	if (error)
+		return error;
+	error = xfs_ioctl_setattr(ip, &fa, mask);
+	mnt_drop_write_file(filp);
+	return -error;
 }
 
 STATIC int
@@ -1172,6 +1235,7 @@ xfs_ioc_setxflags(
 	struct fsxattr		fa;
 	unsigned int		flags;
 	unsigned int		mask;
+	int error;
 
 	if (copy_from_user(&flags, arg, sizeof(flags)))
 		return -EFAULT;
@@ -1186,7 +1250,12 @@ xfs_ioc_setxflags(
 		mask |= FSX_NONBLOCK;
 	fa.fsx_xflags = xfs_merge_ioc_xflags(flags, xfs_ip2xflags(ip));
 
-	return -xfs_ioctl_setattr(ip, &fa, mask);
+	error = mnt_want_write_file(filp);
+	if (error)
+		return error;
+	error = xfs_ioctl_setattr(ip, &fa, mask);
+	mnt_drop_write_file(filp);
+	return -error;
 }
 
 STATIC int
@@ -1296,9 +1365,11 @@ xfs_file_ioctl(
 	if (filp->f_mode & FMODE_NOCMTIME)
 		ioflags |= IO_INVIS;
 
-	xfs_itrace_entry(ip);
+	trace_xfs_file_ioctl(ip);
 
 	switch (cmd) {
+	case FITRIM:
+		return xfs_ioc_trim(mp, arg);
 	case XFS_IOC_ALLOCSP:
 	case XFS_IOC_FREESP:
 	case XFS_IOC_RESVSP:
@@ -1306,7 +1377,8 @@ xfs_file_ioctl(
 	case XFS_IOC_ALLOCSP64:
 	case XFS_IOC_FREESP64:
 	case XFS_IOC_RESVSP64:
-	case XFS_IOC_UNRESVSP64: {
+	case XFS_IOC_UNRESVSP64:
+	case XFS_IOC_ZERO_RANGE: {
 		xfs_flock64_t		bf;
 
 		if (copy_from_user(&bf, arg, sizeof(bf)))
@@ -1319,7 +1391,7 @@ xfs_file_ioctl(
 			XFS_IS_REALTIME_INODE(ip) ?
 			mp->m_rtdev_targp : mp->m_ddev_targp;
 
-		da.d_mem = da.d_miniosz = 1 << target->bt_sshift;
+		da.d_mem =  da.d_miniosz = target->bt_logical_sectorsize;
 		da.d_maxiosz = INT_MAX & ~(da.d_miniosz - 1);
 
 		if (copy_to_user(arg, &da, sizeof(da)))
@@ -1358,8 +1430,13 @@ xfs_file_ioctl(
 		if (copy_from_user(&dmi, arg, sizeof(dmi)))
 			return -XFS_ERROR(EFAULT);
 
+		error = mnt_want_write_file(filp);
+		if (error)
+			return error;
+
 		error = xfs_set_dmattrs(ip, dmi.fsd_dmevmask,
 				dmi.fsd_dmstate);
+		mnt_drop_write_file(filp);
 		return -error;
 	}
 
@@ -1407,7 +1484,11 @@ xfs_file_ioctl(
 
 		if (copy_from_user(&sxp, arg, sizeof(xfs_swapext_t)))
 			return -XFS_ERROR(EFAULT);
+		error = mnt_want_write_file(filp);
+		if (error)
+			return error;
 		error = xfs_swapext(&sxp);
+		mnt_drop_write_file(filp);
 		return -error;
 	}
 
@@ -1430,12 +1511,20 @@ xfs_file_ioctl(
 		if (!capable(CAP_SYS_ADMIN))
 			return -EPERM;
 
+		if (mp->m_flags & XFS_MOUNT_RDONLY)
+			return -XFS_ERROR(EROFS);
+
 		if (copy_from_user(&inout, arg, sizeof(inout)))
 			return -XFS_ERROR(EFAULT);
+
+		error = mnt_want_write_file(filp);
+		if (error)
+			return error;
 
 		/* input parameter is passed in resblks field of structure */
 		in = inout.resblks;
 		error = xfs_reserve_blocks(mp, &in, &inout);
+		mnt_drop_write_file(filp);
 		if (error)
 			return -error;
 
@@ -1466,7 +1555,11 @@ xfs_file_ioctl(
 		if (copy_from_user(&in, arg, sizeof(in)))
 			return -XFS_ERROR(EFAULT);
 
+		error = mnt_want_write_file(filp);
+		if (error)
+			return error;
 		error = xfs_growfs_data(mp, &in);
+		mnt_drop_write_file(filp);
 		return -error;
 	}
 
@@ -1476,7 +1569,11 @@ xfs_file_ioctl(
 		if (copy_from_user(&in, arg, sizeof(in)))
 			return -XFS_ERROR(EFAULT);
 
+		error = mnt_want_write_file(filp);
+		if (error)
+			return error;
 		error = xfs_growfs_log(mp, &in);
+		mnt_drop_write_file(filp);
 		return -error;
 	}
 
@@ -1486,7 +1583,11 @@ xfs_file_ioctl(
 		if (copy_from_user(&in, arg, sizeof(in)))
 			return -XFS_ERROR(EFAULT);
 
+		error = mnt_want_write_file(filp);
+		if (error)
+			return error;
 		error = xfs_growfs_rt(mp, &in);
+		mnt_drop_write_file(filp);
 		return -error;
 	}
 
@@ -1522,6 +1623,29 @@ xfs_file_ioctl(
 
 		error = xfs_errortag_clearall(mp, 1);
 		return -error;
+
+	case XFS_IOC_FREE_EOFBLOCKS: {
+		struct xfs_eofblocks eofb;
+		int i;
+
+		if (copy_from_user(&eofb, arg, sizeof(eofb)))
+			return -XFS_ERROR(EFAULT);
+
+		if (eofb.eof_version != XFS_EOFBLOCKS_VERSION)
+			return -XFS_ERROR(EINVAL);
+
+		if (eofb.eof_flags & ~XFS_EOF_FLAGS_VALID)
+			return -XFS_ERROR(EINVAL);
+
+		if (eofb.pad32 != 0)
+			return -XFS_ERROR(EINVAL);
+		for (i = 0; i < XFS_EOFBLOCKS_PADSZ; i++)
+			if (eofb.pad64[i] != 0)
+				return -XFS_ERROR(EINVAL);
+
+		error = xfs_icache_free_eofblocks(mp, &eofb);
+		return -error;
+	}
 
 	default:
 		return -ENOTTY;

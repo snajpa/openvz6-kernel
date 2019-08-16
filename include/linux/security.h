@@ -52,7 +52,7 @@ struct audit_krule;
  */
 extern int cap_capable(struct task_struct *tsk, const struct cred *cred,
 		       int cap, int audit);
-extern int cap_settime(struct timespec *ts, struct timezone *tz);
+extern int cap_settime(const struct timespec *ts, const struct timezone *tz);
 extern int cap_ptrace_access_check(struct task_struct *child, unsigned int mode);
 extern int cap_ptrace_traceme(struct task_struct *parent);
 extern int cap_capget(struct task_struct *target, kernel_cap_t *effective, kernel_cap_t *inheritable, kernel_cap_t *permitted);
@@ -93,10 +93,14 @@ struct xfrm_user_sec_ctx;
 struct seq_file;
 
 extern int cap_netlink_send(struct sock *sk, struct sk_buff *skb);
-extern int cap_netlink_recv(struct sk_buff *skb, int cap);
 
+#ifdef CONFIG_MMU
 extern unsigned long mmap_min_addr;
 extern unsigned long dac_mmap_min_addr;
+#else
+#define dac_mmap_min_addr	0UL
+#endif
+
 /*
  * Values used in the task_security_ops calls
  */
@@ -120,7 +124,9 @@ struct request_sock;
 #define LSM_UNSAFE_SHARE	1
 #define LSM_UNSAFE_PTRACE	2
 #define LSM_UNSAFE_PTRACE_CAP	4
+#define LSM_UNSAFE_NO_NEW_PRIVS	8
 
+#ifdef CONFIG_MMU
 /*
  * If a hint addr is less than mmap_min_addr change hint to be as
  * low as possible but still greater than mmap_min_addr
@@ -135,6 +141,7 @@ static inline unsigned long round_hint_to_min(unsigned long hint)
 }
 extern int mmap_min_addr_handler(struct ctl_table *table, int write,
 				 void __user *buffer, size_t *lenp, loff_t *ppos);
+#endif
 
 #ifdef CONFIG_SECURITY
 
@@ -263,6 +270,12 @@ static inline void security_free_mnt_opts(struct security_mnt_opts *opts)
  *	on the mount point named by @nd.
  *	@mnt contains the vfsmount for device being mounted.
  *	@path contains the path for the mount point.
+ *	Return 0 if permission is granted.
+ * @sb_remount:
+ *	Extracts security system specifc mount options and verifys no changes
+ *	are being made to those options.
+ *	@sb superblock being remounted
+ *	@data contains the filesystem-specific data.
  *	Return 0 if permission is granted.
  * @sb_umount:
  *	Check permission before the @mnt file system is unmounted.
@@ -690,6 +703,7 @@ static inline void security_free_mnt_opts(struct security_mnt_opts *opts)
  * @kernel_module_request:
  *	Ability to trigger the kernel to automatically upcall to userspace for
  *	userspace to load a kernel module with the given name.
+ *	@kmod_name name of the module requested by the kernel
  *	Return 0 if successful.
  * @task_setuid:
  *	Check permission before setting one or more of the user identity
@@ -832,12 +846,6 @@ static inline void security_free_mnt_opts(struct security_mnt_opts *opts)
  *	@skb contains the sk_buff structure for the netlink message.
  *	Return 0 if the information was successfully saved and message
  *	is allowed to be transmitted.
- * @netlink_recv:
- *	Check permission before processing the received netlink message in
- *	@skb.
- *	@skb contains the sk_buff structure for the netlink message.
- *	@cap indicates the capability required
- *	Return 0 if permission is granted.
  *
  * Security hooks for Unix domain networking.
  *
@@ -1007,17 +1015,26 @@ static inline void security_free_mnt_opts(struct security_mnt_opts *opts)
  *	Sets the connection's peersid to the secmark on skb.
  * @req_classify_flow:
  *	Sets the flow's sid to the openreq sid.
+ * @tun_dev_alloc_security:
+ *	This hook allows a module to allocate a security structure for a TUN
+ *	device.
+ *	@security pointer to a security structure pointer.
+ *	Returns a zero on success, negative values on failure.
+ * @tun_dev_free_security:
+ *	This hook allows a module to free the security structure for a TUN
+ *	device.
+ *	@security pointer to the TUN device's security structure
  * @tun_dev_create:
  *	Check permissions prior to creating a new TUN device.
- * @tun_dev_post_create:
- *	This hook allows a module to update or allocate a per-socket security
- *	structure.
- *	@sk contains the newly created sock structure.
  * @tun_dev_attach:
- *	Check permissions prior to attaching to a persistent TUN device.  This
- *	hook can also be used by the module to update any security state
+ *	This hook can be used by the module to update any security state
  *	associated with the TUN device's sock structure.
  *	@sk contains the existing sock structure.
+ *	@security pointer to the TUN device's security structure.
+ * @tun_dev_open:
+ *	This hook can be used by the module to update any security state
+ *	associated with the TUN device's security structure.
+ *	@security pointer to the TUN devices's security structure.
  *
  * Security hooks for XFRM operations.
  *
@@ -1439,7 +1456,7 @@ struct security_operations {
 	int (*quotactl) (int cmds, int type, int id, struct super_block *sb);
 	int (*quota_on) (struct dentry *dentry);
 	int (*syslog) (int type);
-	int (*settime) (struct timespec *ts, struct timezone *tz);
+	int (*settime) (const struct timespec *ts, const struct timezone *tz);
 	int (*vm_enough_memory) (struct mm_struct *mm, long pages);
 
 	int (*bprm_set_creds) (struct linux_binprm *bprm);
@@ -1451,6 +1468,7 @@ struct security_operations {
 	int (*sb_alloc_security) (struct super_block *sb);
 	void (*sb_free_security) (struct super_block *sb);
 	int (*sb_copy_data) (char *orig, char *copy);
+	int (*sb_remount) (struct super_block *sb, void *data);
 	int (*sb_kern_mount) (struct super_block *sb, int flags, void *data);
 	int (*sb_show_options) (struct seq_file *m, struct super_block *sb);
 	int (*sb_statfs) (struct dentry *dentry);
@@ -1470,7 +1488,7 @@ struct security_operations {
 				   struct path *new_path);
 	int (*sb_set_mnt_opts) (struct super_block *sb,
 				struct security_mnt_opts *opts);
-	void (*sb_clone_mnt_opts) (const struct super_block *oldsb,
+	int (*sb_clone_mnt_opts) (const struct super_block *oldsb,
 				   struct super_block *newsb);
 	int (*sb_parse_opts_str) (char *options, struct security_mnt_opts *opts);
 
@@ -1480,8 +1498,6 @@ struct security_operations {
 	int (*path_rmdir) (struct path *dir, struct dentry *dentry);
 	int (*path_mknod) (struct path *dir, struct dentry *dentry, int mode,
 			   unsigned int dev);
-	int (*path_truncate) (struct path *path, loff_t length,
-			      unsigned int time_attrs);
 	int (*path_symlink) (struct path *dir, struct dentry *dentry,
 			     const char *old_name);
 	int (*path_link) (struct dentry *old_dentry, struct path *new_dir,
@@ -1489,6 +1505,9 @@ struct security_operations {
 	int (*path_rename) (struct path *old_dir, struct dentry *old_dentry,
 			    struct path *new_dir, struct dentry *new_dentry);
 #endif
+
+	int (*path_truncate) (struct path *path, loff_t length,
+			      unsigned int time_attrs);
 
 	int (*inode_alloc_security) (struct inode *inode);
 	void (*inode_free_security) (struct inode *inode);
@@ -1557,7 +1576,7 @@ struct security_operations {
 	void (*cred_transfer)(struct cred *new, const struct cred *old);
 	int (*kernel_act_as)(struct cred *new, u32 secid);
 	int (*kernel_create_files_as)(struct cred *new, struct inode *inode);
-	int (*kernel_module_request)(void);
+	int (*kernel_module_request)(char *kmod_name);
 	int (*task_setuid) (uid_t id0, uid_t id1, uid_t id2, int flags);
 	int (*task_fix_setuid) (struct cred *new, const struct cred *old,
 				int flags);
@@ -1570,7 +1589,8 @@ struct security_operations {
 	int (*task_setnice) (struct task_struct *p, int nice);
 	int (*task_setioprio) (struct task_struct *p, int ioprio);
 	int (*task_getioprio) (struct task_struct *p);
-	int (*task_setrlimit) (unsigned int resource, struct rlimit *new_rlim);
+	int (*task_setrlimit) (struct task_struct *p, unsigned int resource,
+			struct rlimit *new_rlim);
 	int (*task_setscheduler) (struct task_struct *p, int policy,
 				  struct sched_param *lp);
 	int (*task_getscheduler) (struct task_struct *p);
@@ -1615,7 +1635,6 @@ struct security_operations {
 			  struct sembuf *sops, unsigned nsops, int alter);
 
 	int (*netlink_send) (struct sock *sk, struct sk_buff *skb);
-	int (*netlink_recv) (struct sk_buff *skb, int cap);
 
 	void (*d_instantiate) (struct dentry *dentry, struct inode *inode);
 
@@ -1665,9 +1684,11 @@ struct security_operations {
 	void (*inet_csk_clone) (struct sock *newsk, const struct request_sock *req);
 	void (*inet_conn_established) (struct sock *sk, struct sk_buff *skb);
 	void (*req_classify_flow) (const struct request_sock *req, struct flowi *fl);
-	int (*tun_dev_create)(void);
-	void (*tun_dev_post_create)(struct sock *sk);
-	int (*tun_dev_attach)(struct sock *sk);
+	int (*tun_dev_alloc_security) (void **security);
+	void (*tun_dev_free_security) (void *security);
+	int (*tun_dev_create) (void);
+	int (*tun_dev_attach) (struct sock *sk, void *security);
+	int (*tun_dev_open) (void *security);
 #endif	/* CONFIG_SECURITY_NETWORK */
 
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
@@ -1726,7 +1747,7 @@ int security_capset(struct cred *new, const struct cred *old,
 		    const kernel_cap_t *effective,
 		    const kernel_cap_t *inheritable,
 		    const kernel_cap_t *permitted);
-int security_capable(int cap);
+int security_capable(const struct cred *cred, int cap);
 int security_real_capable(struct task_struct *tsk, int cap);
 int security_real_capable_noaudit(struct task_struct *tsk, int cap);
 int security_acct(struct file *file);
@@ -1734,7 +1755,7 @@ int security_sysctl(struct ctl_table *table, int op);
 int security_quotactl(int cmds, int type, int id, struct super_block *sb);
 int security_quota_on(struct dentry *dentry);
 int security_syslog(int type);
-int security_settime(struct timespec *ts, struct timezone *tz);
+int security_settime(const struct timespec *ts, const struct timezone *tz);
 int security_vm_enough_memory(long pages);
 int security_vm_enough_memory_mm(struct mm_struct *mm, long pages);
 int security_vm_enough_memory_kern(long pages);
@@ -1746,6 +1767,7 @@ int security_bprm_secureexec(struct linux_binprm *bprm);
 int security_sb_alloc(struct super_block *sb);
 void security_sb_free(struct super_block *sb);
 int security_sb_copy_data(char *orig, char *copy);
+int security_sb_remount(struct super_block *sb, void *data);
 int security_sb_kern_mount(struct super_block *sb, int flags, void *data);
 int security_sb_show_options(struct seq_file *m, struct super_block *sb);
 int security_sb_statfs(struct dentry *dentry);
@@ -1760,7 +1782,7 @@ void security_sb_post_addmount(struct vfsmount *mnt, struct path *mountpoint);
 int security_sb_pivotroot(struct path *old_path, struct path *new_path);
 void security_sb_post_pivotroot(struct path *old_path, struct path *new_path);
 int security_sb_set_mnt_opts(struct super_block *sb, struct security_mnt_opts *opts);
-void security_sb_clone_mnt_opts(const struct super_block *oldsb,
+int security_sb_clone_mnt_opts(const struct super_block *oldsb,
 				struct super_block *newsb);
 int security_sb_parse_opts_str(char *options, struct security_mnt_opts *opts);
 
@@ -1822,7 +1844,7 @@ void security_commit_creds(struct cred *new, const struct cred *old);
 void security_transfer_creds(struct cred *new, const struct cred *old);
 int security_kernel_act_as(struct cred *new, u32 secid);
 int security_kernel_create_files_as(struct cred *new, struct inode *inode);
-int security_kernel_module_request(void);
+int security_kernel_module_request(char *kmod_name);
 int security_task_setuid(uid_t id0, uid_t id1, uid_t id2, int flags);
 int security_task_fix_setuid(struct cred *new, const struct cred *old,
 			     int flags);
@@ -1835,7 +1857,8 @@ int security_task_setgroups(struct group_info *group_info);
 int security_task_setnice(struct task_struct *p, int nice);
 int security_task_setioprio(struct task_struct *p, int ioprio);
 int security_task_getioprio(struct task_struct *p);
-int security_task_setrlimit(unsigned int resource, struct rlimit *new_rlim);
+int security_task_setrlimit(struct task_struct *p, unsigned int resource,
+		struct rlimit *new_rlim);
 int security_task_setscheduler(struct task_struct *p,
 				int policy, struct sched_param *lp);
 int security_task_getscheduler(struct task_struct *p);
@@ -1873,7 +1896,6 @@ void security_d_instantiate(struct dentry *dentry, struct inode *inode);
 int security_getprocattr(struct task_struct *p, char *name, char **value);
 int security_setprocattr(struct task_struct *p, char *name, void *value, size_t size);
 int security_netlink_send(struct sock *sk, struct sk_buff *skb);
-int security_netlink_recv(struct sk_buff *skb, int cap);
 int security_secid_to_secctx(u32 secid, char **secdata, u32 *seclen);
 int security_secctx_to_secid(const char *secdata, u32 seclen, u32 *secid);
 void security_release_secctx(char *secdata, u32 seclen);
@@ -1881,6 +1903,9 @@ void security_release_secctx(char *secdata, u32 seclen);
 int security_inode_notifysecctx(struct inode *inode, void *ctx, u32 ctxlen);
 int security_inode_setsecctx(struct dentry *dentry, void *ctx, u32 ctxlen);
 int security_inode_getsecctx(struct inode *inode, void **ctx, u32 *ctxlen);
+
+int security_path_truncate(struct path *path, loff_t length,
+			   unsigned int time_attrs);
 #else /* CONFIG_SECURITY */
 struct security_mnt_opts {
 };
@@ -1931,9 +1956,9 @@ static inline int security_capset(struct cred *new,
 	return cap_capset(new, old, effective, inheritable, permitted);
 }
 
-static inline int security_capable(int cap)
+static inline int security_capable(const struct cred *cred, int cap)
 {
-	return cap_capable(current, current_cred(), cap, SECURITY_CAP_AUDIT);
+	return cap_capable(current, cred, cap, SECURITY_CAP_AUDIT);
 }
 
 static inline int security_real_capable(struct task_struct *tsk, int cap)
@@ -1984,7 +2009,8 @@ static inline int security_syslog(int type)
 	return cap_syslog(type);
 }
 
-static inline int security_settime(struct timespec *ts, struct timezone *tz)
+static inline int security_settime(const struct timespec *ts,
+				   const struct timezone *tz)
 {
 	return cap_settime(ts, tz);
 }
@@ -2040,6 +2066,11 @@ static inline void security_sb_free(struct super_block *sb)
 { }
 
 static inline int security_sb_copy_data(char *orig, char *copy)
+{
+	return 0;
+}
+
+static inline int security_sb_remount(struct super_block *sb, void *data)
 {
 	return 0;
 }
@@ -2108,9 +2139,11 @@ static inline int security_sb_set_mnt_opts(struct super_block *sb,
 	return 0;
 }
 
-static inline void security_sb_clone_mnt_opts(const struct super_block *oldsb,
+static inline int security_sb_clone_mnt_opts(const struct super_block *oldsb,
 					      struct super_block *newsb)
-{ }
+{
+	return 0;
+}
 
 static inline int security_sb_parse_opts_str(char *options, struct security_mnt_opts *opts)
 {
@@ -2387,7 +2420,7 @@ static inline int security_kernel_create_files_as(struct cred *cred,
 	return 0;
 }
 
-static inline int security_kernel_module_request(void)
+static inline int security_kernel_module_request(char *kmod_name)
 {
 	return 0;
 }
@@ -2451,7 +2484,8 @@ static inline int security_task_getioprio(struct task_struct *p)
 	return 0;
 }
 
-static inline int security_task_setrlimit(unsigned int resource,
+static inline int security_task_setrlimit(struct task_struct *p,
+					  unsigned int resource,
 					  struct rlimit *new_rlim)
 {
 	return 0;
@@ -2617,11 +2651,6 @@ static inline int security_netlink_send(struct sock *sk, struct sk_buff *skb)
 	return cap_netlink_send(sk, skb);
 }
 
-static inline int security_netlink_recv(struct sk_buff *skb, int cap)
-{
-	return cap_netlink_recv(skb, cap);
-}
-
 static inline int security_secid_to_secctx(u32 secid, char **secdata, u32 *seclen)
 {
 	return -EOPNOTSUPP;
@@ -2649,6 +2678,12 @@ static inline int security_inode_setsecctx(struct dentry *dentry, void *ctx, u32
 static inline int security_inode_getsecctx(struct inode *inode, void **ctx, u32 *ctxlen)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline int security_path_truncate(struct path *path, loff_t length,
+					 unsigned int time_attrs)
+{
+	return 0;
 }
 #endif	/* CONFIG_SECURITY */
 
@@ -2688,9 +2723,11 @@ void security_inet_csk_clone(struct sock *newsk,
 			const struct request_sock *req);
 void security_inet_conn_established(struct sock *sk,
 			struct sk_buff *skb);
+int security_tun_dev_alloc_security(void **security);
+void security_tun_dev_free_security(void *security);
 int security_tun_dev_create(void);
-void security_tun_dev_post_create(struct sock *sk);
-int security_tun_dev_attach(struct sock *sk);
+int security_tun_dev_attach(struct sock *sk, void *security);
+int security_tun_dev_open(void *security);
 
 #else	/* CONFIG_SECURITY_NETWORK */
 static inline int security_unix_stream_connect(struct socket *sock,
@@ -2842,16 +2879,26 @@ static inline void security_inet_conn_established(struct sock *sk,
 {
 }
 
+static inline int security_tun_dev_alloc_security(void **security)
+{
+	return 0;
+}
+
+static inline void security_tun_dev_free_security(void *security)
+{
+}
+
 static inline int security_tun_dev_create(void)
 {
 	return 0;
 }
 
-static inline void security_tun_dev_post_create(struct sock *sk)
+static inline int security_tun_dev_attach(struct sock *sk, void *security)
 {
+	return 0;
 }
 
-static inline int security_tun_dev_attach(struct sock *sk)
+static inline int security_tun_dev_open(void *security)
 {
 	return 0;
 }
@@ -2944,8 +2991,6 @@ int security_path_mkdir(struct path *dir, struct dentry *dentry, int mode);
 int security_path_rmdir(struct path *dir, struct dentry *dentry);
 int security_path_mknod(struct path *dir, struct dentry *dentry, int mode,
 			unsigned int dev);
-int security_path_truncate(struct path *path, loff_t length,
-			   unsigned int time_attrs);
 int security_path_symlink(struct path *dir, struct dentry *dentry,
 			  const char *old_name);
 int security_path_link(struct dentry *old_dentry, struct path *new_dir,
@@ -2971,12 +3016,6 @@ static inline int security_path_rmdir(struct path *dir, struct dentry *dentry)
 
 static inline int security_path_mknod(struct path *dir, struct dentry *dentry,
 				      int mode, unsigned int dev)
-{
-	return 0;
-}
-
-static inline int security_path_truncate(struct path *path, loff_t length,
-					 unsigned int time_attrs)
 {
 	return 0;
 }

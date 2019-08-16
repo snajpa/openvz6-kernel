@@ -69,7 +69,29 @@ static DEFINE_PER_CPU(struct clock_event_device, comparators);
  */
 unsigned long long notrace sched_clock(void)
 {
-	return (get_clock_monotonic() * 125) >> 9;
+	return tod_to_ns(get_clock_monotonic());
+}
+
+unsigned char ptff_function_mask[16];
+unsigned long lpar_offset;
+
+/*
+ * Get time offsets with PTFF
+ */
+void __init ptff_init(void)
+{
+	unsigned long long facility_bits;
+	struct ptff_qto qto;
+
+	if (stfle(&facility_bits, 1) <= 0)
+		return;
+	if (!(facility_bits & (1ULL << (63 - 28))))
+		return;
+	ptff(&ptff_function_mask, sizeof(ptff_function_mask), PTFF_QAF);
+
+	/* get LPAR offset */
+	if (ptff_query(PTFF_QTO) && ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
+		lpar_offset = qto.tod_epoch_difference;
 }
 
 /*
@@ -81,15 +103,15 @@ unsigned long long monotonic_clock(void)
 }
 EXPORT_SYMBOL(monotonic_clock);
 
-void tod_to_timeval(__u64 todval, struct timespec *xtime)
+void tod_to_timeval(__u64 todval, struct timespec *xt)
 {
 	unsigned long long sec;
 
 	sec = todval >> 12;
 	do_div(sec, 1000000);
-	xtime->tv_sec = sec;
+	xt->tv_sec = sec;
 	todval -= (sec * 1000000) << 12;
-	xtime->tv_nsec = ((todval * 1000) >> 12);
+	xt->tv_nsec = ((todval * 1000) >> 12);
 }
 EXPORT_SYMBOL(tod_to_timeval);
 
@@ -214,7 +236,8 @@ struct clocksource * __init clocksource_default_clock(void)
 	return &clocksource_tod;
 }
 
-void update_vsyscall(struct timespec *wall_time, struct clocksource *clock)
+void update_vsyscall(struct timespec *wall_time, struct timespec *wtm,
+			struct clocksource *clock, u32 mult)
 {
 	if (clock != &clocksource_tod)
 		return;
@@ -223,10 +246,11 @@ void update_vsyscall(struct timespec *wall_time, struct clocksource *clock)
 	++vdso_data->tb_update_count;
 	smp_wmb();
 	vdso_data->xtime_tod_stamp = clock->cycle_last;
-	vdso_data->xtime_clock_sec = xtime.tv_sec;
-	vdso_data->xtime_clock_nsec = xtime.tv_nsec;
-	vdso_data->wtom_clock_sec = wall_to_monotonic.tv_sec;
-	vdso_data->wtom_clock_nsec = wall_to_monotonic.tv_nsec;
+	vdso_data->xtime_clock_sec = wall_time->tv_sec;
+	vdso_data->xtime_clock_nsec = wall_time->tv_nsec;
+	vdso_data->wtom_clock_sec = wtm->tv_sec;
+	vdso_data->wtom_clock_nsec = wtm->tv_nsec;
+	vdso_data->ntp_mult = mult;
 	smp_wmb();
 	++vdso_data->tb_update_count;
 }
@@ -319,11 +343,11 @@ static unsigned long clock_sync_flags;
 #define CLOCK_SYNC_STP		3
 
 /*
- * The synchronous get_clock function. It will write the current clock
- * value to the clock pointer and return 0 if the clock is in sync with
- * the external time source. If the clock mode is local it will return
- * -ENOSYS and -EAGAIN if the clock is not in sync with the external
- * reference.
+ * The get_clock function for the physical clock. It will get the current
+ * TOD clock, subtract the LPAR offset and write the result to *clock.
+ * The function returns 0 if the clock is in sync with the external time
+ * source. If the clock mode is local it will return -EOPNOTSUPP and
+ * -EAGAIN if the clock is not in sync with the external reference.
  */
 int get_sync_clock(unsigned long long *clock)
 {
@@ -332,7 +356,7 @@ int get_sync_clock(unsigned long long *clock)
 
 	sw_ptr = &get_cpu_var(clock_sync_word);
 	sw0 = atomic_read(sw_ptr);
-	*clock = get_clock();
+	*clock = get_clock() - lpar_offset;
 	sw1 = atomic_read(sw_ptr);
 	put_cpu_var(clock_sync_sync);
 	if (sw0 == sw1 && (sw0 & 0x80000000U))
@@ -396,7 +420,6 @@ static void __init time_init_wq(void)
 	if (time_sync_wq)
 		return;
 	time_sync_wq = create_singlethread_workqueue("timesync");
-	stop_machine_create();
 }
 
 /*
@@ -530,8 +553,11 @@ void etr_switch_to_local(void)
 	if (!etr_eacr.sl)
 		return;
 	disable_sync_clock(NULL);
-	set_bit(ETR_EVENT_SWITCH_LOCAL, &etr_events);
-	queue_work(time_sync_wq, &etr_work);
+	if (!test_and_set_bit(ETR_EVENT_SWITCH_LOCAL, &etr_events)) {
+		etr_eacr.es = etr_eacr.sl = 0;
+		etr_setr(&etr_eacr);
+		queue_work(time_sync_wq, &etr_work);
+	}
 }
 
 /*
@@ -545,8 +571,11 @@ void etr_sync_check(void)
 	if (!etr_eacr.es)
 		return;
 	disable_sync_clock(NULL);
-	set_bit(ETR_EVENT_SYNC_CHECK, &etr_events);
-	queue_work(time_sync_wq, &etr_work);
+	if (!test_and_set_bit(ETR_EVENT_SYNC_CHECK, &etr_events)) {
+		etr_eacr.es = 0;
+		etr_setr(&etr_eacr);
+		queue_work(time_sync_wq, &etr_work);
+	}
 }
 
 /*
@@ -729,6 +758,7 @@ static int etr_sync_clock(void *data)
 	unsigned long long clock, old_clock, delay, delta;
 	struct clock_sync_data *etr_sync;
 	struct etr_aib *sync_port, *aib;
+	struct ptff_qto qto;
 	int port;
 	int rc;
 
@@ -772,6 +802,10 @@ static int etr_sync_clock(void *data)
 			etr_sync->in_sync = -EAGAIN;
 			rc = -EAGAIN;
 		} else {
+			if (ptff_query(PTFF_QTO) &&
+			    ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
+				/* Update LPAR offset */
+				lpar_offset = qto.tod_epoch_difference;
 			etr_sync->in_sync = 1;
 			rc = 0;
 		}
@@ -908,7 +942,7 @@ static struct etr_eacr etr_handle_update(struct etr_aib *aib,
 	 * Do not try to get the alternate port aib if the clock
 	 * is not in sync yet.
 	 */
-	if (!check_sync_clock())
+	if (!eacr.es || !check_sync_clock())
 		return eacr;
 
 	/*
@@ -1070,7 +1104,7 @@ static void etr_work_fn(struct work_struct *work)
 	 * If the clock is in sync just update the eacr and return.
 	 * If there is no valid sync port wait for a port update.
 	 */
-	if (check_sync_clock() || sync_port < 0) {
+	if ((eacr.es && check_sync_clock()) || sync_port < 0) {
 		etr_update_eacr(eacr);
 		etr_set_tolec_timeout(now);
 		goto out_unlock;
@@ -1497,6 +1531,7 @@ static int stp_sync_clock(void *data)
 	static int first;
 	unsigned long long old_clock, delta;
 	struct clock_sync_data *stp_sync;
+	struct ptff_qto qto;
 	int rc;
 
 	stp_sync = data;
@@ -1521,6 +1556,10 @@ static int stp_sync_clock(void *data)
 		rc = chsc_sstpc(stp_page, STP_OP_SYNC, 0);
 		if (rc == 0) {
 			delta = adjust_time(old_clock, get_clock(), 0);
+			if (ptff_query(PTFF_QTO) &&
+			    ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
+				/* Update LPAR offset */
+				lpar_offset = qto.tod_epoch_difference;
 			fixup_clock_comparator(delta);
 			rc = chsc_sstpi(stp_page, &stp_info,
 					sizeof(struct stp_sstpi));

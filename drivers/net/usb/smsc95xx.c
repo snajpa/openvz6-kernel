@@ -666,9 +666,9 @@ static void smsc95xx_init_mac_address(struct usbnet *dev)
 	}
 
 	/* no eeprom, or eeprom values are invalid. generate random MAC */
-	random_ether_addr(dev->net->dev_addr);
+	eth_hw_addr_random(dev->net);
 	if (netif_msg_ifup(dev))
-		devdbg(dev, "MAC address set to random_ether_addr");
+		devdbg(dev, "MAC address set to random");
 }
 
 static int smsc95xx_set_mac_address(struct usbnet *dev)
@@ -1317,6 +1317,7 @@ static struct usb_driver smsc95xx_driver = {
 	.suspend	= usbnet_suspend,
 	.resume		= usbnet_resume,
 	.disconnect	= usbnet_disconnect,
+	.disable_hub_initiated_lpm = 1,
 };
 
 static int __init smsc95xx_init(void)

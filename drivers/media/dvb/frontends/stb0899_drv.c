@@ -22,6 +22,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 
 #include <linux/dvb/frontend.h>
@@ -713,7 +714,7 @@ static int stb0899_send_diseqc_msg(struct dvb_frontend *fe, struct dvb_diseqc_ma
 	reg = stb0899_read_reg(state, STB0899_DISCNTRL1);
 	STB0899_SETFIELD_VAL(DISPRECHARGE, reg, 0);
 	stb0899_write_reg(state, STB0899_DISCNTRL1, reg);
-
+	msleep(100);
 	return 0;
 }
 
@@ -935,11 +936,14 @@ static int stb0899_table_lookup(const struct stb0899_tab *tab, int max, int val)
 	int res = 0;
 	int min = 0, med;
 
-	if (val < tab[min].read)
+	if (val < tab[min].read) {
+		gmb();
 		res = tab[min].real;
-	else if (val >= tab[max].read)
+	} else if (val >= tab[max].read) {
+		gmb();
 		res = tab[max].real;
-	else {
+	} else {
+		gmb();
 		while ((max - min) > 1) {
 			med = (max + min) / 2;
 			if (val >= tab[min].read && val < tab[med].read)
@@ -1571,7 +1575,7 @@ static enum dvbfe_search stb0899_search(struct dvb_frontend *fe, struct dvb_fron
  * stb0899_track
  * periodically check the signal level against a specified
  * threshold level and perform derotator centering.
- * called once we have a lock from a succesful search
+ * called once we have a lock from a successful search
  * event.
  *
  * Will be called periodically called to maintain the

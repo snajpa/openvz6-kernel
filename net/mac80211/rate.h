@@ -14,27 +14,20 @@
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <linux/types.h>
-#include <linux/kref.h>
 #include <net/mac80211.h>
 #include "ieee80211_i.h"
 #include "sta_info.h"
+#include "driver-ops.h"
 
 struct rate_control_ref {
 	struct ieee80211_local *local;
-	struct rate_control_ops *ops;
+	const struct rate_control_ops *ops;
 	void *priv;
-	struct kref kref;
 };
 
-/* Get a reference to the rate control algorithm. If `name' is NULL, get the
- * first available algorithm. */
-struct rate_control_ref *rate_control_alloc(const char *name,
-					    struct ieee80211_local *local);
 void rate_control_get_rate(struct ieee80211_sub_if_data *sdata,
 			   struct sta_info *sta,
 			   struct ieee80211_tx_rate_control *txrc);
-struct rate_control_ref *rate_control_get(struct rate_control_ref *ref);
-void rate_control_put(struct rate_control_ref *ref);
 
 static inline void rate_control_tx_status(struct ieee80211_local *local,
 					  struct ieee80211_supported_band *sband,
@@ -46,42 +39,48 @@ static inline void rate_control_tx_status(struct ieee80211_local *local,
 	void *priv_sta = sta->rate_ctrl_priv;
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 
-	if (likely(info->flags & IEEE80211_TX_INTFL_RCALGO))
+	if (!ref || !test_sta_flag(sta, WLAN_STA_RATE_CONTROL))
+		return;
+
+	spin_lock_bh(&sta->rate_ctrl_lock);
+	if (ref->ops->tx_status)
 		ref->ops->tx_status(ref->priv, sband, ista, priv_sta, skb);
+	else
+		ref->ops->tx_status_noskb(ref->priv, sband, ista, priv_sta, info);
+	spin_unlock_bh(&sta->rate_ctrl_lock);
 }
 
-
-static inline void rate_control_rate_init(struct sta_info *sta)
-{
-	struct ieee80211_local *local = sta->sdata->local;
-	struct rate_control_ref *ref = sta->rate_ctrl;
-	struct ieee80211_sta *ista = &sta->sta;
-	void *priv_sta = sta->rate_ctrl_priv;
-	struct ieee80211_supported_band *sband;
-
-	sband = local->hw.wiphy->bands[local->hw.conf.channel->band];
-
-	ref->ops->rate_init(ref->priv, sband, ista, priv_sta);
-}
-
-static inline void rate_control_rate_update(struct ieee80211_local *local,
-				    struct ieee80211_supported_band *sband,
-				    struct sta_info *sta, u32 changed)
+static inline void
+rate_control_tx_status_noskb(struct ieee80211_local *local,
+			     struct ieee80211_supported_band *sband,
+			     struct sta_info *sta,
+			     struct ieee80211_tx_info *info)
 {
 	struct rate_control_ref *ref = local->rate_ctrl;
 	struct ieee80211_sta *ista = &sta->sta;
 	void *priv_sta = sta->rate_ctrl_priv;
 
-	if (ref->ops->rate_update)
-		ref->ops->rate_update(ref->priv, sband, ista,
-				      priv_sta, changed);
+	if (!ref || !test_sta_flag(sta, WLAN_STA_RATE_CONTROL))
+		return;
+
+	if (WARN_ON_ONCE(!ref->ops->tx_status_noskb))
+		return;
+
+	spin_lock_bh(&sta->rate_ctrl_lock);
+	ref->ops->tx_status_noskb(ref->priv, sband, ista, priv_sta, info);
+	spin_unlock_bh(&sta->rate_ctrl_lock);
 }
 
+void rate_control_rate_init(struct sta_info *sta);
+void rate_control_rate_update(struct ieee80211_local *local,
+				    struct ieee80211_supported_band *sband,
+				    struct sta_info *sta, u32 changed);
+
 static inline void *rate_control_alloc_sta(struct rate_control_ref *ref,
-					   struct ieee80211_sta *sta,
-					   gfp_t gfp)
+					   struct sta_info *sta, gfp_t gfp)
 {
-	return ref->ops->alloc_sta(ref->priv, sta, gfp);
+	spin_lock_init(&sta->rate_ctrl_lock);
+	return ref->ops->alloc_sta(ref->priv, &sta->sta, gfp);
 }
 
 static inline void rate_control_free_sta(struct sta_info *sta)
@@ -97,7 +96,7 @@ static inline void rate_control_add_sta_debugfs(struct sta_info *sta)
 {
 #ifdef CONFIG_MAC80211_DEBUGFS
 	struct rate_control_ref *ref = sta->rate_ctrl;
-	if (sta->debugfs.dir && ref->ops->add_sta_debugfs)
+	if (ref && sta->debugfs.dir && ref->ops->add_sta_debugfs)
 		ref->ops->add_sta_debugfs(ref->priv, sta->rate_ctrl_priv,
 					  sta->debugfs.dir);
 #endif
@@ -107,40 +106,41 @@ static inline void rate_control_remove_sta_debugfs(struct sta_info *sta)
 {
 #ifdef CONFIG_MAC80211_DEBUGFS
 	struct rate_control_ref *ref = sta->rate_ctrl;
-	if (ref->ops->remove_sta_debugfs)
+	if (ref && ref->ops->remove_sta_debugfs)
 		ref->ops->remove_sta_debugfs(ref->priv, sta->rate_ctrl_priv);
 #endif
 }
 
-/* functions for rate control related to a device */
+/* Get a reference to the rate control algorithm. If `name' is NULL, get the
+ * first available algorithm. */
 int ieee80211_init_rate_ctrl_alg(struct ieee80211_local *local,
 				 const char *name);
 void rate_control_deinitialize(struct ieee80211_local *local);
 
 
 /* Rate control algorithms */
-#ifdef CONFIG_MAC80211_RC_PID
-extern int rc80211_pid_init(void);
-extern void rc80211_pid_exit(void);
-#else
-static inline int rc80211_pid_init(void)
-{
-	return 0;
-}
-static inline void rc80211_pid_exit(void)
-{
-}
-#endif
-
 #ifdef CONFIG_MAC80211_RC_MINSTREL
-extern int rc80211_minstrel_init(void);
-extern void rc80211_minstrel_exit(void);
+int rc80211_minstrel_init(void);
+void rc80211_minstrel_exit(void);
 #else
 static inline int rc80211_minstrel_init(void)
 {
 	return 0;
 }
 static inline void rc80211_minstrel_exit(void)
+{
+}
+#endif
+
+#ifdef CONFIG_MAC80211_RC_MINSTREL_HT
+int rc80211_minstrel_ht_init(void);
+void rc80211_minstrel_ht_exit(void);
+#else
+static inline int rc80211_minstrel_ht_init(void)
+{
+	return 0;
+}
+static inline void rc80211_minstrel_ht_exit(void)
 {
 }
 #endif

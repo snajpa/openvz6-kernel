@@ -109,7 +109,6 @@ int cxio_hal_cq_op(struct cxio_rdev *rdev_p, struct t3_cq *cq,
 		while (!CQ_VLD_ENTRY(rptr, cq->size_log2, cqe)) {
 			udelay(1);
 			if (i++ > 1000000) {
-				BUG_ON(1);
 				printk(KERN_ERR "%s: stalled rnic\n",
 				       rdev_p->dev_name);
 				return -EIO;
@@ -155,20 +154,21 @@ static int cxio_hal_clear_qp_ctx(struct cxio_rdev *rdev_p, u32 qpid)
 	return iwch_cxgb3_ofld_send(rdev_p->t3cdev_p, skb);
 }
 
-int cxio_create_cq(struct cxio_rdev *rdev_p, struct t3_cq *cq)
+int cxio_create_cq(struct cxio_rdev *rdev_p, struct t3_cq *cq, int kernel)
 {
 	struct rdma_cq_setup setup;
 	int size = (1UL << (cq->size_log2)) * sizeof(struct t3_cqe);
 
+	size += 1; /* one extra page for storing cq-in-err state */
 	cq->cqid = cxio_hal_get_cqid(rdev_p->rscp);
 	if (!cq->cqid)
 		return -ENOMEM;
-	cq->sw_queue = kzalloc(size, GFP_KERNEL);
-	if (!cq->sw_queue)
-		return -ENOMEM;
-	cq->queue = dma_alloc_coherent(&(rdev_p->rnic_info.pdev->dev),
-					     (1UL << (cq->size_log2)) *
-					     sizeof(struct t3_cqe),
+	if (kernel) {
+		cq->sw_queue = kzalloc(size, GFP_KERNEL);
+		if (!cq->sw_queue)
+			return -ENOMEM;
+	}
+	cq->queue = dma_alloc_coherent(&(rdev_p->rnic_info.pdev->dev), size,
 					     &(cq->dma_addr), GFP_KERNEL);
 	if (!cq->queue) {
 		kfree(cq->sw_queue);
@@ -188,6 +188,7 @@ int cxio_create_cq(struct cxio_rdev *rdev_p, struct t3_cq *cq)
 	return (rdev_p->t3cdev_p->ctl(rdev_p->t3cdev_p, RDMA_CQ_SETUP, &setup));
 }
 
+#ifdef notyet
 int cxio_resize_cq(struct cxio_rdev *rdev_p, struct t3_cq *cq)
 {
 	struct rdma_cq_setup setup;
@@ -199,6 +200,7 @@ int cxio_resize_cq(struct cxio_rdev *rdev_p, struct t3_cq *cq)
 	setup.ovfl_mode = 1;
 	return (rdev_p->t3cdev_p->ctl(rdev_p->t3cdev_p, RDMA_CQ_SETUP, &setup));
 }
+#endif
 
 static u32 get_qpid(struct cxio_rdev *rdev_p, struct cxio_ucontext *uctx)
 {
@@ -732,14 +734,12 @@ static int __cxio_tpt_op(struct cxio_rdev *rdev_p, u32 reset_tpt_entry,
 			((perm & TPT_MW_BIND) ? F_TPT_MW_BIND_ENABLE : 0) |
 			V_TPT_ADDR_TYPE((zbva ? TPT_ZBTO : TPT_VATO)) |
 			V_TPT_PAGE_SIZE(page_size));
-		tpt.rsvd_pbl_addr = reset_tpt_entry ? 0 :
-				    cpu_to_be32(V_TPT_PBL_ADDR(PBL_OFF(rdev_p, pbl_addr)>>3));
+		tpt.rsvd_pbl_addr = cpu_to_be32(V_TPT_PBL_ADDR(PBL_OFF(rdev_p, pbl_addr)>>3));
 		tpt.len = cpu_to_be32(len);
 		tpt.va_hi = cpu_to_be32((u32) (to >> 32));
 		tpt.va_low_or_fbo = cpu_to_be32((u32) (to & 0xFFFFFFFFULL));
 		tpt.rsvd_bind_cnt_or_pstag = 0;
-		tpt.rsvd_pbl_size = reset_tpt_entry ? 0 :
-				  cpu_to_be32(V_TPT_PBL_SIZE(pbl_size >> 2));
+		tpt.rsvd_pbl_size = cpu_to_be32(V_TPT_PBL_SIZE(pbl_size >> 2));
 	}
 	err = cxio_hal_ctrl_qp_write_mem(rdev_p,
 				       stag_idx +

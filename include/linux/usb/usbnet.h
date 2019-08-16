@@ -43,7 +43,7 @@ struct usbnet {
 	/* protocol/interface state */
 	struct net_device	*net;
 	int			msg_enable;
-	unsigned long		data [5];
+	unsigned long		data[5];
 	u32			xid;
 	u32			hard_mtu;	/* count any extra framing */
 	size_t			rx_urb_size;	/* size for rx urbs */
@@ -65,6 +65,18 @@ struct usbnet {
 #		define EVENT_STS_SPLIT	3
 #		define EVENT_LINK_RESET	4
 #		define EVENT_RX_PAUSED	5
+#		define EVENT_DEV_ASLEEP 6
+#		define EVENT_DEV_OPEN	7
+#		define EVENT_DEVICE_REPORT_IDLE	8
+#		define EVENT_NO_RUNTIME_PM	9
+#		define EVENT_RX_KILL	10
+#		define EVENT_LINK_CHANGE	11
+#ifndef __GENKSYMS__
+	struct usb_anchor	deferred;
+	unsigned char		pkt_cnt, pkt_err;
+	unsigned		interrupt_count;
+	struct mutex		interrupt_mutex;
+#endif
 };
 
 static inline struct usb_driver *driver_of(struct usb_interface *intf)
@@ -90,7 +102,21 @@ struct driver_info {
 #define FLAG_WLAN	0x0080		/* use "wlan%d" names */
 #define FLAG_AVOID_UNLINK_URBS 0x0100	/* don't unlink urbs at usbnet_stop() */
 #define FLAG_SEND_ZLP	0x0200		/* hw requires ZLPs are sent */
+#define FLAG_WWAN	0x0400		/* use "wwan%d" names */
 
+#define FLAG_LINK_INTR	0x0800		/* updates link (carrier) status */
+
+#define FLAG_POINTTOPOINT 0x1000	/* possibly use "usb%d" names */
+
+/*
+ * Indicates to usbnet, that USB driver accumulates multiple IP packets.
+ * Affects statistic (counters) and short packet handling.
+ */
+#define FLAG_MULTI_PACKET	0x2000
+#define FLAG_RX_ASSEMBLE	0x4000	/* rx packets may span >1 frames */
+#define FLAG_NOARP		0x8000	/* device can't do ARP */
+
+#define FLAG_RH_HAS_MANAGE_POWER 0x80000000 /* Flag to indicate that we have manage_power */
 
 	/* init device ... can sleep, or cause probe() failure */
 	int	(*bind)(struct usbnet *, struct usb_interface *);
@@ -133,6 +159,10 @@ struct driver_info {
 	int		out;		/* tx endpoint */
 
 	unsigned long	data;		/* Misc driver specific data */
+#ifndef __GENKSYMS__
+	/* (dis)activate runtime power management */
+	int	(*manage_power)(struct usbnet *, int);
+#endif
 };
 
 /* Minidrivers are just drivers using the "usbnet" core as a powerful
@@ -140,10 +170,21 @@ struct driver_info {
  * much everything except custom framing and chip-specific stuff.
  */
 extern int usbnet_probe(struct usb_interface *, const struct usb_device_id *);
-extern int usbnet_suspend (struct usb_interface *, pm_message_t );
-extern int usbnet_resume (struct usb_interface *);
+extern int usbnet_suspend(struct usb_interface *, pm_message_t);
+extern int usbnet_resume(struct usb_interface *);
 extern void usbnet_disconnect(struct usb_interface *);
+extern void usbnet_device_suggests_idle(struct usbnet *dev);
 
+extern int usbnet_read_cmd(struct usbnet *dev, u8 cmd, u8 reqtype,
+		    u16 value, u16 index, void *data, u16 size);
+extern int usbnet_write_cmd(struct usbnet *dev, u8 cmd, u8 reqtype,
+		    u16 value, u16 index, const void *data, u16 size);
+extern int usbnet_read_cmd_nopm(struct usbnet *dev, u8 cmd, u8 reqtype,
+		    u16 value, u16 index, void *data, u16 size);
+extern int usbnet_write_cmd_nopm(struct usbnet *dev, u8 cmd, u8 reqtype,
+		    u16 value, u16 index, const void *data, u16 size);
+extern int usbnet_write_cmd_async(struct usbnet *dev, u8 cmd, u8 reqtype,
+		    u16 value, u16 index, const void *data, u16 size);
 
 /* Drivers that reuse some of the standard USB CDC infrastructure
  * (notably, using multiple interfaces according to the CDC
@@ -157,8 +198,10 @@ struct cdc_state {
 	struct usb_interface		*data;
 };
 
-extern int usbnet_generic_cdc_bind (struct usbnet *, struct usb_interface *);
-extern void usbnet_cdc_unbind (struct usbnet *, struct usb_interface *);
+extern int usbnet_generic_cdc_bind(struct usbnet *, struct usb_interface *);
+extern int usbnet_cdc_bind(struct usbnet *, struct usb_interface *);
+extern void usbnet_cdc_unbind(struct usbnet *, struct usb_interface *);
+extern void usbnet_cdc_status(struct usbnet *, struct urb *);
 
 /* CDC and RNDIS support the same host-chosen packet filters for IN transfers */
 #define	DEFAULT_FILTER	(USB_CDC_PACKET_TYPE_BROADCAST \
@@ -171,7 +214,8 @@ extern void usbnet_cdc_unbind (struct usbnet *, struct usb_interface *);
 enum skb_state {
 	illegal = 0,
 	tx_start, tx_done,
-	rx_start, rx_done, rx_cleanup
+	rx_start, rx_done, rx_cleanup,
+	unlink_start
 };
 
 struct skb_data {	/* skb->cb is one of these */
@@ -181,29 +225,31 @@ struct skb_data {	/* skb->cb is one of these */
 	size_t			length;
 };
 
-extern int usbnet_open (struct net_device *net);
-extern int usbnet_stop (struct net_device *net);
-extern netdev_tx_t usbnet_start_xmit (struct sk_buff *skb,
-				      struct net_device *net);
-extern void usbnet_tx_timeout (struct net_device *net);
-extern int usbnet_change_mtu (struct net_device *net, int new_mtu);
+extern int usbnet_open(struct net_device *net);
+extern int usbnet_stop(struct net_device *net);
+extern netdev_tx_t usbnet_start_xmit(struct sk_buff *skb,
+				     struct net_device *net);
+extern void usbnet_tx_timeout(struct net_device *net);
+extern int usbnet_change_mtu(struct net_device *net, int new_mtu);
 
 extern int usbnet_get_endpoints(struct usbnet *, struct usb_interface *);
 extern int usbnet_get_ethernet_addr(struct usbnet *, int);
-extern void usbnet_defer_kevent (struct usbnet *, int);
-extern void usbnet_skb_return (struct usbnet *, struct sk_buff *);
+extern void usbnet_defer_kevent(struct usbnet *, int);
+extern void usbnet_skb_return(struct usbnet *, struct sk_buff *);
 extern void usbnet_unlink_rx_urbs(struct usbnet *);
 
 extern void usbnet_pause_rx(struct usbnet *);
 extern void usbnet_resume_rx(struct usbnet *);
 extern void usbnet_purge_paused_rxq(struct usbnet *);
 
-extern int usbnet_get_settings (struct net_device *net, struct ethtool_cmd *cmd);
-extern int usbnet_set_settings (struct net_device *net, struct ethtool_cmd *cmd);
-extern u32 usbnet_get_link (struct net_device *net);
-extern u32 usbnet_get_msglevel (struct net_device *);
-extern void usbnet_set_msglevel (struct net_device *, u32);
-extern void usbnet_get_drvinfo (struct net_device *, struct ethtool_drvinfo *);
+extern int usbnet_get_settings(struct net_device *net,
+			       struct ethtool_cmd *cmd);
+extern int usbnet_set_settings(struct net_device *net,
+			       struct ethtool_cmd *cmd);
+extern u32 usbnet_get_link(struct net_device *net);
+extern u32 usbnet_get_msglevel(struct net_device *);
+extern void usbnet_set_msglevel(struct net_device *, u32);
+extern void usbnet_get_drvinfo(struct net_device *, struct ethtool_drvinfo *);
 extern int usbnet_nway_reset(struct net_device *net);
 
 /* messaging support includes the interface name, so it must not be
@@ -226,5 +272,10 @@ extern int usbnet_nway_reset(struct net_device *net);
 #define devinfo(usbnet, fmt, arg...) \
 	printk(KERN_INFO "%s: " fmt "\n" , (usbnet)->net->name , ## arg); \
 
+extern int usbnet_manage_power(struct usbnet *, int);
+extern void usbnet_link_change(struct usbnet *, bool, bool);
+
+extern int usbnet_status_start(struct usbnet *dev, gfp_t mem_flags);
+extern void usbnet_status_stop(struct usbnet *dev);
 
 #endif /* __LINUX_USB_USBNET_H */

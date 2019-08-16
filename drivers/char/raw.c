@@ -244,9 +244,10 @@ out:
 
 static const struct file_operations raw_fops = {
 	.read	=	do_sync_read,
-	.aio_read = 	generic_file_aio_read,
+	.aio_read = 	blkdev_aio_read,
 	.write	=	do_sync_write,
 	.aio_write =	blkdev_aio_write,
+	.fsync	=	blkdev_fsync,
 	.open	=	raw_open,
 	.release=	raw_release,
 	.ioctl	=	raw_ioctl,

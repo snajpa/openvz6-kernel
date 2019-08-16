@@ -1,5 +1,5 @@
 /*
- * Copyright 2008 Cisco Systems, Inc.  All rights reserved.
+ * Copyright 2008-2010 Cisco Systems, Inc.  All rights reserved.
  * Copyright 2007 Nuova Systems, Inc.  All rights reserved.
  *
  * This program is free software; you may redistribute it and/or modify
@@ -50,6 +50,11 @@ struct vnic_cq_ctrl {
 	u32 pad10;
 };
 
+struct vnic_rx_bytes_counter {
+	unsigned int small_pkt_bytes_cnt;
+	unsigned int large_pkt_bytes_cnt;
+};
+
 struct vnic_cq {
 	unsigned int index;
 	struct vnic_dev *vdev;
@@ -57,6 +62,11 @@ struct vnic_cq {
 	struct vnic_dev_ring ring;
 	unsigned int to_clean;
 	unsigned int last_color;
+	unsigned int interrupt_offset;
+	struct vnic_rx_bytes_counter pkt_size_counter;
+	unsigned int cur_rx_coal_timeval;
+	unsigned int tobe_rx_coal_timeval;
+	ktime_t prev_ts;
 };
 
 static inline unsigned int vnic_cq_service(struct vnic_cq *cq,

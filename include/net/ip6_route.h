@@ -26,7 +26,9 @@ struct route_info {
 
 #include <net/flow.h>
 #include <net/ip6_fib.h>
+#include <net/if_inet6.h>
 #include <net/sock.h>
+#include <net/ipv6.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 
@@ -43,6 +45,14 @@ extern void			ip6_route_input(struct sk_buff *skb);
 extern struct dst_entry *	ip6_route_output(struct net *net,
 						 struct sock *sk,
 						 struct flowi *fl);
+extern struct dst_entry *	ip6_route_lookup(struct net *net,
+						 struct flowi *fl, int flags);
+
+static inline bool rt6_need_strict(const struct in6_addr *daddr)
+{
+	return ipv6_addr_type(daddr) &
+		(IPV6_ADDR_MULTICAST | IPV6_ADDR_LINKLOCAL | IPV6_ADDR_LOOPBACK);
+}
 
 extern int			ip6_route_init(void);
 extern void			ip6_route_cleanup(void);
@@ -54,6 +64,13 @@ extern int			ipv6_route_ioctl(struct net *net,
 extern int			ip6_route_add(struct fib6_config *cfg);
 extern int			ip6_ins_rt(struct rt6_info *);
 extern int			ip6_del_rt(struct rt6_info *);
+
+extern int                     ip6_route_get_saddr(struct net *net,
+						   struct rt6_info *rt,
+						   struct in6_addr *daddr,
+						   unsigned int prefs,
+						   struct in6_addr *saddr);
+
 
 extern struct rt6_info		*rt6_lookup(struct net *net,
 					    const struct in6_addr *daddr,
@@ -113,7 +130,8 @@ struct rt6_rtnl_dump_arg
 extern int rt6_dump_route(struct rt6_info *rt, void *p_arg);
 extern void rt6_ifdown(struct net *net, struct net_device *dev);
 extern void rt6_mtu_change(struct net_device *dev, unsigned mtu);
-
+extern void rt6_remove_prefsrc(struct inet6_ifaddr *ifp);
+extern void rt6_clean_tohost(struct net *net, struct in6_addr *gateway);
 
 /*
  *	Store a destination cache entry in a socket
@@ -145,6 +163,22 @@ static inline int ipv6_unicast_destination(struct sk_buff *skb)
 	struct rt6_info *rt = (struct rt6_info *) skb_dst(skb);
 
 	return rt->rt6i_flags & RTF_LOCAL;
+}
+
+int ip6_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *));
+
+static inline int ip6_skb_dst_mtu(struct sk_buff *skb)
+{
+	struct ipv6_pinfo *np = skb->sk ? inet6_sk(skb->sk) : NULL;
+
+	return (np && np->pmtudisc >= IPV6_PMTUDISC_PROBE) ?
+	       skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
+}
+
+static inline bool ip6_sk_local_df(const struct sock *sk)
+{
+	return inet6_sk(sk)->pmtudisc < IPV6_PMTUDISC_DO ||
+	       inet6_sk(sk)->pmtudisc == IPV6_PMTUDISC_OMIT;
 }
 
 #endif

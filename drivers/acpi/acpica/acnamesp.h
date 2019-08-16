@@ -284,6 +284,11 @@ acpi_status
 acpi_ns_repair_package_list(struct acpi_predefined_data *data,
 			    union acpi_operand_object **obj_desc_ptr);
 
+void
+acpi_ns_remove_null_elements(struct acpi_predefined_data *data,
+			     u8 package_type,
+			     union acpi_operand_object *obj_desc);
+
 /*
  * nssearch - Namespace searching and entry
  */
@@ -347,12 +352,5 @@ struct acpi_namespace_node *acpi_ns_map_handle_to_node(acpi_handle handle);
 acpi_handle acpi_ns_convert_entry_to_handle(struct acpi_namespace_node *node);
 
 void acpi_ns_terminate(void);
-
-struct acpi_namespace_node *acpi_ns_get_parent_node(struct acpi_namespace_node
-						    *node);
-
-struct acpi_namespace_node *acpi_ns_get_next_valid_node(struct
-							acpi_namespace_node
-							*node);
 
 #endif				/* __ACNAMESP_H__ */

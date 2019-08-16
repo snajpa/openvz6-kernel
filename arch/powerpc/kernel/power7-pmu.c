@@ -51,10 +51,6 @@
 #define MMCR1_PMCSEL_MSK	0xff
 
 /*
- * Bits in MMCRA
- */
-
-/*
  * Layout of constraint bits:
  * 6666555555555544444444443333333333222222222211111111110000000000
  * 3210987654321098765432109876543210987654321098765432109876543210
@@ -230,7 +226,7 @@ static int power7_compute_mmcr(u64 event[], int n_ev,
 			       unsigned int hwc[], unsigned long mmcr[])
 {
 	unsigned long mmcr1 = 0;
-	unsigned long mmcra = 0;
+	unsigned long mmcra = MMCRA_SDAR_DCACHE_MISS | MMCRA_SDAR_ERAT_MISS;
 	unsigned int pmc, unit, combine, l2sel, psel;
 	unsigned int pmc_inuse = 0;
 	int i;
@@ -370,7 +366,10 @@ static int init_power7_pmu(void)
 	    strcmp(cur_cpu_spec->oprofile_cpu_type, "ppc64/power7"))
 		return -ENODEV;
 
+	if (__is_processor(PVR_POWER7p))
+		power7_pmu.flags |= PPMU_SIAR_VALID;
+
 	return register_power_pmu(&power7_pmu);
 }
 
-arch_initcall(init_power7_pmu);
+early_initcall(init_power7_pmu);

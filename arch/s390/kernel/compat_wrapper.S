@@ -785,7 +785,7 @@ sys32_getresuid16_wrapper:
 sys32_poll_wrapper:
 	llgtr	%r2,%r2			# struct pollfd *
 	llgfr	%r3,%r3			# unsigned int
-	lgfr	%r4,%r4			# long
+	lgfr	%r4,%r4			# int
 	jg	sys_poll		# branch to system call
 
 	.globl	compat_sys_nfsservctl_wrapper
@@ -1855,3 +1855,20 @@ sys32_execve_wrapper:
 	llgtr	%r3,%r3			# compat_uptr_t *
 	llgtr	%r4,%r4			# compat_uptr_t *
 	jg	sys32_execve		# branch to system call
+
+	.globl	sys_syncfs_wrapper
+sys_syncfs_wrapper:
+	lgfr	%r2,%r2			# int
+	jg	sys_syncfs
+
+	.globl	sys_setns_wrapper
+sys_setns_wrapper:
+	lgfr	%r2,%r2			# int
+	lgfr	%r3,%r3			# int
+	jg	sys_setns
+
+	.globl sys_s390_runtime_instr_wrapper
+sys_s390_runtime_instr_wrapper:
+	lgfr	%r2,%r2			# int
+	lgfr	%r3,%r3			# int
+	jg	sys_s390_runtime_instr

@@ -975,7 +975,7 @@ static int cipso_v4_map_cat_rbm_ntoh(const struct cipso_v4_doi *doi_def,
 				return -EPERM;
 			break;
 		}
-		ret_val = netlbl_secattr_catmap_setbit(secattr->attr.mls.cat,
+		ret_val = netlbl_secattr_catmap_setbit(&secattr->attr.mls.cat,
 						       host_spot,
 						       GFP_ATOMIC);
 		if (ret_val != 0)
@@ -1077,7 +1077,7 @@ static int cipso_v4_map_cat_enum_ntoh(const struct cipso_v4_doi *doi_def,
 	u32 iter;
 
 	for (iter = 0; iter < net_cat_len; iter += 2) {
-		ret_val = netlbl_secattr_catmap_setbit(secattr->attr.mls.cat,
+		ret_val = netlbl_secattr_catmap_setbit(&secattr->attr.mls.cat,
 				get_unaligned_be16(&net_cat[iter]),
 				GFP_ATOMIC);
 		if (ret_val != 0)
@@ -1219,7 +1219,7 @@ static int cipso_v4_map_cat_rng_ntoh(const struct cipso_v4_doi *doi_def,
 		else
 			cat_low = 0;
 
-		ret_val = netlbl_secattr_catmap_setrng(secattr->attr.mls.cat,
+		ret_val = netlbl_secattr_catmap_setrng(&secattr->attr.mls.cat,
 						       cat_low,
 						       cat_high,
 						       GFP_ATOMIC);
@@ -1337,11 +1337,6 @@ static int cipso_v4_parsetag_rbm(const struct cipso_v4_doi *doi_def,
 	secattr->flags |= NETLBL_SECATTR_MLS_LVL;
 
 	if (tag_len > 4) {
-		secattr->attr.mls.cat =
-		                       netlbl_secattr_catmap_alloc(GFP_ATOMIC);
-		if (secattr->attr.mls.cat == NULL)
-			return -ENOMEM;
-
 		ret_val = cipso_v4_map_cat_rbm_ntoh(doi_def,
 						    &tag[4],
 						    tag_len - 4,
@@ -1433,11 +1428,6 @@ static int cipso_v4_parsetag_enum(const struct cipso_v4_doi *doi_def,
 	secattr->flags |= NETLBL_SECATTR_MLS_LVL;
 
 	if (tag_len > 4) {
-		secattr->attr.mls.cat =
-			               netlbl_secattr_catmap_alloc(GFP_ATOMIC);
-		if (secattr->attr.mls.cat == NULL)
-			return -ENOMEM;
-
 		ret_val = cipso_v4_map_cat_enum_ntoh(doi_def,
 						     &tag[4],
 						     tag_len - 4,
@@ -1528,11 +1518,6 @@ static int cipso_v4_parsetag_rng(const struct cipso_v4_doi *doi_def,
 	secattr->flags |= NETLBL_SECATTR_MLS_LVL;
 
 	if (tag_len > 4) {
-		secattr->attr.mls.cat =
-			               netlbl_secattr_catmap_alloc(GFP_ATOMIC);
-		if (secattr->attr.mls.cat == NULL)
-			return -ENOMEM;
-
 		ret_val = cipso_v4_map_cat_rng_ntoh(doi_def,
 						    &tag[4],
 						    tag_len - 4,
@@ -1726,8 +1711,10 @@ int cipso_v4_validate(const struct sk_buff *skb, unsigned char **option)
 		case CIPSO_V4_TAG_LOCAL:
 			/* This is a non-standard tag that we only allow for
 			 * local connections, so if the incoming interface is
-			 * not the loopback device drop the packet. */
-			if (!(skb->dev->flags & IFF_LOOPBACK)) {
+			 * not the loopback device drop the packet. Further,
+			 * there is no legitimate reason for setting this from
+			 * userspace so reject it if skb is NULL. */
+			if (skb == NULL || !(skb->dev->flags & IFF_LOOPBACK)) {
 				err_offset = opt_iter;
 				goto validate_return_locked;
 			}
@@ -1858,6 +1845,11 @@ static int cipso_v4_genopt(unsigned char *buf, u32 buf_len,
 	return CIPSO_V4_HDR_LEN + ret_val;
 }
 
+static void opt_kfree_rcu(struct rcu_head *head)
+{
+	kfree(container_of(head, struct ip_options_rcu, rcu));
+}
+
 /**
  * cipso_v4_sock_setattr - Add a CIPSO option to a socket
  * @sk: the socket
@@ -1880,7 +1872,7 @@ int cipso_v4_sock_setattr(struct sock *sk,
 	unsigned char *buf = NULL;
 	u32 buf_len;
 	u32 opt_len;
-	struct ip_options *opt = NULL;
+	struct ip_options *old, *opt = NULL;
 	struct inet_sock *sk_inet;
 	struct inet_connection_sock *sk_conn;
 
@@ -1911,7 +1903,7 @@ int cipso_v4_sock_setattr(struct sock *sk,
 	 * we won't always have CAP_NET_RAW even though we _always_ want to
 	 * set the IPOPT_CIPSO option. */
 	opt_len = (buf_len + 3) & ~3;
-	opt = kzalloc(sizeof(*opt) + opt_len, GFP_ATOMIC);
+	opt = kzalloc_ip_options(opt_len, GFP_ATOMIC);
 	if (opt == NULL) {
 		ret_val = -ENOMEM;
 		goto socket_setattr_failure;
@@ -1923,21 +1915,23 @@ int cipso_v4_sock_setattr(struct sock *sk,
 	buf = NULL;
 
 	sk_inet = inet_sk(sk);
+	old = rcu_dereference(sk_inet->opt);
 	if (sk_inet->is_icsk) {
 		sk_conn = inet_csk(sk);
-		if (sk_inet->opt)
-			sk_conn->icsk_ext_hdr_len -= sk_inet->opt->optlen;
+		if (old)
+			sk_conn->icsk_ext_hdr_len -= old->optlen;
 		sk_conn->icsk_ext_hdr_len += opt->optlen;
 		sk_conn->icsk_sync_mss(sk, sk_conn->icsk_pmtu_cookie);
 	}
-	opt = xchg(&sk_inet->opt, opt);
-	kfree(opt);
+	rcu_assign_pointer(sk_inet->opt, opt);
+	if (old)
+		call_rcu(&get_ip_options_rcu(old)->rcu, opt_kfree_rcu);
 
 	return 0;
 
 socket_setattr_failure:
 	kfree(buf);
-	kfree(opt);
+	kfree_ip_options(opt);
 	return ret_val;
 }
 
@@ -1984,7 +1978,7 @@ int cipso_v4_req_setattr(struct request_sock *req,
 	 * we won't always have CAP_NET_RAW even though we _always_ want to
 	 * set the IPOPT_CIPSO option. */
 	opt_len = (buf_len + 3) & ~3;
-	opt = kzalloc(sizeof(*opt) + opt_len, GFP_ATOMIC);
+	opt = kzalloc_ip_options(opt_len, GFP_ATOMIC);
 	if (opt == NULL) {
 		ret_val = -ENOMEM;
 		goto req_setattr_failure;
@@ -1997,13 +1991,14 @@ int cipso_v4_req_setattr(struct request_sock *req,
 
 	req_inet = inet_rsk(req);
 	opt = xchg(&req_inet->opt, opt);
-	kfree(opt);
+	if (opt)
+		call_rcu(&get_ip_options_rcu(opt)->rcu, opt_kfree_rcu);
 
 	return 0;
 
 req_setattr_failure:
 	kfree(buf);
-	kfree(opt);
+	kfree_ip_options(opt);
 	return ret_val;
 }
 
@@ -2067,7 +2062,7 @@ int cipso_v4_delopt(struct ip_options **opt_ptr)
 		 * remove the entire option struct */
 		*opt_ptr = NULL;
 		hdr_delta = opt->optlen;
-		kfree(opt);
+		call_rcu(&get_ip_options_rcu(opt)->rcu, opt_kfree_rcu);
 	}
 
 	return hdr_delta;
@@ -2088,7 +2083,7 @@ void cipso_v4_sock_delattr(struct sock *sk)
 	struct inet_sock *sk_inet;
 
 	sk_inet = inet_sk(sk);
-	opt = sk_inet->opt;
+	opt = rcu_dereference(sk_inet->opt);
 	if (opt == NULL || opt->cipso == 0)
 		return;
 
@@ -2186,13 +2181,17 @@ getattr_return:
 int cipso_v4_sock_getattr(struct sock *sk, struct netlbl_lsm_secattr *secattr)
 {
 	struct ip_options *opt;
+	int res = -ENOMSG;
 
-	opt = inet_sk(sk)->opt;
-	if (opt == NULL || opt->cipso == 0)
-		return -ENOMSG;
-
-	return cipso_v4_getattr(opt->__data + opt->cipso - sizeof(struct iphdr),
-				secattr);
+	rcu_read_lock();
+	opt = rcu_dereference(inet_sk(sk)->opt);
+	if (opt && opt->cipso)
+		res = cipso_v4_getattr(opt->__data +
+						opt->cipso -
+						sizeof(struct iphdr),
+				       secattr);
+	rcu_read_unlock();
+	return res;
 }
 
 /**

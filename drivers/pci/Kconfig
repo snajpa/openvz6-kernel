@@ -21,6 +21,18 @@ config PCI_MSI
 
 	   If you don't know what to do here, say N.
 
+config PCI_MSI_DEFAULT_ON
+	def_bool y
+	prompt "Use Message Signaled Interrupts by default"
+	depends on PCI_MSI
+	help
+	  Selecting this option will enable use of PCI MSI where applicable
+	  by default. Support for MSI can be disabled through the use of the
+	  pci=nomsi boot flag. Conversely, if this option is not selected,
+	  support for PCI MSI can be enabled by passing the pci=msi flag.
+
+	  If you don't know what to do here, say N.
+
 config PCI_LEGACY
 	bool "Enable deprecated pci_find_* API"
 	depends on PCI
@@ -39,6 +51,19 @@ config PCI_DEBUG
 	  Say Y here if you want the PCI core to produce a bunch of debug
 	  messages to the system log.  Select this if you are having a
 	  problem with PCI support and want to see more of what is going on.
+
+	  When in doubt, say N.
+
+config PCI_REALLOC_ENABLE_AUTO
+	bool "Enable PCI resource re-allocation detection"
+	depends on PCI
+	help
+	  Say Y here if you want the PCI core to detect if PCI resource
+	  re-allocation needs to be enabled. You can always use pci=realloc=on
+          or pci=realloc=off to override it.  Note this feature is a no-op
+          unless PCI_IOV support is also enabled; in that case it will
+          automatically re-allocate PCI resources if SR-IOV BARs have not
+          been allocated by the BIOS.
 
 	  When in doubt, say N.
 

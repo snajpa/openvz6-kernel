@@ -22,6 +22,7 @@
 #include <xen/interface/xen.h>
 
 #include <asm/sigframe.h>
+#include <asm/spec_ctrl.h>
 
 #define __NO_STUBS 1
 #undef __SYSCALL
@@ -116,6 +117,9 @@ int main(void)
 	BLANK();
 #undef ENTRY
 	DEFINE(TSS_ist, offsetof(struct tss_struct, x86_tss.ist));
+	OFFSET(TSS_sp0, tss_struct, x86_tss.sp0);
+	OFFSET(TSS_stack, tss_struct, stack);
+	DEFINE(TSS_stack_size, sizeof(((struct tss_struct *)0)->stack));
 	BLANK();
 	DEFINE(crypto_tfm_ctx_offset, offsetof(struct crypto_tfm, __crt_ctx));
 	BLANK();
@@ -136,5 +140,10 @@ int main(void)
 	OFFSET(XEN_vcpu_info_pending, vcpu_info, evtchn_upcall_pending);
 #undef ENTRY
 #endif
+	/* Kernel IBRS speculation control structure */
+	OFFSET(KERNEL_IBRS_SPEC_CTRL_enabled, kernel_ibrs_spec_ctrl, enabled);
+	OFFSET(KERNEL_IBRS_SPEC_CTRL_entry, kernel_ibrs_spec_ctrl, entry);
+	OFFSET(KERNEL_IBRS_SPEC_CTRL_exit, kernel_ibrs_spec_ctrl, exit);
+	OFFSET(KERNEL_IBRS_SPEC_CTRL_hi32, kernel_ibrs_spec_ctrl, hi32);
 	return 0;
 }

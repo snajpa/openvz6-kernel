@@ -849,6 +849,7 @@ struct snd_m3 {
 	struct snd_kcontrol *master_switch;
 	struct snd_kcontrol *master_volume;
 	struct tasklet_struct hwvol_tq;
+	unsigned int in_suspend;
 
 #ifdef CONFIG_PM
 	u16 *suspend_mem;
@@ -884,6 +885,7 @@ static struct pci_device_id snd_m3_ids[] = {
 MODULE_DEVICE_TABLE(pci, snd_m3_ids);
 
 static struct snd_pci_quirk m3_amp_quirk_list[] __devinitdata = {
+	SND_PCI_QUIRK(0x0E11, 0x0094, "Compaq Evo N600c", 0x0c),
 	SND_PCI_QUIRK(0x10f7, 0x833e, "Panasonic CF-28", 0x0d),
 	SND_PCI_QUIRK(0x10f7, 0x833d, "Panasonic CF-72", 0x0d),
 	SND_PCI_QUIRK(0x1033, 0x80f1, "NEC LM800J/7", 0x03),
@@ -1612,6 +1614,11 @@ static void snd_m3_update_hw_volume(unsigned long private_data)
 	outb(0x88, chip->iobase + HW_VOL_COUNTER_VOICE);
 	outb(0x88, chip->iobase + SHADOW_MIX_REG_MASTER);
 	outb(0x88, chip->iobase + HW_VOL_COUNTER_MASTER);
+
+	/* Ignore spurious HV interrupts during suspend / resume, this avoids
+	   mistaking them for a mute button press. */
+	if (chip->in_suspend)
+		return;
 
 	if (!chip->master_switch || !chip->master_volume)
 		return;
@@ -2424,6 +2431,7 @@ static int m3_suspend(struct pci_dev *pci, pm_message_t state)
 	if (chip->suspend_mem == NULL)
 		return 0;
 
+	chip->in_suspend = 1;
 	snd_power_change_state(card, SNDRV_CTL_POWER_D3hot);
 	snd_pcm_suspend_all(chip->pcm);
 	snd_ac97_suspend(chip->ac97);
@@ -2497,6 +2505,7 @@ static int m3_resume(struct pci_dev *pci)
 	snd_m3_hv_init(chip);
 
 	snd_power_change_state(card, SNDRV_CTL_POWER_D0);
+	chip->in_suspend = 0;
 	return 0;
 }
 #endif /* CONFIG_PM */
@@ -2565,8 +2574,9 @@ snd_m3_create(struct snd_card *card, struct pci_dev *pci,
 	else {
 		quirk = snd_pci_quirk_lookup(pci, m3_amp_quirk_list);
 		if (quirk) {
-			snd_printdd(KERN_INFO "maestro3: set amp-gpio "
-				    "for '%s'\n", quirk->name);
+			snd_printdd(KERN_INFO
+				    "maestro3: set amp-gpio for '%s'\n",
+				    snd_pci_quirk_name(quirk));
 			chip->amp_gpio = quirk->value;
 		} else if (chip->allegro_flag)
 			chip->amp_gpio = GPO_EXT_AMP_ALLEGRO;
@@ -2576,8 +2586,9 @@ snd_m3_create(struct snd_card *card, struct pci_dev *pci,
 
 	quirk = snd_pci_quirk_lookup(pci, m3_irda_quirk_list);
 	if (quirk) {
-		snd_printdd(KERN_INFO "maestro3: enabled irda workaround "
-			    "for '%s'\n", quirk->name);
+		snd_printdd(KERN_INFO
+			    "maestro3: enabled irda workaround for '%s'\n",
+			    snd_pci_quirk_name(quirk));
 		chip->irda_workaround = 1;
 	}
 	quirk = snd_pci_quirk_lookup(pci, m3_hv_quirk_list);
@@ -2663,8 +2674,6 @@ snd_m3_create(struct snd_card *card, struct pci_dev *pci,
 	snd_m3_enable_ints(chip);
 	snd_m3_assp_continue(chip);
 
-	snd_card_set_dev(card, &pci->dev);
-
 	*chip_ret = chip;
 
 	return 0; 
@@ -2691,7 +2700,8 @@ snd_m3_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 		return -ENOENT;
 	}
 
-	err = snd_card_create(index[dev], id[dev], THIS_MODULE, 0, &card);
+	err = snd_card_new(&pci->dev, index[dev], id[dev], THIS_MODULE,
+			   0, &card);
 	if (err < 0)
 		return err;
 

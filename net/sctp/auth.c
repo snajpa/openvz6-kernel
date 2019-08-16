@@ -386,18 +386,19 @@ nomem:
 }
 
 
-/* Public interface to creat the association shared key.
+/* Public interface to create the association shared key.
  * See code above for the algorithm.
  */
 int sctp_auth_asoc_init_active_key(struct sctp_association *asoc, gfp_t gfp)
 {
 	struct sctp_auth_bytes	*secret;
 	struct sctp_shared_key *ep_key;
+	struct sctp_chunk *chunk;
 
 	/* If we don't support AUTH, or peer is not capable
 	 * we don't need to do anything.
 	 */
-	if (!sctp_auth_enable || !asoc->peer.auth_capable)
+	if (!asoc->ep->auth_enable || !asoc->peer.auth_capable)
 		return 0;
 
 	/* If the key_id is non-zero and we couldn't find an
@@ -414,6 +415,14 @@ int sctp_auth_asoc_init_active_key(struct sctp_association *asoc, gfp_t gfp)
 
 	sctp_auth_key_put(asoc->asoc_shared_key);
 	asoc->asoc_shared_key = secret;
+
+	/* Update send queue in case any chunk already in there now
+	 * needs authenticating
+	 */
+	list_for_each_entry(chunk, &asoc->outqueue.out_chunk_list, list) {
+		if (sctp_auth_send_cid(chunk->chunk_hdr->type, asoc))
+			chunk->auth = 1;
+	}
 
 	return 0;
 }
@@ -447,12 +456,13 @@ int sctp_auth_init_hmacs(struct sctp_endpoint *ep, gfp_t gfp)
 	struct crypto_hash *tfm = NULL;
 	__u16   id;
 
-	/* if the transforms are already allocted, we are done */
-	if (!sctp_auth_enable) {
+	/* If AUTH extension is disabled, we are done */
+	if (!ep->auth_enable) {
 		ep->auth_hmacs = NULL;
 		return 0;
 	}
 
+	/* If the transforms are already allocated, we are done */
 	if (ep->auth_hmacs)
 		return 0;
 
@@ -542,16 +552,20 @@ struct sctp_hmac *sctp_auth_asoc_get_hmac(const struct sctp_association *asoc)
 		id = ntohs(hmacs->hmac_ids[i]);
 
 		/* Check the id is in the supported range */
-		if (id > SCTP_AUTH_HMAC_ID_MAX)
+		if (id > SCTP_AUTH_HMAC_ID_MAX) {
+			id = 0;
 			continue;
+		}
 
 		/* See is we support the id.  Supported IDs have name and
 		 * length fields set, so that we can allocated and use
 		 * them.  We can safely just check for name, for without the
 		 * name, we can't allocate the TFM.
 		 */
-		if (!sctp_hmac_list[id].hmac_name)
+		if (!sctp_hmac_list[id].hmac_name) {
+			id = 0;
 			continue;
+		}
 
 		break;
 	}
@@ -669,7 +683,10 @@ static int __sctp_auth_cid(sctp_cid_t chunk, struct sctp_chunks_param *param)
 /* Check if peer requested that this chunk is authenticated */
 int sctp_auth_send_cid(sctp_cid_t chunk, const struct sctp_association *asoc)
 {
-	if (!sctp_auth_enable || !asoc || !asoc->peer.auth_capable)
+	if (!asoc)
+		return 0;
+
+	if (!asoc->ep->auth_enable || !asoc->peer.auth_capable)
 		return 0;
 
 	return __sctp_auth_cid(chunk, asoc->peer.peer_chunks);
@@ -678,7 +695,10 @@ int sctp_auth_send_cid(sctp_cid_t chunk, const struct sctp_association *asoc)
 /* Check if we requested that peer authenticate this chunk. */
 int sctp_auth_recv_cid(sctp_cid_t chunk, const struct sctp_association *asoc)
 {
-	if (!sctp_auth_enable || !asoc)
+	if (!asoc)
+		return 0;
+
+	if (!asoc->ep->auth_enable)
 		return 0;
 
 	return __sctp_auth_cid(chunk,
@@ -799,8 +819,8 @@ int sctp_auth_ep_set_hmacs(struct sctp_endpoint *ep,
 	if (!has_sha1)
 		return -EINVAL;
 
-	memcpy(ep->auth_hmacs_list->hmac_ids, &hmacs->shmac_idents[0],
-		hmacs->shmac_num_idents * sizeof(__u16));
+	for (i = 0; i < hmacs->shmac_num_idents; i++)
+		ep->auth_hmacs_list->hmac_ids[i] = htons(hmacs->shmac_idents[i]);
 	ep->auth_hmacs_list->param_hdr.length = htons(sizeof(sctp_paramhdr_t) +
 				hmacs->shmac_num_idents * sizeof(__u16));
 	return 0;
@@ -861,8 +881,6 @@ int sctp_auth_set_key(struct sctp_endpoint *ep,
 		list_add(&cur_key->key_list, sh_keys);
 
 	cur_key->key = key;
-	sctp_auth_key_hold(key);
-
 	return 0;
 nomem:
 	if (!replace)

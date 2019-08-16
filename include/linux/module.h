@@ -44,6 +44,14 @@ struct modversion_info
 	char name[MODULE_NAME_LEN];
 };
 
+struct rheldata
+{
+	/* These two u8's make up the X.Y release tag */
+	u8 rhel_major;
+	u8 rhel_minor;
+	u16 rhel_release;
+};
+
 struct module;
 
 struct module_attribute {
@@ -54,6 +62,12 @@ struct module_attribute {
 	void (*setup)(struct module *, const char *);
 	int (*test)(struct module *);
 	void (*free)(struct module *);
+};
+
+struct module_version_attribute {
+	struct module_attribute mattr;
+	const char *module_name;
+	const char *version;
 };
 
 struct module_kobject
@@ -97,6 +111,11 @@ extern struct module __this_module;
 
 /* For userspace: you can also call me... */
 #define MODULE_ALIAS(_alias) MODULE_INFO(alias, _alias)
+
+/* Soft module dependencies. See man modprobe.d for details.
+ * Example: MODULE_SOFTDEP("pre: module-foo module-bar post: module-baz")
+ */
+#define MODULE_SOFTDEP(_softdep) MODULE_INFO(softdep, _softdep)
 
 /*
  * The following license idents are currently accepted as indicating free
@@ -159,7 +178,28 @@ extern struct module __this_module;
   Using this automatically adds a checksum of the .c files and the
   local headers in "srcversion".
 */
+
+#ifdef MODULE
 #define MODULE_VERSION(_version) MODULE_INFO(version, _version)
+#else
+#define MODULE_VERSION(_version)					\
+	extern ssize_t __modver_version_show(struct module_attribute *,	\
+					     struct module *, char *);	\
+	static struct module_version_attribute __modver_version_attr	\
+	__used								\
+    __attribute__ ((__section__ ("__modver"),aligned(sizeof(void *)))) \
+	= {								\
+		.mattr	= {						\
+			.attr	= {					\
+				.name	= "version",			\
+				.mode	= S_IRUGO,			\
+			},						\
+			.show	= __modver_version_show,		\
+		},							\
+		.module_name	= KBUILD_MODNAME,			\
+		.version	= _version,				\
+	}
+#endif
 
 /* Optional firmware file (or files) needed by the module
  * format is simply firmware file name.  Multiple firmware
@@ -303,6 +343,9 @@ struct module
 
 	unsigned int taints;	/* same bits as kernel:tainted */
 
+	/* Is this module GPG signed */
+	int gpgsig_ok;
+
 #ifdef CONFIG_GENERIC_BUG
 	/* Support for BUG */
 	unsigned num_bugs;
@@ -343,7 +386,14 @@ struct module
 	unsigned int num_trace_bprintk_fmt;
 #endif
 #ifdef CONFIG_EVENT_TRACING
+#ifdef __GENKSYMS__
 	struct ftrace_event_call *trace_events;
+#else
+	union {
+		struct ftrace_event_call  *events;
+		struct ftrace_event_call **ptrs;
+	} trace_events;
+#endif
 	unsigned int num_trace_events;
 #endif
 #ifdef CONFIG_FTRACE_MCOUNT_RECORD

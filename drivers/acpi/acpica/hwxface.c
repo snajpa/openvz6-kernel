@@ -80,14 +80,14 @@ acpi_status acpi_reset(void)
 
 	if (reset_reg->space_id == ACPI_ADR_SPACE_SYSTEM_IO) {
 		/*
-		 * For I/O space, write directly to the OSL. This bypasses the port
-		 * validation mechanism, which may block a valid write to the reset
-		 * register.
+		 * For I/O space, write directly to the OSL. This
+		 * bypasses the port validation mechanism, which may
+		 * block a valid write to the reset register. Spec
+		 * section 4.7.3.6 requires register width to be 8.
 		 */
 		status =
 		    acpi_os_write_port((acpi_io_address) reset_reg->address,
-				       acpi_gbl_FADT.reset_value,
-				       reset_reg->bit_width);
+				       acpi_gbl_FADT.reset_value, 8);
 	} else {
 		/* Write the reset value to the reset register */
 
@@ -137,11 +137,6 @@ acpi_status acpi_read(u64 *return_value, struct acpi_generic_address *reg)
 		return (status);
 	}
 
-	width = reg->bit_width;
-	if (width == 64) {
-		width = 32;	/* Break into two 32-bit transfers */
-	}
-
 	/* Initialize entire 64-bit return value to zero */
 
 	*return_value = 0;
@@ -153,24 +148,17 @@ acpi_status acpi_read(u64 *return_value, struct acpi_generic_address *reg)
 	 */
 	if (reg->space_id == ACPI_ADR_SPACE_SYSTEM_MEMORY) {
 		status = acpi_os_read_memory((acpi_physical_address)
-					     address, &value, width);
+					     address, return_value,
+					     reg->bit_width);
 		if (ACPI_FAILURE(status)) {
 			return (status);
 		}
-		*return_value = value;
-
-		if (reg->bit_width == 64) {
-
-			/* Read the top 32 bits */
-
-			status = acpi_os_read_memory((acpi_physical_address)
-						     (address + 4), &value, 32);
-			if (ACPI_FAILURE(status)) {
-				return (status);
-			}
-			*return_value |= ((u64)value << 32);
-		}
 	} else {		/* ACPI_ADR_SPACE_SYSTEM_IO, validated earlier */
+
+		width = reg->bit_width;
+		if (width == 64) {
+			width = 32;	/* Break into two 32-bit transfers */
+		}
 
 		status = acpi_hw_read_port((acpi_io_address)
 					   address, &value, width);
@@ -230,32 +218,22 @@ acpi_status acpi_write(u64 value, struct acpi_generic_address *reg)
 		return (status);
 	}
 
-	width = reg->bit_width;
-	if (width == 64) {
-		width = 32;	/* Break into two 32-bit transfers */
-	}
-
 	/*
 	 * Two address spaces supported: Memory or IO. PCI_Config is
 	 * not supported here because the GAS structure is insufficient
 	 */
 	if (reg->space_id == ACPI_ADR_SPACE_SYSTEM_MEMORY) {
 		status = acpi_os_write_memory((acpi_physical_address)
-					      address, ACPI_LODWORD(value),
-					      width);
+					      address, value, reg->bit_width);
 		if (ACPI_FAILURE(status)) {
 			return (status);
 		}
-
-		if (reg->bit_width == 64) {
-			status = acpi_os_write_memory((acpi_physical_address)
-						      (address + 4),
-						      ACPI_HIDWORD(value), 32);
-			if (ACPI_FAILURE(status)) {
-				return (status);
-			}
-		}
 	} else {		/* ACPI_ADR_SPACE_SYSTEM_IO, validated earlier */
+
+		width = reg->bit_width;
+		if (width == 64) {
+			width = 32;	/* Break into two 32-bit transfers */
+		}
 
 		status = acpi_hw_write_port((acpi_io_address)
 					    address, ACPI_LODWORD(value),

@@ -365,18 +365,19 @@ int iwch_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
 	spin_lock_irqsave(&qhp->lock, flag);
 	if (qhp->attr.state > IWCH_QP_STATE_RTS) {
 		spin_unlock_irqrestore(&qhp->lock, flag);
-		return -EINVAL;
+		err = -EINVAL;
+		goto out;
 	}
 	num_wrs = Q_FREECNT(qhp->wq.sq_rptr, qhp->wq.sq_wptr,
 		  qhp->wq.sq_size_log2);
-	if (num_wrs <= 0) {
+	if (num_wrs == 0) {
 		spin_unlock_irqrestore(&qhp->lock, flag);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto out;
 	}
 	while (wr) {
 		if (num_wrs == 0) {
 			err = -ENOMEM;
-			*bad_wr = wr;
 			break;
 		}
 		idx = Q_PTR2IDX(qhp->wq.wptr, qhp->wq.size_log2);
@@ -428,10 +429,8 @@ int iwch_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
 			     wr->opcode);
 			err = -EINVAL;
 		}
-		if (err) {
-			*bad_wr = wr;
+		if (err)
 			break;
-		}
 		wqe->send.wrid.id0.hi = qhp->wq.sq_wptr;
 		sqp->wr_id = wr->wr_id;
 		sqp->opcode = wr2opcode(t3_wr_opcode);
@@ -453,7 +452,12 @@ int iwch_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
 		++(qhp->wq.sq_wptr);
 	}
 	spin_unlock_irqrestore(&qhp->lock, flag);
-	ring_doorbell(qhp->wq.doorbell, qhp->wq.qpid);
+	if (cxio_wq_db_enabled(&qhp->wq))
+		ring_doorbell(qhp->wq.doorbell, qhp->wq.qpid);
+
+out:
+	if (err)
+		*bad_wr = wr;
 	return err;
 }
 
@@ -471,18 +475,19 @@ int iwch_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
 	spin_lock_irqsave(&qhp->lock, flag);
 	if (qhp->attr.state > IWCH_QP_STATE_RTS) {
 		spin_unlock_irqrestore(&qhp->lock, flag);
-		return -EINVAL;
+		err = -EINVAL;
+		goto out;
 	}
 	num_wrs = Q_FREECNT(qhp->wq.rq_rptr, qhp->wq.rq_wptr,
 			    qhp->wq.rq_size_log2) - 1;
 	if (!wr) {
 		spin_unlock_irqrestore(&qhp->lock, flag);
-		return -EINVAL;
+		err = -ENOMEM;
+		goto out;
 	}
 	while (wr) {
 		if (wr->num_sge > T3_MAX_SGE) {
 			err = -EINVAL;
-			*bad_wr = wr;
 			break;
 		}
 		idx = Q_PTR2IDX(qhp->wq.wptr, qhp->wq.size_log2);
@@ -494,10 +499,10 @@ int iwch_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
 				err = build_zero_stag_recv(qhp, wqe, wr);
 		else
 			err = -ENOMEM;
-		if (err) {
-			*bad_wr = wr;
+
+		if (err)
 			break;
-		}
+
 		build_fw_riwrh((void *) wqe, T3_WR_RCV, T3_COMPLETION_FLAG,
 			       Q_GENBIT(qhp->wq.wptr, qhp->wq.size_log2),
 			       0, sizeof(struct t3_receive_wr) >> 3, T3_SOPEOP);
@@ -510,7 +515,12 @@ int iwch_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
 		num_wrs--;
 	}
 	spin_unlock_irqrestore(&qhp->lock, flag);
-	ring_doorbell(qhp->wq.doorbell, qhp->wq.qpid);
+	if (cxio_wq_db_enabled(&qhp->wq))
+		ring_doorbell(qhp->wq.doorbell, qhp->wq.qpid);
+
+out:
+	if (err)
+		*bad_wr = wr;
 	return err;
 }
 
@@ -543,7 +553,7 @@ int iwch_bind_mw(struct ib_qp *qp,
 	}
 	num_wrs = Q_FREECNT(qhp->wq.sq_rptr, qhp->wq.sq_wptr,
 			    qhp->wq.sq_size_log2);
-	if ((num_wrs) <= 0) {
+	if (num_wrs == 0) {
 		spin_unlock_irqrestore(&qhp->lock, flag);
 		return -ENOMEM;
 	}
@@ -556,18 +566,19 @@ int iwch_bind_mw(struct ib_qp *qp,
 	if (mw_bind->send_flags & IB_SEND_SIGNALED)
 		t3_wr_flags = T3_COMPLETION_FLAG;
 
-	sgl.addr = mw_bind->addr;
-	sgl.lkey = mw_bind->mr->lkey;
-	sgl.length = mw_bind->length;
+	sgl.addr = mw_bind->bind_info.addr;
+	sgl.lkey = mw_bind->bind_info.mr->lkey;
+	sgl.length = mw_bind->bind_info.length;
 	wqe->bind.reserved = 0;
 	wqe->bind.type = TPT_VATO;
 
 	/* TBD: check perms */
-	wqe->bind.perms = iwch_ib_to_tpt_bind_access(mw_bind->mw_access_flags);
-	wqe->bind.mr_stag = cpu_to_be32(mw_bind->mr->lkey);
+	wqe->bind.perms = iwch_ib_to_tpt_bind_access(
+		mw_bind->bind_info.mw_access_flags);
+	wqe->bind.mr_stag = cpu_to_be32(mw_bind->bind_info.mr->lkey);
 	wqe->bind.mw_stag = cpu_to_be32(mw->rkey);
-	wqe->bind.mw_len = cpu_to_be32(mw_bind->length);
-	wqe->bind.mw_va = cpu_to_be64(mw_bind->addr);
+	wqe->bind.mw_len = cpu_to_be32(mw_bind->bind_info.length);
+	wqe->bind.mw_va = cpu_to_be64(mw_bind->bind_info.addr);
 	err = iwch_sgl2pbl_map(rhp, &sgl, 1, &pbl_addr, &page_size);
 	if (err) {
 		spin_unlock_irqrestore(&qhp->lock, flag);
@@ -589,7 +600,8 @@ int iwch_bind_mw(struct ib_qp *qp,
 	++(qhp->wq.sq_wptr);
 	spin_unlock_irqrestore(&qhp->lock, flag);
 
-	ring_doorbell(qhp->wq.doorbell, qhp->wq.qpid);
+	if (cxio_wq_db_enabled(&qhp->wq))
+		ring_doorbell(qhp->wq.doorbell, qhp->wq.qpid);
 
 	return err;
 }
@@ -726,7 +738,7 @@ static inline void build_term_codes(struct respQ_msg_t *rsp_msg,
 	}
 }
 
-int iwch_post_zb_read(struct iwch_qp *qhp)
+int iwch_post_zb_read(struct iwch_ep *ep)
 {
 	union t3_wr *wqe;
 	struct sk_buff *skb;
@@ -749,10 +761,10 @@ int iwch_post_zb_read(struct iwch_qp *qhp)
 	wqe->read.local_len = cpu_to_be32(0);
 	wqe->read.local_to = cpu_to_be64(1);
 	wqe->send.wrh.op_seop_flags = cpu_to_be32(V_FW_RIWR_OP(T3_WR_READ));
-	wqe->send.wrh.gen_tid_len = cpu_to_be32(V_FW_RIWR_TID(qhp->ep->hwtid)|
+	wqe->send.wrh.gen_tid_len = cpu_to_be32(V_FW_RIWR_TID(ep->hwtid)|
 						V_FW_RIWR_LEN(flit_cnt));
 	skb->priority = CPL_PRIORITY_DATA;
-	return iwch_cxgb3_ofld_send(qhp->rhp->rdev.t3cdev_p, skb);
+	return iwch_cxgb3_ofld_send(ep->com.qp->rhp->rdev.t3cdev_p, skb);
 }
 
 /*
@@ -790,55 +802,76 @@ int iwch_post_terminate(struct iwch_qp *qhp, struct respQ_msg_t *rsp_msg)
 /*
  * Assumes qhp lock is held.
  */
-static void __flush_qp(struct iwch_qp *qhp, unsigned long *flag)
+static void __flush_qp(struct iwch_qp *qhp, struct iwch_cq *rchp,
+				struct iwch_cq *schp)
 {
-	struct iwch_cq *rchp, *schp;
 	int count;
 	int flushed;
 
-	rchp = get_chp(qhp->rhp, qhp->attr.rcq);
-	schp = get_chp(qhp->rhp, qhp->attr.scq);
 
 	PDBG("%s qhp %p rchp %p schp %p\n", __func__, qhp, rchp, schp);
 	/* take a ref on the qhp since we must release the lock */
 	atomic_inc(&qhp->refcnt);
-	spin_unlock_irqrestore(&qhp->lock, *flag);
+	spin_unlock(&qhp->lock);
 
-	/* locking heirarchy: cq lock first, then qp lock. */
-	spin_lock_irqsave(&rchp->lock, *flag);
+	/* locking hierarchy: cq lock first, then qp lock. */
+	spin_lock(&rchp->lock);
 	spin_lock(&qhp->lock);
 	cxio_flush_hw_cq(&rchp->cq);
 	cxio_count_rcqes(&rchp->cq, &qhp->wq, &count);
 	flushed = cxio_flush_rq(&qhp->wq, &rchp->cq, count);
 	spin_unlock(&qhp->lock);
-	spin_unlock_irqrestore(&rchp->lock, *flag);
-	if (flushed)
+	spin_unlock(&rchp->lock);
+	if (flushed) {
+		spin_lock(&rchp->comp_handler_lock);
 		(*rchp->ibcq.comp_handler)(&rchp->ibcq, rchp->ibcq.cq_context);
+		spin_unlock(&rchp->comp_handler_lock);
+	}
 
-	/* locking heirarchy: cq lock first, then qp lock. */
-	spin_lock_irqsave(&schp->lock, *flag);
+	/* locking hierarchy: cq lock first, then qp lock. */
+	spin_lock(&schp->lock);
 	spin_lock(&qhp->lock);
 	cxio_flush_hw_cq(&schp->cq);
 	cxio_count_scqes(&schp->cq, &qhp->wq, &count);
 	flushed = cxio_flush_sq(&qhp->wq, &schp->cq, count);
 	spin_unlock(&qhp->lock);
-	spin_unlock_irqrestore(&schp->lock, *flag);
-	if (flushed)
+	spin_unlock(&schp->lock);
+	if (flushed) {
+		spin_lock(&schp->comp_handler_lock);
 		(*schp->ibcq.comp_handler)(&schp->ibcq, schp->ibcq.cq_context);
+		spin_unlock(&schp->comp_handler_lock);
+	}
 
 	/* deref */
 	if (atomic_dec_and_test(&qhp->refcnt))
 	        wake_up(&qhp->wait);
 
-	spin_lock_irqsave(&qhp->lock, *flag);
+	spin_lock(&qhp->lock);
 }
 
-static void flush_qp(struct iwch_qp *qhp, unsigned long *flag)
+static void flush_qp(struct iwch_qp *qhp)
 {
-	if (qhp->ibqp.uobject)
+	struct iwch_cq *rchp, *schp;
+
+	rchp = get_chp(qhp->rhp, qhp->attr.rcq);
+	schp = get_chp(qhp->rhp, qhp->attr.scq);
+
+	if (qhp->ibqp.uobject) {
 		cxio_set_wq_in_error(&qhp->wq);
-	else
-		__flush_qp(qhp, flag);
+		cxio_set_cq_in_error(&rchp->cq);
+		spin_lock(&rchp->comp_handler_lock);
+		(*rchp->ibcq.comp_handler)(&rchp->ibcq, rchp->ibcq.cq_context);
+		spin_unlock(&rchp->comp_handler_lock);
+		if (schp != rchp) {
+			cxio_set_cq_in_error(&schp->cq);
+			spin_lock(&schp->comp_handler_lock);
+			(*schp->ibcq.comp_handler)(&schp->ibcq,
+						   schp->ibcq.cq_context);
+			spin_unlock(&schp->comp_handler_lock);
+		}
+		return;
+	}
+	__flush_qp(qhp, rchp, schp);
 }
 
 
@@ -997,7 +1030,7 @@ int iwch_modify_qp(struct iwch_dev *rhp, struct iwch_qp *qhp,
 			break;
 		case IWCH_QP_STATE_ERROR:
 			qhp->attr.state = IWCH_QP_STATE_ERROR;
-			flush_qp(qhp, &flag);
+			flush_qp(qhp);
 			break;
 		default:
 			ret = -EINVAL;
@@ -1045,7 +1078,7 @@ int iwch_modify_qp(struct iwch_dev *rhp, struct iwch_qp *qhp,
 		}
 		switch (attrs->next_state) {
 			case IWCH_QP_STATE_IDLE:
-				flush_qp(qhp, &flag);
+				flush_qp(qhp);
 				qhp->attr.state = IWCH_QP_STATE_IDLE;
 				qhp->attr.llp_stream_handle = NULL;
 				put_ep(&qhp->ep->com);
@@ -1099,7 +1132,7 @@ err:
 	free=1;
 	wake_up(&qhp->wait);
 	BUG_ON(!ep);
-	flush_qp(qhp, &flag);
+	flush_qp(qhp);
 out:
 	spin_unlock_irqrestore(&qhp->lock, flag);
 
@@ -1125,60 +1158,4 @@ out:
 
 	PDBG("%s exit state %d\n", __func__, qhp->attr.state);
 	return ret;
-}
-
-static int quiesce_qp(struct iwch_qp *qhp)
-{
-	spin_lock_irq(&qhp->lock);
-	iwch_quiesce_tid(qhp->ep);
-	qhp->flags |= QP_QUIESCED;
-	spin_unlock_irq(&qhp->lock);
-	return 0;
-}
-
-static int resume_qp(struct iwch_qp *qhp)
-{
-	spin_lock_irq(&qhp->lock);
-	iwch_resume_tid(qhp->ep);
-	qhp->flags &= ~QP_QUIESCED;
-	spin_unlock_irq(&qhp->lock);
-	return 0;
-}
-
-int iwch_quiesce_qps(struct iwch_cq *chp)
-{
-	int i;
-	struct iwch_qp *qhp;
-
-	for (i=0; i < T3_MAX_NUM_QP; i++) {
-		qhp = get_qhp(chp->rhp, i);
-		if (!qhp)
-			continue;
-		if ((qhp->attr.rcq == chp->cq.cqid) && !qp_quiesced(qhp)) {
-			quiesce_qp(qhp);
-			continue;
-		}
-		if ((qhp->attr.scq == chp->cq.cqid) && !qp_quiesced(qhp))
-			quiesce_qp(qhp);
-	}
-	return 0;
-}
-
-int iwch_resume_qps(struct iwch_cq *chp)
-{
-	int i;
-	struct iwch_qp *qhp;
-
-	for (i=0; i < T3_MAX_NUM_QP; i++) {
-		qhp = get_qhp(chp->rhp, i);
-		if (!qhp)
-			continue;
-		if ((qhp->attr.rcq == chp->cq.cqid) && qp_quiesced(qhp)) {
-			resume_qp(qhp);
-			continue;
-		}
-		if ((qhp->attr.scq == chp->cq.cqid) && qp_quiesced(qhp))
-			resume_qp(qhp);
-	}
-	return 0;
 }

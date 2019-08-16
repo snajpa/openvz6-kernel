@@ -473,6 +473,8 @@ int vcc_recvmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg,
 	struct sk_buff *skb;
 	int copied, error = -EINVAL;
 
+	msg->msg_namelen = 0;
+
 	if (sock->state != SS_CONNECTED)
 		return -ENOTCONN;
 	if (flags & ~MSG_DONTWAIT)		/* only handle MSG_DONTWAIT */
@@ -496,7 +498,7 @@ int vcc_recvmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg,
 	error = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
 	if (error)
 		return error;
-	sock_recv_timestamp(msg, sk, skb);
+	sock_recv_ts_and_drops(msg, sk, skb);
 	pr_debug("RcvM %d -= %d\n", atomic_read(&sk->sk_rmem_alloc), skb->truesize);
 	atm_return(vcc, skb->truesize);
 	skb_free_datagram(sk, skb);
@@ -749,6 +751,7 @@ int vcc_getsockopt(struct socket *sock, int level, int optname,
 				if (!vcc->dev ||
 				    !test_bit(ATM_VF_ADDR,&vcc->flags))
 					return -ENOTCONN;
+				memset(&pvc, 0, sizeof(pvc));
 				pvc.sap_family = AF_ATMPVC;
 				pvc.sap_addr.itf = vcc->dev->number;
 				pvc.sap_addr.vpi = vcc->vpi;

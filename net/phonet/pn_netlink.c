@@ -68,7 +68,7 @@ static int addr_doit(struct sk_buff *skb, struct nlmsghdr *nlh, void *attr)
 	int err;
 	u8 pnaddr;
 
-	if (!capable(CAP_SYS_ADMIN))
+	if (!netlink_capable(skb, CAP_SYS_ADMIN))
 		return -EPERM;
 
 	ASSERT_RTNL();
@@ -162,12 +162,13 @@ out:
 
 int __init phonet_netlink_register(void)
 {
-	int err = __rtnl_register(PF_PHONET, RTM_NEWADDR, addr_doit, NULL);
+	int err = __rtnl_register(PF_PHONET, RTM_NEWADDR, addr_doit,
+				  NULL, NULL);
 	if (err)
 		return err;
 
 	/* Further __rtnl_register() cannot fail */
-	__rtnl_register(PF_PHONET, RTM_DELADDR, addr_doit, NULL);
-	__rtnl_register(PF_PHONET, RTM_GETADDR, NULL, getaddr_dumpit);
+	__rtnl_register(PF_PHONET, RTM_DELADDR, addr_doit, NULL, NULL);
+	__rtnl_register(PF_PHONET, RTM_GETADDR, NULL, getaddr_dumpit, NULL);
 	return 0;
 }

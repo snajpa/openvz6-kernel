@@ -34,6 +34,7 @@
  * exception handlers (including pSeries LPAR) and iSeries LPAR
  * implementations as possible.
  */
+#include <asm/bug.h>
 
 #define EX_R9		0
 #define EX_R10		8
@@ -46,6 +47,66 @@
 #define EX_CCR		60
 #define EX_R3		64
 #define EX_LR		72
+
+#define STF_ENTRY_BARRIER_SLOT						\
+	STF_ENTRY_BARRIER_FIXUP_SECTION;				\
+	mflr	r10;							\
+	bl	stf_barrier_fallback;					\
+	mtlr	r10
+
+#define STF_EXIT_BARRIER_SLOT						\
+	STF_EXIT_BARRIER_FIXUP_SECTION;					\
+	nop;								\
+	nop;								\
+	nop;								\
+	nop;								\
+	nop;								\
+	nop
+
+/*
+ * r10 must be free to use, r13 must be paca
+ */
+#define INTERRUPT_TO_KERNEL						\
+	STF_ENTRY_BARRIER_SLOT
+
+/*
+ * The nop instructions allow us to insert one or more instructions to flush the
+ * L1-D cache when return to userspace or a guest.
+ */
+#define RFI_FLUSH_SLOT							\
+	RFI_FLUSH_FIXUP_SECTION;					\
+	nop;								\
+	nop;								\
+	nop
+
+#ifdef CONFIG_PPC_DEBUG_RFI
+#define CHECK_TARGET_MSR_PR(srr_reg, expected_pr)			\
+	mtspr	SPRN_SPRG_SCRATCH0,r3;					\
+	mfspr	r3,srr_reg;						\
+	extrdi	r3,r3,1,63-MSR_PR_LG;					\
+666:	tdnei	r3,expected_pr;						\
+	EMIT_BUG_ENTRY 666b,__FILE__,__LINE__,0;			\
+	mfspr	r3,SPRN_SPRG_SCRATCH0;
+#else
+#define CHECK_TARGET_MSR_PR(srr_reg, expected_pr)
+#endif
+
+#define RFI_TO_KERNEL							\
+	CHECK_TARGET_MSR_PR(SPRN_SRR1, 0);				\
+	rfid
+
+#define RFI_TO_USER							\
+	CHECK_TARGET_MSR_PR(SPRN_SRR1, 1);				\
+	STF_EXIT_BARRIER_SLOT;						\
+	RFI_FLUSH_SLOT;							\
+	rfid;								\
+	b	rfi_flush_fallback
+
+#define RFI_TO_USER_OR_KERNEL						\
+	STF_EXIT_BARRIER_SLOT;						\
+	RFI_FLUSH_SLOT;							\
+	rfid;								\
+	b	rfi_flush_fallback
 
 /*
  * We're short on space and time in the exception prolog, so we can't
@@ -64,6 +125,7 @@
 	std	r12,area+EX_R12(r13);					\
 	mfspr	r9,SPRN_SPRG_SCRATCH0;					\
 	std	r9,area+EX_R13(r13);					\
+	INTERRUPT_TO_KERNEL;						\
 	mfcr	r9
 
 #define EXCEPTION_PROLOG_PSERIES_1(label)				\
@@ -137,7 +199,8 @@
 	li	r10,0;							   \
 	ld	r11,exception_marker@toc(r2);				   \
 	std	r10,RESULT(r1);		/* clear regs->result		*/ \
-	std	r11,STACK_FRAME_OVERHEAD-16(r1); /* mark the frame	*/
+	std	r11,STACK_FRAME_OVERHEAD-16(r1); /* mark the frame	*/ \
+	ACCOUNT_STOLEN_TIME
 
 /*
  * Exception vectors.
@@ -174,6 +237,7 @@ label##_pSeries:							\
 	mfspr	r13,SPRN_SPRG_PACA;	/* get paca address into r13 */	\
 	std	r9,PACA_EXGEN+EX_R9(r13);	/* save r9, r10 */	\
 	std	r10,PACA_EXGEN+EX_R10(r13);				\
+	INTERRUPT_TO_KERNEL;						\
 	lbz	r10,PACASOFTIRQEN(r13);					\
 	mfcr	r9;							\
 	cmpwi	r10,0;							\

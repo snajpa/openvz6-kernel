@@ -43,7 +43,7 @@ static mempool_t *bio_split_pool __read_mostly;
  * unsigned short
  */
 #define BV(x) { .nr_vecs = x, .name = "biovec-"__stringify(x) }
-struct biovec_slab bvec_slabs[BIOVEC_NR_POOLS] __read_mostly = {
+static struct biovec_slab bvec_slabs[BIOVEC_NR_POOLS] __read_mostly = {
 	BV(1), BV(4), BV(16), BV(64), BV(128), BV(BIO_MAX_PAGES),
 };
 #undef BV
@@ -506,19 +506,18 @@ int bio_get_nr_vecs(struct block_device *bdev)
 	struct request_queue *q = bdev_get_queue(bdev);
 	int nr_pages;
 
-	nr_pages = ((queue_max_sectors(q) << 9) + PAGE_SIZE - 1) >> PAGE_SHIFT;
-	if (nr_pages > queue_max_phys_segments(q))
-		nr_pages = queue_max_phys_segments(q);
-	if (nr_pages > queue_max_hw_segments(q))
-		nr_pages = queue_max_hw_segments(q);
+	nr_pages = min_t(unsigned,
+		     queue_max_segments(q),
+		     queue_max_sectors(q) / (PAGE_SIZE >> 9) + 1);
 
-	return nr_pages;
+	return min_t(unsigned, nr_pages, BIO_MAX_PAGES);
+
 }
 EXPORT_SYMBOL(bio_get_nr_vecs);
 
 static int __bio_add_page(struct request_queue *q, struct bio *bio, struct page
 			  *page, unsigned int len, unsigned int offset,
-			  unsigned short max_sectors)
+			  unsigned int max_sectors)
 {
 	int retried_segments = 0;
 	struct bio_vec *bvec;
@@ -542,17 +541,22 @@ static int __bio_add_page(struct request_queue *q, struct bio *bio, struct page
 
 		if (page == prev->bv_page &&
 		    offset == prev->bv_offset + prev->bv_len) {
+			unsigned int prev_bv_len = prev->bv_len;
 			prev->bv_len += len;
 
 			if (q->merge_bvec_fn) {
 				struct bvec_merge_data bvm = {
+					/* prev_bvec is already charged in
+					   bi_size, discharge it in order to
+					   simulate merging updated prev_bvec
+					   as new bvec. */
 					.bi_bdev = bio->bi_bdev,
 					.bi_sector = bio->bi_sector,
-					.bi_size = bio->bi_size,
+					.bi_size = bio->bi_size - prev_bv_len,
 					.bi_rw = bio->bi_rw,
 				};
 
-				if (q->merge_bvec_fn(q, &bvm, prev) < len) {
+				if (q->merge_bvec_fn(q, &bvm, prev) < prev->bv_len) {
 					prev->bv_len -= len;
 					return 0;
 				}
@@ -566,21 +570,6 @@ static int __bio_add_page(struct request_queue *q, struct bio *bio, struct page
 		return 0;
 
 	/*
-	 * we might lose a segment or two here, but rather that than
-	 * make this too complex.
-	 */
-
-	while (bio->bi_phys_segments >= queue_max_phys_segments(q)
-	       || bio->bi_phys_segments >= queue_max_hw_segments(q)) {
-
-		if (retried_segments)
-			return 0;
-
-		retried_segments = 1;
-		blk_recount_segments(q, bio);
-	}
-
-	/*
 	 * setup the new entry, we might clear it again later if we
 	 * cannot add the page
 	 */
@@ -588,6 +577,22 @@ static int __bio_add_page(struct request_queue *q, struct bio *bio, struct page
 	bvec->bv_page = page;
 	bvec->bv_len = len;
 	bvec->bv_offset = offset;
+	bio->bi_vcnt++;
+	bio->bi_phys_segments++;
+
+	/*
+	 * Perform a recount if the number of segments is greater
+	 * than queue_max_segments(q).
+	 */
+
+	while (bio->bi_phys_segments > queue_max_segments(q)) {
+
+		if (retried_segments)
+			goto failed;
+
+		retried_segments = 1;
+		blk_recount_segments(q, bio);
+	}
 
 	/*
 	 * if queue has other restrictions (eg varying max sector size
@@ -606,23 +611,25 @@ static int __bio_add_page(struct request_queue *q, struct bio *bio, struct page
 		 * merge_bvec_fn() returns number of bytes it can accept
 		 * at this offset
 		 */
-		if (q->merge_bvec_fn(q, &bvm, bvec) < len) {
-			bvec->bv_page = NULL;
-			bvec->bv_len = 0;
-			bvec->bv_offset = 0;
-			return 0;
-		}
+		if (q->merge_bvec_fn(q, &bvm, bvec) < bvec->bv_len)
+			goto failed;
 	}
 
 	/* If we may be able to merge these biovecs, force a recount */
-	if (bio->bi_vcnt && (BIOVEC_PHYS_MERGEABLE(bvec-1, bvec)))
+	if (bio->bi_vcnt > 1 && (BIOVEC_PHYS_MERGEABLE(bvec-1, bvec)))
 		bio->bi_flags &= ~(1 << BIO_SEG_VALID);
 
-	bio->bi_vcnt++;
-	bio->bi_phys_segments++;
  done:
 	bio->bi_size += len;
 	return len;
+
+ failed:
+	bvec->bv_page = NULL;
+	bvec->bv_len = 0;
+	bvec->bv_offset = 0;
+	bio->bi_vcnt--;
+	blk_recount_segments(q, bio);
+	return 0;
 }
 
 /**
@@ -668,6 +675,42 @@ int bio_add_page(struct bio *bio, struct page *page, unsigned int len,
 }
 EXPORT_SYMBOL(bio_add_page);
 
+struct submit_bio_ret {
+	struct completion event;
+	int error;
+};
+
+static void submit_bio_wait_endio(struct bio *bio, int error)
+{
+	struct submit_bio_ret *ret = bio->bi_private;
+
+	ret->error = error;
+	complete(&ret->event);
+}
+
+/**
+ * submit_bio_wait - submit a bio, and wait until it completes
+ * @rw: whether to %READ or %WRITE, or maybe to %READA (read ahead)
+ * @bio: The &struct bio which describes the I/O
+ *
+ * Simple wrapper around submit_bio(). Returns 0 on success, or the error from
+ * bio_endio() on failure.
+ */
+int submit_bio_wait(int rw, struct bio *bio)
+{
+	struct submit_bio_ret ret;
+
+	rw |= REQ_SYNC;
+	init_completion(&ret.event);
+	bio->bi_private = &ret;
+	bio->bi_end_io = submit_bio_wait_endio;
+	submit_bio(rw, bio);
+	wait_for_completion(&ret.event);
+
+	return ret.error;
+}
+
+EXPORT_SYMBOL(submit_bio_wait);
 struct bio_map_data {
 	struct bio_vec *iovecs;
 	struct sg_iovec *sgvecs;
@@ -778,12 +821,22 @@ static int __bio_copy_iov(struct bio *bio, struct bio_vec *iovecs,
 int bio_uncopy_user(struct bio *bio)
 {
 	struct bio_map_data *bmd = bio->bi_private;
-	int ret = 0;
+	struct bio_vec *bvec;
+	int ret = 0, i;
 
-	if (!bio_flagged(bio, BIO_NULL_MAPPED))
-		ret = __bio_copy_iov(bio, bmd->iovecs, bmd->sgvecs,
-				     bmd->nr_sgvecs, bio_data_dir(bio) == READ,
-				     0, bmd->is_our_pages);
+	if (!bio_flagged(bio, BIO_NULL_MAPPED)) {
+		/*
+		 * if we're in a workqueue, the request is orphaned, so
+		 * don't copy into a random user address space, just free.
+		 */
+		if (current->mm)
+			ret = __bio_copy_iov(bio, bmd->iovecs, bmd->sgvecs,
+					     bmd->nr_sgvecs, bio_data_dir(bio) == READ,
+					     0, bmd->is_our_pages);
+		else if (bmd->is_our_pages)
+			__bio_for_each_segment(bvec, bio, i, 0)
+				__free_page(bvec->bv_page);
+	}
 	bio_free_map_data(bmd);
 	bio_put(bio);
 	return ret;
@@ -826,6 +879,12 @@ struct bio *bio_copy_user_iov(struct request_queue *q,
 		end = (uaddr + iov[i].iov_len + PAGE_SIZE - 1) >> PAGE_SHIFT;
 		start = uaddr >> PAGE_SHIFT;
 
+		/*
+		 * Overflow, abort
+		 */
+		if (end < start)
+			return ERR_PTR(-EINVAL);
+
 		nr_pages += end - start;
 		len += iov[i].iov_len;
 	}
@@ -842,7 +901,8 @@ struct bio *bio_copy_user_iov(struct request_queue *q,
 	if (!bio)
 		goto out_bmd;
 
-	bio->bi_rw |= (!write_to_vm << BIO_RW);
+	if (!write_to_vm)
+		bio->bi_rw |= (1 << BIO_RW);
 
 	ret = 0;
 
@@ -946,12 +1006,19 @@ static struct bio *__bio_map_user_iov(struct request_queue *q,
 	struct bio *bio;
 	int cur_page = 0;
 	int ret, offset;
+	struct bio_vec *bvec;
 
 	for (i = 0; i < iov_count; i++) {
 		unsigned long uaddr = (unsigned long)iov[i].iov_base;
 		unsigned long len = iov[i].iov_len;
 		unsigned long end = (uaddr + len + PAGE_SIZE - 1) >> PAGE_SHIFT;
 		unsigned long start = uaddr >> PAGE_SHIFT;
+
+		/*
+		 * Overflow, abort
+		 */
+		if (end < start)
+			return ERR_PTR(-EINVAL);
 
 		nr_pages += end - start;
 		/*
@@ -980,10 +1047,15 @@ static struct bio *__bio_map_user_iov(struct request_queue *q,
 		unsigned long start = uaddr >> PAGE_SHIFT;
 		const int local_nr_pages = end - start;
 		const int page_limit = cur_page + local_nr_pages;
-		
+
 		ret = get_user_pages_fast(uaddr, local_nr_pages,
 				write_to_vm, &pages[cur_page]);
-		if (ret < local_nr_pages) {
+		if (unlikely(ret < local_nr_pages)) {
+			for (j = cur_page; j < page_limit; j++) {
+				if (!pages[j])
+					break;
+				put_page(pages[j]);
+			}
 			ret = -EFAULT;
 			goto out_unmap;
 		}
@@ -991,6 +1063,7 @@ static struct bio *__bio_map_user_iov(struct request_queue *q,
 		offset = uaddr & ~PAGE_MASK;
 		for (j = cur_page; j < page_limit; j++) {
 			unsigned int bytes = PAGE_SIZE - offset;
+			unsigned short prev_bi_vcnt = bio->bi_vcnt;
 
 			if (len <= 0)
 				break;
@@ -1004,6 +1077,13 @@ static struct bio *__bio_map_user_iov(struct request_queue *q,
 			if (bio_add_pc_page(q, bio, pages[j], bytes, offset) <
 					    bytes)
 				break;
+
+			/*
+			 * check if vector was merged with previous
+			 * drop page reference if needed
+			 */
+			if (bio->bi_vcnt == prev_bi_vcnt)
+				put_page(pages[j]);
 
 			len -= bytes;
 			offset = 0;
@@ -1030,10 +1110,8 @@ static struct bio *__bio_map_user_iov(struct request_queue *q,
 	return bio;
 
  out_unmap:
-	for (i = 0; i < nr_pages; i++) {
-		if(!pages[i])
-			break;
-		page_cache_release(pages[i]);
+	__bio_for_each_segment(bvec, bio, j, 0) {
+		put_page(bvec->bv_page);
 	}
  out:
 	kfree(pages);
@@ -1437,6 +1515,13 @@ static void bio_pair_end_1(struct bio *bi, int err)
 	if (err)
 		bp->error = err;
 
+	/*
+	 * If the integrity payload was created for this bio (and not
+	 * split from the parent), then go ahead and free it.
+	 */
+	if (bio_integrity(bi) && bi->bi_integrity != &bp->bip1)
+	        bio_integrity_free(bi, NULL);
+
 	bio_pair_release(bp);
 }
 
@@ -1446,6 +1531,13 @@ static void bio_pair_end_2(struct bio *bi, int err)
 
 	if (err)
 		bp->error = err;
+
+	/*
+	 * If the integrity payload was created for this bio (and not
+	 * split from the parent), then go ahead and free it.
+	 */
+	if (bio_integrity(bi) && bi->bi_integrity != &bp->bip2)
+	        bio_integrity_free(bi, NULL);
 
 	bio_pair_release(bp);
 }
@@ -1463,7 +1555,7 @@ struct bio_pair *bio_split(struct bio *bi, int first_sectors)
 	trace_block_split(bdev_get_queue(bi->bi_bdev), bi,
 				bi->bi_sector + first_sectors);
 
-	BUG_ON(bi->bi_vcnt != 1);
+	BUG_ON(bi->bi_vcnt != 1 && bi->bi_vcnt != 0);
 	BUG_ON(bi->bi_idx != 0);
 	atomic_set(&bp->cnt, 3);
 	bp->error = 0;
@@ -1473,17 +1565,20 @@ struct bio_pair *bio_split(struct bio *bi, int first_sectors)
 	bp->bio2.bi_size -= first_sectors << 9;
 	bp->bio1.bi_size = first_sectors << 9;
 
-	bp->bv1 = bi->bi_io_vec[0];
-	bp->bv2 = bi->bi_io_vec[0];
-	bp->bv2.bv_offset += first_sectors << 9;
-	bp->bv2.bv_len -= first_sectors << 9;
-	bp->bv1.bv_len = first_sectors << 9;
+	if (bi->bi_vcnt != 0) {
+		bp->bv1 = bi->bi_io_vec[0];
+		bp->bv2 = bi->bi_io_vec[0];
 
-	bp->bio1.bi_io_vec = &bp->bv1;
-	bp->bio2.bi_io_vec = &bp->bv2;
+		bp->bv2.bv_offset += first_sectors << 9;
+		bp->bv2.bv_len -= first_sectors << 9;
+		bp->bv1.bv_len = first_sectors << 9;
 
-	bp->bio1.bi_max_vecs = 1;
-	bp->bio2.bi_max_vecs = 1;
+		bp->bio1.bi_io_vec = &bp->bv1;
+		bp->bio2.bi_io_vec = &bp->bv2;
+
+		bp->bio1.bi_max_vecs = 1;
+		bp->bio2.bi_max_vecs = 1;
+	}
 
 	bp->bio1.bi_end_io = bio_pair_end_1;
 	bp->bio2.bi_end_io = bio_pair_end_2;
@@ -1603,9 +1698,6 @@ struct bio_set *bioset_create(unsigned int pool_size, unsigned int front_pad)
 	if (!bs->bio_pool)
 		goto bad;
 
-	if (bioset_integrity_create(bs, pool_size))
-		goto bad;
-
 	if (!biovec_create_pools(bs, pool_size))
 		return bs;
 
@@ -1623,12 +1715,10 @@ static void __init biovec_init_slabs(void)
 		int size;
 		struct biovec_slab *bvs = bvec_slabs + i;
 
-#ifndef CONFIG_BLK_DEV_INTEGRITY
 		if (bvs->nr_vecs <= BIO_INLINE_VECS) {
 			bvs->slab = NULL;
 			continue;
 		}
-#endif
 
 		size = bvs->nr_vecs * sizeof(struct bio_vec);
 		bvs->slab = kmem_cache_create(bvs->name, size, 0,
@@ -1650,6 +1740,9 @@ static int __init init_bio(void)
 	fs_bio_set = bioset_create(BIO_POOL_SIZE, 0);
 	if (!fs_bio_set)
 		panic("bio: can't allocate bios\n");
+
+	if (bioset_integrity_create(fs_bio_set, BIO_POOL_SIZE))
+		panic("bio: can't create integrity pool\n");
 
 	bio_split_pool = mempool_create_kmalloc_pool(BIO_SPLIT_ENTRIES,
 						     sizeof(struct bio_pair));

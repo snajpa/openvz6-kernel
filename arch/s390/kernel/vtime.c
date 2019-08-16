@@ -19,11 +19,14 @@
 #include <linux/kernel_stat.h>
 #include <linux/rcupdate.h>
 #include <linux/posix-timers.h>
+#include <linux/cpu.h>
 
 #include <asm/s390_ext.h>
 #include <asm/timer.h>
 #include <asm/irq_regs.h>
 #include <asm/cputime.h>
+
+asm(".include \"asm/nobp.h\"\n");
 
 static DEFINE_PER_CPU(struct vtimer_queue, virt_cpu_timer);
 
@@ -60,7 +63,13 @@ static void do_account_vtime(struct task_struct *tsk, int hardirq_offset)
 	timer = S390_lowcore.last_update_timer;
 	clock = S390_lowcore.last_update_clock;
 	asm volatile ("  STPT %0\n"    /* Store current cpu timer value */
+#if defined(CONFIG_MARCH_Z9_109) || \
+    defined(CONFIG_MARCH_Z10) || \
+    defined(CONFIG_MARCH_Z196)
+		      "  STCKF %1"     /* Store current tod clock value */
+#else
 		      "  STCK %1"      /* Store current tod clock value */
+#endif
 		      : "=m" (S390_lowcore.last_update_timer),
 		        "=m" (S390_lowcore.last_update_clock) );
 	S390_lowcore.system_timer += timer - S390_lowcore.last_update_timer;
@@ -167,6 +176,8 @@ void vtime_stop_cpu(void)
 	/* Wait for external, I/O or machine check interrupt. */
 	psw.mask = psw_kernel_bits | PSW_MASK_WAIT | PSW_MASK_IO | PSW_MASK_EXT;
 
+	idle->nohz_delay = 0;
+
 	/* Check if the CPU timer needs to be reprogrammed. */
 	if (vq->do_spt) {
 		__u64 vmax = VTIMER_MAX_SLICE;
@@ -190,6 +201,7 @@ void vtime_stop_cpu(void)
 			"	larl	1,1f\n"
 			"	stg	1,8(%2)\n"
 #endif /* CONFIG_64BIT */
+			"	BPON	     \n"
 			"	stpt	0(%4)\n"
 			"	spt	0(%5)\n"
 			"	stck	0(%3)\n"
@@ -223,6 +235,7 @@ void vtime_stop_cpu(void)
 			"	larl	1,1f\n"
 			"	stg	1,8(%2)\n"
 #endif /* CONFIG_64BIT */
+			"	BPON	     \n"
 			"	stpt	0(%4)\n"
 			"	stck	0(%3)\n"
 #ifndef CONFIG_64BIT
@@ -560,6 +573,23 @@ void init_cpu_vtimer(void)
 	__ctl_set_bit(0,10);
 }
 
+static int __cpuinit s390_nohz_notify(struct notifier_block *self,
+				      unsigned long action, void *hcpu)
+{
+	struct s390_idle_data *idle;
+	long cpu = (long) hcpu;
+
+	idle = &per_cpu(s390_idle, cpu);
+	switch (action) {
+	case CPU_DYING:
+	case CPU_DYING_FROZEN:
+		idle->nohz_delay = 0;
+	default:
+		break;
+	}
+	return NOTIFY_OK;
+}
+
 void __init vtime_init(void)
 {
 	/* request the cpu timer external interrupt */
@@ -568,5 +598,6 @@ void __init vtime_init(void)
 
 	/* Enable cpu timer interrupts on the boot cpu. */
 	init_cpu_vtimer();
+	cpu_notifier(s390_nohz_notify, 0);
 }
 

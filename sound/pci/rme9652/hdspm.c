@@ -487,7 +487,7 @@ struct hdspm {
 	struct snd_kcontrol *playback_mixer_ctls[HDSPM_MAX_CHANNELS];
 	/* but input to much, so not used */
 	struct snd_kcontrol *input_mixer_ctls[HDSPM_MAX_CHANNELS];
-	/* full mixer accessable over mixer ioctl or hwdep-device */
+	/* full mixer accessible over mixer ioctl or hwdep-device */
 	struct hdspm_mixer *mixer;
 
 };
@@ -550,7 +550,7 @@ static inline int HDSPM_bit2freq(int n)
 	return bit2freq_tab[n];
 }
 
-/* Write/read to/from HDSPM with Adresses in Bytes
+/* Write/read to/from HDSPM with Addresses in Bytes
    not words but only 32Bit writes are allowed */
 
 static inline void hdspm_write(struct hdspm * hdspm, unsigned int reg,
@@ -2908,7 +2908,7 @@ static int snd_hdspm_create_controls(struct snd_card *card, struct hdspm * hdspm
 
 	/* Channel playback mixer as default control 
 	   Note: the whole matrix would be 128*HDSPM_MIXER_CHANNELS Faders,
-	   thats too * big for any alsamixer they are accesible via special
+	   thats too * big for any alsamixer they are accessible via special
 	   IOCTL on hwdep and the mixer 2dimensional mixer control
 	*/
 
@@ -4127,6 +4127,7 @@ static int snd_hdspm_hwdep_ioctl(struct snd_hwdep * hw, struct file *file,
 
 	case SNDRV_HDSPM_IOCTL_GET_CONFIG_INFO:
 
+		memset(&info, 0, sizeof(info));
 		spin_lock_irq(&hdspm->lock);
 		info.pref_sync_ref = hdspm_pref_sync_ref(hdspm);
 		info.wordclock_sync_check = hdspm_wc_sync_check(hdspm);
@@ -4494,8 +4495,8 @@ static int __devinit snd_hdspm_probe(struct pci_dev *pci,
 		return -ENOENT;
 	}
 
-	err = snd_card_create(index[dev], id[dev],
-			      THIS_MODULE, sizeof(struct hdspm), &card);
+	err = snd_card_new(&pci->dev, index[dev], id[dev],
+			   THIS_MODULE, sizeof(struct hdspm), &card);
 	if (err < 0)
 		return err;
 
@@ -4503,8 +4504,6 @@ static int __devinit snd_hdspm_probe(struct pci_dev *pci,
 	card->private_free = snd_hdspm_card_free;
 	hdspm->dev = dev;
 	hdspm->pci = pci;
-
-	snd_card_set_dev(card, &pci->dev);
 
 	err = snd_hdspm_create(card, hdspm, precise_ptr[dev],
 			       enable_monitor[dev]);

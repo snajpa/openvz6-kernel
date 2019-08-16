@@ -21,6 +21,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/jhash.h>
+#include <linux/netdevice.h>
 
 #include <net/flow.h>
 #include <net/sock.h>
@@ -52,11 +53,65 @@ struct ip_options {
 			ts_needaddr:1;
 	unsigned char	router_alert;
 	unsigned char	cipso;
+
+#ifndef __GENKSYMS__
+	unsigned char	rhel_alloc_flag:1;
+#else
 	unsigned char	__pad2;
+#endif
 	unsigned char	__data[0];
 };
 
 #define optlength(opt) (sizeof(struct ip_options) + opt->optlen)
+
+struct ip_options_rcu {
+	struct rcu_head rcu;
+	struct ip_options opt;
+};
+
+struct ip_options_data {
+	struct ip_options	opt;
+	char			data[40];
+};
+
+static inline struct ip_options_rcu *get_ip_options_rcu(struct ip_options *opt)
+{
+	if (!opt)
+		return NULL;
+	/*
+	 * Warn if someone allocated opt directly without using
+	 * rhel_ip_options_set_alloc_flag().
+	 */
+	WARN_ON(!opt->rhel_alloc_flag);
+
+	return container_of(opt, struct ip_options_rcu, opt);
+}
+
+static inline void rhel_ip_options_set_alloc_flag(struct ip_options *opt)
+{
+	opt->rhel_alloc_flag = 1;
+}
+
+static inline struct ip_options *kmalloc_ip_options(size_t opt_len, gfp_t flags)
+{
+	struct ip_options_rcu *opt_rcu;
+
+	opt_rcu = kmalloc(sizeof(struct ip_options_rcu) + opt_len, flags);
+	if (!opt_rcu)
+		return NULL;
+	rhel_ip_options_set_alloc_flag(&opt_rcu->opt);
+	return &opt_rcu->opt;
+}
+
+static inline struct ip_options *kzalloc_ip_options(size_t opt_len, gfp_t flags)
+{
+	return kmalloc_ip_options(opt_len, flags | __GFP_ZERO);
+}
+
+static inline void kfree_ip_options(struct ip_options *opt)
+{
+	kfree(get_ip_options_rcu(opt));
+}
 
 struct inet_request_sock {
 	struct request_sock	req;
@@ -149,6 +204,13 @@ struct inet_sock {
 	} cork;
 };
 
+static inline __u32 inet_sk_rxhash(struct sock *sk)
+{
+	struct sock_extended *ske = sk_extended(sk);
+
+	return ske->inet_sock_extended.rxhash;
+}
+
 #define IPCORK_OPT	1	/* ip-options has been held in ipcork.opt */
 #define IPCORK_ALLFRAG	2	/* always fragment (for ipv6 for now) */
 
@@ -217,4 +279,33 @@ static inline __u8 inet_sk_flowi_flags(const struct sock *sk)
 	return inet_sk(sk)->transparent ? FLOWI_FLAG_ANYSRC : 0;
 }
 
+static inline void inet_rps_record_flow(struct sock *sk)
+{
+	struct rps_sock_flow_table *sock_flow_table;
+
+	rcu_read_lock();
+	sock_flow_table = rcu_dereference(rps_sock_flow_table);
+	rps_record_sock_flow(sock_flow_table, inet_sk_rxhash(sk));
+	rcu_read_unlock();
+}
+
+static inline void inet_rps_reset_flow(struct sock *sk)
+{
+	struct rps_sock_flow_table *sock_flow_table;
+
+	rcu_read_lock();
+	sock_flow_table = rcu_dereference(rps_sock_flow_table);
+	rps_reset_sock_flow(sock_flow_table, inet_sk_rxhash(sk));
+	rcu_read_unlock();
+}
+
+static inline void inet_rps_save_rxhash(struct sock *sk, u32 rxhash)
+{
+	struct sock_extended *ske = sk_extended(sk);
+
+	if (unlikely(ske->inet_sock_extended.rxhash != rxhash)) {
+		inet_rps_reset_flow(sk);
+		ske->inet_sock_extended.rxhash = rxhash;
+	}
+}
 #endif	/* _INET_SOCK_H */

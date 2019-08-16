@@ -180,8 +180,8 @@ struct ext3_group_desc
 
 /* Flags that should be inherited by new inodes from their parent. */
 #define EXT3_FL_INHERITED (EXT3_SECRM_FL | EXT3_UNRM_FL | EXT3_COMPR_FL |\
-			   EXT3_SYNC_FL | EXT3_IMMUTABLE_FL | EXT3_APPEND_FL |\
-			   EXT3_NODUMP_FL | EXT3_NOATIME_FL | EXT3_COMPRBLK_FL|\
+			   EXT3_SYNC_FL | EXT3_NODUMP_FL |\
+			   EXT3_NOATIME_FL | EXT3_COMPRBLK_FL |\
 			   EXT3_NOCOMPR_FL | EXT3_JOURNAL_DATA_FL |\
 			   EXT3_NOTAIL_FL | EXT3_DIRSYNC_FL)
 
@@ -708,21 +708,30 @@ struct ext3_dir_entry_2 {
 					 ~EXT3_DIR_ROUND)
 #define EXT3_MAX_REC_LEN		((1<<16)-1)
 
+/*
+ * Tests against MAX_REC_LEN etc were put in place for 64k block
+ * sizes; if that is not possible on this arch, we can skip
+ * those tests and speed things up.
+ */
 static inline unsigned ext3_rec_len_from_disk(__le16 dlen)
 {
 	unsigned len = le16_to_cpu(dlen);
 
+#if (PAGE_CACHE_SIZE >= 65536)
 	if (len == EXT3_MAX_REC_LEN)
 		return 1 << 16;
+#endif
 	return len;
 }
 
 static inline __le16 ext3_rec_len_to_disk(unsigned len)
 {
+#if (PAGE_CACHE_SIZE >= 65536)
 	if (len == (1 << 16))
 		return cpu_to_le16(EXT3_MAX_REC_LEN);
 	else if (len > (1 << 16))
 		BUG();
+#endif
 	return cpu_to_le16(len);
 }
 
@@ -757,7 +766,9 @@ struct dx_hash_info
 	u32		*seed;
 };
 
-#define EXT3_HTREE_EOF	0x7fffffff
+/* 32 and 64 bit signed EOF for dx directories */
+#define EXT3_HTREE_EOF_32BIT	((1UL  << (32 - 1)) - 1)
+#define EXT3_HTREE_EOF_64BIT	((1ULL << (64 - 1)) - 1)
 
 /*
  * Control parameters used by ext3_htree_next_block
@@ -840,6 +851,7 @@ extern struct ext3_group_desc * ext3_get_group_desc(struct super_block * sb,
 extern int ext3_should_retry_alloc(struct super_block *sb, int *retries);
 extern void ext3_init_block_alloc_info(struct inode *);
 extern void ext3_rsv_window_add(struct super_block *sb, struct ext3_reserve_window_node *rsv);
+extern int ext3_trim_fs(struct super_block *sb, struct fstrim_range *range);
 
 /* dir.c */
 extern int ext3_check_dir_entry(const char *, struct inode *,
@@ -877,7 +889,7 @@ int ext3_get_blocks_handle(handle_t *handle, struct inode *inode,
 	int create);
 
 extern struct inode *ext3_iget(struct super_block *, unsigned long);
-extern int  ext3_write_inode (struct inode *, int);
+extern int  ext3_write_inode (struct inode *, struct writeback_control *);
 extern int  ext3_setattr (struct dentry *, struct iattr *);
 extern void ext3_delete_inode (struct inode *);
 extern int  ext3_sync_inode (handle_t *, struct inode *);
@@ -917,6 +929,8 @@ extern void __ext3_std_error (struct super_block *, const char *, int);
 extern void ext3_abort (struct super_block *, const char *, const char *, ...)
 	__attribute__ ((format (printf, 3, 4)));
 extern void ext3_warning (struct super_block *, const char *, const char *, ...)
+	__attribute__ ((format (printf, 3, 4)));
+extern void ext3_msg(struct super_block *, const char *, const char *, ...)
 	__attribute__ ((format (printf, 3, 4)));
 extern void ext3_update_dynamic_rev (struct super_block *sb);
 

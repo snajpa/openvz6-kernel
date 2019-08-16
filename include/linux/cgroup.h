@@ -27,6 +27,8 @@ struct css_id;
 
 extern int cgroup_init_early(void);
 extern int cgroup_init(void);
+extern void cgroup_wq_init(void);
+extern void cgroup_queue_work(struct work_struct *work);
 extern void cgroup_lock(void);
 extern bool cgroup_lock_live_group(struct cgroup *cgrp);
 extern void cgroup_unlock(void);
@@ -75,6 +77,12 @@ enum {
 	CSS_REMOVED, /* This CSS is dead */
 };
 
+/* Caller must verify that the css is not for root cgroup */
+static inline void __css_get(struct cgroup_subsys_state *css, int count)
+{
+	atomic_add(count, &css->refcnt);
+}
+
 /*
  * Call css_get() to hold a reference on the css; it can be used
  * for a reference obtained via:
@@ -86,7 +94,7 @@ static inline void css_get(struct cgroup_subsys_state *css)
 {
 	/* We don't need to reference count the root state */
 	if (!test_bit(CSS_ROOT, &css->flags))
-		atomic_inc(&css->refcnt);
+		__css_get(css, 1);
 }
 
 static inline bool css_is_removed(struct cgroup_subsys_state *css)
@@ -117,11 +125,11 @@ static inline bool css_tryget(struct cgroup_subsys_state *css)
  * css_get() or css_tryget()
  */
 
-extern void __css_put(struct cgroup_subsys_state *css);
+extern void __css_put(struct cgroup_subsys_state *css, int count);
 static inline void css_put(struct cgroup_subsys_state *css)
 {
 	if (!test_bit(CSS_ROOT, &css->flags))
-		__css_put(css);
+		__css_put(css, 1);
 }
 
 /* bits in struct cgroup flags field */
@@ -220,6 +228,12 @@ struct cgroup {
 
 	/* For RCU-protected deletion */
 	struct rcu_head rcu_head;
+
+#ifndef __GENKSYMS__
+	/* List of events which userspace want to recieve */
+	struct list_head event_list;
+	spinlock_t event_list_lock;
+#endif
 };
 
 /*
@@ -362,6 +376,26 @@ struct cftype {
 	int (*trigger)(struct cgroup *cgrp, unsigned int event);
 
 	int (*release)(struct inode *inode, struct file *file);
+
+	/*
+	 * register_event() callback will be used to add new userspace
+	 * waiter for changes related to the cftype. Implement it if
+	 * you want to provide this functionality. Use eventfd_signal()
+	 * on eventfd to send notification to userspace.
+	 */
+	int (*register_event)(struct cgroup *cgrp, struct cftype *cft,
+			struct eventfd_ctx *eventfd, const char *args);
+	/*
+	 * unregister_event() callback will be called when userspace
+	 * closes the eventfd or on cgroup removing.
+	 * This callback must be implemented, if you want provide
+	 * notification functionality.
+	 *
+	 * Be careful. It can be called after destroy(), so you have
+	 * to keep all nesessary data, until all events are removed.
+	 */
+	int (*unregister_event)(struct cgroup *cgrp, struct cftype *cft,
+			struct eventfd_ctx *eventfd);
 };
 
 struct cgroup_scanner {
@@ -426,12 +460,17 @@ struct cgroup_subsys {
 	int (*pre_destroy)(struct cgroup_subsys *ss, struct cgroup *cgrp);
 	void (*destroy)(struct cgroup_subsys *ss, struct cgroup *cgrp);
 	int (*can_attach)(struct cgroup_subsys *ss, struct cgroup *cgrp,
-			  struct task_struct *tsk, bool threadgroup);
+			  struct task_struct *tsk);
+	int (*can_attach_task)(struct cgroup *cgrp, struct task_struct *tsk);
+	void (*cancel_attach)(struct cgroup_subsys *ss, struct cgroup *cgrp,
+			      struct task_struct *tsk);
+	void (*pre_attach)(struct cgroup *cgrp);
+	void (*attach_task)(struct cgroup *cgrp, struct task_struct *tsk);
 	void (*attach)(struct cgroup_subsys *ss, struct cgroup *cgrp,
-			struct cgroup *old_cgrp, struct task_struct *tsk,
-			bool threadgroup);
+		       struct cgroup *old_cgrp, struct task_struct *tsk);
 	void (*fork)(struct cgroup_subsys *ss, struct task_struct *task);
-	void (*exit)(struct cgroup_subsys *ss, struct task_struct *task);
+	void (*exit)(struct cgroup_subsys *ss, struct cgroup *cgrp,
+			struct cgroup *old_cgrp, struct task_struct *task);
 	int (*populate)(struct cgroup_subsys *ss,
 			struct cgroup *cgrp);
 	void (*post_clone)(struct cgroup_subsys *ss, struct cgroup *cgrp);
@@ -525,6 +564,7 @@ struct task_struct *cgroup_iter_next(struct cgroup *cgrp,
 void cgroup_iter_end(struct cgroup *cgrp, struct cgroup_iter *it);
 int cgroup_scan_tasks(struct cgroup_scanner *scan);
 int cgroup_attach_task(struct cgroup *, struct task_struct *);
+int cgroup_attach_task_all(struct task_struct *from, struct task_struct *);
 
 /*
  * CSS ID is ID for cgroup_subsys_state structs under subsys. This only works
@@ -563,11 +603,13 @@ bool css_is_ancestor(struct cgroup_subsys_state *cg,
 /* Get id and depth of css */
 unsigned short css_id(struct cgroup_subsys_state *css);
 unsigned short css_depth(struct cgroup_subsys_state *css);
+struct cgroup_subsys_state *cgroup_css_from_dir(struct file *f, int id);
 
 #else /* !CONFIG_CGROUPS */
 
 static inline int cgroup_init_early(void) { return 0; }
 static inline int cgroup_init(void) { return 0; }
+static inline void cgroup_wq_init(void) {}
 static inline void cgroup_fork(struct task_struct *p) {}
 static inline void cgroup_fork_callbacks(struct task_struct *p) {}
 static inline void cgroup_post_fork(struct task_struct *p) {}
@@ -579,6 +621,13 @@ static inline int cgroupstats_build(struct cgroupstats *stats,
 					struct dentry *dentry)
 {
 	return -EINVAL;
+}
+
+/* No cgroups - nothing to do */
+static inline int cgroup_attach_task_all(struct task_struct *from,
+					 struct task_struct *t)
+{
+	return 0;
 }
 
 #endif /* !CONFIG_CGROUPS */

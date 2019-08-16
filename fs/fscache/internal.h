@@ -22,6 +22,12 @@
  *
  */
 
+#ifdef pr_fmt
+#undef pr_fmt
+#endif
+
+#define pr_fmt(fmt) "FS-Cache: " fmt
+
 #include <linux/fscache-cache.h>
 #include <linux/sched.h>
 
@@ -85,14 +91,11 @@ extern struct kobject *fscache_root;
 
 extern int fscache_wait_bit(void *);
 extern int fscache_wait_bit_interruptible(void *);
+extern int fscache_wait_atomic_t(atomic_t *);
 
 /*
  * object.c
  */
-extern const char fscache_object_states_short[FSCACHE_OBJECT__NSTATES][5];
-
-extern void fscache_withdrawing_object(struct fscache_cache *,
-				       struct fscache_object *);
 extern void fscache_enqueue_object(struct fscache_object *);
 
 /*
@@ -102,8 +105,10 @@ extern void fscache_enqueue_object(struct fscache_object *);
 extern const struct file_operations fscache_objlist_fops;
 
 extern void fscache_objlist_add(struct fscache_object *);
+extern void fscache_objlist_remove(struct fscache_object *);
 #else
 #define fscache_objlist_add(object) do {} while(0)
+#define fscache_objlist_remove(object) do {} while(0)
 #endif
 
 /*
@@ -113,10 +118,21 @@ extern int fscache_submit_exclusive_op(struct fscache_object *,
 				       struct fscache_operation *);
 extern int fscache_submit_op(struct fscache_object *,
 			     struct fscache_operation *);
-extern int fscache_cancel_op(struct fscache_operation *);
+extern int fscache_cancel_op(struct fscache_operation *, bool);
+extern void fscache_cancel_all_ops(struct fscache_object *);
 extern void fscache_abort_object(struct fscache_object *);
 extern void fscache_start_operations(struct fscache_object *);
 extern void fscache_operation_gc(struct work_struct *);
+
+/*
+ * page.c
+ */
+extern int fscache_wait_for_deferred_lookup(struct fscache_cookie *);
+extern int fscache_wait_for_operation_activation(struct fscache_object *,
+						 struct fscache_operation *,
+						 atomic_t *,
+						 atomic_t *);
+extern void fscache_invalidate_writes(struct fscache_cookie *);
 
 /*
  * proc.c
@@ -140,6 +156,7 @@ extern atomic_t fscache_n_op_pend;
 extern atomic_t fscache_n_op_run;
 extern atomic_t fscache_n_op_enqueue;
 extern atomic_t fscache_n_op_deferred_release;
+extern atomic_t fscache_n_op_initialised;
 extern atomic_t fscache_n_op_release;
 extern atomic_t fscache_n_op_gc;
 extern atomic_t fscache_n_op_cancelled;
@@ -186,6 +203,7 @@ extern atomic_t fscache_n_store_vmscan_not_storing;
 extern atomic_t fscache_n_store_vmscan_gone;
 extern atomic_t fscache_n_store_vmscan_busy;
 extern atomic_t fscache_n_store_vmscan_cancelled;
+extern atomic_t fscache_n_store_vmscan_wait;
 
 extern atomic_t fscache_n_marks;
 extern atomic_t fscache_n_uncaches;
@@ -196,6 +214,9 @@ extern atomic_t fscache_n_acquires_no_cache;
 extern atomic_t fscache_n_acquires_ok;
 extern atomic_t fscache_n_acquires_nobufs;
 extern atomic_t fscache_n_acquires_oom;
+
+extern atomic_t fscache_n_invalidates;
+extern atomic_t fscache_n_invalidates_run;
 
 extern atomic_t fscache_n_updates;
 extern atomic_t fscache_n_updates_null;
@@ -229,6 +250,7 @@ extern atomic_t fscache_n_cop_alloc_object;
 extern atomic_t fscache_n_cop_lookup_object;
 extern atomic_t fscache_n_cop_lookup_complete;
 extern atomic_t fscache_n_cop_grab_object;
+extern atomic_t fscache_n_cop_invalidate_object;
 extern atomic_t fscache_n_cop_update_object;
 extern atomic_t fscache_n_cop_drop_object;
 extern atomic_t fscache_n_cop_put_object;
@@ -241,6 +263,11 @@ extern atomic_t fscache_n_cop_allocate_pages;
 extern atomic_t fscache_n_cop_write_page;
 extern atomic_t fscache_n_cop_uncache_page;
 extern atomic_t fscache_n_cop_dissociate_pages;
+
+extern atomic_t fscache_n_cache_no_space_reject;
+extern atomic_t fscache_n_cache_stale_objects;
+extern atomic_t fscache_n_cache_retired_objects;
+extern atomic_t fscache_n_cache_culled_objects;
 
 static inline void fscache_stat(atomic_t *stat)
 {
@@ -270,6 +297,11 @@ extern const struct file_operations fscache_stats_fops;
 static inline void fscache_raise_event(struct fscache_object *object,
 				       unsigned event)
 {
+	BUG_ON(event >= NR_FSCACHE_OBJECT_EVENTS);
+#if 0
+	printk("*** fscache_raise_event(OBJ%d{%lx},%x)\n",
+	       object->debug_id, object->event_mask, (1 << event));
+#endif
 	if (!test_and_set_bit(event, &object->events) &&
 	    test_bit(event, &object->event_mask))
 		fscache_enqueue_object(object);
@@ -313,17 +345,11 @@ void fscache_put_context(struct fscache_cookie *cookie, void *context)
 #define dbgprintk(FMT, ...) \
 	printk(KERN_DEBUG "[%-6.6s] "FMT"\n", current->comm, ##__VA_ARGS__)
 
-/* make sure we maintain the format strings, even when debugging is disabled */
-static inline __attribute__((format(printf, 1, 2)))
-void _dbprintk(const char *fmt, ...)
-{
-}
-
 #define kenter(FMT, ...) dbgprintk("==> %s("FMT")", __func__, ##__VA_ARGS__)
 #define kleave(FMT, ...) dbgprintk("<== %s()"FMT"", __func__, ##__VA_ARGS__)
 #define kdebug(FMT, ...) dbgprintk(FMT, ##__VA_ARGS__)
 
-#define kjournal(FMT, ...) _dbprintk(FMT, ##__VA_ARGS__)
+#define kjournal(FMT, ...) no_printk(FMT, ##__VA_ARGS__)
 
 #ifdef __KDEBUG
 #define _enter(FMT, ...) kenter(FMT, ##__VA_ARGS__)
@@ -350,9 +376,9 @@ do {						\
 } while (0)
 
 #else
-#define _enter(FMT, ...) _dbprintk("==> %s("FMT")", __func__, ##__VA_ARGS__)
-#define _leave(FMT, ...) _dbprintk("<== %s()"FMT"", __func__, ##__VA_ARGS__)
-#define _debug(FMT, ...) _dbprintk(FMT, ##__VA_ARGS__)
+#define _enter(FMT, ...) no_printk("==> %s("FMT")", __func__, ##__VA_ARGS__)
+#define _leave(FMT, ...) no_printk("<== %s()"FMT"", __func__, ##__VA_ARGS__)
+#define _debug(FMT, ...) no_printk(FMT, ##__VA_ARGS__)
 #endif
 
 /*
@@ -389,8 +415,8 @@ do {						\
 #define ASSERT(X)							\
 do {									\
 	if (unlikely(!(X))) {						\
-		printk(KERN_ERR "\n");					\
-		printk(KERN_ERR "FS-Cache: Assertion failed\n");	\
+		pr_err("\n");					\
+		pr_err("Assertion failed\n");	\
 		BUG();							\
 	}								\
 } while (0)
@@ -398,9 +424,9 @@ do {									\
 #define ASSERTCMP(X, OP, Y)						\
 do {									\
 	if (unlikely(!((X) OP (Y)))) {					\
-		printk(KERN_ERR "\n");					\
-		printk(KERN_ERR "FS-Cache: Assertion failed\n");	\
-		printk(KERN_ERR "%lx " #OP " %lx is false\n",		\
+		pr_err("\n");					\
+		pr_err("Assertion failed\n");	\
+		pr_err("%lx " #OP " %lx is false\n",		\
 		       (unsigned long)(X), (unsigned long)(Y));		\
 		BUG();							\
 	}								\
@@ -409,8 +435,8 @@ do {									\
 #define ASSERTIF(C, X)							\
 do {									\
 	if (unlikely((C) && !(X))) {					\
-		printk(KERN_ERR "\n");					\
-		printk(KERN_ERR "FS-Cache: Assertion failed\n");	\
+		pr_err("\n");					\
+		pr_err("Assertion failed\n");	\
 		BUG();							\
 	}								\
 } while (0)
@@ -418,9 +444,9 @@ do {									\
 #define ASSERTIFCMP(C, X, OP, Y)					\
 do {									\
 	if (unlikely((C) && !((X) OP (Y)))) {				\
-		printk(KERN_ERR "\n");					\
-		printk(KERN_ERR "FS-Cache: Assertion failed\n");	\
-		printk(KERN_ERR "%lx " #OP " %lx is false\n",		\
+		pr_err("\n");					\
+		pr_err("Assertion failed\n");	\
+		pr_err("%lx " #OP " %lx is false\n",		\
 		       (unsigned long)(X), (unsigned long)(Y));		\
 		BUG();							\
 	}								\

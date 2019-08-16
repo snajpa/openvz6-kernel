@@ -95,6 +95,7 @@ static int ibm_slot_error_detail;
 static int ibm_get_config_addr_info;
 static int ibm_get_config_addr_info2;
 static int ibm_configure_bridge;
+static int ibm_configure_pe;
 
 int eeh_subsystem_enabled;
 EXPORT_SYMBOL(eeh_subsystem_enabled);
@@ -263,6 +264,8 @@ void eeh_slot_error_detail(struct pci_dn *pdn, int severity)
 	pci_regs_buf[0] = 0;
 
 	rtas_pci_enable(pdn, EEH_THAW_MMIO);
+	rtas_configure_bridge(pdn);
+	eeh_restore_bars(pdn);
 	loglen = gather_pci_data(pdn, pci_regs_buf, EEH_PCI_REGS_LOG_LEN);
 
 	rtas_slot_error_detail(pdn, severity, pci_regs_buf, loglen);
@@ -450,6 +453,39 @@ void eeh_clear_slot (struct device_node *dn, int mode_flag)
 	spin_unlock_irqrestore(&confirm_error_lock, flags);
 }
 
+void __eeh_set_pe_freset(struct device_node *parent, unsigned int *freset)
+{
+	struct device_node *dn;
+
+	for_each_child_of_node(parent, dn) {
+		if (PCI_DN(dn)) {
+
+			struct pci_dev *dev = PCI_DN(dn)->pcidev;
+
+			if (dev && dev->driver)
+				*freset |= dev->needs_freset;
+
+			__eeh_set_pe_freset(dn, freset);
+		}
+	}
+}
+
+void eeh_set_pe_freset(struct device_node *dn, unsigned int *freset)
+{
+	struct pci_dev *dev;
+	dn = find_device_pe(dn);
+
+	/* Back up one, since config addrs might be shared */
+	if (!pcibios_find_pci_bus(dn) && PCI_DN(dn->parent))
+		dn = dn->parent;
+
+	dev = PCI_DN(dn)->pcidev;
+	if (dev)
+		*freset |= dev->needs_freset;
+
+	__eeh_set_pe_freset(dn, freset);
+}
+
 /**
  * eeh_dn_check_failure - check if all 1's data is due to EEH slot freeze
  * @dn device node
@@ -491,7 +527,7 @@ int eeh_dn_check_failure(struct device_node *dn, struct pci_dev *dev)
 	    pdn->eeh_mode & EEH_MODE_NOCHECK) {
 		ignored_check++;
 		pr_debug("EEH: Ignored check (%x) for %s %s\n",
-			 pdn->eeh_mode, pci_name (dev), dn->full_name);
+			 pdn->eeh_mode, eeh_pci_name(dev), dn->full_name);
 		return 0;
 	}
 
@@ -515,9 +551,9 @@ int eeh_dn_check_failure(struct device_node *dn, struct pci_dev *dev)
 			printk (KERN_ERR "EEH: %d reads ignored for recovering device at "
 				"location=%s driver=%s pci addr=%s\n",
 				pdn->eeh_check_count, location,
-				dev->driver->name, pci_name(dev));
+				eeh_driver_name(dev), eeh_pci_name(dev));
 			printk (KERN_ERR "EEH: Might be infinite loop in %s driver\n",
-				dev->driver->name);
+				eeh_driver_name(dev));
 			dump_stack();
 		}
 		goto dn_unlock;
@@ -620,8 +656,6 @@ unsigned long eeh_check_failure(const volatile void __iomem *token, unsigned lon
 
 	dn = pci_device_to_OF_node(dev);
 	eeh_dn_check_failure (dn, dev);
-
-	pci_dev_put(dev);
 	return val;
 }
 
@@ -694,15 +728,24 @@ rtas_pci_slot_reset(struct pci_dn *pdn, int state)
 	if (pdn->eeh_pe_config_addr)
 		config_addr = pdn->eeh_pe_config_addr;
 
-	rc = rtas_call(ibm_set_slot_reset,4,1, NULL,
+	rc = rtas_call(ibm_set_slot_reset, 4, 1, NULL,
 	               config_addr,
 	               BUID_HI(pdn->phb->buid),
 	               BUID_LO(pdn->phb->buid),
 	               state);
-	if (rc)
-		printk (KERN_WARNING "EEH: Unable to reset the failed slot,"
-		        " (%d) #RST=%d dn=%s\n",
-		        rc, state, pdn->node->full_name);
+
+	/* Fundamental-reset not supported on this PE, try hot-reset */
+	if (rc == -8 && state == 3) {
+		rc = rtas_call(ibm_set_slot_reset, 4, 1, NULL,
+			       config_addr,
+			       BUID_HI(pdn->phb->buid),
+			       BUID_LO(pdn->phb->buid), 1);
+		if (rc)
+			printk(KERN_WARNING
+				"EEH: Unable to reset the failed slot,"
+				" #RST=%d dn=%s\n",
+				rc, pdn->node->full_name);
+	}
 }
 
 /**
@@ -718,14 +761,20 @@ int pcibios_set_pcie_reset_state(struct pci_dev *dev, enum pcie_reset_state stat
 	struct device_node *dn = pci_device_to_OF_node(dev);
 	struct pci_dn *pdn = PCI_DN(dn);
 
+	/* We should set the EEH flag below to avoid PCI cfg space access
+	 * during EEH, otherwise we could get many unexpected errors. */
+
 	switch (state) {
 	case pcie_deassert_reset:
 		rtas_pci_slot_reset(pdn, 0);
+		eeh_toggle_dev_flag(pdn, EEH_MODE_PCI_CFG_BLOCKED, false);
 		break;
 	case pcie_hot_reset:
+		eeh_toggle_dev_flag(pdn, EEH_MODE_PCI_CFG_BLOCKED, true);
 		rtas_pci_slot_reset(pdn, 1);
 		break;
 	case pcie_warm_reset:
+		eeh_toggle_dev_flag(pdn, EEH_MODE_PCI_CFG_BLOCKED, true);
 		rtas_pci_slot_reset(pdn, 3);
 		break;
 	default:
@@ -738,18 +787,21 @@ int pcibios_set_pcie_reset_state(struct pci_dev *dev, enum pcie_reset_state stat
 /**
  * rtas_set_slot_reset -- assert the pci #RST line for 1/4 second
  * @pdn: pci device node to be reset.
- *
- *  Return 0 if success, else a non-zero value.
  */
 
 static void __rtas_set_slot_reset(struct pci_dn *pdn)
 {
-	struct pci_dev *dev = pdn->pcidev;
+	unsigned int freset = 0;
 
-	/* Determine type of EEH reset required by device,
-	 * default hot reset or fundamental reset
+	/* Determine type of EEH reset required for
+	 * Partitionable Endpoint, a hot-reset (1)
+	 * or a fundamental reset (3).
+	 * A fundamental reset required by any device under
+	 * Partitionable Endpoint trumps hot-reset.
 	 */
-	if (dev->needs_freset)
+	eeh_set_pe_freset(pdn->node, &freset);
+
+	if (freset)
 		rtas_pci_slot_reset(pdn, 3);
 	else
 		rtas_pci_slot_reset(pdn, 1);
@@ -897,13 +949,20 @@ rtas_configure_bridge(struct pci_dn *pdn)
 {
 	int config_addr;
 	int rc;
+	int token;
 
 	/* Use PE configuration address, if present */
 	config_addr = pdn->eeh_config_addr;
 	if (pdn->eeh_pe_config_addr)
 		config_addr = pdn->eeh_pe_config_addr;
 
-	rc = rtas_call(ibm_configure_bridge,3,1, NULL,
+	/* Use new configure-pe function, if supported */
+	if (ibm_configure_pe != RTAS_UNKNOWN_SERVICE)
+		token = ibm_configure_pe;
+	else
+		token = ibm_configure_bridge;
+
+	rc = rtas_call(token, 3, 1, NULL,
 	               config_addr,
 	               BUID_HI(pdn->phb->buid),
 	               BUID_LO(pdn->phb->buid));
@@ -1079,6 +1138,7 @@ void __init eeh_init(void)
 	ibm_get_config_addr_info = rtas_token("ibm,get-config-addr-info");
 	ibm_get_config_addr_info2 = rtas_token("ibm,get-config-addr-info2");
 	ibm_configure_bridge = rtas_token ("ibm,configure-bridge");
+	ibm_configure_pe = rtas_token("ibm,configure-pe");
 
 	if (ibm_set_eeh_option == RTAS_UNKNOWN_SERVICE)
 		return;
@@ -1125,7 +1185,7 @@ void __init eeh_init(void)
  * on the CEC architecture, type of the device, on earlier boot
  * command-line arguments & etc.
  */
-static void eeh_add_device_early(struct device_node *dn)
+void eeh_add_device_early(struct device_node *dn)
 {
 	struct pci_controller *phb;
 	struct eeh_early_enable_info info;
@@ -1160,7 +1220,7 @@ EXPORT_SYMBOL_GPL(eeh_add_device_tree_early);
  * This routine must be used to complete EEH initialization for PCI
  * devices that were added after system boot (e.g. hotplug, dlpar).
  */
-static void eeh_add_device_late(struct pci_dev *dev)
+void eeh_add_device_late(struct pci_dev *dev)
 {
 	struct device_node *dn;
 	struct pci_dn *pdn;
@@ -1178,7 +1238,6 @@ static void eeh_add_device_late(struct pci_dev *dev)
 	}
 	WARN_ON(pdn->pcidev);
 
-	pci_dev_get (dev);
 	pdn->pcidev = dev;
 
 	pci_addr_cache_insert_device(dev);
@@ -1210,9 +1269,11 @@ EXPORT_SYMBOL_GPL(eeh_add_device_tree_late);
  * this device will no longer be detected after this call; thus,
  * i/o errors affecting this slot may leave this device unusable.
  */
-static void eeh_remove_device(struct pci_dev *dev)
+void eeh_remove_device(struct pci_dev *dev)
 {
 	struct device_node *dn;
+	struct pci_dn *pdn;
+
 	if (!dev || !eeh_subsystem_enabled)
 		return;
 
@@ -1220,12 +1281,15 @@ static void eeh_remove_device(struct pci_dev *dev)
 	pr_debug("EEH: Removing device %s\n", pci_name(dev));
 
 	dn = pci_device_to_OF_node(dev);
-	if (PCI_DN(dn)->pcidev == NULL) {
-		pr_debug("EEH: Not referenced !\n");
-		return;
+	pdn = dn ? PCI_DN(dn) : NULL;
+	if (pdn != NULL) {
+		if (pdn->pcidev == NULL) {
+			pr_debug("EEH: Not referenced !\n");
+			return;
+		}
+
+		pdn->pcidev = NULL;
 	}
-	PCI_DN(dn)->pcidev = NULL;
-	pci_dev_put (dev);
 
 	pci_addr_cache_remove_device(dev);
 	eeh_sysfs_remove_device(dev);
@@ -1244,6 +1308,27 @@ void eeh_remove_bus_device(struct pci_dev *dev)
 	}
 }
 EXPORT_SYMBOL_GPL(eeh_remove_bus_device);
+
+void eeh_toggle_dev_flag(struct pci_dn *pdn, int flag, bool set)
+{
+	struct device_node *dn;
+	struct pci_dn *current_pdn;
+	int dev_slot;
+
+	dev_slot = PCI_SLOT(pdn->devfn);
+	dn = (pdn->node)->parent;
+
+	for (dn = dn->child; dn; dn = dn->sibling) {
+		current_pdn = PCI_DN(dn);
+		if (current_pdn && PCI_SLOT(current_pdn->devfn) == dev_slot) {
+
+			if (set)
+				current_pdn->eeh_mode |= flag;
+			else
+				current_pdn->eeh_mode &= (~flag);
+		}
+	}
+}
 
 static int proc_eeh_show(struct seq_file *m, void *v)
 {

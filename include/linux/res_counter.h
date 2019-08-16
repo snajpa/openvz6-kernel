@@ -128,6 +128,7 @@ int __must_check res_counter_charge(struct res_counter *counter,
 
 void res_counter_uncharge_locked(struct res_counter *counter, unsigned long val);
 void res_counter_uncharge(struct res_counter *counter, unsigned long val);
+void res_counter_uncharge_local(struct res_counter *counter, unsigned long val);
 
 static inline bool res_counter_limit_check_locked(struct res_counter *cnt)
 {
@@ -178,6 +179,18 @@ static inline bool res_counter_check_under_limit(struct res_counter *cnt)
 
 	spin_lock_irqsave(&cnt->lock, flags);
 	ret = res_counter_limit_check_locked(cnt);
+	spin_unlock_irqrestore(&cnt->lock, flags);
+	return ret;
+}
+
+static inline bool res_counter_check_room(struct res_counter *cnt,
+					  unsigned long room)
+{
+	bool ret;
+	unsigned long flags;
+
+	spin_lock_irqsave(&cnt->lock, flags);
+	ret = cnt->limit - cnt->usage >= room;
 	spin_unlock_irqrestore(&cnt->lock, flags);
 	return ret;
 }

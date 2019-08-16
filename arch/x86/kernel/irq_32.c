@@ -19,9 +19,12 @@
 #include <linux/percpu.h>
 
 #include <asm/apic.h>
+#include <asm/nospec-branch.h>
 
 DEFINE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
 EXPORT_PER_CPU_SYMBOL(irq_stat);
+
+DEFINE_PER_CPU_SHARED_ALIGNED(rh_irq_cpustat_t, rh_irq_stat);
 
 DEFINE_PER_CPU(struct pt_regs *, irq_regs);
 EXPORT_PER_CPU_SYMBOL(irq_regs);
@@ -67,11 +70,11 @@ static DEFINE_PER_CPU_PAGE_ALIGNED(union irq_ctx, softirq_stack);
 static void call_on_stack(void *func, void *stack)
 {
 	asm volatile("xchgl	%%ebx,%%esp	\n"
-		     "call	*%%edi		\n"
+		     CALL_NOSPEC
 		     "movl	%%ebx,%%esp	\n"
 		     : "=b" (stack)
 		     : "0" (stack),
-		       "D"(func)
+		       [thunk_target] "D"(func)
 		     : "memory", "cc", "edx", "ecx", "eax");
 }
 
@@ -110,11 +113,11 @@ execute_on_irq_stack(int overflow, struct irq_desc *desc, int irq)
 		call_on_stack(print_stack_overflow, isp);
 
 	asm volatile("xchgl	%%ebx,%%esp	\n"
-		     "call	*%%edi		\n"
+		     CALL_NOSPEC
 		     "movl	%%ebx,%%esp	\n"
 		     : "=a" (arg1), "=d" (arg2), "=b" (isp)
 		     :  "0" (irq),   "1" (desc),  "2" (isp),
-			"D" (desc->handle_irq)
+			[thunk_target] "D" (desc->handle_irq)
 		     : "memory", "cc", "ecx");
 	return 1;
 }
@@ -211,48 +214,3 @@ bool handle_irq(unsigned irq, struct pt_regs *regs)
 
 	return true;
 }
-
-#ifdef CONFIG_HOTPLUG_CPU
-
-/* A cpu has been removed from cpu_online_mask.  Reset irq affinities. */
-void fixup_irqs(void)
-{
-	unsigned int irq;
-	struct irq_desc *desc;
-
-	for_each_irq_desc(irq, desc) {
-		const struct cpumask *affinity;
-
-		if (!desc)
-			continue;
-		if (irq == 2)
-			continue;
-
-		affinity = desc->affinity;
-		if (cpumask_any_and(affinity, cpu_online_mask) >= nr_cpu_ids) {
-			printk("Breaking affinity for irq %i\n", irq);
-			affinity = cpu_all_mask;
-		}
-		if (desc->chip->set_affinity)
-			desc->chip->set_affinity(irq, affinity);
-		else if (desc->action)
-			printk_once("Cannot set affinity for irq %i\n", irq);
-	}
-
-#if 0
-	barrier();
-	/* Ingo Molnar says: "after the IO-APIC masks have been redirected
-	   [note the nop - the interrupt-enable boundary on x86 is two
-	   instructions from sti] - to flush out pending hardirqs and
-	   IPIs. After this point nothing is supposed to reach this CPU." */
-	__asm__ __volatile__("sti; nop; cli");
-	barrier();
-#else
-	/* That doesn't seem sufficient.  Give it 1ms. */
-	local_irq_enable();
-	mdelay(1);
-	local_irq_disable();
-#endif
-}
-#endif
-

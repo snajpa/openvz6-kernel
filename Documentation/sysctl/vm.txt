@@ -18,7 +18,9 @@ files can be found in mm/swap.c.
 
 Currently, these files are in /proc/sys/vm:
 
+- admin_reserve_kbytes
 - block_dump
+- compact_memory
 - dirty_background_bytes
 - dirty_background_ratio
 - dirty_bytes
@@ -26,12 +28,15 @@ Currently, these files are in /proc/sys/vm:
 - dirty_ratio
 - dirty_writeback_centisecs
 - drop_caches
+- extfrag_threshold
+- extra_free_kbytes
 - hugepages_treat_as_movable
 - hugetlb_shm_group
 - laptop_mode
 - legacy_va_layout
 - lowmem_reserve_ratio
 - max_map_count
+- meminfo_legacy_layout
 - memory_failure_early_kill
 - memory_failure_recovery
 - min_free_kbytes
@@ -45,6 +50,7 @@ Currently, these files are in /proc/sys/vm:
 - numa_zonelist_order
 - oom_dump_tasks
 - oom_kill_allocating_task
+- overcommit_kbytes
 - overcommit_memory
 - overcommit_ratio
 - page-cluster
@@ -57,6 +63,35 @@ Currently, these files are in /proc/sys/vm:
 
 ==============================================================
 
+admin_reserve_kbytes
+
+The amount of free memory in the system that should be reserved for users
+with the capability cap_sys_admin.
+
+admin_reserve_kbytes defaults to min(3% of free pages, 8MB)
+
+That should provide enough for the admin to log in and kill a process,
+if necessary, under the default overcommit 'guess' mode.
+
+Systems running under overcommit 'never' should increase this to account
+for the full Virtual Memory Size of programs used to recover. Otherwise,
+root may not be able to log in to recover the system.
+
+How do you calculate a minimum useful reserve?
+
+sshd or login + bash (or some other shell) + top (or ps, kill, etc.)
+
+For overcommit 'guess', we can sum resident set sizes (RSS).
+On x86_64 this is about 8MB.
+
+For overcommit 'never', we can take the max of their virtual sizes (VSZ)
+and add the sum of their RSS.
+On x86_64 this is about 128MB.
+
+Changing this takes effect whenever an application requests memory.
+
+==============================================================
+
 block_dump
 
 block_dump enables block I/O debugging when set to a nonzero value. More
@@ -64,10 +99,19 @@ information on block I/O debugging is in Documentation/laptops/laptop-mode.txt.
 
 ==============================================================
 
+compact_memory
+
+Available only when CONFIG_COMPACTION is set. When 1 is written to the file,
+all zones are compacted such that free memory is available in contiguous
+blocks where possible. This can be important for example in the allocation of
+huge pages although processes will also directly compact memory as required.
+
+==============================================================
+
 dirty_background_bytes
 
-Contains the amount of dirty memory at which the pdflush background writeback
-daemon will start writeback.
+Contains the amount of dirty memory at which the background kernel
+flusher threads will start writeback.
 
 If dirty_background_bytes is written, dirty_background_ratio becomes a function
 of its value (dirty_background_bytes / the amount of dirtyable system memory).
@@ -77,7 +121,7 @@ of its value (dirty_background_bytes / the amount of dirtyable system memory).
 dirty_background_ratio
 
 Contains, as a percentage of total system memory, the number of pages at which
-the pdflush background writeback daemon will start writing out dirty data.
+the background kernel flusher threads will start writing out dirty data.
 
 ==============================================================
 
@@ -98,9 +142,9 @@ retained.
 dirty_expire_centisecs
 
 This tunable is used to define when dirty data is old enough to be eligible
-for writeout by the pdflush daemons.  It is expressed in 100'ths of a second.
-Data which has been dirty in-memory for longer than this interval will be
-written out next time a pdflush daemon wakes up.
+for writeout by the kernel flusher threads.  It is expressed in 100'ths
+of a second.  Data which has been dirty in-memory for longer than this
+interval will be written out next time a flusher thread wakes up.
 
 ==============================================================
 
@@ -114,7 +158,7 @@ data.
 
 dirty_writeback_centisecs
 
-The pdflush writeback daemons will periodically wake up and write `old' data
+The kernel flusher threads will periodically wake up and write `old' data
 out to disk.  This tunable expresses the interval between those wakeups, in
 100'ths of a second.
 
@@ -136,6 +180,35 @@ To free pagecache, dentries and inodes:
 
 As this is a non-destructive operation and dirty objects are not freeable, the
 user should run `sync' first.
+
+==============================================================
+
+extfrag_threshold
+
+This parameter affects whether the kernel will compact memory or direct
+reclaim to satisfy a high-order allocation. /proc/extfrag_index shows what
+the fragmentation index for each order is in each zone in the system. Values
+tending towards 0 imply allocations would fail due to lack of memory,
+values towards 1000 imply failures are due to fragmentation and -1 implies
+that the allocation will succeed as long as watermarks are met.
+
+The kernel will not compact memory in a zone if the
+fragmentation index is <= extfrag_threshold. The default value is 500.
+
+==============================================================
+
+extra_free_kbytes
+
+This parameter tells the VM to keep extra free memory between the threshold
+where background reclaim (kswapd) kicks in, and the threshold where direct
+reclaim (by allocating processes) kicks in.
+
+This is useful for workloads that require low latency memory allocations
+and have a bounded burstiness in memory allocations, for example a
+realtime application that receives and transmits network traffic
+(causing in-kernel memory allocations) with a maximum total message burst
+size of 200MB may need 200MB of extra free memory to avoid direct reclaim
+related latencies.
 
 ==============================================================
 
@@ -278,6 +351,16 @@ The default value is 65536.
 
 =============================================================
 
+meminfo_legacy_layout:  (.el6 only, for backwards compatibility)
+
+If non-zero, the sysctl will disable the reporting of new entries
+introduced to /proc/meminfo and the kernel will keep the legacy (2.6.32)
+layout when reporting data through that interface.
+
+The default value is 1
+
+=============================================================
+
 memory_failure_early_kill:
 
 Control how to kill processes when uncorrected memory error (typically
@@ -400,10 +483,9 @@ See Documentation/vm/hugetlbpage.txt
 nr_pdflush_threads
 
 The current number of pdflush threads.  This value is read-only.
-The value changes according to the number of dirty pages in the system.
 
-When necessary, additional pdflush threads are created, one per second, up to
-nr_pdflush_threads_max.
+Since pdflush mechanism is not used anymore, this value is always zero.
+This interface remains for compatibility only.
 
 ==============================================================
 
@@ -486,7 +568,7 @@ information may not be desired.
 If this is set to non-zero, this information is shown whenever the
 OOM killer actually kills a memory-hogging task.
 
-The default value is 0.
+The default value is 1 (enabled).
 
 ==============================================================
 
@@ -508,6 +590,17 @@ If panic_on_oom is selected, it takes precedence over whatever value
 is used in oom_kill_allocating_task.
 
 The default value is 0.
+
+==============================================================
+
+overcommit_kbytes:
+
+When overcommit_memory is set to 2, the committed address space is not
+permitted to exceed swap plus this amount of physical RAM. See below.
+
+Note: overcommit_kbytes is the counterpart of overcommit_ratio. Only one
+of them may be specified at a time. Setting one disables the other (which
+then appears as 0 when read).
 
 ==============================================================
 
@@ -573,11 +666,14 @@ Because other nodes' memory may be free. This means system total status
 may be not fatal yet.
 
 If this is set to 2, the kernel panics compulsorily even on the
-above-mentioned.
+above-mentioned. Even oom happens under memory cgroup, the whole
+system panics.
 
 The default value is 0.
 1 and 2 are for failover of clustering. Please select either
 according to your policy of failover.
+panic_on_oom=2+kdump gives you very strong tool to investigate
+why oom happens. You can get snapshot.
 
 =============================================================
 
@@ -609,7 +705,9 @@ swappiness
 
 This control is used to define how aggressive the kernel will swap
 memory pages.  Higher values will increase agressiveness, lower values
-decrease the amount of swap.
+decrease the amount of swap.  A value of 0 instructs the kernel not to
+initiate swap until the amount of free and file-backed pages is less
+than the high water mark in a zone.
 
 The default value is 60.
 
@@ -618,8 +716,8 @@ The default value is 60.
 vfs_cache_pressure
 ------------------
 
-Controls the tendency of the kernel to reclaim the memory which is used for
-caching of directory and inode objects.
+This percentage value controls the tendency of the kernel to reclaim
+the memory which is used for caching of directory and inode objects.
 
 At the default value of vfs_cache_pressure=100 the kernel will attempt to
 reclaim dentries and inodes at a "fair" rate with respect to pagecache and
@@ -628,6 +726,11 @@ to retain dentry and inode caches. When vfs_cache_pressure=0, the kernel will
 never reclaim dentries and inodes due to memory pressure and this can easily
 lead to out-of-memory conditions. Increasing vfs_cache_pressure beyond 100
 causes the kernel to prefer to reclaim dentries and inodes.
+
+Increasing vfs_cache_pressure significantly beyond 100 may have negative
+performance impact. Reclaim code needs to take various locks to find freeable
+directory and inode objects. With vfs_cache_pressure=1000, it will look for
+ten times more freeable objects than there are.
 
 ==============================================================
 

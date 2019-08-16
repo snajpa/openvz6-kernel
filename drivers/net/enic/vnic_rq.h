@@ -1,5 +1,5 @@
 /*
- * Copyright 2008, 2009 Cisco Systems, Inc.  All rights reserved.
+ * Copyright 2008-2010 Cisco Systems, Inc.  All rights reserved.
  * Copyright 2007 Nuova Systems, Inc.  All rights reserved.
  *
  * This program is free software; you may redistribute it and/or modify
@@ -52,12 +52,16 @@ struct vnic_rq_ctrl {
 	u32 pad10;
 };
 
-/* Break the vnic_rq_buf allocations into blocks of 64 entries */
-#define VNIC_RQ_BUF_BLK_ENTRIES 64
-#define VNIC_RQ_BUF_BLK_SZ \
-	(VNIC_RQ_BUF_BLK_ENTRIES * sizeof(struct vnic_rq_buf))
+/* Break the vnic_rq_buf allocations into blocks of 32/64 entries */
+#define VNIC_RQ_BUF_MIN_BLK_ENTRIES 32
+#define VNIC_RQ_BUF_DFLT_BLK_ENTRIES 64
+#define VNIC_RQ_BUF_BLK_ENTRIES(entries) \
+	((unsigned int)((entries < VNIC_RQ_BUF_DFLT_BLK_ENTRIES) ? \
+	VNIC_RQ_BUF_MIN_BLK_ENTRIES : VNIC_RQ_BUF_DFLT_BLK_ENTRIES))
+#define VNIC_RQ_BUF_BLK_SZ(entries) \
+	(VNIC_RQ_BUF_BLK_ENTRIES(entries) * sizeof(struct vnic_rq_buf))
 #define VNIC_RQ_BUF_BLKS_NEEDED(entries) \
-	DIV_ROUND_UP(entries, VNIC_RQ_BUF_BLK_ENTRIES)
+	DIV_ROUND_UP(entries, VNIC_RQ_BUF_BLK_ENTRIES(entries))
 #define VNIC_RQ_BUF_BLKS_MAX VNIC_RQ_BUF_BLKS_NEEDED(4096)
 
 struct vnic_rq_buf {
@@ -68,6 +72,7 @@ struct vnic_rq_buf {
 	unsigned int len;
 	unsigned int index;
 	void *desc;
+	uint64_t wr_id;
 };
 
 struct vnic_rq {
@@ -80,6 +85,21 @@ struct vnic_rq {
 	struct vnic_rq_buf *to_clean;
 	void *os_buf_head;
 	unsigned int pkts_outstanding;
+#ifdef CONFIG_NET_RX_BUSY_POLL
+#define ENIC_POLL_STATE_IDLE		0
+#define ENIC_POLL_STATE_NAPI		(1 << 0) /* NAPI owns this poll */
+#define ENIC_POLL_STATE_POLL		(1 << 1) /* poll owns this poll */
+#define ENIC_POLL_STATE_NAPI_YIELD	(1 << 2) /* NAPI yielded this poll */
+#define ENIC_POLL_STATE_POLL_YIELD	(1 << 3) /* poll yielded this poll */
+#define ENIC_POLL_YIELD			(ENIC_POLL_STATE_NAPI_YIELD |	\
+					 ENIC_POLL_STATE_POLL_YIELD)
+#define ENIC_POLL_LOCKED		(ENIC_POLL_STATE_NAPI |		\
+					 ENIC_POLL_STATE_POLL)
+#define ENIC_POLL_USER_PEND		(ENIC_POLL_STATE_POLL |		\
+					 ENIC_POLL_STATE_POLL_YIELD)
+	unsigned int bpoll_state;
+	spinlock_t bpoll_lock;
+#endif /* CONFIG_NET_RX_BUSY_POLL */
 };
 
 static inline unsigned int vnic_rq_desc_avail(struct vnic_rq *rq)
@@ -106,7 +126,8 @@ static inline unsigned int vnic_rq_next_index(struct vnic_rq *rq)
 
 static inline void vnic_rq_post(struct vnic_rq *rq,
 	void *os_buf, unsigned int os_buf_index,
-	dma_addr_t dma_addr, unsigned int len)
+	dma_addr_t dma_addr, unsigned int len,
+	uint64_t wrid)
 {
 	struct vnic_rq_buf *buf = rq->to_use;
 
@@ -114,6 +135,7 @@ static inline void vnic_rq_post(struct vnic_rq *rq,
 	buf->os_buf_index = os_buf_index;
 	buf->dma_addr = dma_addr;
 	buf->len = len;
+	buf->wr_id = wrid;
 
 	buf = buf->next;
 	rq->to_use = buf;
@@ -135,11 +157,6 @@ static inline void vnic_rq_post(struct vnic_rq *rq,
 		wmb();
 		iowrite32(buf->index, &rq->ctrl->posted_index);
 	}
-}
-
-static inline int vnic_rq_posting_soon(struct vnic_rq *rq)
-{
-	return ((rq->to_use->index & VNIC_RQ_RETURN_RATE) == 0);
 }
 
 static inline void vnic_rq_return_descs(struct vnic_rq *rq, unsigned int count)
@@ -195,13 +212,116 @@ static inline int vnic_rq_fill(struct vnic_rq *rq,
 	return 0;
 }
 
+#ifdef CONFIG_NET_RX_BUSY_POLL
+static inline void enic_busy_poll_init_lock(struct vnic_rq *rq)
+{
+	spin_lock_init(&rq->bpoll_lock);
+	rq->bpoll_state = ENIC_POLL_STATE_IDLE;
+}
+
+static inline bool enic_poll_lock_napi(struct vnic_rq *rq)
+{
+	bool rc = true;
+
+	spin_lock(&rq->bpoll_lock);
+	if (rq->bpoll_state & ENIC_POLL_LOCKED) {
+		WARN_ON(rq->bpoll_state & ENIC_POLL_STATE_NAPI);
+		rq->bpoll_state |= ENIC_POLL_STATE_NAPI_YIELD;
+		rc = false;
+	} else {
+		rq->bpoll_state = ENIC_POLL_STATE_NAPI;
+	}
+	spin_unlock(&rq->bpoll_lock);
+
+	return rc;
+}
+
+static inline bool enic_poll_unlock_napi(struct vnic_rq *rq)
+{
+	bool rc = false;
+
+	spin_lock(&rq->bpoll_lock);
+	WARN_ON(rq->bpoll_state &
+		(ENIC_POLL_STATE_POLL | ENIC_POLL_STATE_NAPI_YIELD));
+	if (rq->bpoll_state & ENIC_POLL_STATE_POLL_YIELD)
+		rc = true;
+	rq->bpoll_state = ENIC_POLL_STATE_IDLE;
+	spin_unlock(&rq->bpoll_lock);
+
+	return rc;
+}
+
+static inline bool enic_poll_lock_poll(struct vnic_rq *rq)
+{
+	bool rc = true;
+
+	spin_lock_bh(&rq->bpoll_lock);
+	if (rq->bpoll_state & ENIC_POLL_LOCKED) {
+		rq->bpoll_state |= ENIC_POLL_STATE_POLL_YIELD;
+		rc = false;
+	} else {
+		rq->bpoll_state |= ENIC_POLL_STATE_POLL;
+	}
+	spin_unlock_bh(&rq->bpoll_lock);
+
+	return rc;
+}
+
+static inline bool enic_poll_unlock_poll(struct vnic_rq *rq)
+{
+	bool rc = false;
+
+	spin_lock_bh(&rq->bpoll_lock);
+	WARN_ON(rq->bpoll_state & ENIC_POLL_STATE_NAPI);
+	if (rq->bpoll_state & ENIC_POLL_STATE_POLL_YIELD)
+		rc = true;
+	rq->bpoll_state = ENIC_POLL_STATE_IDLE;
+	spin_unlock_bh(&rq->bpoll_lock);
+
+	return rc;
+}
+
+static inline bool enic_poll_busy_polling(struct vnic_rq *rq)
+{
+	WARN_ON(!(rq->bpoll_state & ENIC_POLL_LOCKED));
+	return rq->bpoll_state & ENIC_POLL_USER_PEND;
+}
+
+#else
+
+static inline void enic_busy_poll_init_lock(struct vnic_rq *rq)
+{
+}
+
+static inline bool enic_poll_lock_napi(struct vnic_rq *rq)
+{
+	return true;
+}
+
+static inline bool enic_poll_unlock_napi(struct vnic_rq *rq)
+{
+	return false;
+}
+
+static inline bool enic_poll_lock_poll(struct vnic_rq *rq)
+{
+	return false;
+}
+
+static inline bool enic_poll_unlock_poll(struct vnic_rq *rq)
+{
+	return false;
+}
+
+static inline bool enic_poll_ll_polling(struct vnic_rq *rq)
+{
+	return false;
+}
+#endif /* CONFIG_NET_RX_BUSY_POLL */
+
 void vnic_rq_free(struct vnic_rq *rq);
 int vnic_rq_alloc(struct vnic_dev *vdev, struct vnic_rq *rq, unsigned int index,
 	unsigned int desc_count, unsigned int desc_size);
-void vnic_rq_init_start(struct vnic_rq *rq, unsigned int cq_index,
-	unsigned int fetch_index, unsigned int posted_index,
-	unsigned int error_interrupt_enable,
-	unsigned int error_interrupt_offset);
 void vnic_rq_init(struct vnic_rq *rq, unsigned int cq_index,
 	unsigned int error_interrupt_enable,
 	unsigned int error_interrupt_offset);

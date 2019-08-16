@@ -44,8 +44,6 @@ static bool
 ebt_vlan_mt(const struct sk_buff *skb, const struct xt_match_param *par)
 {
 	const struct ebt_vlan_info *info = par->matchinfo;
-	const struct vlan_hdr *fp;
-	struct vlan_hdr _frame;
 
 	unsigned short TCI;	/* Whole TCI, given from parsed frame */
 	unsigned short id;	/* VLAN ID, given from frame TCI */
@@ -53,9 +51,20 @@ ebt_vlan_mt(const struct sk_buff *skb, const struct xt_match_param *par)
 	/* VLAN encapsulated Type/Length field, given from orig frame */
 	__be16 encap;
 
-	fp = skb_header_pointer(skb, 0, sizeof(_frame), &_frame);
-	if (fp == NULL)
-		return false;
+	if (skb_vlan_tag_present(skb)) {
+		TCI = skb_vlan_tag_get(skb);
+		encap = skb->protocol;
+	} else {
+		const struct vlan_hdr *fp;
+		struct vlan_hdr _frame;
+
+		fp = skb_header_pointer(skb, 0, sizeof(_frame), &_frame);
+		if (fp == NULL)
+			return false;
+
+		TCI = ntohs(fp->h_vlan_TCI);
+		encap = fp->h_vlan_encapsulated_proto;
+	}
 
 	/* Tag Control Information (TCI) consists of the following elements:
 	 * - User_priority. The user_priority field is three bits in length,
@@ -64,10 +73,8 @@ ebt_vlan_mt(const struct sk_buff *skb, const struct xt_match_param *par)
 	 * (CFI) is a single bit flag value. Currently ignored.
 	 * - VLAN Identifier (VID). The VID is encoded as
 	 * an unsigned binary number. */
-	TCI = ntohs(fp->h_vlan_TCI);
 	id = TCI & VLAN_VID_MASK;
 	prio = (TCI >> 13) & 0x7;
-	encap = fp->h_vlan_encapsulated_proto;
 
 	/* Checking VLAN Identifier (VID) */
 	if (GET_BITMASK(EBT_VLAN_ID))
@@ -117,10 +124,10 @@ static bool ebt_vlan_mt_check(const struct xt_mtchk_param *par)
 	 * 0 - The null VLAN ID.
 	 * 1 - The default Port VID (PVID)
 	 * 0x0FFF - Reserved for implementation use.
-	 * if_vlan.h: VLAN_GROUP_ARRAY_LEN 4096. */
+	 * if_vlan.h: VLAN_N_VID 4096. */
 	if (GET_BITMASK(EBT_VLAN_ID)) {
 		if (!!info->id) { /* if id!=0 => check vid range */
-			if (info->id > VLAN_GROUP_ARRAY_LEN) {
+			if (info->id > VLAN_N_VID) {
 				DEBUG_MSG
 				    ("id %d is out of range (1-4096)\n",
 				     info->id);

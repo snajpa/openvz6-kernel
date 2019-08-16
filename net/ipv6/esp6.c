@@ -338,19 +338,15 @@ static u32 esp6_get_mtu(struct xfrm_state *x, int mtu)
 	struct esp_data *esp = x->data;
 	u32 blksize = ALIGN(crypto_aead_blocksize(esp->aead), 4);
 	u32 align = max_t(u32, blksize, esp->padlen);
-	u32 rem;
+	unsigned int net_adj;
 
-	mtu -= x->props.header_len + crypto_aead_authsize(esp->aead);
-	rem = mtu & (align - 1);
-	mtu &= ~(align - 1);
+	if (x->props.mode != XFRM_MODE_TUNNEL)
+		net_adj = sizeof(struct ipv6hdr);
+	else
+		net_adj = 0;
 
-	if (x->props.mode != XFRM_MODE_TUNNEL) {
-		u32 padsize = ((blksize - 1) & 7) + 1;
-		mtu -= blksize - padsize;
-		mtu += min_t(u32, blksize - padsize, rem);
-	}
-
-	return mtu - 2;
+	return ((mtu - x->props.header_len - crypto_aead_authsize(esp->aead) -
+		 net_adj) & ~(align - 1)) + net_adj - 2;
 }
 
 static void esp6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
@@ -365,7 +361,7 @@ static void esp6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 	    type != ICMPV6_PKT_TOOBIG)
 		return;
 
-	x = xfrm_state_lookup(net, (xfrm_address_t *)&iph->daddr, esph->spi, IPPROTO_ESP, AF_INET6);
+	x = xfrm_state_lookup_with_mark(net, skb->mark, (xfrm_address_t *)&iph->daddr, esph->spi, IPPROTO_ESP, AF_INET6);
 	if (!x)
 		return;
 	printk(KERN_DEBUG "pmtu discovery on SA ESP/%08x/%pI6\n",
@@ -473,7 +469,7 @@ static int esp_init_authenc(struct xfrm_state *x)
 		}
 
 		err = crypto_aead_setauthsize(
-			aead, aalg_desc->uinfo.auth.icv_truncbits / 8);
+			aead, x->aalg->alg_trunc_len / 8);
 		if (err)
 			goto free_key;
 	}

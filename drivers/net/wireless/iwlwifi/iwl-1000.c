@@ -1,6 +1,6 @@
 /******************************************************************************
  *
- * Copyright(c) 2008-2009 Intel Corporation. All rights reserved.
+ * Copyright(c) 2008 - 2014 Intel Corporation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of version 2 of the GNU General Public License as
@@ -24,143 +24,117 @@
  *
  *****************************************************************************/
 
-#include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/init.h>
-#include <linux/pci.h>
-#include <linux/dma-mapping.h>
-#include <linux/delay.h>
-#include <linux/skbuff.h>
-#include <linux/netdevice.h>
-#include <linux/wireless.h>
-#include <net/mac80211.h>
-#include <linux/etherdevice.h>
-#include <asm/unaligned.h>
-
-#include "iwl-eeprom.h"
-#include "iwl-dev.h"
-#include "iwl-core.h"
-#include "iwl-io.h"
-#include "iwl-sta.h"
-#include "iwl-helpers.h"
-#include "iwl-5000-hw.h"
+#include <linux/stringify.h>
+#include "iwl-config.h"
+#include "iwl-csr.h"
+#include "iwl-agn-hw.h"
 
 /* Highest firmware API version supported */
-#define IWL1000_UCODE_API_MAX 3
+#define IWL1000_UCODE_API_MAX 5
+#define IWL100_UCODE_API_MAX 5
+
+/* Oldest version we won't warn about */
+#define IWL1000_UCODE_API_OK 5
+#define IWL100_UCODE_API_OK 5
 
 /* Lowest firmware API version supported */
 #define IWL1000_UCODE_API_MIN 1
+#define IWL100_UCODE_API_MIN 5
+
+/* EEPROM version */
+#define EEPROM_1000_TX_POWER_VERSION	(4)
+#define EEPROM_1000_EEPROM_VERSION	(0x15C)
 
 #define IWL1000_FW_PRE "iwlwifi-1000-"
-#define _IWL1000_MODULE_FIRMWARE(api) IWL1000_FW_PRE #api ".ucode"
-#define IWL1000_MODULE_FIRMWARE(api) _IWL1000_MODULE_FIRMWARE(api)
+#define IWL1000_MODULE_FIRMWARE(api) IWL1000_FW_PRE __stringify(api) ".ucode"
+
+#define IWL100_FW_PRE "iwlwifi-100-"
+#define IWL100_MODULE_FIRMWARE(api) IWL100_FW_PRE __stringify(api) ".ucode"
 
 
-/*
- * For 1000, use advance thermal throttling critical temperature threshold,
- * but legacy thermal management implementation for now.
- * This is for the reason of 1000 uCode using advance thermal throttling API
- * but not implement ct_kill_exit based on ct_kill exit temperature
- * so the thermal throttling will still based on legacy thermal throttling
- * management.
- * The code here need to be modified once 1000 uCode has the advanced thermal
- * throttling algorithm in place
- */
-static void iwl1000_set_ct_threshold(struct iwl_priv *priv)
-{
-	/* want Celsius */
-	priv->hw_params.ct_kill_threshold = CT_KILL_THRESHOLD_LEGACY;
-	priv->hw_params.ct_kill_exit_threshold = CT_KILL_EXIT_THRESHOLD;
-}
-
-/* NIC configuration for 1000 series */
-static void iwl1000_nic_config(struct iwl_priv *priv)
-{
-	iwl5000_nic_config(priv);
-
-	/* Setting digital SVR for 1000 card to 1.32V */
-	/* locking is acquired in iwl_set_bits_mask_prph() function */
-	iwl_set_bits_mask_prph(priv, APMG_DIGITAL_SVR_REG,
-				APMG_SVR_DIGITAL_VOLTAGE_1_32,
-				~APMG_SVR_VOLTAGE_CONFIG_BIT_MSK);
-}
-
-static struct iwl_lib_ops iwl1000_lib = {
-	.set_hw_params = iwl5000_hw_set_hw_params,
-	.txq_update_byte_cnt_tbl = iwl5000_txq_update_byte_cnt_tbl,
-	.txq_inval_byte_cnt_tbl = iwl5000_txq_inval_byte_cnt_tbl,
-	.txq_set_sched = iwl5000_txq_set_sched,
-	.txq_agg_enable = iwl5000_txq_agg_enable,
-	.txq_agg_disable = iwl5000_txq_agg_disable,
-	.txq_attach_buf_to_tfd = iwl_hw_txq_attach_buf_to_tfd,
-	.txq_free_tfd = iwl_hw_txq_free_tfd,
-	.txq_init = iwl_hw_tx_queue_init,
-	.rx_handler_setup = iwl5000_rx_handler_setup,
-	.setup_deferred_work = iwl5000_setup_deferred_work,
-	.is_valid_rtc_data_addr = iwl5000_hw_valid_rtc_data_addr,
-	.load_ucode = iwl5000_load_ucode,
-	.dump_nic_event_log = iwl_dump_nic_event_log,
-	.dump_nic_error_log = iwl_dump_nic_error_log,
-	.init_alive_start = iwl5000_init_alive_start,
-	.alive_notify = iwl5000_alive_notify,
-	.send_tx_power = iwl5000_send_tx_power,
-	.update_chain_flags = iwl_update_chain_flags,
-	.apm_ops = {
-		.init =	iwl5000_apm_init,
-		.reset = iwl5000_apm_reset,
-		.stop = iwl5000_apm_stop,
-		.config = iwl1000_nic_config,
-		.set_pwr_src = iwl_set_pwr_src,
-	},
-	.eeprom_ops = {
-		.regulatory_bands = {
-			EEPROM_5000_REG_BAND_1_CHANNELS,
-			EEPROM_5000_REG_BAND_2_CHANNELS,
-			EEPROM_5000_REG_BAND_3_CHANNELS,
-			EEPROM_5000_REG_BAND_4_CHANNELS,
-			EEPROM_5000_REG_BAND_5_CHANNELS,
-			EEPROM_5000_REG_BAND_24_HT40_CHANNELS,
-			EEPROM_5000_REG_BAND_52_HT40_CHANNELS
-		},
-		.verify_signature  = iwlcore_eeprom_verify_signature,
-		.acquire_semaphore = iwlcore_eeprom_acquire_semaphore,
-		.release_semaphore = iwlcore_eeprom_release_semaphore,
-		.calib_version	= iwl5000_eeprom_calib_version,
-		.query_addr = iwl5000_eeprom_query_addr,
-	},
-	.post_associate = iwl_post_associate,
-	.isr = iwl_isr_ict,
-	.config_ap = iwl_config_ap,
-	.temp_ops = {
-		.temperature = iwl5000_temperature,
-		.set_ct_kill = iwl1000_set_ct_threshold,
-	 },
-};
-
-static struct iwl_ops iwl1000_ops = {
-	.ucode = &iwl5000_ucode,
-	.lib = &iwl1000_lib,
-	.hcmd = &iwl5000_hcmd,
-	.utils = &iwl5000_hcmd_utils,
-};
-
-struct iwl_cfg iwl1000_bgn_cfg = {
-	.name = "1000 Series BGN",
-	.fw_name_pre = IWL1000_FW_PRE,
-	.ucode_api_max = IWL1000_UCODE_API_MAX,
-	.ucode_api_min = IWL1000_UCODE_API_MIN,
-	.sku = IWL_SKU_G|IWL_SKU_N,
-	.ops = &iwl1000_ops,
+static const struct iwl_base_params iwl1000_base_params = {
+	.num_of_queues = IWLAGN_NUM_QUEUES,
 	.eeprom_size = OTP_LOW_IMAGE_SIZE,
-	.eeprom_ver = EEPROM_5000_EEPROM_VERSION,
-	.eeprom_calib_ver = EEPROM_5000_TX_POWER_VERSION,
-	.mod_params = &iwl50_mod_params,
-	.valid_tx_ant = ANT_A,
-	.valid_rx_ant = ANT_AB,
-	.need_pll_cfg = true,
+	.pll_cfg_val = CSR50_ANA_PLL_CFG_VAL,
 	.max_ll_items = OTP_MAX_LL_ITEMS_1000,
 	.shadow_ram_support = false,
-	.ht_greenfield_support = true,
-	.use_rts_for_ht = true, /* use rts/cts protection */
+	.led_compensation = 51,
+	.wd_timeout = IWL_WATCHDOG_DISABLED,
+	.max_event_log_size = 128,
+	.scd_chain_ext_wa = true,
 };
 
+static const struct iwl_ht_params iwl1000_ht_params = {
+	.ht_greenfield_support = true,
+	.use_rts_for_aggregation = true, /* use rts/cts protection */
+	.ht40_bands = BIT(IEEE80211_BAND_2GHZ),
+};
+
+static const struct iwl_eeprom_params iwl1000_eeprom_params = {
+	.regulatory_bands = {
+		EEPROM_REG_BAND_1_CHANNELS,
+		EEPROM_REG_BAND_2_CHANNELS,
+		EEPROM_REG_BAND_3_CHANNELS,
+		EEPROM_REG_BAND_4_CHANNELS,
+		EEPROM_REG_BAND_5_CHANNELS,
+		EEPROM_REG_BAND_24_HT40_CHANNELS,
+		EEPROM_REGULATORY_BAND_NO_HT40,
+	}
+};
+
+#define IWL_DEVICE_1000						\
+	.fw_name_pre = IWL1000_FW_PRE,				\
+	.ucode_api_max = IWL1000_UCODE_API_MAX,			\
+	.ucode_api_ok = IWL1000_UCODE_API_OK,			\
+	.ucode_api_min = IWL1000_UCODE_API_MIN,			\
+	.device_family = IWL_DEVICE_FAMILY_1000,		\
+	.max_inst_size = IWLAGN_RTC_INST_SIZE,			\
+	.max_data_size = IWLAGN_RTC_DATA_SIZE,			\
+	.nvm_ver = EEPROM_1000_EEPROM_VERSION,		\
+	.nvm_calib_ver = EEPROM_1000_TX_POWER_VERSION,	\
+	.base_params = &iwl1000_base_params,			\
+	.eeprom_params = &iwl1000_eeprom_params,		\
+	.led_mode = IWL_LED_BLINK,				\
+	.max_ht_ampdu_exponent = IEEE80211_HT_MAX_AMPDU_64K
+
+const struct iwl_cfg iwl1000_bgn_cfg = {
+	.name = "Intel(R) Centrino(R) Wireless-N 1000 BGN",
+	IWL_DEVICE_1000,
+	.ht_params = &iwl1000_ht_params,
+};
+
+const struct iwl_cfg iwl1000_bg_cfg = {
+	.name = "Intel(R) Centrino(R) Wireless-N 1000 BG",
+	IWL_DEVICE_1000,
+};
+
+#define IWL_DEVICE_100						\
+	.fw_name_pre = IWL100_FW_PRE,				\
+	.ucode_api_max = IWL100_UCODE_API_MAX,			\
+	.ucode_api_ok = IWL100_UCODE_API_OK,			\
+	.ucode_api_min = IWL100_UCODE_API_MIN,			\
+	.device_family = IWL_DEVICE_FAMILY_100,			\
+	.max_inst_size = IWLAGN_RTC_INST_SIZE,			\
+	.max_data_size = IWLAGN_RTC_DATA_SIZE,			\
+	.nvm_ver = EEPROM_1000_EEPROM_VERSION,		\
+	.nvm_calib_ver = EEPROM_1000_TX_POWER_VERSION,	\
+	.base_params = &iwl1000_base_params,			\
+	.eeprom_params = &iwl1000_eeprom_params,		\
+	.led_mode = IWL_LED_RF_STATE,				\
+	.rx_with_siso_diversity = true,				\
+	.max_ht_ampdu_exponent = IEEE80211_HT_MAX_AMPDU_64K
+
+const struct iwl_cfg iwl100_bgn_cfg = {
+	.name = "Intel(R) Centrino(R) Wireless-N 100 BGN",
+	IWL_DEVICE_100,
+	.ht_params = &iwl1000_ht_params,
+};
+
+const struct iwl_cfg iwl100_bg_cfg = {
+	.name = "Intel(R) Centrino(R) Wireless-N 100 BG",
+	IWL_DEVICE_100,
+};
+
+MODULE_FIRMWARE(IWL1000_MODULE_FIRMWARE(IWL1000_UCODE_API_OK));
+MODULE_FIRMWARE(IWL100_MODULE_FIRMWARE(IWL100_UCODE_API_OK));

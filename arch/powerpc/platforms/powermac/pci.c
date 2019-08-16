@@ -731,7 +731,7 @@ static void __init setup_bandit(struct pci_controller *hose,
 static int __init setup_uninorth(struct pci_controller *hose,
 				 struct resource *addr)
 {
-	ppc_pci_add_flags(PPC_PCI_REASSIGN_ALL_BUS);
+	pci_add_flags(PCI_REASSIGN_ALL_BUS);
 	has_uninorth = 1;
 	hose->ops = &macrisc_pci_ops;
 	hose->cfg_addr = ioremap(addr->start + 0x800000, 0x1000);
@@ -809,6 +809,7 @@ static void __init parse_region_decode(struct pci_controller *hose,
 			hose->mem_resources[cur].name = hose->dn->full_name;
 			hose->mem_resources[cur].start = base;
 			hose->mem_resources[cur].end = end;
+			hose->mem_offset[cur] = 0;
 			DBG("  %d: 0x%08lx-0x%08lx\n", cur, base, end);
 		} else {
 			DBG("   :           -0x%08lx\n", end);
@@ -852,7 +853,6 @@ static void __init setup_u3_ht(struct pci_controller* hose)
 	hose->io_resource.start = 0;
 	hose->io_resource.end = 0x003fffff;
 	hose->io_resource.flags = IORESOURCE_IO;
-	hose->pci_mem_offset = 0;
 	hose->first_busno = 0;
 	hose->last_busno = 0xef;
 
@@ -998,7 +998,7 @@ void __init pmac_pci_init(void)
 	struct device_node *np, *root;
 	struct device_node *ht = NULL;
 
-	ppc_pci_set_flags(PPC_PCI_CAN_SKIP_ISA_ALIGN);
+	pci_set_flags(PCI_CAN_SKIP_ISA_ALIGN);
 
 	root = of_find_node_by_path("/");
 	if (root == NULL) {
@@ -1045,9 +1045,6 @@ void __init pmac_pci_init(void)
 	}
 	/* pmac_check_ht_link(); */
 
-	/* We can allocate missing resources if any */
-	pci_probe_only = 0;
-
 #else /* CONFIG_PPC64 */
 	init_p2pbridge();
 	init_second_ohare();
@@ -1057,7 +1054,7 @@ void __init pmac_pci_init(void)
 	 * some offset between bus number and domains for now when we
 	 * assign all busses should help for now
 	 */
-	if (ppc_pci_has_flag(PPC_PCI_REASSIGN_ALL_BUS))
+	if (pci_has_flag(PCI_REASSIGN_ALL_BUS))
 		pcibios_assign_bus_offset = 0x10;
 #endif
 }

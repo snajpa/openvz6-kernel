@@ -60,6 +60,18 @@ struct pcmcia_driver {
 int pcmcia_register_driver(struct pcmcia_driver *driver);
 void pcmcia_unregister_driver(struct pcmcia_driver *driver);
 
+/**
+ * module_pcmcia_driver() - Helper macro for registering a pcmcia driver
+ * @__pcmcia_driver: pcmcia_driver struct
+ *
+ * Helper macro for pcmcia drivers which do not do anything special in module
+ * init/exit. This eliminates a lot of boilerplate. Each module may only use
+ * this macro once, and calling it replaces module_init() and module_exit().
+ */
+#define module_pcmcia_driver(__pcmcia_driver) \
+	module_driver(__pcmcia_driver, pcmcia_register_driver, \
+			pcmcia_unregister_driver)
+
 /* Some drivers use dev_node_t to store char or block device information.
  * Don't use this in new drivers, though.
  */
@@ -195,6 +207,12 @@ int pccard_get_tuple_data(struct pcmcia_socket *s, tuple_t *tuple);
 #define pcmcia_get_tuple_data(p_dev, tuple) \
 		pccard_get_tuple_data(p_dev->socket, tuple)
 
+/* loop over CIS entries */
+int pcmcia_loop_tuple(struct pcmcia_device *p_dev, cisdata_t code,
+		      int (*loop_tuple) (struct pcmcia_device *p_dev,
+					 tuple_t *tuple,
+					 void *priv_data),
+		      void *priv_data);
 
 /* loop CIS entries for valid configuration */
 int pcmcia_loop_config(struct pcmcia_device *p_dev,
@@ -215,11 +233,43 @@ int pcmcia_reset_card(struct pcmcia_socket *skt);
 int pcmcia_access_configuration_register(struct pcmcia_device *p_dev,
 					 conf_reg_t *reg);
 
+/**
+ * pcmcia_read_config_byte() - read a byte from a card configuration register
+ *
+ * pcmcia_read_config_byte() reads a byte from a configuration register in
+ * attribute memory.
+ */
+static inline int pcmcia_read_config_byte(struct pcmcia_device *p_dev, off_t where, u8 *val)
+{
+        int ret;
+        conf_reg_t reg = { 0, CS_READ, where, 0 };
+
+        ret = pcmcia_access_configuration_register(p_dev, &reg);
+        *val = reg.Value;
+
+        return ret;
+}
+
+/**
+ * pcmcia_write_config_byte() - write a byte to a card configuration register
+ *
+ * pcmcia_write_config_byte() writes a byte to a configuration register in
+ * attribute memory.
+ */
+static inline int pcmcia_write_config_byte(struct pcmcia_device *p_dev, off_t where, u8 val)
+{
+	conf_reg_t reg = { 0, CS_WRITE, where, val };
+
+	return pcmcia_access_configuration_register(p_dev, &reg);
+}
+
 /* device configuration */
 int pcmcia_request_io(struct pcmcia_device *p_dev, io_req_t *req);
 int pcmcia_request_irq(struct pcmcia_device *p_dev, irq_req_t *req);
 int pcmcia_request_configuration(struct pcmcia_device *p_dev,
 				 config_req_t *req);
+
+#define pcmcia_enable_device(p_dev) pcmcia_request_configuration(p_dev, &(p_dev)->conf)
 
 int pcmcia_request_window(struct pcmcia_device **p_dev, win_req_t *req,
 			  window_handle_t *wh);

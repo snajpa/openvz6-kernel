@@ -1,6 +1,7 @@
 #include "cache.h"
 #include "run-command.h"
 #include "exec_cmd.h"
+#include "debug.h"
 
 static inline void close_pair(int fd[2])
 {
@@ -19,6 +20,7 @@ int start_command(struct child_process *cmd)
 {
 	int need_in, need_out, need_err;
 	int fdin[2], fdout[2], fderr[2];
+	char sbuf[STRERR_BUFSIZE];
 
 	/*
 	 * In case of errors we must keep the promise to close FDs
@@ -99,7 +101,7 @@ int start_command(struct child_process *cmd)
 
 		if (cmd->dir && chdir(cmd->dir))
 			die("exec %s: cd to %s failed (%s)", cmd->argv[0],
-			    cmd->dir, strerror(errno));
+			    cmd->dir, strerror_r(errno, sbuf, sizeof(sbuf)));
 		if (cmd->env) {
 			for (; *cmd->env; cmd->env++) {
 				if (strchr(*cmd->env, '='))
@@ -153,6 +155,8 @@ int start_command(struct child_process *cmd)
 
 static int wait_or_whine(pid_t pid)
 {
+	char sbuf[STRERR_BUFSIZE];
+
 	for (;;) {
 		int status, code;
 		pid_t waiting = waitpid(pid, &status, 0);
@@ -160,7 +164,8 @@ static int wait_or_whine(pid_t pid)
 		if (waiting < 0) {
 			if (errno == EINTR)
 				continue;
-			error("waitpid failed (%s)", strerror(errno));
+			error("waitpid failed (%s)",
+			      strerror_r(errno, sbuf, sizeof(sbuf)));
 			return -ERR_RUN_COMMAND_WAITPID;
 		}
 		if (waiting != pid)
@@ -211,94 +216,4 @@ int run_command_v_opt(const char **argv, int opt)
 	struct child_process cmd;
 	prepare_run_command_v_opt(&cmd, argv, opt);
 	return run_command(&cmd);
-}
-
-int run_command_v_opt_cd_env(const char **argv, int opt, const char *dir, const char *const *env)
-{
-	struct child_process cmd;
-	prepare_run_command_v_opt(&cmd, argv, opt);
-	cmd.dir = dir;
-	cmd.env = env;
-	return run_command(&cmd);
-}
-
-int start_async(struct async *async)
-{
-	int pipe_out[2];
-
-	if (pipe(pipe_out) < 0)
-		return error("cannot create pipe: %s", strerror(errno));
-	async->out = pipe_out[0];
-
-	/* Flush stdio before fork() to avoid cloning buffers */
-	fflush(NULL);
-
-	async->pid = fork();
-	if (async->pid < 0) {
-		error("fork (async) failed: %s", strerror(errno));
-		close_pair(pipe_out);
-		return -1;
-	}
-	if (!async->pid) {
-		close(pipe_out[0]);
-		exit(!!async->proc(pipe_out[1], async->data));
-	}
-	close(pipe_out[1]);
-
-	return 0;
-}
-
-int finish_async(struct async *async)
-{
-	int ret = 0;
-
-	if (wait_or_whine(async->pid))
-		ret = error("waitpid (async) failed");
-
-	return ret;
-}
-
-int run_hook(const char *index_file, const char *name, ...)
-{
-	struct child_process hook;
-	const char **argv = NULL, *env[2];
-	char idx[PATH_MAX];
-	va_list args;
-	int ret;
-	size_t i = 0, alloc = 0;
-
-	if (access(perf_path("hooks/%s", name), X_OK) < 0)
-		return 0;
-
-	va_start(args, name);
-	ALLOC_GROW(argv, i + 1, alloc);
-	argv[i++] = perf_path("hooks/%s", name);
-	while (argv[i-1]) {
-		ALLOC_GROW(argv, i + 1, alloc);
-		argv[i++] = va_arg(args, const char *);
-	}
-	va_end(args);
-
-	memset(&hook, 0, sizeof(hook));
-	hook.argv = argv;
-	hook.no_stdin = 1;
-	hook.stdout_to_stderr = 1;
-	if (index_file) {
-		snprintf(idx, sizeof(idx), "PERF_INDEX_FILE=%s", index_file);
-		env[0] = idx;
-		env[1] = NULL;
-		hook.env = env;
-	}
-
-	ret = start_command(&hook);
-	free(argv);
-	if (ret) {
-		warning("Could not spawn %s", argv[0]);
-		return ret;
-	}
-	ret = finish_command(&hook);
-	if (ret == -ERR_RUN_COMMAND_WAITPID_SIGNAL)
-		warning("%s exited due to uncaught signal", argv[0]);
-
-	return ret;
 }

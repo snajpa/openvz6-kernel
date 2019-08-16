@@ -31,7 +31,6 @@
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/compiler.h>
-#include <linux/delay.h>
 #include <linux/blktrace_api.h>
 #include <linux/hash.h>
 #include <linux/uaccess.h>
@@ -71,34 +70,9 @@ static int elv_iosched_allow_merge(struct request *rq, struct bio *bio)
 /*
  * can we safely merge with this request?
  */
-int elv_rq_merge_ok(struct request *rq, struct bio *bio)
+bool elv_rq_merge_ok(struct request *rq, struct bio *bio)
 {
-	if (!rq_mergeable(rq))
-		return 0;
-
-	/*
-	 * Don't merge file system requests and discard requests
-	 */
-	if (bio_rw_flagged(bio, BIO_RW_DISCARD) !=
-	    bio_rw_flagged(rq->bio, BIO_RW_DISCARD))
-		return 0;
-
-	/*
-	 * different data direction or already started, don't merge
-	 */
-	if (bio_data_dir(bio) != rq_data_dir(rq))
-		return 0;
-
-	/*
-	 * must be same device and not a special request
-	 */
-	if (rq->rq_disk != bio->bi_bdev->bd_disk || rq->special)
-		return 0;
-
-	/*
-	 * only merge integrity protected bio into ditto rq
-	 */
-	if (bio_integrity(bio) != blk_integrity_rq(rq))
+	if (!blk_rq_merge_ok(rq, bio))
 		return 0;
 
 	if (!elv_iosched_allow_merge(rq, bio))
@@ -107,23 +81,6 @@ int elv_rq_merge_ok(struct request *rq, struct bio *bio)
 	return 1;
 }
 EXPORT_SYMBOL(elv_rq_merge_ok);
-
-static inline int elv_try_merge(struct request *__rq, struct bio *bio)
-{
-	int ret = ELEVATOR_NO_MERGE;
-
-	/*
-	 * we can merge and sequence is ok, check if it's possible
-	 */
-	if (elv_rq_merge_ok(__rq, bio)) {
-		if (blk_rq_pos(__rq) + blk_rq_sectors(__rq) == bio->bi_sector)
-			ret = ELEVATOR_BACK_MERGE;
-		else if (blk_rq_pos(__rq) - bio_sectors(bio) == bio->bi_sector)
-			ret = ELEVATOR_FRONT_MERGE;
-	}
-
-	return ret;
-}
 
 static struct elevator_type *elevator_find(const char *name)
 {
@@ -248,8 +205,10 @@ int elevator_init(struct request_queue *q, char *name)
 {
 	struct elevator_type *e = NULL;
 	struct elevator_queue *eq;
-	int ret = 0;
 	void *data;
+
+	if (unlikely(q->elevator))
+		return 0;
 
 	INIT_LIST_HEAD(&q->queue_head);
 	q->last_merge = NULL;
@@ -290,7 +249,7 @@ int elevator_init(struct request_queue *q, char *name)
 	}
 
 	elevator_attach(q, eq, data);
-	return ret;
+	return 0;
 }
 EXPORT_SYMBOL(elevator_init);
 
@@ -357,7 +316,7 @@ static struct request *elv_rqhash_find(struct request_queue *q, sector_t offset)
  * RB-tree support functions for inserting/lookup/removal of requests
  * in a sorted RB tree.
  */
-struct request *elv_rb_add(struct rb_root *root, struct request *rq)
+void elv_rb_add(struct rb_root *root, struct request *rq)
 {
 	struct rb_node **p = &root->rb_node;
 	struct rb_node *parent = NULL;
@@ -369,15 +328,12 @@ struct request *elv_rb_add(struct rb_root *root, struct request *rq)
 
 		if (blk_rq_pos(rq) < blk_rq_pos(__rq))
 			p = &(*p)->rb_left;
-		else if (blk_rq_pos(rq) > blk_rq_pos(__rq))
+		else if (blk_rq_pos(rq) >= blk_rq_pos(__rq))
 			p = &(*p)->rb_right;
-		else
-			return __rq;
 	}
 
 	rb_link_node(&rq->rb_node, parent, p);
 	rb_insert_color(&rq->rb_node, root);
-	return NULL;
 }
 EXPORT_SYMBOL(elv_rb_add);
 
@@ -432,7 +388,8 @@ void elv_dispatch_sort(struct request_queue *q, struct request *rq)
 	list_for_each_prev(entry, &q->queue_head) {
 		struct request *pos = list_entry_rq(entry);
 
-		if (blk_discard_rq(rq) != blk_discard_rq(pos))
+		if ((rq->cmd_flags & REQ_DISCARD) !=
+		    (pos->cmd_flags & REQ_DISCARD))
 			break;
 		if (rq_data_dir(rq) != rq_data_dir(pos))
 			break;
@@ -482,8 +439,8 @@ int elv_merge(struct request_queue *q, struct request **req, struct bio *bio)
 	/*
 	 * First try one-hit cache.
 	 */
-	if (q->last_merge) {
-		ret = elv_try_merge(q->last_merge, bio);
+	if (q->last_merge && elv_rq_merge_ok(q->last_merge, bio)) {
+		ret = blk_try_merge(q->last_merge, bio);
 		if (ret != ELEVATOR_NO_MERGE) {
 			*req = q->last_merge;
 			return ret;
@@ -536,6 +493,15 @@ void elv_merge_requests(struct request_queue *q, struct request *rq,
 	q->last_merge = rq;
 }
 
+void elv_bio_merged(struct request_queue *q, struct request *rq,
+			struct bio *bio)
+{
+	struct elevator_queue *e = q->elevator;
+
+	if (e->ops->elevator_bio_merged_fn)
+		e->ops->elevator_bio_merged_fn(q, rq, bio);
+}
+
 void elv_requeue_request(struct request_queue *q, struct request *rq)
 {
 	/*
@@ -544,7 +510,7 @@ void elv_requeue_request(struct request_queue *q, struct request *rq)
 	 */
 	if (blk_account_rq(rq)) {
 		q->in_flight[rq_is_sync(rq)]--;
-		if (blk_sorted_rq(rq))
+		if (rq->cmd_flags & REQ_SORTED)
 			elv_deactivate_rq(q, rq);
 	}
 
@@ -556,49 +522,39 @@ void elv_requeue_request(struct request_queue *q, struct request *rq)
 void elv_drain_elevator(struct request_queue *q)
 {
 	static int printed;
+
+	lockdep_assert_held(q->queue_lock);
+
 	while (q->elevator->ops->elevator_dispatch_fn(q, 1))
 		;
-	if (q->nr_sorted == 0)
-		return;
-	if (printed++ < 10) {
+	if (q->nr_sorted && printed++ < 10) {
 		printk(KERN_ERR "%s: forced dispatching is broken "
 		       "(nr_sorted=%u), please report this\n",
 		       q->elevator->elevator_type->elevator_name, q->nr_sorted);
 	}
 }
 
-/*
- * Call with queue lock held, interrupts disabled
- */
 void elv_quiesce_start(struct request_queue *q)
 {
 	if (!q->elevator)
 		return;
 
+	spin_lock_irq(q->queue_lock);
 	queue_flag_set(QUEUE_FLAG_ELVSWITCH, q);
+	spin_unlock_irq(q->queue_lock);
 
-	/*
-	 * make sure we don't have any requests in flight
-	 */
-	elv_drain_elevator(q);
-	while (q->rq.elvpriv) {
-		__blk_run_queue(q);
-		spin_unlock_irq(q->queue_lock);
-		msleep(10);
-		spin_lock_irq(q->queue_lock);
-		elv_drain_elevator(q);
-	}
+	blk_drain_queue(q, false);
 }
 
 void elv_quiesce_end(struct request_queue *q)
 {
+	spin_lock_irq(q->queue_lock);
 	queue_flag_clear(QUEUE_FLAG_ELVSWITCH, q);
+	spin_unlock_irq(q->queue_lock);
 }
 
 void elv_insert(struct request_queue *q, struct request *rq, int where)
 {
-	struct list_head *pos;
-	unsigned ordseq;
 	int unplug_it = 1;
 
 	trace_block_rq_insert(q, rq);
@@ -606,9 +562,16 @@ void elv_insert(struct request_queue *q, struct request *rq, int where)
 	rq->q = q;
 
 	switch (where) {
+	case ELEVATOR_INSERT_REQUEUE:
+		/*
+		 * Most requeues happen because of a busy condition,
+		 * don't force unplug of the queue for that case.
+		 * Clear unplug_it and fall through.
+		 */
+		unplug_it = 0;
+
 	case ELEVATOR_INSERT_FRONT:
 		rq->cmd_flags |= REQ_SOFTBARRIER;
-
 		list_add(&rq->queuelist, &q->queue_head);
 		break;
 
@@ -630,7 +593,7 @@ void elv_insert(struct request_queue *q, struct request *rq, int where)
 		break;
 
 	case ELEVATOR_INSERT_SORT:
-		BUG_ON(!blk_fs_request(rq) && !blk_discard_rq(rq));
+		BUG_ON(rq->cmd_type != REQ_TYPE_FS);
 		rq->cmd_flags |= REQ_SORTED;
 		q->nr_sorted++;
 		if (rq_mergeable(rq)) {
@@ -647,34 +610,9 @@ void elv_insert(struct request_queue *q, struct request *rq, int where)
 		q->elevator->ops->elevator_add_req_fn(q, rq);
 		break;
 
-	case ELEVATOR_INSERT_REQUEUE:
-		/*
-		 * If ordered flush isn't in progress, we do front
-		 * insertion; otherwise, requests should be requeued
-		 * in ordseq order.
-		 */
+	case ELEVATOR_INSERT_FLUSH:
 		rq->cmd_flags |= REQ_SOFTBARRIER;
-
-		/*
-		 * Most requeues happen because of a busy condition,
-		 * don't force unplug of the queue for that case.
-		 */
-		unplug_it = 0;
-
-		if (q->ordseq == 0) {
-			list_add(&rq->queuelist, &q->queue_head);
-			break;
-		}
-
-		ordseq = blk_ordered_req_seq(rq);
-
-		list_for_each(pos, &q->queue_head) {
-			struct request *pos_rq = list_entry_rq(pos);
-			if (ordseq <= blk_ordered_req_seq(pos_rq))
-				break;
-		}
-
-		list_add_tail(&rq->queuelist, pos);
+		blk_insert_flush(rq);
 		break;
 
 	default:
@@ -695,27 +633,9 @@ void elv_insert(struct request_queue *q, struct request *rq, int where)
 void __elv_add_request(struct request_queue *q, struct request *rq, int where,
 		       int plug)
 {
-	if (q->ordcolor)
-		rq->cmd_flags |= REQ_ORDERED_COLOR;
-
 	if (rq->cmd_flags & (REQ_SOFTBARRIER | REQ_HARDBARRIER)) {
-		/*
-		 * toggle ordered color
-		 */
-		if (blk_barrier_rq(rq))
-			q->ordcolor ^= 1;
-
-		/*
-		 * barriers implicitly indicate back insertion
-		 */
-		if (where == ELEVATOR_INSERT_SORT)
-			where = ELEVATOR_INSERT_BACK;
-
-		/*
-		 * this request is scheduling boundary, update
-		 * end_sector
-		 */
-		if (blk_fs_request(rq) || blk_discard_rq(rq)) {
+		/* barriers are scheduling boundary, update end_sector */
+		if (rq->cmd_type == REQ_TYPE_FS) {
 			q->end_sector = rq_end_sector(rq);
 			q->boundary_rq = rq;
 		}
@@ -780,7 +700,7 @@ int elv_set_request(struct request_queue *q, struct request *rq, gfp_t gfp_mask)
 	if (e->ops->elevator_set_req_fn)
 		return e->ops->elevator_set_req_fn(q, rq, gfp_mask);
 
-	rq->elevator_private = NULL;
+	rq->elevator_private[0] = NULL;
 	return 0;
 }
 
@@ -806,6 +726,8 @@ void elv_abort_queue(struct request_queue *q)
 {
 	struct request *rq;
 
+	blk_abort_flushes(q);
+
 	while (!list_empty(&q->queue_head)) {
 		rq = list_entry_rq(q->queue_head.next);
 		rq->cmd_flags |= REQ_QUIET;
@@ -829,26 +751,9 @@ void elv_completed_request(struct request_queue *q, struct request *rq)
 	 */
 	if (blk_account_rq(rq)) {
 		q->in_flight[rq_is_sync(rq)]--;
-		if (blk_sorted_rq(rq) && e->ops->elevator_completed_req_fn)
+		if ((rq->cmd_flags & REQ_SORTED) &&
+		    e->ops->elevator_completed_req_fn)
 			e->ops->elevator_completed_req_fn(q, rq);
-	}
-
-	/*
-	 * Check if the queue is waiting for fs requests to be
-	 * drained for flush sequence.
-	 */
-	if (unlikely(q->ordseq)) {
-		struct request *next = NULL;
-
-		if (!list_empty(&q->queue_head))
-			next = list_entry_rq(q->queue_head.next);
-
-		if (!queue_in_flight(q) &&
-		    blk_ordered_cur_seq(q) == QUEUE_ORDSEQ_DRAIN &&
-		    (!next || blk_ordered_req_seq(next) > QUEUE_ORDSEQ_DRAIN)) {
-			blk_ordered_complete_seq(q, QUEUE_ORDSEQ_DRAIN, 0);
-			__blk_run_queue(q);
-		}
 	}
 }
 
@@ -889,7 +794,7 @@ elv_attr_store(struct kobject *kobj, struct attribute *attr,
 	return error;
 }
 
-static struct sysfs_ops elv_sysfs_ops = {
+static const struct sysfs_ops elv_sysfs_ops = {
 	.show	= elv_attr_show,
 	.store	= elv_attr_store,
 };
@@ -915,14 +820,17 @@ int elv_register_queue(struct request_queue *q)
 			}
 		}
 		kobject_uevent(&e->kobj, KOBJ_ADD);
+		e->registered = 1;
 	}
 	return error;
 }
+EXPORT_SYMBOL(elv_register_queue);
 
 static void __elv_unregister_queue(struct elevator_queue *e)
 {
 	kobject_uevent(&e->kobj, KOBJ_REMOVE);
 	kobject_del(&e->kobj);
+	e->registered = 0;
 }
 
 void elv_unregister_queue(struct request_queue *q)
@@ -930,6 +838,7 @@ void elv_unregister_queue(struct request_queue *q)
 	if (q)
 		__elv_unregister_queue(q->elevator);
 }
+EXPORT_SYMBOL(elv_unregister_queue);
 
 void elv_register(struct elevator_type *e)
 {
@@ -984,24 +893,24 @@ static int elevator_switch(struct request_queue *q, struct elevator_type *new_e)
 {
 	struct elevator_queue *old_elevator, *e;
 	void *data;
+	int err;
 
 	/*
 	 * Allocate new elevator
 	 */
 	e = elevator_alloc(q, new_e);
 	if (!e)
-		return 0;
+		return -ENOMEM;
 
 	data = elevator_init_queue(q, e);
 	if (!data) {
 		kobject_put(&e->kobj);
-		return 0;
+		return -ENOMEM;
 	}
 
 	/*
 	 * Turn on BYPASS and drain all requests w/ elevator private data
 	 */
-	spin_lock_irq(q->queue_lock);
 	elv_quiesce_start(q);
 
 	/*
@@ -1012,26 +921,27 @@ static int elevator_switch(struct request_queue *q, struct elevator_type *new_e)
 	/*
 	 * attach and start new elevator
 	 */
+	spin_lock_irq(q->queue_lock);
 	elevator_attach(q, e, data);
-
 	spin_unlock_irq(q->queue_lock);
 
-	__elv_unregister_queue(old_elevator);
+	if (old_elevator->registered) {
+		__elv_unregister_queue(old_elevator);
 
-	if (elv_register_queue(q))
-		goto fail_register;
+		err = elv_register_queue(q);
+		if (err)
+			goto fail_register;
+	}
 
 	/*
 	 * finally exit old elevator and turn off BYPASS.
 	 */
 	elevator_exit(old_elevator);
-	spin_lock_irq(q->queue_lock);
 	elv_quiesce_end(q);
-	spin_unlock_irq(q->queue_lock);
 
 	blk_add_trace_msg(q, "elv switch: %s", e->elevator_type->elevator_name);
 
-	return 1;
+	return 0;
 
 fail_register:
 	/*
@@ -1041,22 +951,21 @@ fail_register:
 	elevator_exit(e);
 	q->elevator = old_elevator;
 	elv_register_queue(q);
+	elv_quiesce_end(q);
 
-	spin_lock_irq(q->queue_lock);
-	queue_flag_clear(QUEUE_FLAG_ELVSWITCH, q);
-	spin_unlock_irq(q->queue_lock);
-
-	return 0;
+	return err;
 }
 
-ssize_t elv_iosched_store(struct request_queue *q, const char *name,
-			  size_t count)
+/*
+ * Switch this queue to the given IO scheduler.
+ */
+int elevator_change(struct request_queue *q, const char *name)
 {
 	char elevator_name[ELV_NAME_MAX];
 	struct elevator_type *e;
 
 	if (!q->elevator)
-		return count;
+		return -ENXIO;
 
 	strlcpy(elevator_name, name, sizeof(elevator_name));
 	e = elevator_get(strstrip(elevator_name));
@@ -1067,13 +976,27 @@ ssize_t elv_iosched_store(struct request_queue *q, const char *name,
 
 	if (!strcmp(elevator_name, q->elevator->elevator_type->elevator_name)) {
 		elevator_put(e);
-		return count;
+		return 0;
 	}
 
-	if (!elevator_switch(q, e))
-		printk(KERN_ERR "elevator: switch to %s failed\n",
-							elevator_name);
-	return count;
+	return elevator_switch(q, e);
+}
+EXPORT_SYMBOL(elevator_change);
+
+ssize_t elv_iosched_store(struct request_queue *q, const char *name,
+			  size_t count)
+{
+	int ret;
+
+	if (!q->elevator)
+		return count;
+
+	ret = elevator_change(q, name);
+	if (!ret)
+		return count;
+
+	printk(KERN_ERR "elevator: switch to %s failed\n", name);
+	return ret;
 }
 
 ssize_t elv_iosched_show(struct request_queue *q, char *name)
@@ -1083,7 +1006,7 @@ ssize_t elv_iosched_show(struct request_queue *q, char *name)
 	struct elevator_type *__e;
 	int len = 0;
 
-	if (!q->elevator)
+	if (!q->elevator || !blk_queue_stackable(q))
 		return sprintf(name, "none\n");
 
 	elv = e->elevator_type;

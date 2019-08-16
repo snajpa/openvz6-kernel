@@ -35,26 +35,37 @@ typedef struct xfs_sync_work {
 int xfs_syncd_init(struct xfs_mount *mp);
 void xfs_syncd_stop(struct xfs_mount *mp);
 
-int xfs_sync_attr(struct xfs_mount *mp, int flags);
-int xfs_sync_data(struct xfs_mount *mp, int flags);
-int xfs_sync_fsdata(struct xfs_mount *mp, int flags);
-
 int xfs_quiesce_data(struct xfs_mount *mp);
 void xfs_quiesce_attr(struct xfs_mount *mp);
 
 void xfs_flush_inodes(struct xfs_inode *ip);
 
-int xfs_reclaim_inode(struct xfs_inode *ip, int locked, int sync_mode);
 int xfs_reclaim_inodes(struct xfs_mount *mp, int mode);
 
 void xfs_inode_set_reclaim_tag(struct xfs_inode *ip);
 void __xfs_inode_set_reclaim_tag(struct xfs_perag *pag, struct xfs_inode *ip);
+void __xfs_inode_clear_reclaim(struct xfs_perag *pag, struct xfs_inode *ip);
 void __xfs_inode_clear_reclaim_tag(struct xfs_mount *mp, struct xfs_perag *pag,
 				struct xfs_inode *ip);
 
-int xfs_sync_inode_valid(struct xfs_inode *ip, struct xfs_perag *pag);
+extern struct workqueue_struct *xfs_eofblocks_wq;
+
+void xfs_inode_set_eofblocks_tag(struct xfs_inode *ip);
+void xfs_inode_clear_eofblocks_tag(struct xfs_inode *ip);
+int xfs_icache_free_eofblocks(struct xfs_mount *, struct xfs_eofblocks *);
+void xfs_eofblocks_worker(struct work_struct *);
+
+int xfs_sync_inode_grab(struct xfs_inode *ip);
 int xfs_inode_ag_iterator(struct xfs_mount *mp,
-	int (*execute)(struct xfs_inode *ip, struct xfs_perag *pag, int flags),
-	int flags, int tag);
+	int (*execute)(struct xfs_inode *ip, struct xfs_perag *pag,
+		int flags, void *args),
+	int flags, void *args);
+int xfs_inode_ag_iterator_tag(struct xfs_mount *mp,
+	int (*execute)(struct xfs_inode *ip, struct xfs_perag *pag,
+		int flags, void *args),
+	int flags, void *args, int tag);
+
+void xfs_inode_shrinker_register(struct xfs_mount *mp);
+void xfs_inode_shrinker_unregister(struct xfs_mount *mp);
 
 #endif

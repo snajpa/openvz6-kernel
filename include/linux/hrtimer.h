@@ -146,9 +146,7 @@ struct hrtimer_clock_base {
 	ktime_t			resolution;
 	ktime_t			(*get_time)(void);
 	ktime_t			softirq_time;
-#ifdef CONFIG_HIGH_RES_TIMERS
 	ktime_t			offset;
-#endif
 };
 
 #define HRTIMER_MAX_CLOCK_BASES 2
@@ -162,10 +160,14 @@ struct hrtimer_clock_base {
  * @expires_next:	absolute time of the next event which was scheduled
  *			via clock_set_next_event()
  * @hres_active:	State of high resolution mode
- * @check_clocks:	Indictator, when set evaluate time source and clock
- *			event devices whether high resolution mode can be
- *			activated.
- * @nr_events:		Total number of timer interrupt events
+ * @hang_detected:	The last hrtimer interrupt detected a hang
+ * @nr_events:		Total number of hrtimer interrupt events
+ * @nr_retries:		Total number of hrtimer interrupt retries
+ * @nr_hangs:		Total number of hrtimer interrupt hangs
+ * @max_hang_time:	Maximum time spent in hrtimer_interrupt
+ * @clock_was_set:	Sequence counter of clock was set events
+ *                      Note that in RHEL6 clock_was_set is upstream's
+ *                      clock_was_set_seq (KABI).
  */
 struct hrtimer_cpu_base {
 	spinlock_t			lock;
@@ -173,7 +175,14 @@ struct hrtimer_cpu_base {
 #ifdef CONFIG_HIGH_RES_TIMERS
 	ktime_t				expires_next;
 	int				hres_active;
+	int				hang_detected;
 	unsigned long			nr_events;
+	unsigned long			nr_retries;
+	unsigned long			nr_hangs;
+	ktime_t				max_hang_time;
+#endif
+#ifndef __GENKSYMS__
+	unsigned int			clock_was_set; /* clock_was_set_seq */
 #endif
 };
 
@@ -245,8 +254,11 @@ static inline ktime_t hrtimer_expires_remaining(const struct hrtimer *timer)
 #ifdef CONFIG_HIGH_RES_TIMERS
 struct clock_event_device;
 
-extern void clock_was_set(void);
-extern void hres_timers_resume(void);
+#ifdef CONFIG_TIMERFD
+extern void timerfd_clock_was_set(void);
+#else
+static inline void timerfd_clock_was_set(void) { }
+#endif
 extern void hrtimer_interrupt(struct clock_event_device *dev);
 
 /*
@@ -275,20 +287,14 @@ extern void hrtimer_peek_ahead_timers(void);
 # define MONOTONIC_RES_NSEC	HIGH_RES_NSEC
 # define KTIME_MONOTONIC_RES	KTIME_HIGH_RES
 
+extern void clock_was_set_delayed(void);
+
 #else
 
 # define MONOTONIC_RES_NSEC	LOW_RES_NSEC
 # define KTIME_MONOTONIC_RES	KTIME_LOW_RES
 
-/*
- * clock_was_set() is a NOP for non- high-resolution systems. The
- * time-sorted order guarantees that a timer does not expire early and
- * is expired in the next softirq when the clock was advanced.
- */
-static inline void clock_was_set(void) { }
 static inline void hrtimer_peek_ahead_timers(void) { }
-
-static inline void hres_timers_resume(void) { }
 
 /*
  * In non high resolution mode the time reference is taken from
@@ -303,11 +309,20 @@ static inline int hrtimer_is_hres_active(struct hrtimer *timer)
 {
 	return 0;
 }
+
+static inline void clock_was_set_delayed(void) { }
+
 #endif
+
+extern void clock_was_set(void);
+extern void hrtimers_resume(void);
 
 extern ktime_t ktime_get(void);
 extern ktime_t ktime_get_real(void);
-
+extern ktime_t ktime_get_boottime(void);
+extern ktime_t ktime_get_monotonic_offset(void);
+extern ktime_t ktime_get_update_offsets(unsigned int *cwsseq,
+					ktime_t *offs_real);
 
 DECLARE_PER_CPU(struct tick_device, tick_cpu_device);
 
@@ -446,7 +461,7 @@ extern void timer_stats_update_stats(void *timer, pid_t pid, void *startf,
 
 static inline void timer_stats_account_hrtimer(struct hrtimer *timer)
 {
-	if (likely(!timer->start_site))
+	if (likely(!timer_stats_active))
 		return;
 	timer_stats_update_stats(timer, timer->start_pid, timer->start_site,
 				 timer->function, timer->start_comm, 0);
@@ -457,8 +472,6 @@ extern void __timer_stats_hrtimer_set_start_info(struct hrtimer *timer,
 
 static inline void timer_stats_hrtimer_set_start_info(struct hrtimer *timer)
 {
-	if (likely(!timer_stats_active))
-		return;
 	__timer_stats_hrtimer_set_start_info(timer, __builtin_return_address(0));
 }
 

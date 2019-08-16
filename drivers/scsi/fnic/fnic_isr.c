@@ -37,6 +37,9 @@ static irqreturn_t fnic_isr_legacy(int irq, void *data)
 	if (!pba)
 		return IRQ_NONE;
 
+	fnic->fnic_stats.misc_stats.last_isr_time = jiffies;
+	atomic64_inc(&fnic->fnic_stats.misc_stats.isr_count);
+
 	if (pba & (1 << FNIC_INTX_NOTIFY)) {
 		vnic_intr_return_all_credits(&fnic->intr[FNIC_INTX_NOTIFY]);
 		fnic_handle_link_event(fnic);
@@ -48,9 +51,9 @@ static irqreturn_t fnic_isr_legacy(int irq, void *data)
 	}
 
 	if (pba & (1 << FNIC_INTX_WQ_RQ_COPYWQ)) {
-		work_done += fnic_wq_copy_cmpl_handler(fnic, 8);
-		work_done += fnic_wq_cmpl_handler(fnic, 4);
-		work_done += fnic_rq_cmpl_handler(fnic, 4);
+		work_done += fnic_wq_copy_cmpl_handler(fnic, -1);
+		work_done += fnic_wq_cmpl_handler(fnic, -1);
+		work_done += fnic_rq_cmpl_handler(fnic, -1);
 
 		vnic_intr_return_credits(&fnic->intr[FNIC_INTX_WQ_RQ_COPYWQ],
 					 work_done,
@@ -66,9 +69,12 @@ static irqreturn_t fnic_isr_msi(int irq, void *data)
 	struct fnic *fnic = data;
 	unsigned long work_done = 0;
 
-	work_done += fnic_wq_copy_cmpl_handler(fnic, 8);
-	work_done += fnic_wq_cmpl_handler(fnic, 4);
-	work_done += fnic_rq_cmpl_handler(fnic, 4);
+	fnic->fnic_stats.misc_stats.last_isr_time = jiffies;
+	atomic64_inc(&fnic->fnic_stats.misc_stats.isr_count);
+
+	work_done += fnic_wq_copy_cmpl_handler(fnic, -1);
+	work_done += fnic_wq_cmpl_handler(fnic, -1);
+	work_done += fnic_rq_cmpl_handler(fnic, -1);
 
 	vnic_intr_return_credits(&fnic->intr[0],
 				 work_done,
@@ -83,7 +89,10 @@ static irqreturn_t fnic_isr_msix_rq(int irq, void *data)
 	struct fnic *fnic = data;
 	unsigned long rq_work_done = 0;
 
-	rq_work_done = fnic_rq_cmpl_handler(fnic, 4);
+	fnic->fnic_stats.misc_stats.last_isr_time = jiffies;
+	atomic64_inc(&fnic->fnic_stats.misc_stats.isr_count);
+
+	rq_work_done = fnic_rq_cmpl_handler(fnic, -1);
 	vnic_intr_return_credits(&fnic->intr[FNIC_MSIX_RQ],
 				 rq_work_done,
 				 1 /* unmask intr */,
@@ -97,7 +106,10 @@ static irqreturn_t fnic_isr_msix_wq(int irq, void *data)
 	struct fnic *fnic = data;
 	unsigned long wq_work_done = 0;
 
-	wq_work_done = fnic_wq_cmpl_handler(fnic, 4);
+	fnic->fnic_stats.misc_stats.last_isr_time = jiffies;
+	atomic64_inc(&fnic->fnic_stats.misc_stats.isr_count);
+
+	wq_work_done = fnic_wq_cmpl_handler(fnic, -1);
 	vnic_intr_return_credits(&fnic->intr[FNIC_MSIX_WQ],
 				 wq_work_done,
 				 1 /* unmask intr */,
@@ -110,7 +122,10 @@ static irqreturn_t fnic_isr_msix_wq_copy(int irq, void *data)
 	struct fnic *fnic = data;
 	unsigned long wq_copy_work_done = 0;
 
-	wq_copy_work_done = fnic_wq_copy_cmpl_handler(fnic, 8);
+	fnic->fnic_stats.misc_stats.last_isr_time = jiffies;
+	atomic64_inc(&fnic->fnic_stats.misc_stats.isr_count);
+
+	wq_copy_work_done = fnic_wq_copy_cmpl_handler(fnic, -1);
 	vnic_intr_return_credits(&fnic->intr[FNIC_MSIX_WQ_COPY],
 				 wq_copy_work_done,
 				 1 /* unmask intr */,
@@ -121,6 +136,9 @@ static irqreturn_t fnic_isr_msix_wq_copy(int irq, void *data)
 static irqreturn_t fnic_isr_msix_err_notify(int irq, void *data)
 {
 	struct fnic *fnic = data;
+
+	fnic->fnic_stats.misc_stats.last_isr_time = jiffies;
+	atomic64_inc(&fnic->fnic_stats.misc_stats.isr_count);
 
 	vnic_intr_return_all_credits(&fnic->intr[FNIC_MSIX_ERR_NOTIFY]);
 	fnic_log_q_error(fnic);

@@ -135,6 +135,7 @@
 
 /* constants to configure the command buffer */
 #define CMD_BUFFER_SIZE    8192
+#define CMD_BUFFER_UNINITIALIZED 1
 #define CMD_BUFFER_ENTRIES 512
 #define MMIO_CMD_SIZE_SHIFT 56
 #define MMIO_CMD_SIZE_512 (0x9ULL << MMIO_CMD_SIZE_SHIFT)
@@ -166,6 +167,34 @@
 #define PM_MAP_MASK(lvl)	(PM_ADDR_MASK & \
 				(~((1ULL << (12 + ((lvl) * 9))) - 1)))
 #define PM_ALIGNED(lvl, addr)	((PM_MAP_MASK(lvl) & (addr)) == (addr))
+
+/*
+ * Returns the page table level to use for a given page size
+ * Pagesize is expected to be a power-of-two
+ */
+#define PAGE_SIZE_LEVEL(pagesize) \
+		((__ffs(pagesize) - 12) / 9)
+/*
+ * Returns the number of ptes to use for a given page size
+ * Pagesize is expected to be a power-of-two
+ */
+#define PAGE_SIZE_PTE_COUNT(pagesize) \
+		(1ULL << ((__ffs(pagesize) - 12) % 9))
+
+/*
+ * Aligns a given io-virtual address to a given page size
+ * Pagesize is expected to be a power-of-two
+ */
+#define PAGE_SIZE_ALIGN(address, pagesize) \
+		((address) & ~((pagesize) - 1))
+/*
+ * Creates an IOMMU PTE for an address an a given pagesize
+ * The PTE has no permission bits set
+ * Pagesize is expected to be a power-of-two larger than 4096
+ */
+#define PAGE_SIZE_PTE(address, pagesize)		\
+		(((address) | ((pagesize) - 1)) &	\
+		 (~(pagesize >> 1)) & PM_ADDR_MASK)
 
 #define IOMMU_PTE_P  (1ULL << 0)
 #define IOMMU_PTE_TV (1ULL << 1)
@@ -297,6 +326,9 @@ struct amd_iommu {
 	/* Pointer to PCI device of this IOMMU */
 	struct pci_dev *dev;
 
+	/* Cache pdev to root device for resume quirks */
+	struct pci_dev *root_pdev;
+
 	/* physical address of MMIO space */
 	u64 mmio_phys;
 	/* virtual address of MMIO space */
@@ -304,6 +336,9 @@ struct amd_iommu {
 
 	/* capabilities of that IOMMU read from ACPI */
 	u32 cap;
+
+	/* flags read from acpi table */
+	u8 acpi_flags;
 
 	/*
 	 * Capability pointer. There could be more than one IOMMU per PCI
@@ -348,6 +383,24 @@ struct amd_iommu {
 
 	/* default dma_ops domain for that IOMMU */
 	struct dma_ops_domain *default_dom;
+
+	/*
+	 * We can't rely on the BIOS to restore all values on reinit, so we
+	 * need to stash them
+	 */
+
+	/* The iommu BAR */
+	u32 stored_addr_lo;
+	u32 stored_addr_hi;
+
+	/*
+	 * Each iommu has 6 l1s, each of which is documented as having 0x12
+	 * registers
+	 */
+	u32 stored_l1[6][0x12];
+
+	/* The l2 indirect registers */
+	u32 stored_l2[0x83];
 };
 
 /*
@@ -465,6 +518,12 @@ struct __iommu_counter {
 static inline void amd_iommu_stats_init(void) { }
 
 #endif /* CONFIG_AMD_IOMMU_STATS */
+
+static inline bool is_rd890_iommu(struct pci_dev *pdev)
+{
+	return (pdev->vendor == PCI_VENDOR_ID_ATI) &&
+		(pdev->device == PCI_DEVICE_ID_RD890_IOMMU);
+}
 
 /* some function prototypes */
 extern void amd_iommu_reset_cmd_buffer(struct amd_iommu *iommu);

@@ -76,6 +76,7 @@ struct fcp_cmnd32 {
 #define	FCP_PTA_HEADQ	    1	/* head of queue task attribute */
 #define	FCP_PTA_ORDERED     2	/* ordered task attribute */
 #define	FCP_PTA_ACA	    4	/* auto. contigent allegiance */
+#define	FCP_PTA_MASK	    7	/* mask for task attribute field */
 #define	FCP_PRI_SHIFT	    3	/* priority field starts in bit 3 */
 #define	FCP_PRI_RESVD_MASK  0x80	/* reserved bits in priority field */
 
@@ -83,6 +84,8 @@ struct fcp_cmnd32 {
  * fc_tm_flags - task management flags field.
  */
 #define	FCP_TMF_CLR_ACA		0x40	/* clear ACA condition */
+#define	FCP_TMF_TGT_RESET	0x20	/* target reset task management,
+					   deprecated as of FCP-3 */
 #define	FCP_TMF_LUN_RESET	0x10	/* logical unit reset task management */
 #define	FCP_TMF_CLR_TASK_SET	0x04	/* clear task set */
 #define	FCP_TMF_ABT_TASK_SET	0x02	/* abort task set */
@@ -122,6 +125,9 @@ struct fcp_txrdy {
  *
  * All response frames will always contain the fcp_resp template.  Some
  * will also include the fcp_resp_len template.
+ *
+ * From Table 23, the FCP_RSP_INFO can either be 4 bytes or 8 bytes, both
+ * are valid length.
  */
 struct fcp_resp {
 	__u8		_fr_resvd[8];	/* reserved */
@@ -150,6 +156,9 @@ struct fcp_resp_rsp_info {
     __u8      rsp_code;           /* Response Info Code */
     __u8      _fr_resvd2[4];      /* reserved */
 };
+
+#define FCP_RESP_RSP_INFO_LEN4    4 /* without reserved field */
+#define FCP_RESP_RSP_INFO_LEN8    8 /* with reserved field */
 
 struct fcp_resp_with_ext {
 	struct fcp_resp resp;
@@ -195,5 +204,11 @@ struct fcp_srr {
 	__u8		srr_r_ctl;	/* r_ctl for the information unit */
 	__u8		srr_resvd2[3];	/* reserved */
 };
+
+/*
+ * Feature bits in name server FC-4 Features object.
+ */
+#define	FCP_FEAT_TARG	(1 << 0)	/* target function supported */
+#define	FCP_FEAT_INIT	(1 << 1)	/* initiator function supported */
 
 #endif /* _FC_FCP_H_ */

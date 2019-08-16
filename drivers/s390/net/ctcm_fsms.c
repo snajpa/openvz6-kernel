@@ -44,7 +44,6 @@
 #include <asm/idals.h>
 
 #include "fsm.h"
-#include "cu3088.h"
 
 #include "ctcm_dbug.h"
 #include "ctcm_main.h"
@@ -1340,6 +1339,7 @@ static void ctcmpc_chx_txdone(fsm_instance *fi, int event, void *arg)
 
 	spin_unlock(&ch->collect_lock);
 	clear_normalized_cda(&ch->ccw[1]);
+	ch->ccw[1].count = ch->max_bufsize;
 	if (set_normalized_cda(&ch->ccw[1], ch->trans_skb->data)) {
 		dev_kfree_skb_any(ch->trans_skb);
 		ch->trans_skb = NULL;

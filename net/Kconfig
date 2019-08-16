@@ -202,6 +202,29 @@ source "net/phonet/Kconfig"
 source "net/ieee802154/Kconfig"
 source "net/sched/Kconfig"
 source "net/dcb/Kconfig"
+source "net/openvswitch/Kconfig"
+
+config RPS
+	boolean
+	depends on SMP && SYSFS && USE_GENERIC_SMP_HELPERS
+	default y
+
+config NETPRIO_CGROUP
+	tristate "Network priority cgroup"
+	depends on CGROUPS
+	---help---
+	  Cgroup subsystem for use in assigning processes to network priorities on
+	  a per-interface basis
+
+config NET_RX_BUSY_POLL
+	boolean
+	default y
+
+config RFS_ACCEL
+	boolean
+	depends on RPS && GENERIC_HARDIRQS
+	select CPU_RMAP
+	default y
 
 menu "Network testing"
 

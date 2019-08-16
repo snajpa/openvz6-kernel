@@ -2,6 +2,8 @@
 #define _TRACE_KVM_H
 
 #include <linux/tracepoint.h>
+#include <asm/vmx.h>
+#include <asm/svm.h>
 
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM kvm
@@ -148,26 +150,32 @@ TRACE_EVENT(kvm_apic,
 #define trace_kvm_apic_read(reg, val)		trace_kvm_apic(0, reg, val)
 #define trace_kvm_apic_write(reg, val)		trace_kvm_apic(1, reg, val)
 
+#define KVM_ISA_VMX   1
+#define KVM_ISA_SVM   2
+
 /*
  * Tracepoint for kvm guest exit:
  */
 TRACE_EVENT(kvm_exit,
-	TP_PROTO(unsigned int exit_reason, unsigned long guest_rip),
-	TP_ARGS(exit_reason, guest_rip),
+	TP_PROTO(unsigned int exit_reason, unsigned long guest_rip, u32 isa),
+	TP_ARGS(exit_reason, guest_rip, isa),
 
 	TP_STRUCT__entry(
 		__field(	unsigned int,	exit_reason	)
 		__field(	unsigned long,	guest_rip	)
+		__field(	u32,	        isa             )
 	),
 
 	TP_fast_assign(
 		__entry->exit_reason	= exit_reason;
 		__entry->guest_rip	= guest_rip;
+		__entry->isa            = isa;
 	),
 
 	TP_printk("reason %s rip 0x%lx",
-		 ftrace_print_symbols_seq(p, __entry->exit_reason,
-					  kvm_x86_ops->exit_reasons_str),
+		 (__entry->isa == KVM_ISA_VMX) ?
+		 __print_symbolic(__entry->exit_reason, VMX_EXIT_REASONS) :
+		 __print_symbolic(__entry->exit_reason, SVM_EXIT_REASONS),
 		 __entry->guest_rip)
 );
 
@@ -187,6 +195,38 @@ TRACE_EVENT(kvm_inj_virq,
 	),
 
 	TP_printk("irq %u", __entry->irq)
+);
+
+#define EXS(x) { x##_VECTOR, "#" #x }
+
+#define kvm_trace_sym_exc						\
+	EXS(DE), EXS(DB), EXS(BP), EXS(OF), EXS(BR), EXS(UD), EXS(NM),	\
+	EXS(DF), EXS(TS), EXS(NP), EXS(SS), EXS(GP), EXS(PF),		\
+	EXS(MF), EXS(MC)
+
+/*
+ * Tracepoint for kvm interrupt injection:
+ */
+TRACE_EVENT(kvm_inj_exception,
+	TP_PROTO(unsigned exception, bool has_error, unsigned error_code),
+	TP_ARGS(exception, has_error, error_code),
+
+	TP_STRUCT__entry(
+		__field(	u8,	exception	)
+		__field(	u8,	has_error	)
+		__field(	u32,	error_code	)
+	),
+
+	TP_fast_assign(
+		__entry->exception	= exception;
+		__entry->has_error	= has_error;
+		__entry->error_code	= error_code;
+	),
+
+	TP_printk("%s (0x%x)",
+		  __print_symbolic(__entry->exception, kvm_trace_sym_exc),
+		  /* FIXME: don't print error_code if not present */
+		  __entry->has_error ? __entry->error_code : 0)
 );
 
 /*
@@ -348,6 +388,91 @@ TRACE_EVENT(kvm_apic_accept_irq,
 		  __entry->tm ? "level" : "edge",
 		  __entry->coalesced ? " (coalesced)" : "")
 );
+
+TRACE_EVENT(kvm_eoi,
+	    TP_PROTO(struct kvm_lapic *apic, int vector),
+	    TP_ARGS(apic, vector),
+
+	TP_STRUCT__entry(
+		__field(	__u32,		apicid		)
+		__field(	int,		vector		)
+	),
+
+	TP_fast_assign(
+		__entry->apicid		= apic->vcpu->vcpu_id;
+		__entry->vector		= vector;
+	),
+
+	TP_printk("apicid %x vector %d", __entry->apicid, __entry->vector)
+);
+
+TRACE_EVENT(kvm_pv_eoi,
+	    TP_PROTO(struct kvm_lapic *apic, int vector),
+	    TP_ARGS(apic, vector),
+
+	TP_STRUCT__entry(
+		__field(	__u32,		apicid		)
+		__field(	int,		vector		)
+	),
+
+	TP_fast_assign(
+		__entry->apicid		= apic->vcpu->vcpu_id;
+		__entry->vector		= vector;
+	),
+
+	TP_printk("apicid %x vector %d", __entry->apicid, __entry->vector)
+);
+
+TRACE_EVENT(kvm_write_tsc_offset,
+	TP_PROTO(unsigned int vcpu_id, __u64 previous_tsc_offset,
+		 __u64 next_tsc_offset),
+	TP_ARGS(vcpu_id, previous_tsc_offset, next_tsc_offset),
+
+	TP_STRUCT__entry(
+		__field( unsigned int,	vcpu_id				)
+		__field(	__u64,	previous_tsc_offset		)
+		__field(	__u64,	next_tsc_offset			)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id		= vcpu_id;
+		__entry->previous_tsc_offset	= previous_tsc_offset;
+		__entry->next_tsc_offset	= next_tsc_offset;
+	),
+
+	TP_printk("vcpu=%u prev=%llu next=%llu", __entry->vcpu_id,
+		  __entry->previous_tsc_offset, __entry->next_tsc_offset)
+);
+
+TRACE_EVENT(kvm_ple_window,
+	TP_PROTO(bool grow, unsigned int vcpu_id, int new, int old),
+	TP_ARGS(grow, vcpu_id, new, old),
+
+	TP_STRUCT__entry(
+		__field(                bool,      grow         )
+		__field(        unsigned int,   vcpu_id         )
+		__field(                 int,       new         )
+		__field(                 int,       old         )
+	),
+
+	TP_fast_assign(
+		__entry->grow           = grow;
+		__entry->vcpu_id        = vcpu_id;
+		__entry->new            = new;
+		__entry->old            = old;
+	),
+
+	TP_printk("vcpu %u: ple_window %d (%s %d)",
+	          __entry->vcpu_id,
+	          __entry->new,
+	          __entry->grow ? "grow" : "shrink",
+	          __entry->old)
+);
+
+#define trace_kvm_ple_window_grow(vcpu_id, new, old) \
+	trace_kvm_ple_window(true, vcpu_id, new, old)
+#define trace_kvm_ple_window_shrink(vcpu_id, new, old) \
+	trace_kvm_ple_window(false, vcpu_id, new, old)
 
 #endif /* _TRACE_KVM_H */
 

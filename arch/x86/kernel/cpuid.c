@@ -40,16 +40,13 @@
 #include <linux/cpu.h>
 #include <linux/notifier.h>
 #include <linux/uaccess.h>
+#include <linux/slab.h>
 
 #include <asm/processor.h>
 #include <asm/msr.h>
 #include <asm/system.h>
 
 static struct class *cpuid_class;
-
-struct cpuid_regs {
-	u32 eax, ebx, ecx, edx;
-};
 
 static void cpuid_smp_cpuid(void *cmd_block)
 {
@@ -143,13 +140,57 @@ static const struct file_operations cpuid_fops = {
 	.open = cpuid_open,
 };
 
+static ssize_t print_cpu_modalias(struct device *dev,
+				  struct device_attribute *attr,
+				  char *bufptr)
+{
+	int size = PAGE_SIZE;
+	int i, n;
+	char *buf = bufptr;
+
+	n = snprintf(buf, size, "x86cpu:vendor:%04X:family:"
+		     "%04X:model:%04X:feature:",
+		boot_cpu_data.x86_vendor,
+		boot_cpu_data.x86,
+		boot_cpu_data.x86_model);
+	size -= n;
+	buf += n;
+	size -= 2;
+	for (i = 0; i < NCAPINTS*32; i++) {
+		if (boot_cpu_has(i)) {
+			n = snprintf(buf, size, ",%04X", i);
+			if (n < 0) {
+				WARN(1, "x86 features overflow page\n");
+				break;
+			}
+			size -= n;
+			buf += n;
+		}
+	}
+	*buf++ = ',';
+	*buf++ = '\n';
+	return buf - bufptr;
+}
+
+static DEVICE_ATTR(modalias, 0444, print_cpu_modalias, NULL);
+
 static __cpuinit int cpuid_device_create(int cpu)
 {
 	struct device *dev;
+	int err;
 
 	dev = device_create(cpuid_class, NULL, MKDEV(CPUID_MAJOR, cpu), NULL,
 			    "cpu%d", cpu);
-	return IS_ERR(dev) ? PTR_ERR(dev) : 0;
+	if (IS_ERR(dev))
+		return PTR_ERR(dev);
+
+	err = device_create_file(dev, &dev_attr_modalias);
+	if (err) {
+		/* keep device around on error. attribute is optional. */
+		err = 0;
+	}
+
+	return 0;
 }
 
 static void cpuid_device_destroy(int cpu)
@@ -174,7 +215,7 @@ static int __cpuinit cpuid_class_cpu_callback(struct notifier_block *nfb,
 		cpuid_device_destroy(cpu);
 		break;
 	}
-	return err ? NOTIFY_BAD : NOTIFY_OK;
+	return notifier_from_errno(err);
 }
 
 static struct notifier_block __refdata cpuid_class_cpu_notifier =
@@ -187,12 +228,24 @@ static char *cpuid_devnode(struct device *dev, mode_t *mode)
 	return kasprintf(GFP_KERNEL, "cpu/%u/cpuid", MINOR(dev->devt));
 }
 
+static int cpuid_dev_uevent(struct device *dev, struct kobj_uevent_env *env)
+{
+	char *buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	if (buf) {
+		print_cpu_modalias(NULL, NULL, buf);
+		add_uevent_var(env, "MODALIAS=%s", buf);
+		kfree(buf);
+	}
+	return 0;
+}
+
 static int __init cpuid_init(void)
 {
 	int i, err = 0;
 	i = 0;
 
-	if (register_chrdev(CPUID_MAJOR, "cpu/cpuid", &cpuid_fops)) {
+	if (__register_chrdev(CPUID_MAJOR, 0, NR_CPUS,
+			      "cpu/cpuid", &cpuid_fops)) {
 		printk(KERN_ERR "cpuid: unable to get major %d for cpuid\n",
 		       CPUID_MAJOR);
 		err = -EBUSY;
@@ -204,6 +257,7 @@ static int __init cpuid_init(void)
 		goto out_chrdev;
 	}
 	cpuid_class->devnode = cpuid_devnode;
+	cpuid_class->dev_uevent = cpuid_dev_uevent;
 	for_each_online_cpu(i) {
 		err = cpuid_device_create(i);
 		if (err != 0)
@@ -221,7 +275,7 @@ out_class:
 	}
 	class_destroy(cpuid_class);
 out_chrdev:
-	unregister_chrdev(CPUID_MAJOR, "cpu/cpuid");
+	__unregister_chrdev(CPUID_MAJOR, 0, NR_CPUS, "cpu/cpuid");
 out:
 	return err;
 }
@@ -233,7 +287,7 @@ static void __exit cpuid_exit(void)
 	for_each_online_cpu(cpu)
 		cpuid_device_destroy(cpu);
 	class_destroy(cpuid_class);
-	unregister_chrdev(CPUID_MAJOR, "cpu/cpuid");
+	__unregister_chrdev(CPUID_MAJOR, 0, NR_CPUS, "cpu/cpuid");
 	unregister_hotcpu_notifier(&cpuid_class_cpu_notifier);
 }
 

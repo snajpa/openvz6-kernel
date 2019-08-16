@@ -1,5 +1,5 @@
 /*
- * Copyright 2008 Cisco Systems, Inc.  All rights reserved.
+ * Copyright 2008-2010 Cisco Systems, Inc.  All rights reserved.
  * Copyright 2007 Nuova Systems, Inc.  All rights reserved.
  *
  * This program is free software; you may redistribute it and/or modify
@@ -22,37 +22,34 @@
 #include <linux/types.h>
 #include <linux/pci.h>
 #include <linux/delay.h>
+#include <linux/slab.h>
 
 #include "vnic_dev.h"
 #include "vnic_rq.h"
+#include "enic.h"
 
 static int vnic_rq_alloc_bufs(struct vnic_rq *rq)
 {
 	struct vnic_rq_buf *buf;
-	struct vnic_dev *vdev;
 	unsigned int i, j, count = rq->ring.desc_count;
 	unsigned int blks = VNIC_RQ_BUF_BLKS_NEEDED(count);
 
-	vdev = rq->vdev;
-
 	for (i = 0; i < blks; i++) {
-		rq->bufs[i] = kzalloc(VNIC_RQ_BUF_BLK_SZ, GFP_ATOMIC);
-		if (!rq->bufs[i]) {
-			printk(KERN_ERR "Failed to alloc rq_bufs\n");
+		rq->bufs[i] = kzalloc(VNIC_RQ_BUF_BLK_SZ(count), GFP_ATOMIC);
+		if (!rq->bufs[i])
 			return -ENOMEM;
-		}
 	}
 
 	for (i = 0; i < blks; i++) {
 		buf = rq->bufs[i];
-		for (j = 0; j < VNIC_RQ_BUF_BLK_ENTRIES; j++) {
-			buf->index = i * VNIC_RQ_BUF_BLK_ENTRIES + j;
+		for (j = 0; j < VNIC_RQ_BUF_BLK_ENTRIES(count); j++) {
+			buf->index = i * VNIC_RQ_BUF_BLK_ENTRIES(count) + j;
 			buf->desc = (u8 *)rq->ring.descs +
 				rq->ring.desc_size * buf->index;
 			if (buf->index + 1 == count) {
 				buf->next = rq->bufs[0];
 				break;
-			} else if (j + 1 == VNIC_RQ_BUF_BLK_ENTRIES) {
+			} else if (j + 1 == VNIC_RQ_BUF_BLK_ENTRIES(count)) {
 				buf->next = rq->bufs[i + 1];
 			} else {
 				buf->next = buf + 1;
@@ -76,8 +73,10 @@ void vnic_rq_free(struct vnic_rq *rq)
 	vnic_dev_free_desc_ring(vdev, &rq->ring);
 
 	for (i = 0; i < VNIC_RQ_BUF_BLKS_MAX; i++) {
-		kfree(rq->bufs[i]);
-		rq->bufs[i] = NULL;
+		if (rq->bufs[i]) {
+			kfree(rq->bufs[i]);
+			rq->bufs[i] = NULL;
+		}
 	}
 
 	rq->ctrl = NULL;
@@ -93,7 +92,7 @@ int vnic_rq_alloc(struct vnic_dev *vdev, struct vnic_rq *rq, unsigned int index,
 
 	rq->ctrl = vnic_dev_get_res(vdev, RES_TYPE_RQ, index);
 	if (!rq->ctrl) {
-		printk(KERN_ERR "Failed to hook RQ[%d] resource\n", index);
+		vdev_err("Failed to hook RQ[%d] resource\n", index);
 		return -EINVAL;
 	}
 
@@ -112,16 +111,17 @@ int vnic_rq_alloc(struct vnic_dev *vdev, struct vnic_rq *rq, unsigned int index,
 	return 0;
 }
 
-void vnic_rq_init_start(struct vnic_rq *rq, unsigned int cq_index,
+static void vnic_rq_init_start(struct vnic_rq *rq, unsigned int cq_index,
 	unsigned int fetch_index, unsigned int posted_index,
 	unsigned int error_interrupt_enable,
 	unsigned int error_interrupt_offset)
 {
 	u64 paddr;
+	unsigned int count = rq->ring.desc_count;
 
 	paddr = (u64)rq->ring.base_addr | VNIC_PADDR_TARGET;
 	writeq(paddr, &rq->ctrl->ring_base);
-	iowrite32(rq->ring.desc_count, &rq->ctrl->ring_size);
+	iowrite32(count, &rq->ctrl->ring_size);
 	iowrite32(cq_index, &rq->ctrl->cq_index);
 	iowrite32(error_interrupt_enable, &rq->ctrl->error_interrupt_enable);
 	iowrite32(error_interrupt_offset, &rq->ctrl->error_interrupt_offset);
@@ -131,18 +131,23 @@ void vnic_rq_init_start(struct vnic_rq *rq, unsigned int cq_index,
 	iowrite32(posted_index, &rq->ctrl->posted_index);
 
 	rq->to_use = rq->to_clean =
-		&rq->bufs[fetch_index / VNIC_RQ_BUF_BLK_ENTRIES]
-			[fetch_index % VNIC_RQ_BUF_BLK_ENTRIES];
+		&rq->bufs[fetch_index / VNIC_RQ_BUF_BLK_ENTRIES(count)]
+			[fetch_index % VNIC_RQ_BUF_BLK_ENTRIES(count)];
 }
 
 void vnic_rq_init(struct vnic_rq *rq, unsigned int cq_index,
 	unsigned int error_interrupt_enable,
 	unsigned int error_interrupt_offset)
 {
-	u32 fetch_index;
+	u32 fetch_index = 0;
 
 	/* Use current fetch_index as the ring starting point */
 	fetch_index = ioread32(&rq->ctrl->fetch_index);
+
+	if (fetch_index == 0xFFFFFFFF) { /* check for hardware gone  */
+		/* Hardware surprise removal: reset fetch_index */
+		fetch_index = 0;
+	}
 
 	vnic_rq_init_start(rq, cq_index,
 		fetch_index, fetch_index,
@@ -163,17 +168,18 @@ void vnic_rq_enable(struct vnic_rq *rq)
 int vnic_rq_disable(struct vnic_rq *rq)
 {
 	unsigned int wait;
+	struct vnic_dev *vdev = rq->vdev;
 
 	iowrite32(0, &rq->ctrl->enable);
 
 	/* Wait for HW to ACK disable request */
-	for (wait = 0; wait < 100; wait++) {
+	for (wait = 0; wait < 1000; wait++) {
 		if (!(ioread32(&rq->ctrl->running)))
 			return 0;
-		udelay(1);
+		udelay(10);
 	}
 
-	printk(KERN_ERR "Failed to disable RQ[%d]\n", rq->index);
+	vdev_neterr("Failed to disable RQ[%d]\n", rq->index);
 
 	return -ETIMEDOUT;
 }
@@ -183,24 +189,27 @@ void vnic_rq_clean(struct vnic_rq *rq,
 {
 	struct vnic_rq_buf *buf;
 	u32 fetch_index;
-
-	BUG_ON(ioread32(&rq->ctrl->enable));
+	unsigned int count = rq->ring.desc_count;
+	int i;
 
 	buf = rq->to_clean;
 
-	while (vnic_rq_desc_used(rq) > 0) {
-
+	for (i = 0; i < rq->ring.desc_count; i++) {
 		(*buf_clean)(rq, buf);
-
-		buf = rq->to_clean = buf->next;
-		rq->ring.desc_avail++;
+		buf = buf->next;
 	}
+	rq->ring.desc_avail = rq->ring.desc_count - 1;
 
 	/* Use current fetch_index as the ring starting point */
 	fetch_index = ioread32(&rq->ctrl->fetch_index);
+
+	if (fetch_index == 0xFFFFFFFF) { /* check for hardware gone  */
+		/* Hardware surprise removal: reset fetch_index */
+		fetch_index = 0;
+	}
 	rq->to_use = rq->to_clean =
-		&rq->bufs[fetch_index / VNIC_RQ_BUF_BLK_ENTRIES]
-			[fetch_index % VNIC_RQ_BUF_BLK_ENTRIES];
+		&rq->bufs[fetch_index / VNIC_RQ_BUF_BLK_ENTRIES(count)]
+			[fetch_index % VNIC_RQ_BUF_BLK_ENTRIES(count)];
 	iowrite32(fetch_index, &rq->ctrl->posted_index);
 
 	vnic_dev_clear_desc_ring(&rq->ring);

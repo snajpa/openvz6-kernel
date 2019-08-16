@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2004-2009 Emulex.  All rights reserved.           *
+ * Copyright (C) 2004-2015 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
  * www.emulex.com                                                  *
  *                                                                 *
@@ -25,12 +25,14 @@
 #include <linux/blkdev.h>
 #include <linux/pci.h>
 #include <linux/interrupt.h>
+#include <linux/slab.h>
 #include <linux/utsname.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_device.h>
 #include <scsi/scsi_host.h>
 #include <scsi/scsi_transport_fc.h>
+#include <scsi/fc/fc_fs.h>
 
 #include "lpfc_hw4.h"
 #include "lpfc_hw.h"
@@ -46,14 +48,15 @@
 #include "lpfc_vport.h"
 #include "lpfc_debugfs.h"
 
-#define HBA_PORTSPEED_UNKNOWN               0	/* Unknown - transceiver
-						 * incapable of reporting */
-#define HBA_PORTSPEED_1GBIT                 1	/* 1 GBit/sec */
-#define HBA_PORTSPEED_2GBIT                 2	/* 2 GBit/sec */
-#define HBA_PORTSPEED_4GBIT                 8   /* 4 GBit/sec */
-#define HBA_PORTSPEED_8GBIT                16   /* 8 GBit/sec */
-#define HBA_PORTSPEED_10GBIT                4	/* 10 GBit/sec */
-#define HBA_PORTSPEED_NOT_NEGOTIATED        5	/* Speed not established */
+/* FDMI Port Speed definitions */
+#define HBA_PORTSPEED_1GBIT		0x0001	/* 1 GBit/sec */
+#define HBA_PORTSPEED_2GBIT		0x0002	/* 2 GBit/sec */
+#define HBA_PORTSPEED_4GBIT		0x0008	/* 4 GBit/sec */
+#define HBA_PORTSPEED_10GBIT		0x0004	/* 10 GBit/sec */
+#define HBA_PORTSPEED_8GBIT		0x0010	/* 8 GBit/sec */
+#define HBA_PORTSPEED_16GBIT		0x0020	/* 16 GBit/sec */
+#define HBA_PORTSPEED_32GBIT		0x0040  /* 32 GBit/sec */
+#define HBA_PORTSPEED_UNKNOWN		0x0800	/* Unknown */
 
 #define FOURBYTES	4
 
@@ -87,7 +90,6 @@ void
 lpfc_ct_unsol_event(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		    struct lpfc_iocbq *piocbq)
 {
-
 	struct lpfc_dmabuf *mp = NULL;
 	IOCB_t *icmd = &piocbq->iocb;
 	int i;
@@ -97,12 +99,14 @@ lpfc_ct_unsol_event(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 	struct list_head head;
 	struct lpfc_dmabuf *bdeBuf;
 
-	lpfc_bsg_ct_unsol_event(phba, pring, piocbq);
+	if (lpfc_bsg_ct_unsol_event(phba, pring, piocbq) == 0)
+		return;
 
 	if (unlikely(icmd->ulpStatus == IOSTAT_NEED_BUFFER)) {
 		lpfc_sli_hbqbuf_add_hbqs(phba, LPFC_ELS_HBQ);
 	} else if ((icmd->ulpStatus == IOSTAT_LOCAL_REJECT) &&
-		((icmd->un.ulpWord[4] & 0xff) == IOERR_RCV_BUFFER_WAITING)) {
+		   ((icmd->un.ulpWord[4] & IOERR_PARAM_MASK) ==
+		   IOERR_RCV_BUFFER_WAITING)) {
 		/* Not enough posted buffers; Try posting more buffers */
 		phba->fc_stat.NoRcvBuf++;
 		if (!(phba->sli3_options & LPFC_SLI3_HBQ_ENABLED))
@@ -158,6 +162,27 @@ lpfc_ct_unsol_event(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		}
 		list_del(&head);
 	}
+}
+
+/**
+ * lpfc_ct_handle_unsol_abort - ct upper level protocol abort handler
+ * @phba: Pointer to HBA context object.
+ * @dmabuf: pointer to a dmabuf that describes the FC sequence
+ *
+ * This function serves as the upper level protocol abort handler for CT
+ * protocol.
+ *
+ * Return 1 if abort has been handled, 0 otherwise.
+ **/
+int
+lpfc_ct_handle_unsol_abort(struct lpfc_hba *phba, struct hbq_dmabuf *dmabuf)
+{
+	int handled;
+
+	/* CT upper level goes through BSG */
+	handled = lpfc_bsg_ct_unsol_abort(phba, dmabuf);
+
+	return handled;
 }
 
 static void
@@ -256,7 +281,7 @@ lpfc_ct_free_iocb(struct lpfc_hba *phba, struct lpfc_iocbq *ctiocb)
 		buf_ptr = (struct lpfc_dmabuf *) ctiocb->context3;
 		lpfc_mbuf_free(phba, buf_ptr->virt, buf_ptr->phys);
 		kfree(buf_ptr);
-		ctiocb->context1 = NULL;
+		ctiocb->context3 = NULL;
 	}
 	lpfc_sli_release_iocbq(phba, ctiocb);
 	return 0;
@@ -304,8 +329,8 @@ lpfc_gen_req(struct lpfc_vport *vport, struct lpfc_dmabuf *bmp,
 	/* Fill in rest of iocb */
 	icmd->un.genreq64.w5.hcsw.Fctl = (SI | LA);
 	icmd->un.genreq64.w5.hcsw.Dfctl = 0;
-	icmd->un.genreq64.w5.hcsw.Rctl = FC_UNSOL_CTL;
-	icmd->un.genreq64.w5.hcsw.Type = FC_COMMON_TRANSPORT_ULP;
+	icmd->un.genreq64.w5.hcsw.Rctl = FC_RCTL_DD_UNSOL_CTL;
+	icmd->un.genreq64.w5.hcsw.Type = FC_TYPE_CT;
 
 	if (!tmo) {
 		 /* FC spec states we need 3 * ratov for CT requests */
@@ -316,6 +341,8 @@ lpfc_gen_req(struct lpfc_vport *vport, struct lpfc_dmabuf *bmp,
 	icmd->ulpLe = 1;
 	icmd->ulpClass = CLASS3;
 	icmd->ulpContext = ndlp->nlp_rpi;
+	if (phba->sli_rev == LPFC_SLI_REV4)
+		icmd->ulpContext = phba->sli4_hba.rpi_ids[ndlp->nlp_rpi];
 
 	if (phba->sli3_options & LPFC_SLI3_NPIV_ENABLED) {
 		/* For GEN_REQUEST64_CR, use the RPI */
@@ -363,9 +390,14 @@ lpfc_ct_cmd(struct lpfc_vport *vport, struct lpfc_dmabuf *inmp,
 	outmp = lpfc_alloc_ct_rsp(phba, cmdcode, bpl, rsp_size, &cnt);
 	if (!outmp)
 		return -ENOMEM;
-
+	/*
+	 * Form the CT IOCB.  The total number of BDEs in this IOCB
+	 * is the single command plus response count from
+	 * lpfc_alloc_ct_rsp.
+	 */
+	cnt += 1;
 	status = lpfc_gen_req(vport, bmp, inmp, outmp, cmpl, ndlp, 0,
-			      cnt+1, 0, retry);
+			      cnt, 0, retry);
 	if (status) {
 		lpfc_free_ct_rsp(phba, outmp);
 		return -ENOMEM;
@@ -501,6 +533,9 @@ lpfc_ns_rsp(struct lpfc_vport *vport, struct lpfc_dmabuf *mp, uint32_t Size)
 							SLI_CTNS_GFF_ID,
 							0, Did) == 0)
 							vport->num_disc_nodes++;
+						else
+							lpfc_setup_disc_node
+								(vport, Did);
 					}
 					else {
 						lpfc_debugfs_disc_trc(vport,
@@ -587,7 +622,8 @@ lpfc_cmpl_ct_cmd_gid_ft(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		/* Check for retry */
 		if (vport->fc_ns_retry < LPFC_MAX_NS_RETRY) {
 			if (irsp->ulpStatus != IOSTAT_LOCAL_REJECT ||
-			    irsp->un.ulpWord[4] != IOERR_NO_RESOURCES)
+			    (irsp->un.ulpWord[4] & IOERR_PARAM_MASK) !=
+			    IOERR_NO_RESOURCES)
 				vport->fc_ns_retry++;
 
 			/* CT command is being retried */
@@ -737,7 +773,9 @@ lpfc_cmpl_ct_cmd_gff_id(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		if (cmdiocb->retry < LPFC_MAX_NS_RETRY) {
 			retry = 1;
 			if (irsp->ulpStatus == IOSTAT_LOCAL_REJECT) {
-				switch (irsp->un.ulpWord[4]) {
+				switch ((irsp->un.ulpWord[4] &
+					IOERR_PARAM_MASK)) {
+
 				case IOERR_NO_RESOURCES:
 					/* We don't increment the retry
 					 * count for this case.
@@ -858,12 +896,14 @@ lpfc_cmpl_ct(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 
 	if (irsp->ulpStatus) {
 		lpfc_printf_vlog(vport, KERN_ERR, LOG_DISCOVERY,
-				 "0268 NS cmd %x Error (%d %d)\n",
+				 "0268 NS cmd x%x Error (x%x x%x)\n",
 				 cmdcode, irsp->ulpStatus, irsp->un.ulpWord[4]);
 
 		if ((irsp->ulpStatus == IOSTAT_LOCAL_REJECT) &&
-			((irsp->un.ulpWord[4] == IOERR_SLI_DOWN) ||
-			 (irsp->un.ulpWord[4] == IOERR_SLI_ABORTED)))
+			(((irsp->un.ulpWord[4] & IOERR_PARAM_MASK) ==
+			  IOERR_SLI_DOWN) ||
+			 ((irsp->un.ulpWord[4] & IOERR_PARAM_MASK) ==
+			  IOERR_SLI_ABORTED)))
 			goto out;
 
 		retry = cmdiocb->retry;
@@ -1030,13 +1070,30 @@ int
 lpfc_vport_symbolic_node_name(struct lpfc_vport *vport, char *symbol,
 	size_t size)
 {
-	char fwrev[16];
-	int n;
+	char fwrev[FW_REV_STR_SIZE];
+	int n = 0;
 
 	lpfc_decode_firmware_rev(vport->phba, fwrev, 0);
 
-	n = snprintf(symbol, size, "Emulex %s FV%s DV%s",
-		vport->phba->ModelName, fwrev, lpfc_release_version);
+	n = snprintf(symbol, size, "Emulex %s", vport->phba->ModelName);
+
+	if (size < n)
+		return n;
+	n += snprintf(symbol + n, size - n, " FV%s", fwrev);
+
+	if (size < n)
+		return n;
+	n += snprintf(symbol + n, size - n, " DV%s", lpfc_release_version);
+
+	if (size < n)
+		return n;
+	n += snprintf(symbol + n, size - n, " HN:%s", init_utsname()->nodename);
+
+	/* Note :- OS name is "Linux" as per requirement BZ168199. */
+	if (size < n)
+		return n;
+	n += snprintf(symbol + n, size - n, " OS:%s", init_utsname()->sysname);
+
 	return n;
 }
 
@@ -1209,7 +1266,7 @@ lpfc_ns_cmd(struct lpfc_vport *vport, int cmdcode,
 		    be16_to_cpu(SLI_CTNS_RFF_ID);
 		CtReq->un.rff.PortId = cpu_to_be32(vport->fc_myDID);
 		CtReq->un.rff.fbits = FC4_FEATURE_INIT;
-		CtReq->un.rff.type_code = FC_FCP_DATA;
+		CtReq->un.rff.type_code = FC_TYPE_FCP;
 		cmpl = lpfc_cmpl_ct_cmd_rff_id;
 		break;
 	}
@@ -1549,8 +1606,12 @@ lpfc_fdmi_cmd(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp, int cmdcode)
 			ae->ad.bits.AttrLen = be16_to_cpu(FOURBYTES + 4);
 
 			ae->un.SupportSpeed = 0;
+			if (phba->lmt & LMT_32Gb)
+				ae->un.SupportSpeed |= HBA_PORTSPEED_32GBIT;
+			if (phba->lmt & LMT_16Gb)
+				ae->un.SupportSpeed |= HBA_PORTSPEED_16GBIT;
 			if (phba->lmt & LMT_10Gb)
-				ae->un.SupportSpeed = HBA_PORTSPEED_10GBIT;
+				ae->un.SupportSpeed |= HBA_PORTSPEED_10GBIT;
 			if (phba->lmt & LMT_8Gb)
 				ae->un.SupportSpeed |= HBA_PORTSPEED_8GBIT;
 			if (phba->lmt & LMT_4Gb)
@@ -1568,24 +1629,29 @@ lpfc_fdmi_cmd(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp, int cmdcode)
 			ae->ad.bits.AttrType = be16_to_cpu(PORT_SPEED);
 			ae->ad.bits.AttrLen = be16_to_cpu(FOURBYTES + 4);
 			switch(phba->fc_linkspeed) {
-				case LA_1GHZ_LINK:
-					ae->un.PortSpeed = HBA_PORTSPEED_1GBIT;
+			case LPFC_LINK_SPEED_1GHZ:
+				ae->un.PortSpeed = HBA_PORTSPEED_1GBIT;
 				break;
-				case LA_2GHZ_LINK:
-					ae->un.PortSpeed = HBA_PORTSPEED_2GBIT;
+			case LPFC_LINK_SPEED_2GHZ:
+				ae->un.PortSpeed = HBA_PORTSPEED_2GBIT;
 				break;
-				case LA_4GHZ_LINK:
-					ae->un.PortSpeed = HBA_PORTSPEED_4GBIT;
+			case LPFC_LINK_SPEED_4GHZ:
+				ae->un.PortSpeed = HBA_PORTSPEED_4GBIT;
 				break;
-				case LA_8GHZ_LINK:
-					ae->un.PortSpeed = HBA_PORTSPEED_8GBIT;
+			case LPFC_LINK_SPEED_8GHZ:
+				ae->un.PortSpeed = HBA_PORTSPEED_8GBIT;
 				break;
-				case LA_10GHZ_LINK:
-					ae->un.PortSpeed = HBA_PORTSPEED_10GBIT;
+			case LPFC_LINK_SPEED_10GHZ:
+				ae->un.PortSpeed = HBA_PORTSPEED_10GBIT;
 				break;
-				default:
-					ae->un.PortSpeed =
-						HBA_PORTSPEED_UNKNOWN;
+			case LPFC_LINK_SPEED_16GHZ:
+				ae->un.PortSpeed = HBA_PORTSPEED_16GBIT;
+				break;
+			case LPFC_LINK_SPEED_32GHZ:
+				ae->un.PortSpeed = HBA_PORTSPEED_32GBIT;
+				break;
+			default:
+				ae->un.PortSpeed = HBA_PORTSPEED_UNKNOWN;
 				break;
 			}
 			pab->ab.EntryCnt++;
@@ -1690,6 +1756,55 @@ fdmi_cmd_exit:
 	return 1;
 }
 
+/**
+ * lpfc_delayed_disc_tmo - Timeout handler for delayed discovery timer.
+ * @ptr - Context object of the timer.
+ *
+ * This function set the WORKER_DELAYED_DISC_TMO flag and wake up
+ * the worker thread.
+ **/
+void
+lpfc_delayed_disc_tmo(unsigned long ptr)
+{
+	struct lpfc_vport *vport = (struct lpfc_vport *)ptr;
+	struct lpfc_hba   *phba = vport->phba;
+	uint32_t tmo_posted;
+	unsigned long iflag;
+
+	spin_lock_irqsave(&vport->work_port_lock, iflag);
+	tmo_posted = vport->work_port_events & WORKER_DELAYED_DISC_TMO;
+	if (!tmo_posted)
+		vport->work_port_events |= WORKER_DELAYED_DISC_TMO;
+	spin_unlock_irqrestore(&vport->work_port_lock, iflag);
+
+	if (!tmo_posted)
+		lpfc_worker_wake_up(phba);
+	return;
+}
+
+/**
+ * lpfc_delayed_disc_timeout_handler - Function called by worker thread to
+ *      handle delayed discovery.
+ * @vport: pointer to a host virtual N_Port data structure.
+ *
+ * This function start nport discovery of the vport.
+ **/
+void
+lpfc_delayed_disc_timeout_handler(struct lpfc_vport *vport)
+{
+	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
+
+	spin_lock_irq(shost->host_lock);
+	if (!(vport->fc_flag & FC_DISC_DELAYED)) {
+		spin_unlock_irq(shost->host_lock);
+		return;
+	}
+	vport->fc_flag &= ~FC_DISC_DELAYED;
+	spin_unlock_irq(shost->host_lock);
+
+	lpfc_do_scr_ns_plogi(vport->phba, vport);
+}
+
 void
 lpfc_fdmi_tmo(unsigned long ptr)
 {
@@ -1719,7 +1834,8 @@ lpfc_fdmi_timeout_handler(struct lpfc_vport *vport)
 		if (init_utsname()->nodename[0] != '\0')
 			lpfc_fdmi_cmd(vport, ndlp, SLI_MGMT_DHBA);
 		else
-			mod_timer(&vport->fc_fdmitmo, jiffies + HZ * 60);
+			mod_timer(&vport->fc_fdmitmo, jiffies +
+				  msecs_to_jiffies(1000 * 60));
 	}
 	return;
 }
@@ -1735,7 +1851,7 @@ lpfc_decode_firmware_rev(struct lpfc_hba *phba, char *fwrevision, int flag)
 	uint8_t *fwname;
 
 	if (phba->sli_rev == LPFC_SLI_REV4)
-		sprintf(fwrevision, "%s", vp->rev.opFwName);
+		snprintf(fwrevision, FW_REV_STR_SIZE, "%s", vp->rev.opFwName);
 	else if (vp->rev.rBit) {
 		if (psli->sli_flag & LPFC_SLI_ACTIVE)
 			rev = vp->rev.sli2FwRev;
@@ -1756,6 +1872,9 @@ lpfc_decode_firmware_rev(struct lpfc_hba *phba, char *fwrevision, int flag)
 			break;
 		case 2:
 			c = 'B';
+			break;
+		case 3:
+			c = 'X';
 			break;
 		default:
 			c = 0;
@@ -1802,12 +1921,7 @@ lpfc_decode_firmware_rev(struct lpfc_hba *phba, char *fwrevision, int flag)
 		c  = (rev & 0x0000ff00) >> 8;
 		b4 = (rev & 0x000000ff);
 
-		if (flag)
-			sprintf(fwrevision, "%d.%d%d%c%d ", b1,
-				b2, b3, c, b4);
-		else
-			sprintf(fwrevision, "%d.%d%d%c%d ", b1,
-				b2, b3, c, b4);
+		sprintf(fwrevision, "%d.%d%d%c%d", b1, b2, b3, c, b4);
 	}
 	return;
 }

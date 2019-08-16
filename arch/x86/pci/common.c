@@ -21,6 +21,7 @@ unsigned int pci_probe = PCI_PROBE_BIOS | PCI_PROBE_CONF1 | PCI_PROBE_CONF2 |
 
 unsigned int pci_early_dump_regs;
 static int pci_bf_sort;
+static int smbios_type_b1_flag;
 int pci_routeirq;
 int noioapicquirk;
 #ifdef CONFIG_X86_REROUTE_FOR_BROKEN_BOOT_IRQS
@@ -30,7 +31,6 @@ int noioapicreroute = 1;
 #endif
 int pcibios_last_bus = -1;
 unsigned long pirq_table_addr;
-struct pci_bus *pci_root_bus;
 struct pci_raw_ops *raw_pci_ops;
 struct pci_raw_ops *raw_pci_ext_ops;
 
@@ -130,6 +130,23 @@ void __init dmi_check_skip_isa_align(void)
 static void __devinit pcibios_fixup_device_resources(struct pci_dev *dev)
 {
 	struct resource *rom_r = &dev->resource[PCI_ROM_RESOURCE];
+	struct resource *bar_r;
+	int bar;
+
+	if (pci_probe & PCI_NOASSIGN_BARS) {
+		/*
+		* If the BIOS did not assign the BAR, zero out the
+		* resource so the kernel doesn't attmept to assign
+		* it later on in pci_assign_unassigned_resources
+		*/
+		for (bar = 0; bar <= PCI_STD_RESOURCE_END; bar++) {
+			bar_r = &dev->resource[bar];
+			if (bar_r->start == 0 && bar_r->end != 0) {
+				bar_r->flags = 0;
+				bar_r->end = 0;
+			}
+		}
+	}
 
 	if (pci_probe & PCI_NOASSIGN_ROMS) {
 		if (rom_r->parent)
@@ -151,9 +168,6 @@ void __devinit pcibios_fixup_bus(struct pci_bus *b)
 {
 	struct pci_dev *dev;
 
-	/* root bus? */
-	if (!b->parent)
-		x86_pci_root_bus_res_quirks(b);
 	pci_read_bridge_bases(b);
 	list_for_each_entry(dev, &b->devices, bus_list)
 		pcibios_fixup_device_resources(dev);
@@ -171,6 +185,39 @@ static int __devinit set_bf_sort(const struct dmi_system_id *d)
 		printk(KERN_INFO "PCI: %s detected, enabling pci=bfsort.\n", d->ident);
 	}
 	return 0;
+}
+
+static void __devinit read_dmi_type_b1(const struct dmi_header *dm,
+				       void *private_data)
+{
+	u8 *d = (u8 *)dm + 4;
+
+	if (dm->type != 0xB1)
+		return;
+	switch (((*(u32 *)d) >> 9) & 0x03) {
+	case 0x00:
+		printk(KERN_INFO "dmi type 0xB1 record - unknown flag\n");
+		break;
+	case 0x01: /* set pci=bfsort */
+		smbios_type_b1_flag = 1;
+		break;
+	case 0x02: /* do not set pci=bfsort */
+		smbios_type_b1_flag = 2;
+		break;
+	default:
+		break;
+	}
+}
+
+static int __devinit find_sort_method(const struct dmi_system_id *d)
+{
+	dmi_walk(read_dmi_type_b1, NULL);
+
+	if (smbios_type_b1_flag == 1) {
+		set_bf_sort(d);
+		return 0;
+	}
+	return -1;
 }
 
 /*
@@ -238,6 +285,13 @@ static const struct dmi_system_id __devinitconst pciprobe_dmi_table[] = {
 		.matches = {
 			DMI_MATCH(DMI_SYS_VENDOR, "Dell"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "PowerEdge R900"),
+		},
+	},
+	{
+		.callback = find_sort_method,
+		.ident = "Dell System",
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "Dell Inc"),
 		},
 	},
 	{
@@ -378,37 +432,27 @@ void __init dmi_check_pciprobe(void)
 	dmi_check_system(pciprobe_dmi_table);
 }
 
-struct pci_bus * __devinit pcibios_scan_root(int busnum)
+void __devinit pcibios_scan_root(int busnum)
 {
-	struct pci_bus *bus = NULL;
+	struct pci_bus *bus;
 	struct pci_sysdata *sd;
+	LIST_HEAD(resources);
 
-	while ((bus = pci_find_next_bus(bus)) != NULL) {
-		if (bus->number == busnum) {
-			/* Already scanned */
-			return bus;
-		}
-	}
-
-	/* Allocate per-root-bus (not per bus) arch-specific data.
-	 * TODO: leak; this memory is never freed.
-	 * It's arguable whether it's worth the trouble to care.
-	 */
 	sd = kzalloc(sizeof(*sd), GFP_KERNEL);
 	if (!sd) {
-		printk(KERN_ERR "PCI: OOM, not probing PCI bus %02x\n", busnum);
-		return NULL;
+		printk(KERN_ERR "PCI: OOM, skipping PCI bus %02x\n", busnum);
+		return;
 	}
-
-	sd->node = get_mp_bus_to_node(busnum);
-
+	sd->node = x86_pci_root_bus_node(busnum);
+	x86_pci_root_bus_resources(busnum, &resources);
 	printk(KERN_DEBUG "PCI: Probing PCI hardware (bus %02x)\n", busnum);
-	bus = pci_scan_bus_parented(NULL, busnum, &pci_root_ops, sd);
-	if (!bus)
+	bus = pci_scan_root_bus(NULL, busnum, &pci_root_ops, sd, &resources);
+	if (!bus) {
+		pci_free_resource_list(&resources);
 		kfree(sd);
-
-	return bus;
+	}
 }
+
 
 extern u8 pci_cache_line_size;
 
@@ -431,6 +475,22 @@ int __init pcibios_init(void)
 		pci_cache_line_size = 64 >> 2;	/* K7 & K8 */
 	else if (c->x86 > 6 && c->x86_vendor == X86_VENDOR_INTEL)
 		pci_cache_line_size = 128 >> 2;	/* P4 */
+
+	if (c->x86_clflush_size != (pci_cache_line_size <<2))
+		printk(KERN_DEBUG "PCI: old code would have set cacheline "
+			"size to %d bytes, but clflush_size = %d\n",
+			pci_cache_line_size << 2,
+			c->x86_clflush_size);
+
+	/* Once we know this logic works, all the above code can be deleted. */
+	if (c->x86_clflush_size > 0) {
+		pci_cache_line_size = c->x86_clflush_size >> 2;
+		printk(KERN_DEBUG "PCI: pci_cache_line_size set to %d bytes\n",
+			pci_cache_line_size << 2);
+	} else {
+		pci_cache_line_size = 32 >> 2;
+		printk(KERN_DEBUG "PCI: Unknown cacheline size. Setting to 32 bytes\n");
+	}
 
 	pcibios_resource_survey();
 
@@ -512,11 +572,17 @@ char * __devinit  pcibios_setup(char *str)
 	} else if (!strcmp(str, "norom")) {
 		pci_probe |= PCI_NOASSIGN_ROMS;
 		return NULL;
+	} else if (!strcmp(str, "nobar")) {
+		pci_probe |= PCI_NOASSIGN_BARS;
+		return NULL;
 	} else if (!strcmp(str, "assign-busses")) {
 		pci_probe |= PCI_ASSIGN_ALL_BUSSES;
 		return NULL;
 	} else if (!strcmp(str, "use_crs")) {
 		pci_probe |= PCI_USE__CRS;
+		return NULL;
+	} else if (!strcmp(str, "nocrs")) {
+		pci_probe |= PCI_ROOT_NO_CRS;
 		return NULL;
 	} else if (!strcmp(str, "earlydump")) {
 		pci_early_dump_regs = 1;
@@ -572,100 +638,3 @@ int pci_ext_cfg_avail(struct pci_dev *dev)
 	else
 		return 0;
 }
-
-struct pci_bus * __devinit pci_scan_bus_on_node(int busno, struct pci_ops *ops, int node)
-{
-	struct pci_bus *bus = NULL;
-	struct pci_sysdata *sd;
-
-	/*
-	 * Allocate per-root-bus (not per bus) arch-specific data.
-	 * TODO: leak; this memory is never freed.
-	 * It's arguable whether it's worth the trouble to care.
-	 */
-	sd = kzalloc(sizeof(*sd), GFP_KERNEL);
-	if (!sd) {
-		printk(KERN_ERR "PCI: OOM, skipping PCI bus %02x\n", busno);
-		return NULL;
-	}
-	sd->node = node;
-	bus = pci_scan_bus(busno, ops, sd);
-	if (!bus)
-		kfree(sd);
-
-	return bus;
-}
-
-struct pci_bus * __devinit pci_scan_bus_with_sysdata(int busno)
-{
-	return pci_scan_bus_on_node(busno, &pci_root_ops, -1);
-}
-
-/*
- * NUMA info for PCI busses
- *
- * Early arch code is responsible for filling in reasonable values here.
- * A node id of "-1" means "use current node".  In other words, if a bus
- * has a -1 node id, it's not tightly coupled to any particular chunk
- * of memory (as is the case on some Nehalem systems).
- */
-#ifdef CONFIG_NUMA
-
-#define BUS_NR 256
-
-#ifdef CONFIG_X86_64
-
-static int mp_bus_to_node[BUS_NR] = {
-	[0 ... BUS_NR - 1] = -1
-};
-
-void set_mp_bus_to_node(int busnum, int node)
-{
-	if (busnum >= 0 &&  busnum < BUS_NR)
-		mp_bus_to_node[busnum] = node;
-}
-
-int get_mp_bus_to_node(int busnum)
-{
-	int node = -1;
-
-	if (busnum < 0 || busnum > (BUS_NR - 1))
-		return node;
-
-	node = mp_bus_to_node[busnum];
-
-	/*
-	 * let numa_node_id to decide it later in dma_alloc_pages
-	 * if there is no ram on that node
-	 */
-	if (node != -1 && !node_online(node))
-		node = -1;
-
-	return node;
-}
-
-#else /* CONFIG_X86_32 */
-
-static int mp_bus_to_node[BUS_NR] = {
-	[0 ... BUS_NR - 1] = -1
-};
-
-void set_mp_bus_to_node(int busnum, int node)
-{
-	if (busnum >= 0 &&  busnum < BUS_NR)
-	mp_bus_to_node[busnum] = (unsigned char) node;
-}
-
-int get_mp_bus_to_node(int busnum)
-{
-	int node;
-
-	if (busnum < 0 || busnum > (BUS_NR - 1))
-		return 0;
-	node = mp_bus_to_node[busnum];
-	return node;
-}
-
-#endif /* CONFIG_X86_32 */
-
-#endif /* CONFIG_NUMA */

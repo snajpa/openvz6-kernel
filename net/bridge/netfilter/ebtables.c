@@ -100,16 +100,24 @@ static inline int ebt_dev_check(char *entry, const struct net_device *device)
 
 #define FWINV2(bool,invflg) ((bool) ^ !!(e->invflags & invflg))
 /* process standard matches */
-static inline int ebt_basic_match(struct ebt_entry *e, struct ethhdr *h,
-   const struct net_device *in, const struct net_device *out)
+static inline int
+ebt_basic_match(struct ebt_entry *e, struct sk_buff *skb,
+		const struct net_device *in, const struct net_device *out)
 {
+	const struct ethhdr *h = eth_hdr(skb);
+	__be16 ethproto;
 	int verdict, i;
 
+	if (skb_vlan_tag_present(skb))
+		ethproto = htons(ETH_P_8021Q);
+	else
+		ethproto = h->h_proto;
+
 	if (e->bitmask & EBT_802_3) {
-		if (FWINV2(ntohs(h->h_proto) >= 1536, EBT_IPROTO))
+		if (FWINV2(ntohs(ethproto) >= 1536, EBT_IPROTO))
 			return 1;
 	} else if (!(e->bitmask & EBT_NOPROTO) &&
-	   FWINV2(e->ethproto != h->h_proto, EBT_IPROTO))
+	   FWINV2(e->ethproto != ethproto, EBT_IPROTO))
 		return 1;
 
 	if (FWINV2(ebt_dev_check(e->in, in), EBT_IIN))
@@ -188,7 +196,7 @@ unsigned int ebt_do_table (unsigned int hook, struct sk_buff *skb,
 	base = private->entries;
 	i = 0;
 	while (i < nentries) {
-		if (ebt_basic_match(point, eth_hdr(skb), in, out))
+		if (ebt_basic_match(point, skb, in, out))
 			goto letscontinue;
 
 		if (EBT_MATCH_ITERATE(point, ebt_do_match, skb, &mtpar) != 0)
@@ -339,8 +347,13 @@ ebt_check_match(struct ebt_entry_match *m, struct xt_mtchk_param *par,
 	    left - sizeof(struct ebt_entry_match) < m->match_size)
 		return -EINVAL;
 
-	match = try_then_request_module(xt_find_match(NFPROTO_BRIDGE,
-		m->u.name, 0), "ebt_%s", m->u.name);
+	match = xt_find_match(NFPROTO_BRIDGE, m->u.name, 0);
+	if (IS_ERR_OR_NULL(match) || match->family != NFPROTO_BRIDGE) {
+		if (!IS_ERR_OR_NULL(match))
+			module_put(match->me);
+		request_module("ebt_%s", m->u.name);
+		match = xt_find_match(NFPROTO_BRIDGE, m->u.name, 0);
+	}
 	if (IS_ERR(match))
 		return PTR_ERR(match);
 	if (match == NULL)
@@ -979,6 +992,8 @@ static int do_replace(struct net *net, void __user *user, unsigned int len)
 	if (tmp.num_counters >= INT_MAX / sizeof(struct ebt_counter))
 		return -ENOMEM;
 
+	tmp.name[sizeof(tmp.name) - 1] = 0;
+
 	countersize = COUNTER_OFFSET(tmp.nentries) * nr_cpu_ids;
 	newinfo = vmalloc(sizeof(*newinfo) + countersize);
 	if (!newinfo)
@@ -1406,6 +1421,9 @@ static int do_ebt_set_ctl(struct sock *sk,
 {
 	int ret;
 
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
 	switch(cmd) {
 	case EBT_SO_SET_ENTRIES:
 		ret = do_replace(sock_net(sk), user, len);
@@ -1424,6 +1442,9 @@ static int do_ebt_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 	int ret;
 	struct ebt_replace tmp;
 	struct ebt_table *t;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
 
 	if (copy_from_user(&tmp, user, sizeof(tmp)))
 		return -EFAULT;

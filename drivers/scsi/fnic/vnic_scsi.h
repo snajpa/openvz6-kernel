@@ -54,8 +54,8 @@
 #define VNIC_FNIC_PLOGI_TIMEOUT_MIN         1000
 #define VNIC_FNIC_PLOGI_TIMEOUT_MAX         255000
 
-#define VNIC_FNIC_IO_THROTTLE_COUNT_MIN     256
-#define VNIC_FNIC_IO_THROTTLE_COUNT_MAX     4096
+#define VNIC_FNIC_IO_THROTTLE_COUNT_MIN     1
+#define VNIC_FNIC_IO_THROTTLE_COUNT_MAX     2048
 
 #define VNIC_FNIC_LINK_DOWN_TIMEOUT_MIN     0
 #define VNIC_FNIC_LINK_DOWN_TIMEOUT_MAX     240000
@@ -95,5 +95,6 @@ struct vnic_fc_config {
 
 #define VFCF_FCP_SEQ_LVL_ERR	0x1	/* Enable FCP-2 Error Recovery */
 #define VFCF_PERBI		0x2	/* persistent binding info available */
+#define VFCF_FIP_CAPABLE	0x4	/* firmware can handle FIP */
 
 #endif /* _VNIC_SCSI_H_ */

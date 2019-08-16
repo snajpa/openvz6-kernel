@@ -4,7 +4,7 @@
 
   PIO data transfer
 
-  Copyright (c) 2005-2008 Michael Buesch <mb@bu3sch.de>
+  Copyright (c) 2005-2008 Michael Buesch <m@bues.ch>
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -31,6 +31,7 @@
 
 #include <linux/delay.h>
 #include <linux/sched.h>
+#include <linux/slab.h>
 
 
 static u16 generate_cookie(struct b43_pio_txqueue *q,
@@ -110,7 +111,7 @@ static u16 index_to_pioqueue_base(struct b43_wldev *dev,
 		B43_MMIO_PIO11_BASE5,
 	};
 
-	if (dev->dev->id.revision >= 11) {
+	if (dev->dev->core_rev >= 11) {
 		B43_WARN_ON(index >= ARRAY_SIZE(bases_rev11));
 		return bases_rev11[index];
 	}
@@ -120,14 +121,14 @@ static u16 index_to_pioqueue_base(struct b43_wldev *dev,
 
 static u16 pio_txqueue_offset(struct b43_wldev *dev)
 {
-	if (dev->dev->id.revision >= 11)
+	if (dev->dev->core_rev >= 11)
 		return 0x18;
 	return 0;
 }
 
 static u16 pio_rxqueue_offset(struct b43_wldev *dev)
 {
-	if (dev->dev->id.revision >= 11)
+	if (dev->dev->core_rev >= 11)
 		return 0x38;
 	return 8;
 }
@@ -143,7 +144,7 @@ static struct b43_pio_txqueue *b43_setup_pioqueue_tx(struct b43_wldev *dev,
 	if (!q)
 		return NULL;
 	q->dev = dev;
-	q->rev = dev->dev->id.revision;
+	q->rev = dev->dev->core_rev;
 	q->mmio_base = index_to_pioqueue_base(dev, index) +
 		       pio_txqueue_offset(dev);
 	q->index = index;
@@ -177,7 +178,7 @@ static struct b43_pio_rxqueue *b43_setup_pioqueue_rx(struct b43_wldev *dev,
 	if (!q)
 		return NULL;
 	q->dev = dev;
-	q->rev = dev->dev->id.revision;
+	q->rev = dev->dev->core_rev;
 	q->mmio_base = index_to_pioqueue_base(dev, index) +
 		       pio_rxqueue_offset(dev);
 
@@ -195,7 +196,7 @@ static void b43_pio_cancel_tx_packets(struct b43_pio_txqueue *q)
 	for (i = 0; i < ARRAY_SIZE(q->packets); i++) {
 		pack = &(q->packets[i]);
 		if (pack->skb) {
-			dev_kfree_skb_any(pack->skb);
+			ieee80211_free_txskb(q->dev->wl->hw, pack->skb);
 			pack->skb = NULL;
 		}
 	}
@@ -338,16 +339,19 @@ static u16 tx_write_2byte_queue(struct b43_pio_txqueue *q,
 	ctl |= B43_PIO_TXCTL_WRITELO | B43_PIO_TXCTL_WRITEHI;
 	b43_piotx_write16(q, B43_PIO_TXCTL, ctl);
 
-	ssb_block_write(dev->dev, data, (data_len & ~1),
+	b43_block_write(dev, data, (data_len & ~1),
 			q->mmio_base + B43_PIO_TXDATA,
 			sizeof(u16));
 	if (data_len & 1) {
+		u8 *tail = wl->pio_tailspace;
+		BUILD_BUG_ON(sizeof(wl->pio_tailspace) < 2);
+
 		/* Write the last byte. */
 		ctl &= ~B43_PIO_TXCTL_WRITEHI;
 		b43_piotx_write16(q, B43_PIO_TXCTL, ctl);
-		wl->tx_tail[0] = data[data_len - 1];
-		wl->tx_tail[1] = 0;
-		ssb_block_write(dev->dev, wl->tx_tail, 2,
+		tail[0] = data[data_len - 1];
+		tail[1] = 0;
+		b43_block_write(dev, tail, 2,
 				q->mmio_base + B43_PIO_TXDATA,
 				sizeof(u16));
 	}
@@ -389,35 +393,35 @@ static u32 tx_write_4byte_queue(struct b43_pio_txqueue *q,
 	       B43_PIO8_TXCTL_16_23 | B43_PIO8_TXCTL_24_31;
 	b43_piotx_write32(q, B43_PIO8_TXCTL, ctl);
 
-	ssb_block_write(dev->dev, data, (data_len & ~3),
+	b43_block_write(dev, data, (data_len & ~3),
 			q->mmio_base + B43_PIO8_TXDATA,
 			sizeof(u32));
 	if (data_len & 3) {
-		wl->tx_tail[3] = 0;
+		u8 *tail = wl->pio_tailspace;
+		BUILD_BUG_ON(sizeof(wl->pio_tailspace) < 4);
+
+		memset(tail, 0, 4);
 		/* Write the last few bytes. */
 		ctl &= ~(B43_PIO8_TXCTL_8_15 | B43_PIO8_TXCTL_16_23 |
 			 B43_PIO8_TXCTL_24_31);
 		switch (data_len & 3) {
 		case 3:
 			ctl |= B43_PIO8_TXCTL_16_23 | B43_PIO8_TXCTL_8_15;
-			wl->tx_tail[0] = data[data_len - 3];
-			wl->tx_tail[1] = data[data_len - 2];
-			wl->tx_tail[2] = data[data_len - 1];
+			tail[0] = data[data_len - 3];
+			tail[1] = data[data_len - 2];
+			tail[2] = data[data_len - 1];
 			break;
 		case 2:
 			ctl |= B43_PIO8_TXCTL_8_15;
-			wl->tx_tail[0] = data[data_len - 2];
-			wl->tx_tail[1] = data[data_len - 1];
-			wl->tx_tail[2] = 0;
+			tail[0] = data[data_len - 2];
+			tail[1] = data[data_len - 1];
 			break;
 		case 1:
-			wl->tx_tail[0] = data[data_len - 1];
-			wl->tx_tail[1] = 0;
-			wl->tx_tail[2] = 0;
+			tail[0] = data[data_len - 1];
 			break;
 		}
 		b43_piotx_write32(q, B43_PIO8_TXCTL, ctl);
-		ssb_block_write(dev->dev, wl->tx_tail, 4,
+		b43_block_write(dev, tail, 4,
 				q->mmio_base + B43_PIO8_TXDATA,
 				sizeof(u32));
 	}
@@ -456,6 +460,7 @@ static int pio_tx_frame(struct b43_pio_txqueue *q,
 	int err;
 	unsigned int hdrlen;
 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+	struct b43_txhdr *txhdr = (struct b43_txhdr *)wl->pio_scratchspace;
 
 	B43_WARN_ON(list_empty(&q->packets_list));
 	pack = list_entry(q->packets_list.next,
@@ -463,7 +468,9 @@ static int pio_tx_frame(struct b43_pio_txqueue *q,
 
 	cookie = generate_cookie(q, pack);
 	hdrlen = b43_txhdr_size(dev);
-	err = b43_generate_txhdr(dev, (u8 *)&wl->txhdr, skb,
+	BUILD_BUG_ON(sizeof(wl->pio_scratchspace) < sizeof(struct b43_txhdr));
+	B43_WARN_ON(sizeof(wl->pio_scratchspace) < hdrlen);
+	err = b43_generate_txhdr(dev, (u8 *)txhdr, skb,
 				 info, cookie);
 	if (err)
 		return err;
@@ -477,9 +484,9 @@ static int pio_tx_frame(struct b43_pio_txqueue *q,
 
 	pack->skb = skb;
 	if (q->rev >= 8)
-		pio_tx_frame_4byte_queue(pack, (const u8 *)&wl->txhdr, hdrlen);
+		pio_tx_frame_4byte_queue(pack, (const u8 *)txhdr, hdrlen);
 	else
-		pio_tx_frame_2byte_queue(pack, (const u8 *)&wl->txhdr, hdrlen);
+		pio_tx_frame_2byte_queue(pack, (const u8 *)txhdr, hdrlen);
 
 	/* Remove it from the list of available packet slots.
 	 * It will be put back when we receive the status report. */
@@ -532,7 +539,7 @@ int b43_pio_tx(struct b43_wldev *dev, struct sk_buff *skb)
 		/* Not enough memory on the queue. */
 		err = -EBUSY;
 		ieee80211_stop_queue(dev->wl->hw, skb_get_queue_mapping(skb));
-		q->stopped = 1;
+		q->stopped = true;
 		goto out;
 	}
 
@@ -545,7 +552,7 @@ int b43_pio_tx(struct b43_wldev *dev, struct sk_buff *skb)
 	if (unlikely(err == -ENOKEY)) {
 		/* Drop this packet, as we don't have the encryption key
 		 * anymore and must not transmit it unencrypted. */
-		dev_kfree_skb_any(skb);
+		ieee80211_free_txskb(dev->wl->hw, skb);
 		err = 0;
 		goto out;
 	}
@@ -553,14 +560,13 @@ int b43_pio_tx(struct b43_wldev *dev, struct sk_buff *skb)
 		b43err(dev->wl, "PIO transmission failure\n");
 		goto out;
 	}
-	q->nr_tx_packets++;
 
 	B43_WARN_ON(q->buffer_used > q->buffer_size);
 	if (((q->buffer_size - q->buffer_used) < roundup(2 + 2 + 6, 4)) ||
 	    (q->free_packet_slots == 0)) {
 		/* The queue is full. */
 		ieee80211_stop_queue(dev->wl->hw, skb_get_queue_mapping(skb));
-		q->stopped = 1;
+		q->stopped = true;
 	}
 
 out:
@@ -595,23 +601,7 @@ void b43_pio_handle_txstatus(struct b43_wldev *dev,
 
 	if (q->stopped) {
 		ieee80211_wake_queue(dev->wl->hw, q->queue_prio);
-		q->stopped = 0;
-	}
-}
-
-void b43_pio_get_tx_stats(struct b43_wldev *dev,
-			  struct ieee80211_tx_queue_stats *stats)
-{
-	const int nr_queues = dev->wl->hw->queues;
-	struct b43_pio_txqueue *q;
-	int i;
-
-	for (i = 0; i < nr_queues; i++) {
-		q = select_queue_by_priority(dev, i);
-
-		stats[i].len = B43_PIO_MAX_NR_TXPACKETS - q->free_packet_slots;
-		stats[i].limit = B43_PIO_MAX_NR_TXPACKETS;
-		stats[i].count = q->nr_tx_packets;
+		q->stopped = false;
 	}
 }
 
@@ -621,12 +611,25 @@ static bool pio_rx_frame(struct b43_pio_rxqueue *q)
 	struct b43_wldev *dev = q->dev;
 	struct b43_wl *wl = dev->wl;
 	u16 len;
-	u32 macstat;
+	u32 macstat = 0;
 	unsigned int i, padding;
 	struct sk_buff *skb;
 	const char *err_msg = NULL;
+	struct b43_rxhdr_fw4 *rxhdr =
+		(struct b43_rxhdr_fw4 *)wl->pio_scratchspace;
+	size_t rxhdr_size = sizeof(*rxhdr);
 
-	memset(&wl->rxhdr, 0, sizeof(wl->rxhdr));
+	BUILD_BUG_ON(sizeof(wl->pio_scratchspace) < sizeof(*rxhdr));
+	switch (dev->fw.hdr_format) {
+	case B43_FW_HDR_410:
+	case B43_FW_HDR_351:
+		rxhdr_size -= sizeof(rxhdr->format_598) -
+			sizeof(rxhdr->format_351);
+		break;
+	case B43_FW_HDR_598:
+		break;
+	}
+	memset(rxhdr, 0, rxhdr_size);
 
 	/* Check if we have data and wait for it to get ready. */
 	if (q->rev >= 8) {
@@ -634,7 +637,7 @@ static bool pio_rx_frame(struct b43_pio_rxqueue *q)
 
 		ctl = b43_piorx_read32(q, B43_PIO8_RXCTL);
 		if (!(ctl & B43_PIO8_RXCTL_FRAMERDY))
-			return 0;
+			return false;
 		b43_piorx_write32(q, B43_PIO8_RXCTL,
 				  B43_PIO8_RXCTL_FRAMERDY);
 		for (i = 0; i < 10; i++) {
@@ -648,7 +651,7 @@ static bool pio_rx_frame(struct b43_pio_rxqueue *q)
 
 		ctl = b43_piorx_read16(q, B43_PIO_RXCTL);
 		if (!(ctl & B43_PIO_RXCTL_FRAMERDY))
-			return 0;
+			return false;
 		b43_piorx_write16(q, B43_PIO_RXCTL,
 				  B43_PIO_RXCTL_FRAMERDY);
 		for (i = 0; i < 10; i++) {
@@ -659,21 +662,21 @@ static bool pio_rx_frame(struct b43_pio_rxqueue *q)
 		}
 	}
 	b43dbg(q->dev->wl, "PIO RX timed out\n");
-	return 1;
+	return true;
 data_ready:
 
 	/* Get the preamble (RX header) */
 	if (q->rev >= 8) {
-		ssb_block_read(dev->dev, &wl->rxhdr, sizeof(wl->rxhdr),
+		b43_block_read(dev, rxhdr, rxhdr_size,
 			       q->mmio_base + B43_PIO8_RXDATA,
 			       sizeof(u32));
 	} else {
-		ssb_block_read(dev->dev, &wl->rxhdr, sizeof(wl->rxhdr),
+		b43_block_read(dev, rxhdr, rxhdr_size,
 			       q->mmio_base + B43_PIO_RXDATA,
 			       sizeof(u16));
 	}
 	/* Sanity checks. */
-	len = le16_to_cpu(wl->rxhdr.frame_len);
+	len = le16_to_cpu(rxhdr->frame_len);
 	if (unlikely(len > 0x700)) {
 		err_msg = "len > 0x700";
 		goto rx_error;
@@ -683,7 +686,15 @@ data_ready:
 		goto rx_error;
 	}
 
-	macstat = le32_to_cpu(wl->rxhdr.mac_status);
+	switch (dev->fw.hdr_format) {
+	case B43_FW_HDR_598:
+		macstat = le32_to_cpu(rxhdr->format_598.mac_status);
+		break;
+	case B43_FW_HDR_410:
+	case B43_FW_HDR_351:
+		macstat = le32_to_cpu(rxhdr->format_351.mac_status);
+		break;
+	}
 	if (macstat & B43_RX_MAC_FCSERR) {
 		if (!(q->dev->wl->filter_flags & FIF_FCSFAIL)) {
 			/* Drop frames with failed FCS. */
@@ -704,51 +715,61 @@ data_ready:
 	skb_reserve(skb, 2);
 	skb_put(skb, len + padding);
 	if (q->rev >= 8) {
-		ssb_block_read(dev->dev, skb->data + padding, (len & ~3),
+		b43_block_read(dev, skb->data + padding, (len & ~3),
 			       q->mmio_base + B43_PIO8_RXDATA,
 			       sizeof(u32));
 		if (len & 3) {
+			u8 *tail = wl->pio_tailspace;
+			BUILD_BUG_ON(sizeof(wl->pio_tailspace) < 4);
+
 			/* Read the last few bytes. */
-			ssb_block_read(dev->dev, wl->rx_tail, 4,
+			b43_block_read(dev, tail, 4,
 				       q->mmio_base + B43_PIO8_RXDATA,
 				       sizeof(u32));
 			switch (len & 3) {
 			case 3:
-				skb->data[len + padding - 3] = wl->rx_tail[0];
-				skb->data[len + padding - 2] = wl->rx_tail[1];
-				skb->data[len + padding - 1] = wl->rx_tail[2];
+				skb->data[len + padding - 3] = tail[0];
+				skb->data[len + padding - 2] = tail[1];
+				skb->data[len + padding - 1] = tail[2];
 				break;
 			case 2:
-				skb->data[len + padding - 2] = wl->rx_tail[0];
-				skb->data[len + padding - 1] = wl->rx_tail[1];
+				skb->data[len + padding - 2] = tail[0];
+				skb->data[len + padding - 1] = tail[1];
 				break;
 			case 1:
-				skb->data[len + padding - 1] = wl->rx_tail[0];
+				skb->data[len + padding - 1] = tail[0];
 				break;
 			}
 		}
 	} else {
-		ssb_block_read(dev->dev, skb->data + padding, (len & ~1),
+		b43_block_read(dev, skb->data + padding, (len & ~1),
 			       q->mmio_base + B43_PIO_RXDATA,
 			       sizeof(u16));
 		if (len & 1) {
+			u8 *tail = wl->pio_tailspace;
+			BUILD_BUG_ON(sizeof(wl->pio_tailspace) < 2);
+
 			/* Read the last byte. */
-			ssb_block_read(dev->dev, wl->rx_tail, 2,
+			b43_block_read(dev, tail, 2,
 				       q->mmio_base + B43_PIO_RXDATA,
 				       sizeof(u16));
-			skb->data[len + padding - 1] = wl->rx_tail[0];
+			skb->data[len + padding - 1] = tail[0];
 		}
 	}
 
-	b43_rx(q->dev, skb, &wl->rxhdr);
+	b43_rx(q->dev, skb, rxhdr);
 
-	return 1;
+	return true;
 
 rx_error:
 	if (err_msg)
 		b43dbg(q->dev->wl, "PIO RX error: %s\n", err_msg);
-	b43_piorx_write16(q, B43_PIO_RXCTL, B43_PIO_RXCTL_DATARDY);
-	return 1;
+	if (q->rev >= 8)
+		b43_piorx_write32(q, B43_PIO8_RXCTL, B43_PIO8_RXCTL_DATARDY);
+	else
+		b43_piorx_write16(q, B43_PIO_RXCTL, B43_PIO_RXCTL_DATARDY);
+
+	return true;
 }
 
 void b43_pio_rx(struct b43_pio_rxqueue *q)

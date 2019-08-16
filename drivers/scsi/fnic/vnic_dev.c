@@ -583,6 +583,16 @@ int vnic_dev_init(struct vnic_dev *vdev, int arg)
 	return vnic_dev_cmd(vdev, CMD_INIT, &a0, &a1, wait);
 }
 
+u16 vnic_dev_set_default_vlan(struct vnic_dev *vdev, u16 new_default_vlan)
+{
+	u64 a0 = new_default_vlan, a1 = 0;
+	int wait = 1000;
+	int old_vlan = 0;
+
+	old_vlan = vnic_dev_cmd(vdev, CMD_SET_DEFAULT_VLAN, &a0, &a1, wait);
+	return (u16)old_vlan;
+}
+
 int vnic_dev_link_status(struct vnic_dev *vdev)
 {
 	if (vdev->linkstatus)
@@ -653,7 +663,7 @@ void vnic_dev_unregister(struct vnic_dev *vdev)
 				vdev->linkstatus_pa);
 		if (vdev->stats)
 			pci_free_consistent(vdev->pdev,
-				sizeof(struct vnic_dev),
+				sizeof(struct vnic_stats),
 				vdev->stats, vdev->stats_pa);
 		if (vdev->fw_info)
 			pci_free_consistent(vdev->pdev,

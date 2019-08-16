@@ -28,6 +28,8 @@ source "drivers/ata/Kconfig"
 
 source "drivers/md/Kconfig"
 
+source "drivers/target/Kconfig"
+
 source "drivers/message/fusion/Kconfig"
 
 source "drivers/ieee1394/Kconfig"
@@ -54,11 +56,15 @@ source "drivers/spi/Kconfig"
 
 source "drivers/pps/Kconfig"
 
+source "drivers/ptp/Kconfig"
+
 source "drivers/gpio/Kconfig"
 
 source "drivers/w1/Kconfig"
 
 source "drivers/power/Kconfig"
+
+source "drivers/powercap/Kconfig"
 
 source "drivers/hwmon/Kconfig"
 
@@ -67,6 +73,8 @@ source "drivers/thermal/Kconfig"
 source "drivers/watchdog/Kconfig"
 
 source "drivers/ssb/Kconfig"
+
+source "drivers/bcma/Kconfig"
 
 source "drivers/mfd/Kconfig"
 
@@ -109,6 +117,8 @@ source "drivers/uio/Kconfig"
 source "drivers/vlynq/Kconfig"
 
 source "drivers/xen/Kconfig"
+
+source "drivers/hv/Kconfig"
 
 source "drivers/staging/Kconfig"
 

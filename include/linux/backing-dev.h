@@ -30,6 +30,7 @@ enum bdi_state {
 	BDI_async_congested,	/* The async (write) queue is getting full */
 	BDI_sync_congested,	/* The sync queue is getting full */
 	BDI_registered,		/* bdi_register() was done */
+	BDI_writeback_running,	/* Writeback is in progress */
 	BDI_unused,		/* Available bits start here */
 };
 
@@ -43,23 +44,34 @@ enum bdi_stat_item {
 
 #define BDI_STAT_BATCH (8*(1+ilog2(nr_cpu_ids)))
 
-struct bdi_writeback {
-	struct list_head list;			/* hangs off the bdi */
+struct bdi_wb_aux {
+	unsigned long last_active;	/* last time bdi thread was active */
+	struct timer_list wakeup_timer; /* used for delayed bdi thread wakeup */
+};
 
-	struct backing_dev_info *bdi;		/* our parent bdi */
+struct bdi_writeback {
+#ifdef __GENKSYMS__
+	struct list_head list;			/* DEPRECATED */
+#else
+	union {
+		struct list_head list;
+		struct bdi_wb_aux *aux;
+	};
+#endif
+	struct backing_dev_info *bdi;	/* our parent bdi */
 	unsigned int nr;
 
-	unsigned long last_old_flush;		/* last old data flush */
+	unsigned long last_old_flush;	/* last old data flush */
 
-	struct task_struct	*task;		/* writeback task */
-	struct list_head	b_dirty;	/* dirty inodes */
-	struct list_head	b_io;		/* parked for writeback */
-	struct list_head	b_more_io;	/* parked for more writeback */
+	struct task_struct *task;	/* writeback thread */
+	struct list_head b_dirty;	/* dirty inodes */
+	struct list_head b_io;		/* parked for writeback */
+	struct list_head b_more_io;	/* parked for more writeback */
 };
 
 struct backing_dev_info {
 	struct list_head bdi_list;
-	struct rcu_head rcu_head;
+	struct rcu_head rcu_head; /* DEPRECATED */
 	unsigned long ra_pages;	/* max readahead in PAGE_CACHE_SIZE units */
 	unsigned long state;	/* Always use atomic bitops on this */
 	unsigned int capabilities; /* Device capabilities */
@@ -79,10 +91,8 @@ struct backing_dev_info {
 	unsigned int max_ratio, max_prop_frac;
 
 	struct bdi_writeback wb;  /* default writeback info for this bdi */
-	spinlock_t wb_lock;	  /* protects update side of wb_list */
-	struct list_head wb_list; /* the flusher threads hanging off this bdi */
-	unsigned long wb_mask;	  /* bitmask of registered tasks */
-	unsigned int wb_cnt;	  /* number of registered tasks */
+	spinlock_t wb_lock;	  /* protects work_list */
+	struct list_head wb_list; /* DEPRECATED */
 
 	struct list_head work_list;
 
@@ -101,10 +111,12 @@ int bdi_register(struct backing_dev_info *bdi, struct device *parent,
 		const char *fmt, ...);
 int bdi_register_dev(struct backing_dev_info *bdi, dev_t dev);
 void bdi_unregister(struct backing_dev_info *bdi);
-void bdi_start_writeback(struct backing_dev_info *bdi, struct super_block *sb,
-				long nr_pages);
-int bdi_writeback_task(struct bdi_writeback *wb);
+void bdi_start_writeback(struct backing_dev_info *bdi, long nr_pages);
+void bdi_start_background_writeback(struct backing_dev_info *bdi);
+int bdi_writeback_thread(void *data);
 int bdi_has_dirty_io(struct backing_dev_info *bdi);
+void bdi_arm_supers_timer(void);
+void bdi_wakeup_thread_delayed(struct backing_dev_info *bdi);
 
 extern spinlock_t bdi_lock;
 extern struct list_head bdi_list;
@@ -231,6 +243,7 @@ int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
 #define BDI_CAP_EXEC_MAP	0x00000040
 #define BDI_CAP_NO_ACCT_WB	0x00000080
 #define BDI_CAP_SWAP_BACKED	0x00000100
+#define BDI_CAP_STABLE_WRITES	0x00000200
 
 #define BDI_CAP_VMFLAGS \
 	(BDI_CAP_READ_MAP | BDI_CAP_WRITE_MAP | BDI_CAP_EXEC_MAP)
@@ -281,7 +294,12 @@ enum {
 void clear_bdi_congested(struct backing_dev_info *bdi, int sync);
 void set_bdi_congested(struct backing_dev_info *bdi, int sync);
 long congestion_wait(int sync, long timeout);
+long wait_iff_congested(struct zone *zone, int sync, long timeout);
 
+static inline bool bdi_cap_stable_pages_required(struct backing_dev_info *bdi)
+{
+	return bdi->capabilities & BDI_CAP_STABLE_WRITES;
+}
 
 static inline bool bdi_cap_writeback_dirty(struct backing_dev_info *bdi)
 {

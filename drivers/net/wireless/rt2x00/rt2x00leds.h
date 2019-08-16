@@ -1,5 +1,5 @@
 /*
-	Copyright (C) 2004 - 2009 rt2x00 SourceForge Project
+	Copyright (C) 2004 - 2009 Ivo van Doorn <IvDoorn@gmail.com>
 	<http://rt2x00.serialmonkey.com>
 
 	This program is free software; you can redistribute it and/or modify
@@ -13,9 +13,7 @@
 	GNU General Public License for more details.
 
 	You should have received a copy of the GNU General Public License
-	along with this program; if not, write to the
-	Free Software Foundation, Inc.,
-	59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+	along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
 /*
@@ -33,8 +31,6 @@ enum led_type {
 	LED_TYPE_QUALITY,
 };
 
-#ifdef CONFIG_RT2X00_LIB_LEDS
-
 struct rt2x00_led {
 	struct rt2x00_dev *rt2x00dev;
 	struct led_classdev led_dev;
@@ -44,7 +40,5 @@ struct rt2x00_led {
 #define LED_INITIALIZED		( 1 << 0 )
 #define LED_REGISTERED		( 1 << 1 )
 };
-
-#endif /* CONFIG_RT2X00_LIB_LEDS */
 
 #endif /* RT2X00LEDS_H */

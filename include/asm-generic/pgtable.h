@@ -25,6 +25,26 @@
 })
 #endif
 
+#ifndef __HAVE_ARCH_PMDP_SET_ACCESS_FLAGS
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#define pmdp_set_access_flags(__vma, __address, __pmdp, __entry, __dirty) \
+	({								\
+		int __changed = !pmd_same(*(__pmdp), __entry);		\
+		VM_BUG_ON((__address) & ~HPAGE_PMD_MASK);		\
+		if (__changed) {					\
+			set_pmd_at((__vma)->vm_mm, __address, __pmdp,	\
+				   __entry);				\
+			flush_tlb_range(__vma, __address,		\
+					(__address) + HPAGE_PMD_SIZE);	\
+		}							\
+		__changed;						\
+	})
+#else /* CONFIG_TRANSPARENT_HUGEPAGE */
+#define pmdp_set_access_flags(__vma, __address, __pmdp, __entry, __dirty) \
+	({ BUG(); 0; })
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+#endif
+
 #ifndef __HAVE_ARCH_PTEP_TEST_AND_CLEAR_YOUNG
 #define ptep_test_and_clear_young(__vma, __address, __ptep)		\
 ({									\
@@ -39,6 +59,25 @@
 })
 #endif
 
+#ifndef __HAVE_ARCH_PMDP_TEST_AND_CLEAR_YOUNG
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#define pmdp_test_and_clear_young(__vma, __address, __pmdp)		\
+({									\
+	pmd_t __pmd = *(__pmdp);					\
+	int r = 1;							\
+	if (!pmd_young(__pmd))						\
+		r = 0;							\
+	else								\
+		set_pmd_at((__vma)->vm_mm, (__address),			\
+			   (__pmdp), pmd_mkold(__pmd));			\
+	r;								\
+})
+#else /* CONFIG_TRANSPARENT_HUGEPAGE */
+#define pmdp_test_and_clear_young(__vma, __address, __pmdp)	\
+	({ BUG(); 0; })
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+#endif
+
 #ifndef __HAVE_ARCH_PTEP_CLEAR_YOUNG_FLUSH
 #define ptep_clear_flush_young(__vma, __address, __ptep)		\
 ({									\
@@ -50,6 +89,24 @@
 })
 #endif
 
+#ifndef __HAVE_ARCH_PMDP_CLEAR_YOUNG_FLUSH
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#define pmdp_clear_flush_young(__vma, __address, __pmdp)		\
+({									\
+	int __young;							\
+	VM_BUG_ON((__address) & ~HPAGE_PMD_MASK);			\
+	__young = pmdp_test_and_clear_young(__vma, __address, __pmdp);	\
+	if (__young)							\
+		flush_tlb_range(__vma, __address,			\
+				(__address) + HPAGE_PMD_SIZE);		\
+	__young;							\
+})
+#else /* CONFIG_TRANSPARENT_HUGEPAGE */
+#define pmdp_clear_flush_young(__vma, __address, __pmdp)	\
+	({ BUG(); 0; })
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+#endif
+
 #ifndef __HAVE_ARCH_PTEP_GET_AND_CLEAR
 #define ptep_get_and_clear(__mm, __address, __ptep)			\
 ({									\
@@ -57,6 +114,20 @@
 	pte_clear((__mm), (__address), (__ptep));			\
 	__pte;								\
 })
+#endif
+
+#ifndef __HAVE_ARCH_PMDP_GET_AND_CLEAR
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#define pmdp_get_and_clear(__mm, __address, __pmdp)			\
+({									\
+	pmd_t __pmd = *(__pmdp);					\
+	pmd_clear((__mm), (__address), (__pmdp));			\
+	__pmd;								\
+})
+#else /* CONFIG_TRANSPARENT_HUGEPAGE */
+#define pmdp_get_and_clear(__mm, __address, __pmdp)	\
+	({ BUG(); 0; })
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 #endif
 
 #ifndef __HAVE_ARCH_PTEP_GET_AND_CLEAR_FULL
@@ -90,6 +161,22 @@ do {									\
 })
 #endif
 
+#ifndef __HAVE_ARCH_PMDP_CLEAR_FLUSH
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#define pmdp_clear_flush(__vma, __address, __pmdp)			\
+({									\
+	pmd_t __pmd;							\
+	VM_BUG_ON((__address) & ~HPAGE_PMD_MASK);			\
+	__pmd = pmdp_get_and_clear((__vma)->vm_mm, __address, __pmdp);	\
+	flush_tlb_range(__vma, __address, (__address) + HPAGE_PMD_SIZE);\
+	__pmd;								\
+})
+#else /* CONFIG_TRANSPARENT_HUGEPAGE */
+#define pmdp_clear_flush(__vma, __address, __pmdp)	\
+	({ BUG(); 0; })
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+#endif
+
 #ifndef __HAVE_ARCH_PTEP_SET_WRPROTECT
 struct mm_struct;
 static inline void ptep_set_wrprotect(struct mm_struct *mm, unsigned long address, pte_t *ptep)
@@ -99,8 +186,43 @@ static inline void ptep_set_wrprotect(struct mm_struct *mm, unsigned long addres
 }
 #endif
 
+#ifndef __HAVE_ARCH_PMDP_SET_WRPROTECT
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+static inline void pmdp_set_wrprotect(struct mm_struct *mm, unsigned long address, pmd_t *pmdp)
+{
+	pmd_t old_pmd = *pmdp;
+	set_pmd_at(mm, address, pmdp, pmd_wrprotect(old_pmd));
+}
+#else /* CONFIG_TRANSPARENT_HUGEPAGE */
+#define pmdp_set_wrprotect(mm, address, pmdp) BUG()
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+#endif
+
+#ifndef __HAVE_ARCH_PMDP_SPLITTING_FLUSH
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#define pmdp_splitting_flush(__vma, __address, __pmdp)			\
+({									\
+	pmd_t __pmd = pmd_mksplitting(*(__pmdp));			\
+	VM_BUG_ON((__address) & ~HPAGE_PMD_MASK);			\
+	set_pmd_at((__vma)->vm_mm, __address, __pmdp, __pmd);		\
+	/* tlb flush only to serialize against gup-fast */		\
+	flush_tlb_range(__vma, __address, (__address) + HPAGE_PMD_SIZE);\
+})
+#else /* CONFIG_TRANSPARENT_HUGEPAGE */
+#define pmdp_splitting_flush(__vma, __address, __pmdp) BUG()
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+#endif
+
 #ifndef __HAVE_ARCH_PTE_SAME
 #define pte_same(A,B)	(pte_val(A) == pte_val(B))
+#endif
+
+#ifndef __HAVE_ARCH_PMD_SAME
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+#define pmd_same(A,B)	(pmd_val(A) == pmd_val(B))
+#else /* CONFIG_TRANSPARENT_HUGEPAGE */
+#define pmd_same(A,B)	({ BUG(); 0; })
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 #endif
 
 #ifndef __HAVE_ARCH_PAGE_TEST_DIRTY
@@ -224,7 +346,12 @@ static inline void __ptep_modify_prot_commit(struct mm_struct *mm,
 	 * The pte is non-present, so there's no hardware state to
 	 * preserve.
 	 */
-	set_pte_at(mm, addr, ptep, pte);
+#ifdef CONFIG_PARAVIRT
+	if (likely(!paravirt_enabled()))
+		native_set_pte_at(mm, addr, ptep, pte);
+	else
+#endif
+		set_pte_at(mm, addr, ptep, pte);
 }
 
 #ifndef __HAVE_ARCH_PTEP_MODIFY_PROT_TRANSACTION
@@ -343,6 +470,115 @@ extern int track_pfn_vma_copy(struct vm_area_struct *vma);
 extern void untrack_pfn_vma(struct vm_area_struct *vma, unsigned long pfn,
 				unsigned long size);
 #endif
+
+#ifdef __HAVE_COLOR_ZERO_PAGE
+static inline int is_zero_pfn(unsigned long pfn)
+{
+	extern unsigned long zero_pfn;
+	unsigned long offset_from_zero_pfn = pfn - zero_pfn;
+	return offset_from_zero_pfn <= (zero_page_mask >> PAGE_SHIFT);
+}
+
+static inline unsigned long my_zero_pfn(unsigned long addr)
+{
+	return page_to_pfn(ZERO_PAGE(addr));
+}
+#else
+static inline int is_zero_pfn(unsigned long pfn)
+{
+	extern unsigned long zero_pfn;
+	return pfn == zero_pfn;
+}
+
+static inline unsigned long my_zero_pfn(unsigned long addr)
+{
+	extern unsigned long zero_pfn;
+	return zero_pfn;
+}
+#endif
+
+#ifndef CONFIG_TRANSPARENT_HUGEPAGE
+#define pmd_trans_huge(pmd) 0
+#define pmd_trans_splitting(pmd) (0)
+#ifndef __HAVE_ARCH_PMD_WRITE
+#define pmd_write(pmd)	({ BUG(); 0; })
+#endif /* __HAVE_ARCH_PMD_WRITE */
+#endif
+
+#ifndef  __HAVE_ARCH_READ_PMD_ATOMIC
+static inline pmd_t read_pmd_atomic(pmd_t *pmdp)
+{
+	/*
+	 * Depend on compiler for an atomic pmd read. NOTE: this is
+	 * only going to work, if the pmdval_t isn't larger than
+	 * an unsigned long.
+	 */
+	return *pmdp;
+}
+#endif /* __HAVE_ARCH_READ_PMD */
+
+/*
+ * This function is meant to be used by sites walking pagetables with
+ * the mmap_sem hold in read mode to protect against MADV_DONTNEED and
+ * transhuge page faults. MADV_DONTNEED can convert a transhuge pmd
+ * into a null pmd and the transhuge page fault can convert a null pmd
+ * into an hugepmd or into a regular pmd (if the hugepage allocation
+ * fails). While holding the mmap_sem in read mode the pmd becomes
+ * stable and stops changing under us only if it's not null and not a
+ * transhuge pmd. When those races occurs and this function makes a
+ * difference vs the standard pmd_none_or_clear_bad, the result is
+ * undefined so behaving like if the pmd was none is safe (because it
+ * can return none anyway). The compiler level barrier() is critically
+ * important to compute the two checks atomically on the same pmdval.
+ *
+ * For 32bit kernels with a 64bit large pmd_t this automatically takes
+ * care of reading the pmd atomically to avoid SMP race conditions
+ * against pmd_populate() when the mmap_sem is hold for reading by the
+ * caller (a special atomic read not done by "gcc" as in the generic
+ * version above, is also needed when THP is disabled because the page
+ * fault can populate the pmd from under us).
+ */
+static inline int pmd_none_or_trans_huge_or_clear_bad(pmd_t *pmd)
+{
+	pmd_t pmdval = read_pmd_atomic(pmd);
+	/*
+	 * The barrier will stabilize the pmdval in a register or on
+	 * the stack so that it will stop changing under the code.
+	 */
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	barrier();
+#endif
+	if (pmd_none(pmdval))
+		return 1;
+	if (unlikely(pmd_bad(pmdval))) {
+		if (!pmd_trans_huge(pmdval))
+			pmd_clear_bad(pmd);
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * This is a noop if Transparent Hugepage Support is not built into
+ * the kernel. Otherwise it is equivalent to
+ * pmd_none_or_trans_huge_or_clear_bad(), and shall only be called in
+ * places that already verified the pmd is not none and they want to
+ * walk ptes while holding the mmap sem in read mode (write mode don't
+ * need this). If THP is not enabled, the pmd can't go away under the
+ * code even if MADV_DONTNEED runs, but if THP is enabled we need to
+ * run a pmd_trans_unstable before walking the ptes after
+ * split_huge_page_pmd returns (because it may have run when the pmd
+ * become null, but then a page fault can map in a THP and not a
+ * regular page).
+ */
+static inline int pmd_trans_unstable(pmd_t *pmd)
+{
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	return pmd_none_or_trans_huge_or_clear_bad(pmd);
+#else
+	return 0;
+#endif
+}
 
 #endif /* !__ASSEMBLY__ */
 

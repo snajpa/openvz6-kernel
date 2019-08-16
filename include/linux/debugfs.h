@@ -38,6 +38,11 @@ struct dentry *debugfs_create_file(const char *name, mode_t mode,
 				   struct dentry *parent, void *data,
 				   const struct file_operations *fops);
 
+struct dentry *debugfs_create_file_size(const char *name, umode_t mode,
+					struct dentry *parent, void *data,
+					const struct file_operations *fops,
+					loff_t file_size);
+
 struct dentry *debugfs_create_dir(const char *name, struct dentry *parent);
 
 struct dentry *debugfs_create_symlink(const char *name, struct dentry *parent,
@@ -63,6 +68,8 @@ struct dentry *debugfs_create_x16(const char *name, mode_t mode,
 				  struct dentry *parent, u16 *value);
 struct dentry *debugfs_create_x32(const char *name, mode_t mode,
 				  struct dentry *parent, u32 *value);
+struct dentry *debugfs_create_x64(const char *name, mode_t mode,
+				  struct dentry *parent, u64 *value);
 struct dentry *debugfs_create_size_t(const char *name, mode_t mode,
 				     struct dentry *parent, size_t *value);
 struct dentry *debugfs_create_bool(const char *name, mode_t mode,
@@ -87,6 +94,14 @@ bool debugfs_initialized(void);
 static inline struct dentry *debugfs_create_file(const char *name, mode_t mode,
 					struct dentry *parent, void *data,
 					const struct file_operations *fops)
+{
+	return ERR_PTR(-ENODEV);
+}
+
+static inline struct dentry *debugfs_create_file_size(const char *name, umode_t mode,
+					struct dentry *parent, void *data,
+					const struct file_operations *fops,
+					loff_t file_size)
 {
 	return ERR_PTR(-ENODEV);
 }

@@ -32,12 +32,22 @@
 #include <asm/setup.h>
 #ifndef __ASSEMBLY__
 
+void storage_key_init_range(unsigned long start, unsigned long end);
+
+static unsigned long pfmf(unsigned long function, unsigned long address)
+{
+	asm volatile(
+		"	.insn	rre,0xb9af0000,%[function],%[address]"
+		: [address] "+a" (address)
+		: [function] "d" (function)
+		: "memory");
+	return address;
+}
+
 static inline void clear_page(void *page)
 {
 	if (MACHINE_HAS_PFMF) {
-		asm volatile(
-			"	.insn	rre,0xb9af0000,%0,%1"
-			: : "d" (0x10000), "a" (page) : "memory", "cc");
+		pfmf(0x10000, (unsigned long)page);
 	} else {
 		register unsigned long reg1 asm ("1") = 0;
 		register void *reg2 asm ("2") = page;
@@ -128,6 +138,11 @@ page_get_storage_key(unsigned long addr)
 struct page;
 void arch_free_page(struct page *page, int order);
 void arch_alloc_page(struct page *page, int order);
+
+static inline int devmem_is_allowed(unsigned long pfn)
+{
+	return 0;
+}
 
 #define HAVE_ARCH_FREE_PAGE
 #define HAVE_ARCH_ALLOC_PAGE

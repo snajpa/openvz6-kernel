@@ -183,8 +183,18 @@ struct tcf_proto
 
 struct qdisc_skb_cb {
 	unsigned int		pkt_len;
-	char			data[];
+	u16			slave_dev_queue_mapping;
+	u16			_pad;
+#define QDISC_CB_PRIV_LEN 20
+	unsigned char		data[QDISC_CB_PRIV_LEN];
 };
+
+static inline void qdisc_cb_private_validate(const struct sk_buff *skb, int sz)
+{
+	struct qdisc_skb_cb *qcb;
+	MAYBE_BUILD_BUG_ON(sizeof(skb->cb) < sizeof(unsigned int) + sz);
+	MAYBE_BUILD_BUG_ON(sizeof(qcb->data) < sz);
+}
 
 static inline int qdisc_qlen(struct Qdisc *q)
 {
@@ -260,6 +270,7 @@ extern struct Qdisc noop_qdisc;
 extern struct Qdisc_ops noop_qdisc_ops;
 extern struct Qdisc_ops pfifo_fast_ops;
 extern struct Qdisc_ops mq_qdisc_ops;
+extern struct Qdisc_ops *default_qdisc_ops;
 
 struct Qdisc_class_common
 {
@@ -307,6 +318,7 @@ extern void dev_init_scheduler(struct net_device *dev);
 extern void dev_shutdown(struct net_device *dev);
 extern void dev_activate(struct net_device *dev);
 extern void dev_deactivate(struct net_device *dev);
+extern void dev_deactivate_many(struct list_head *head);
 extern struct Qdisc *dev_graft_qdisc(struct netdev_queue *dev_queue,
 				     struct Qdisc *qdisc);
 extern void qdisc_reset(struct Qdisc *qdisc);
@@ -322,12 +334,24 @@ extern void qdisc_calculate_pkt_len(struct sk_buff *skb,
 extern void tcf_destroy(struct tcf_proto *tp);
 extern void tcf_destroy_chain(struct tcf_proto **fl);
 
-/* Reset all TX qdiscs of a device.  */
+/* Reset all TX qdiscs greater then index of a device.  */
+static inline void qdisc_reset_all_tx_gt(struct net_device *dev, unsigned int i)
+{
+	struct Qdisc *qdisc;
+
+	for (; i < dev->num_tx_queues; i++) {
+		qdisc = netdev_get_tx_queue(dev, i)->qdisc;
+		if (qdisc) {
+			spin_lock_bh(qdisc_lock(qdisc));
+			qdisc_reset(qdisc);
+			spin_unlock_bh(qdisc_lock(qdisc));
+		}
+	}
+}
+
 static inline void qdisc_reset_all_tx(struct net_device *dev)
 {
-	unsigned int i;
-	for (i = 0; i < dev->num_tx_queues; i++)
-		qdisc_reset(netdev_get_tx_queue(dev, i)->qdisc);
+	qdisc_reset_all_tx_gt(dev, 0);
 }
 
 /* Are all TX queues of the device empty?  */

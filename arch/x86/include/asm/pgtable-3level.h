@@ -26,25 +26,121 @@
  */
 static inline void native_set_pte(pte_t *ptep, pte_t pte)
 {
+	mm_track_pte(ptep);
 	ptep->pte_high = pte.pte_high;
 	smp_wmb();
 	ptep->pte_low = pte.pte_low;
 }
 
+#define  __HAVE_ARCH_READ_PMD_ATOMIC
+/*
+ * pte_offset_map_lock on 32bit PAE kernels was reading the pmd_t with
+ * a "*pmdp" dereference done by gcc. Problem is, in certain places
+ * where pte_offset_map_lock is called, concurrent page faults are
+ * allowed, if the mmap_sem is hold for reading. An example is mincore
+ * vs page faults vs MADV_DONTNEED. On the page fault side
+ * pmd_populate rightfully does a set_64bit, but if we're reading the
+ * pmd_t with a "*pmdp" on the mincore side, a SMP race can happen
+ * because gcc will not read the 64bit of the pmd atomically. To fix
+ * this all places running pmd_offset_map_lock() while holding the
+ * mmap_sem in read mode, shall read the pmdp pointer using this
+ * function to know if the pmd is null nor not, and in turn to know if
+ * they can run pmd_offset_map_lock or pmd_trans_huge or other pmd
+ * operations.
+ *
+ * Without THP if the mmap_sem is hold for reading, the
+ * pmd can only transition from null to not null while read_pmd_atomic runs.
+ * So there's no need of literally reading it atomically.
+ *
+ * With THP if the mmap_sem is hold for reading, the pmd can become
+ * THP or null or point to a pte (and in turn become "stable") at any
+ * time under read_pmd_atomic, so it's mandatory to read it atomically
+ * with cmpxchg8b.
+ */
+#ifndef CONFIG_TRANSPARENT_HUGEPAGE
+static inline pmd_t read_pmd_atomic(pmd_t *pmdp)
+{
+	pmdval_t ret;
+	u32 *tmp = (u32 *)pmdp;
+
+	ret = (pmdval_t) (*tmp);
+	if (ret) {
+		/*
+		 * If the low part is null, we must not read the high part
+		 * or we can end up with a partial pmd.
+		 */
+		smp_rmb();
+		ret |= ((pmdval_t)*(tmp + 1)) << 32;
+	}
+
+	return (pmd_t) { ret };
+}
+#else /* CONFIG_TRANSPARENT_HUGEPAGE */
+static inline pmd_t read_pmd_atomic(pmd_t *pmdp)
+{
+	pmdval_t val = (pmdval_t)atomic64_read((atomic64_t *)pmdp);
+	return (pmd_t) { val };
+}
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+
 static inline void native_set_pte_atomic(pte_t *ptep, pte_t pte)
 {
+	mm_track_pte(ptep);
 	set_64bit((unsigned long long *)(ptep), native_pte_val(pte));
 }
 
 static inline void native_set_pmd(pmd_t *pmdp, pmd_t pmd)
 {
+	mm_track_pmd(pmdp);
 	set_64bit((unsigned long long *)(pmdp), native_pmd_val(pmd));
 }
 
+/*
+ * PHYSICAL_PAGE_MASK is casted to 32 bits, so we can't use it here.
+ */
+#define PGD_PAE_PHYS_MASK	(__PHYSICAL_MASK & PAGE_MASK)
+
+/*
+ * PAE allows Base Address, P, PWT, PCD and AVL bits to be set in PGD entries.
+ * Bits 9-11 are ignored. All other bits are Reserved (must be zero).
+ */
+#define PGD_ALLOWED_BITS	(PGD_PAE_PHYS_MASK | _PAGE_PRESENT | \
+				 _PAGE_PWT | _PAGE_PCD | \
+				 _PAGE_UNUSED1 | _PAGE_IOMAP | _PAGE_HIDDEN)
+
 static inline void native_set_pud(pud_t *pudp, pud_t pud)
 {
+	mm_track_pud(pudp);
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	pud.pgd.pgd &= PGD_ALLOWED_BITS;
+	pud.pgd = pti_set_user_pgd((pgd_t *)pudp, pud.pgd);
+#endif
 	set_64bit((unsigned long long *)(pudp), native_pud_val(pud));
 }
+
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+/*
+ * The NX bit isn't allowed in the PDPTE (PGD) entries in Physical Address
+ * Extension (PAE) mode. As a result, PGD entry poisoning for user PGD
+ * entries won't work.
+ */
+
+static inline void kaiser_poison_pgd(pgd_t *pgd)
+{
+}
+
+static inline void kaiser_unpoison_pgd(pgd_t *pgd)
+{
+}
+
+static inline void kaiser_poison_pgd_atomic(pgd_t *pgd)
+{
+}
+
+static inline void kaiser_unpoison_pgd_atomic(pgd_t *pgd)
+{
+}
+#endif
 
 /*
  * For PTEs and PDEs, we must clear the P-bit first when clearing a page table
@@ -54,6 +150,7 @@ static inline void native_set_pud(pud_t *pudp, pud_t pud)
 static inline void native_pte_clear(struct mm_struct *mm, unsigned long addr,
 				    pte_t *ptep)
 {
+	mm_track_pte(ptep);
 	ptep->pte_low = 0;
 	smp_wmb();
 	ptep->pte_high = 0;
@@ -62,6 +159,9 @@ static inline void native_pte_clear(struct mm_struct *mm, unsigned long addr,
 static inline void native_pmd_clear(pmd_t *pmd)
 {
 	u32 *tmp = (u32 *)pmd;
+
+	mm_track_pmd(pmd);
+
 	*tmp = 0;
 	smp_wmb();
 	*(tmp + 1) = 0;
@@ -69,9 +169,13 @@ static inline void native_pmd_clear(pmd_t *pmd)
 
 static inline void pud_clear(pud_t *pudp)
 {
-	unsigned long pgd;
 
+	mm_track_pud(pudp);
 	set_pud(pudp, __pud(0));
+
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	pti_set_user_pgd((pgd_t *)pudp, __pgd(0));
+#endif
 
 	/*
 	 * According to Intel App note "TLBs, Paging-Structure Caches,
@@ -79,19 +183,18 @@ static inline void pud_clear(pud_t *pudp)
 	 * section 8.1: in PAE mode we explicitly have to flush the
 	 * TLB via cr3 if the top-level pgd is changed...
 	 *
-	 * Make sure the pud entry we're updating is within the
-	 * current pgd to avoid unnecessary TLB flushes.
-	 */
-	pgd = read_cr3();
-	if (__pa(pudp) >= pgd && __pa(pudp) <
-	    (pgd + sizeof(pgd_t)*PTRS_PER_PGD))
-		write_cr3(pgd);
+	 * Currently all places where pud_clear() is called either have
+	 * flush_tlb_mm() followed or don't need TLB flush (x86_64 code or
+	 * pud_clear_bad()), so we don't need TLB flush here.
+ 	 */
 }
 
 #ifdef CONFIG_SMP
 static inline pte_t native_ptep_get_and_clear(pte_t *ptep)
 {
 	pte_t res;
+
+	mm_track_pte(ptep);
 
 	/* xchg acts as a barrier before the setting of the high bits */
 	res.pte_low = xchg(&ptep->pte_low, 0);

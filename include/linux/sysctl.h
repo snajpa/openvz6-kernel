@@ -162,6 +162,7 @@ enum
 	KERN_MAX_LOCK_DEPTH=74,
 	KERN_NMI_WATCHDOG=75, /* int: enable/disable nmi watchdog */
 	KERN_PANIC_ON_NMI=76, /* int: whether we will panic on an unrecovered */
+	KERN_PANIC_ON_WARN=77, /* int: call panic() in WARN() functions */
 };
 
 
@@ -490,6 +491,18 @@ enum
 	NET_IPV4_CONF_PROMOTE_SECONDARIES=20,
 	NET_IPV4_CONF_ARP_ACCEPT=21,
 	NET_IPV4_CONF_ARP_NOTIFY=22,
+	NET_IPV4_CONF_ACCEPT_LOCAL=23,
+	NET_IPV4_CONF_SRC_VMARK=24,
+	NET_IPV4_CONF_PROXY_ARP_PVLAN=25,
+
+	/*
+	 * KABI Note:
+	 * Growing __NET_IPV4_CONF_MAX would break kABI theoretically because
+	 * struct in_device encapsulates struct ipv4_devconf. The use of
+	 * DECLARE_BITMAP() allows us to let __NET_IPV4_CONF_MAX grow to a
+	 * value of 32 because it is rounded up to the boundary of a long.
+	 */
+	NET_IPV4_CONF_ROUTE_LOCALNET=26,
 	__NET_IPV4_CONF_MAX
 };
 
@@ -995,6 +1008,8 @@ extern int proc_doulongvec_minmax(struct ctl_table *, int,
 				  void __user *, size_t *, loff_t *);
 extern int proc_doulongvec_ms_jiffies_minmax(struct ctl_table *table, int,
 				      void __user *, size_t *, loff_t *);
+extern int proc_do_large_bitmap(struct ctl_table *, int,
+				void __user *, size_t *, loff_t *);
 
 extern int do_sysctl (int __user *name, int nlen,
 		      void __user *oldval, size_t __user *oldlenp,

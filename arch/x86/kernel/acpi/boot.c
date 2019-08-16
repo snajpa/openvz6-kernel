@@ -41,6 +41,7 @@
 #include <asm/io.h>
 #include <asm/mpspec.h>
 #include <asm/smp.h>
+#include <asm/processor.h>
 
 static int __initdata acpi_force = 0;
 u32 acpi_rsdt_forced;
@@ -49,6 +50,7 @@ EXPORT_SYMBOL(acpi_disabled);
 
 #ifdef	CONFIG_X86_64
 # include <asm/proto.h>
+# include <asm/numa_64.h>
 #endif				/* X86 */
 
 #define BAD_MADT_ENTRY(entry, end) (					    \
@@ -65,6 +67,7 @@ int acpi_ht __initdata = 1;	/* enable HT */
 int acpi_lapic;
 int acpi_ioapic;
 int acpi_strict;
+int acpi_disable_cmcff;
 
 u8 acpi_sci_flags __initdata;
 int acpi_sci_override_gsi __initdata;
@@ -148,6 +151,11 @@ static int __init acpi_parse_madt(struct acpi_table_header *table)
 static void __cpuinit acpi_register_lapic(int id, u8 enabled)
 {
 	unsigned int ver = 0;
+
+	if (id >= (MAX_LOCAL_APIC-1)) {
+		printk(KERN_INFO PREFIX "skipped apicid that is too big\n");
+		return;
+	}
 
 	if (!enabled) {
 		++disabled_cpus;
@@ -446,8 +454,15 @@ void __init acpi_pic_sci_set_trigger(unsigned int irq, u16 trigger)
 int acpi_gsi_to_irq(u32 gsi, unsigned int *irq)
 {
 	*irq = gsi;
+
+#ifdef CONFIG_X86_IO_APIC
+	if (acpi_irq_model == ACPI_IRQ_MODEL_IOAPIC)
+		setup_IO_APIC_irq_extra(gsi);
+#endif
+
 	return 0;
 }
+EXPORT_SYMBOL_GPL(acpi_gsi_to_irq);
 
 /*
  * success: return IRQ number (>=0)
@@ -473,7 +488,8 @@ int acpi_register_gsi(struct device *dev, u32 gsi, int trigger, int polarity)
 		plat_gsi = mp_register_gsi(dev, gsi, trigger, polarity);
 	}
 #endif
-	acpi_gsi_to_irq(plat_gsi, &irq);
+	irq = plat_gsi;
+
 	return irq;
 }
 
@@ -482,42 +498,30 @@ int acpi_register_gsi(struct device *dev, u32 gsi, int trigger, int polarity)
  */
 #ifdef CONFIG_ACPI_HOTPLUG_CPU
 
-static int __cpuinit _acpi_map_lsapic(acpi_handle handle, int *pcpu)
+static void acpi_map_cpu2node(acpi_handle handle, int cpu, int physid)
 {
-	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
-	union acpi_object *obj;
-	struct acpi_madt_local_apic *lapic;
+#ifdef CONFIG_ACPI_NUMA
+	int nid;
+
+	nid = acpi_get_node(handle);
+	if (nid == -1 || !node_online(nid))
+		return;
+#ifdef CONFIG_X86_64
+	apicid_to_node[physid] = nid;
+	numa_set_node(cpu, nid);
+#else /* CONFIG_X86_32 */
+	apicid_2_node[physid] = nid;
+	cpu_to_node_map[cpu] = nid;
+#endif
+
+#endif
+}
+
+static int _acpi_map_lsapic(acpi_handle handle, int physid, int *pcpu)
+{
 	cpumask_var_t tmp_map, new_map;
-	u8 physid;
 	int cpu;
 	int retval = -ENOMEM;
-
-	if (ACPI_FAILURE(acpi_evaluate_object(handle, "_MAT", NULL, &buffer)))
-		return -EINVAL;
-
-	if (!buffer.length || !buffer.pointer)
-		return -EINVAL;
-
-	obj = buffer.pointer;
-	if (obj->type != ACPI_TYPE_BUFFER ||
-	    obj->buffer.length < sizeof(*lapic)) {
-		kfree(buffer.pointer);
-		return -EINVAL;
-	}
-
-	lapic = (struct acpi_madt_local_apic *)obj->buffer.pointer;
-
-	if (lapic->header.type != ACPI_MADT_TYPE_LOCAL_APIC ||
-	    !(lapic->lapic_flags & ACPI_MADT_ENABLED)) {
-		kfree(buffer.pointer);
-		return -EINVAL;
-	}
-
-	physid = lapic->id;
-
-	kfree(buffer.pointer);
-	buffer.length = ACPI_ALLOCATE_BUFFER;
-	buffer.pointer = NULL;
 
 	if (!alloc_cpumask_var(&tmp_map, GFP_KERNEL))
 		goto out;
@@ -526,7 +530,7 @@ static int __cpuinit _acpi_map_lsapic(acpi_handle handle, int *pcpu)
 		goto free_tmp_map;
 
 	cpumask_copy(tmp_map, cpu_present_mask);
-	acpi_register_lapic(physid, lapic->lapic_flags & ACPI_MADT_ENABLED);
+	acpi_register_lapic(physid, ACPI_MADT_ENABLED);
 
 	/*
 	 * If mp_register_lapic successfully generates a new logical cpu
@@ -540,6 +544,7 @@ static int __cpuinit _acpi_map_lsapic(acpi_handle handle, int *pcpu)
 	}
 
 	cpu = cpumask_first(new_map);
+	acpi_map_cpu2node(handle, cpu, physid);
 
 	*pcpu = cpu;
 	retval = 0;
@@ -553,9 +558,9 @@ out:
 }
 
 /* wrapper to silence section mismatch warning */
-int __ref acpi_map_lsapic(acpi_handle handle, int *pcpu)
+int __ref acpi_map_lsapic(acpi_handle handle, int physid, int *pcpu)
 {
-	return _acpi_map_lsapic(handle, pcpu);
+	return _acpi_map_lsapic(handle, physid, pcpu);
 }
 EXPORT_SYMBOL(acpi_map_lsapic);
 
@@ -624,6 +629,7 @@ static int __init acpi_parse_hpet(struct acpi_table_header *table)
 	}
 
 	hpet_address = hpet_tbl->address.address;
+	hpet_blockid = hpet_tbl->sequence;
 
 	/*
 	 * Some broken BIOSes advertise HPET at 0x0. We really do not
@@ -773,6 +779,8 @@ static int __init acpi_parse_madt_lapic_entries(void)
 {
 	int count;
 	int x2count = 0;
+	int ret;
+	struct acpi_subtable_proc madt_proc[2];
 
 	if (!cpu_has_apic)
 		return -ENODEV;
@@ -797,10 +805,22 @@ static int __init acpi_parse_madt_lapic_entries(void)
 				      acpi_parse_sapic, MAX_APICS);
 
 	if (!count) {
-		x2count = acpi_table_parse_madt(ACPI_MADT_TYPE_LOCAL_X2APIC,
-						acpi_parse_x2apic, MAX_APICS);
-		count = acpi_table_parse_madt(ACPI_MADT_TYPE_LOCAL_APIC,
-					      acpi_parse_lapic, MAX_APICS);
+		memset(madt_proc, 0, sizeof(madt_proc));
+		madt_proc[0].id = ACPI_MADT_TYPE_LOCAL_APIC;
+		madt_proc[0].handler = acpi_parse_lapic;
+		madt_proc[1].id = ACPI_MADT_TYPE_LOCAL_X2APIC;
+		madt_proc[1].handler = acpi_parse_x2apic;
+		ret = acpi_table_parse_entries_array(ACPI_SIG_MADT,
+				sizeof(struct acpi_table_madt),
+				madt_proc, ARRAY_SIZE(madt_proc), MAX_LOCAL_APIC);
+		if (ret < 0) {
+			printk(KERN_ERR PREFIX
+					"Error parsing LAPIC/X2APIC entries\n");
+			return ret;
+		}
+
+		x2count = madt_proc[0].count;
+		count = madt_proc[1].count;
 	}
 	if (!count && !x2count) {
 		printk(KERN_ERR PREFIX "No LAPIC entries present\n");
@@ -1184,9 +1204,6 @@ static void __init acpi_process_madt(void)
 		if (!error) {
 			acpi_lapic = 1;
 
-#ifdef CONFIG_X86_BIGSMP
-			generic_bigsmp_probe();
-#endif
 			/*
 			 * Parse MADT IO-APIC entries
 			 */
@@ -1196,8 +1213,6 @@ static void __init acpi_process_madt(void)
 				acpi_ioapic = 1;
 
 				smp_found_config = 1;
-				if (apic->setup_apic_routing)
-					apic->setup_apic_routing();
 			}
 		}
 		if (error == -EINVAL) {
@@ -1348,14 +1363,6 @@ static struct dmi_system_id __initdata acpi_dmi_table[] = {
 	 },
 	{
 	 .callback = force_acpi_ht,
-	 .ident = "ASUS P2B-DS",
-	 .matches = {
-		     DMI_MATCH(DMI_BOARD_VENDOR, "ASUSTeK Computer INC."),
-		     DMI_MATCH(DMI_BOARD_NAME, "P2B-DS"),
-		     },
-	 },
-	{
-	 .callback = force_acpi_ht,
 	 .ident = "ASUS CUR-DLS",
 	 .matches = {
 		     DMI_MATCH(DMI_BOARD_VENDOR, "ASUSTeK Computer INC."),
@@ -1461,6 +1468,15 @@ static struct dmi_system_id __initdata acpi_dmi_table[] = {
 		     DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 360"),
 		     },
 	 },
+	{
+	 .callback = disable_acpi_pci,
+	 .ident = "HP xw9300 Workstation",
+	 .matches = {
+		     DMI_MATCH(DMI_SYS_VENDOR, "Hewlett-Packard"),
+		     DMI_MATCH(DMI_PRODUCT_NAME, "HP xw9300 Workstation"),
+		     },
+	 },
+
 	{}
 };
 
@@ -1537,6 +1553,20 @@ static struct dmi_system_id __initdata acpi_dmi_table_late[] = {
 int __init acpi_boot_table_init(void)
 {
 	int error;
+
+	/*
+	 * Disable ACPI OSI Win8 for everyone except Intel Broadwell.
+	 * Note, if necessary, dmi_check_system or acpi_blacklisted
+	 * can disable OSI Win8 for specific Broadwell-based systems.
+	 */
+	if (!((boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) &&
+	      (boot_cpu_data.x86 == 6) &&
+	      (boot_cpu_data.x86_model == 61))) {
+		char windows2012[] = "!Windows 2012";
+		char windows2013[] = "!Windows 2013";
+		acpi_osi_setup(windows2012);
+		acpi_osi_setup(windows2013);
+	}
 
 	dmi_check_system(acpi_dmi_table);
 
@@ -1653,6 +1683,10 @@ static int __init parse_acpi(char *arg)
 	/* "acpi=noirq" disables ACPI interrupt routing */
 	else if (strcmp(arg, "noirq") == 0) {
 		acpi_noirq_set();
+	}
+	/* "acpi=nocmcff" disables FF mode for corrected errors */
+	else if (strcmp(arg, "nocmcff") == 0) {
+		acpi_disable_cmcff = 1;
 	} else {
 		/* Core will printk when we return error. */
 		return -EINVAL;

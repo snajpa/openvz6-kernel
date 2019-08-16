@@ -30,6 +30,7 @@ int main(void)
 	DEFINE(__TI_precount, offsetof(struct thread_info, preempt_count));
 	DEFINE(__TI_user_timer, offsetof(struct thread_info, user_timer));
 	DEFINE(__TI_system_timer, offsetof(struct thread_info, system_timer));
+	DEFINE(__TI_last_break, offsetof(struct thread_info, last_break));
 	BLANK();
 	DEFINE(__PT_ARGS, offsetof(struct pt_regs, args));
 	DEFINE(__PT_PSW, offsetof(struct pt_regs, psw));
@@ -52,6 +53,7 @@ int main(void)
 	DEFINE(__VDSO_WTOM_NSEC, offsetof(struct vdso_data, wtom_clock_nsec));
 	DEFINE(__VDSO_TIMEZONE, offsetof(struct vdso_data, tz_minuteswest));
 	DEFINE(__VDSO_ECTG_OK, offsetof(struct vdso_data, ectg_available));
+	DEFINE(__VDSO_NTP_MULT, offsetof(struct vdso_data, ntp_mult));
 	DEFINE(__VDSO_ECTG_BASE,
 	       offsetof(struct vdso_per_cpu_data, ectg_timer_base));
 	DEFINE(__VDSO_ECTG_USER,
@@ -65,5 +67,9 @@ int main(void)
 	DEFINE(__SIGP_RESTART, sigp_restart);
 	DEFINE(__SIGP_SENSE, sigp_sense);
 	DEFINE(__SIGP_INITIAL_CPU_RESET, sigp_initial_cpu_reset);
+	DEFINE(__LC_RST_OLD_PSW, offsetof(struct _lowcore, restart_old_psw));
+	/* constants for transactional execution */
+	DEFINE(__LC_PGM_TDB, offsetof(struct _lowcore, pgm_tdb));
+	DEFINE(__THREAD_trap_tdb, offsetof(struct task_struct, thread.trap_tdb));
 	return 0;
 }

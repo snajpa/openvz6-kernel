@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2004-2009 Emulex.  All rights reserved.           *
+ * Copyright (C) 2004-2014 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
  * www.emulex.com                                                  *
  * Portions Copyright (C) 2004-2005 Christoph Hellwig              *
@@ -20,6 +20,7 @@
  *******************************************************************/
 
 #include <linux/mempool.h>
+#include <linux/slab.h>
 #include <linux/pci.h>
 #include <linux/interrupt.h>
 
@@ -37,10 +38,30 @@
 #include "lpfc_scsi.h"
 #include "lpfc.h"
 #include "lpfc_crtn.h"
+#include "lpfc_logmsg.h"
 
 #define LPFC_MBUF_POOL_SIZE     64      /* max elements in MBUF safety pool */
 #define LPFC_MEM_POOL_SIZE      64      /* max elem in non-DMA safety pool */
+#define LPFC_RRQ_POOL_SIZE      1024    /* max elem in non-DMA safety pool */
+#define LPFC_DEVICE_DATA_POOL_SIZE 64   /* max elements in device data pool */
 
+int
+lpfc_mem_alloc_active_rrq_pool_s4(struct lpfc_hba *phba) {
+	size_t bytes;
+	int max_xri = phba->sli4_hba.max_cfg_param.max_xri;
+
+	if (max_xri <= 0)
+		return -ENOMEM;
+	bytes = ((BITS_PER_LONG - 1 + max_xri) / BITS_PER_LONG) *
+		  sizeof(unsigned long);
+	phba->cfg_rrq_xri_bitmap_sz = bytes;
+	phba->active_rrq_pool = mempool_create_kmalloc_pool(LPFC_MEM_POOL_SIZE,
+							    bytes);
+	if (!phba->active_rrq_pool)
+		return -ENOMEM;
+	else
+		return 0;
+}
 
 /**
  * lpfc_mem_alloc - create and allocate all PCI and memory pools
@@ -61,21 +82,28 @@ int
 lpfc_mem_alloc(struct lpfc_hba *phba, int align)
 {
 	struct lpfc_dma_pool *pool = &phba->lpfc_mbuf_safety_pool;
-	int longs;
 	int i;
 
-	if (phba->sli_rev == LPFC_SLI_REV4)
+	if (phba->sli_rev == LPFC_SLI_REV4) {
+		/* Calculate alignment */
+		if (phba->cfg_sg_dma_buf_size < SLI4_PAGE_SIZE)
+			i = phba->cfg_sg_dma_buf_size;
+		else
+			i = SLI4_PAGE_SIZE;
+
 		phba->lpfc_scsi_dma_buf_pool =
 			pci_pool_create("lpfc_scsi_dma_buf_pool",
 				phba->pcidev,
 				phba->cfg_sg_dma_buf_size,
-				phba->cfg_sg_dma_buf_size,
+				i,
 				0);
-	else
+	} else {
 		phba->lpfc_scsi_dma_buf_pool =
 			pci_pool_create("lpfc_scsi_dma_buf_pool",
 				phba->pcidev, phba->cfg_sg_dma_buf_size,
 				align, 0);
+	}
+
 	if (!phba->lpfc_scsi_dma_buf_pool)
 		goto fail;
 
@@ -112,11 +140,16 @@ lpfc_mem_alloc(struct lpfc_hba *phba, int align)
 		goto fail_free_mbox_pool;
 
 	if (phba->sli_rev == LPFC_SLI_REV4) {
+		phba->rrq_pool =
+			mempool_create_kmalloc_pool(LPFC_RRQ_POOL_SIZE,
+						sizeof(struct lpfc_node_rrq));
+		if (!phba->rrq_pool)
+			goto fail_free_nlp_mem_pool;
 		phba->lpfc_hrb_pool = pci_pool_create("lpfc_hrb_pool",
 					      phba->pcidev,
 					      LPFC_HDR_BUF_SIZE, align, 0);
 		if (!phba->lpfc_hrb_pool)
-			goto fail_free_nlp_mem_pool;
+			goto fail_free_rrq_mem_pool;
 
 		phba->lpfc_drb_pool = pci_pool_create("lpfc_drb_pool",
 					      phba->pcidev,
@@ -132,20 +165,24 @@ lpfc_mem_alloc(struct lpfc_hba *phba, int align)
 		phba->lpfc_hrb_pool = NULL;
 		phba->lpfc_drb_pool = NULL;
 	}
-	/* vpi zero is reserved for the physical port so add 1 to max */
-	longs = ((phba->max_vpi + 1) + BITS_PER_LONG - 1) / BITS_PER_LONG;
-	phba->vpi_bmask = kzalloc(longs * sizeof(unsigned long), GFP_KERNEL);
-	if (!phba->vpi_bmask)
-		goto fail_free_dbq_pool;
+
+	if (phba->cfg_EnableXLane) {
+		phba->device_data_mem_pool = mempool_create_kmalloc_pool(
+					LPFC_DEVICE_DATA_POOL_SIZE,
+					sizeof(struct lpfc_device_data));
+		if (!phba->device_data_mem_pool)
+			goto fail_free_hrb_pool;
+	} else {
+		phba->device_data_mem_pool = NULL;
+	}
 
 	return 0;
-
- fail_free_dbq_pool:
-	pci_pool_destroy(phba->lpfc_drb_pool);
-	phba->lpfc_drb_pool = NULL;
  fail_free_hrb_pool:
 	pci_pool_destroy(phba->lpfc_hrb_pool);
 	phba->lpfc_hrb_pool = NULL;
+ fail_free_rrq_mem_pool:
+	mempool_destroy(phba->rrq_pool);
+	phba->rrq_pool = NULL;
  fail_free_nlp_mem_pool:
 	mempool_destroy(phba->nlp_mem_pool);
 	phba->nlp_mem_pool = NULL;
@@ -181,9 +218,7 @@ lpfc_mem_free(struct lpfc_hba *phba)
 {
 	int i;
 	struct lpfc_dma_pool *pool = &phba->lpfc_mbuf_safety_pool;
-
-	/* Free VPI bitmask memory */
-	kfree(phba->vpi_bmask);
+	struct lpfc_device_data *device_data;
 
 	/* Free HBQ pools */
 	lpfc_sli_hbqbuf_free_all(phba);
@@ -198,9 +233,17 @@ lpfc_mem_free(struct lpfc_hba *phba)
 		pci_pool_destroy(phba->lpfc_hbq_pool);
 	phba->lpfc_hbq_pool = NULL;
 
+	if (phba->rrq_pool)
+		mempool_destroy(phba->rrq_pool);
+	phba->rrq_pool = NULL;
+
 	/* Free NLP memory pool */
 	mempool_destroy(phba->nlp_mem_pool);
 	phba->nlp_mem_pool = NULL;
+	if (phba->sli_rev == LPFC_SLI_REV4 && phba->active_rrq_pool) {
+		mempool_destroy(phba->active_rrq_pool);
+		phba->active_rrq_pool = NULL;
+	}
 
 	/* Free mbox memory pool */
 	mempool_destroy(phba->mbox_mem_pool);
@@ -219,6 +262,19 @@ lpfc_mem_free(struct lpfc_hba *phba)
 	pci_pool_destroy(phba->lpfc_scsi_dma_buf_pool);
 	phba->lpfc_scsi_dma_buf_pool = NULL;
 
+	/* Free Device Data memory pool */
+	if (phba->device_data_mem_pool) {
+		/* Ensure all objects have been returned to the pool */
+		while (!list_empty(&phba->luns)) {
+			device_data = list_first_entry(&phba->luns,
+						       struct lpfc_device_data,
+						       listentry);
+			list_del(&device_data->listentry);
+			mempool_free(device_data, phba->device_data_mem_pool);
+		}
+		mempool_destroy(phba->device_data_mem_pool);
+	}
+	phba->device_data_mem_pool = NULL;
 	return;
 }
 
@@ -393,7 +449,7 @@ lpfc_els_hbq_alloc(struct lpfc_hba *phba)
 {
 	struct hbq_dmabuf *hbqbp;
 
-	hbqbp = kmalloc(sizeof(struct hbq_dmabuf), GFP_KERNEL);
+	hbqbp = kzalloc(sizeof(struct hbq_dmabuf), GFP_KERNEL);
 	if (!hbqbp)
 		return NULL;
 
@@ -445,7 +501,7 @@ lpfc_sli4_rb_alloc(struct lpfc_hba *phba)
 {
 	struct hbq_dmabuf *dma_buf;
 
-	dma_buf = kmalloc(sizeof(struct hbq_dmabuf), GFP_KERNEL);
+	dma_buf = kzalloc(sizeof(struct hbq_dmabuf), GFP_KERNEL);
 	if (!dma_buf)
 		return NULL;
 

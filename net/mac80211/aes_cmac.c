@@ -10,15 +10,16 @@
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/crypto.h>
+#include <linux/export.h>
 #include <linux/err.h>
+#include <crypto/aes.h>
 
 #include <net/mac80211.h>
 #include "key.h"
 #include "aes_cmac.h"
 
-#define AES_BLOCK_SIZE 16
-#define AES_CMAC_KEY_LEN 16
 #define CMAC_TLEN 8 /* CMAC TLen = 64 bits (8 octets) */
+#define CMAC_TLEN_256 16 /* CMAC TLen = 128 bits (16 octets) */
 #define AAD_LEN 20
 
 
@@ -34,17 +35,13 @@ static void gf_mulx(u8 *pad)
 		pad[AES_BLOCK_SIZE - 1] ^= 0x87;
 }
 
-
-static void aes_128_cmac_vector(struct crypto_cipher *tfm, u8 *scratch,
-				size_t num_elem,
-				const u8 *addr[], const size_t *len, u8 *mac)
+static void aes_cmac_vector(struct crypto_cipher *tfm, size_t num_elem,
+			    const u8 *addr[], const size_t *len, u8 *mac,
+			    size_t mac_len)
 {
-	u8 *cbc, *pad;
+	u8 cbc[AES_BLOCK_SIZE], pad[AES_BLOCK_SIZE];
 	const u8 *pos, *end;
 	size_t i, e, left, total_len;
-
-	cbc = scratch;
-	pad = scratch + AES_BLOCK_SIZE;
 
 	memset(cbc, 0, AES_BLOCK_SIZE);
 
@@ -91,11 +88,11 @@ static void aes_128_cmac_vector(struct crypto_cipher *tfm, u8 *scratch,
 	for (i = 0; i < AES_BLOCK_SIZE; i++)
 		pad[i] ^= cbc[i];
 	crypto_cipher_encrypt_one(tfm, pad, pad);
-	memcpy(mac, pad, CMAC_TLEN);
+	memcpy(mac, pad, mac_len);
 }
 
 
-void ieee80211_aes_cmac(struct crypto_cipher *tfm, u8 *scratch, const u8 *aad,
+void ieee80211_aes_cmac(struct crypto_cipher *tfm, const u8 *aad,
 			const u8 *data, size_t data_len, u8 *mic)
 {
 	const u8 *addr[3];
@@ -110,19 +107,35 @@ void ieee80211_aes_cmac(struct crypto_cipher *tfm, u8 *scratch, const u8 *aad,
 	addr[2] = zero;
 	len[2] = CMAC_TLEN;
 
-	aes_128_cmac_vector(tfm, scratch, 3, addr, len, mic);
+	aes_cmac_vector(tfm, 3, addr, len, mic, CMAC_TLEN);
 }
 
+void ieee80211_aes_cmac_256(struct crypto_cipher *tfm, const u8 *aad,
+			    const u8 *data, size_t data_len, u8 *mic)
+{
+	const u8 *addr[3];
+	size_t len[3];
+	u8 zero[CMAC_TLEN_256];
 
-struct crypto_cipher * ieee80211_aes_cmac_key_setup(const u8 key[])
+	memset(zero, 0, CMAC_TLEN_256);
+	addr[0] = aad;
+	len[0] = AAD_LEN;
+	addr[1] = data;
+	len[1] = data_len - CMAC_TLEN_256;
+	addr[2] = zero;
+	len[2] = CMAC_TLEN_256;
+
+	aes_cmac_vector(tfm, 3, addr, len, mic, CMAC_TLEN_256);
+}
+
+struct crypto_cipher *ieee80211_aes_cmac_key_setup(const u8 key[],
+						   size_t key_len)
 {
 	struct crypto_cipher *tfm;
 
 	tfm = crypto_alloc_cipher("aes", 0, CRYPTO_ALG_ASYNC);
-	if (IS_ERR(tfm))
-		return NULL;
-
-	crypto_cipher_setkey(tfm, key, AES_CMAC_KEY_LEN);
+	if (!IS_ERR(tfm))
+		crypto_cipher_setkey(tfm, key, key_len);
 
 	return tfm;
 }
@@ -130,6 +143,5 @@ struct crypto_cipher * ieee80211_aes_cmac_key_setup(const u8 key[])
 
 void ieee80211_aes_cmac_key_free(struct crypto_cipher *tfm)
 {
-	if (tfm)
-		crypto_free_cipher(tfm);
+	crypto_free_cipher(tfm);
 }

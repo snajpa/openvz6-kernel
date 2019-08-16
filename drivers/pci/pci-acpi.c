@@ -116,7 +116,7 @@ static void acpi_pci_propagate_wakeup_enable(struct pci_bus *bus, bool enable)
 		int ret;
 
 		ret = acpi_pm_device_sleep_wake(&bridge->dev, enable);
-		if (!ret || bridge->is_pcie)
+		if (!ret || pci_is_pcie(bridge))
 			return;
 		bus = bus->parent;
 	}
@@ -131,7 +131,7 @@ static int acpi_pci_sleep_wake(struct pci_dev *dev, bool enable)
 	if (acpi_pci_can_wakeup(dev))
 		return acpi_pm_device_sleep_wake(&dev->dev, enable);
 
-	if (!dev->is_pcie)
+	if (!pci_is_pcie(dev))
 		acpi_pci_propagate_wakeup_enable(dev->bus, enable);
 
 	return 0;
@@ -195,6 +195,7 @@ static int __init acpi_pci_init(void)
 
 	if (acpi_gbl_FADT.boot_flags & ACPI_FADT_NO_ASPM) {
 		printk(KERN_INFO"ACPI FADT declares the system doesn't support PCIe ASPM, so disable it\n");
+		pcie_clear_aspm();
 		pcie_no_aspm();
 	}
 

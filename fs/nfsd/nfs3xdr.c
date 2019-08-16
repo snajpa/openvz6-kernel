@@ -1,6 +1,4 @@
 /*
- * linux/fs/nfsd/nfs3xdr.c
- *
  * XDR support for nfsd/protocol version 3.
  *
  * Copyright (C) 1995, 1996, 1997 Olaf Kirch <okir@monad.swb.de>
@@ -8,19 +6,8 @@
  * 2003-08-09 Jamie Lokier: Use htonl() for nanoseconds, not htons()!
  */
 
-#include <linux/types.h>
-#include <linux/time.h>
-#include <linux/nfs3.h>
-#include <linux/list.h>
-#include <linux/spinlock.h>
-#include <linux/dcache.h>
 #include <linux/namei.h>
-#include <linux/mm.h>
-#include <linux/vfs.h>
-#include <linux/sunrpc/xdr.h>
-#include <linux/sunrpc/svc.h>
-#include <linux/nfsd/nfsd.h>
-#include <linux/nfsd/xdr3.h>
+#include "xdr3.h"
 #include "auth.h"
 
 #define NFSDDBG_FACILITY		NFSDDBG_XDR
@@ -273,9 +260,11 @@ void fill_post_wcc(struct svc_fh *fhp)
 	err = vfs_getattr(fhp->fh_export->ex_path.mnt, fhp->fh_dentry,
 			&fhp->fh_post_attr);
 	fhp->fh_post_change = fhp->fh_dentry->d_inode->i_version;
-	if (err)
+	if (err) {
 		fhp->fh_post_saved = 0;
-	else
+		/* Grab the ctime anyway - set_change_info might use it */
+		fhp->fh_post_attr.ctime = fhp->fh_dentry->d_inode->i_ctime;
+	} else
 		fhp->fh_post_saved = 1;
 }
 
@@ -365,6 +354,7 @@ nfs3svc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p,
 {
 	unsigned int len, v, hdr, dlen;
 	u32 max_blocksize = svc_max_payload(rqstp);
+	struct kvec *head = rqstp->rq_arg.head;
 
 	if (!(p = decode_fh(p, &args->fh)))
 		return 0;
@@ -373,6 +363,8 @@ nfs3svc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p,
 	args->count = ntohl(*p++);
 	args->stable = ntohl(*p++);
 	len = args->len = ntohl(*p++);
+	if ((void *)p > head->iov_base + head->iov_len)
+		return 0;
 	/*
 	 * The count must equal the amount of data passed.
 	 */
@@ -383,9 +375,8 @@ nfs3svc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p,
 	 * Check to make sure that we got the right number of
 	 * bytes.
 	 */
-	hdr = (void*)p - rqstp->rq_arg.head[0].iov_base;
-	dlen = rqstp->rq_arg.head[0].iov_len + rqstp->rq_arg.page_len
-		- hdr;
+	hdr = (void*)p - head->iov_base;
+	dlen = head->iov_len + rqstp->rq_arg.page_len - hdr;
 	/*
 	 * Round the length of the data which was specified up to
 	 * the next multiple of XDR units and then compare that
@@ -402,7 +393,7 @@ nfs3svc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p,
 		len = args->len = max_blocksize;
 	}
 	rqstp->rq_vec[0].iov_base = (void*)p;
-	rqstp->rq_vec[0].iov_len = rqstp->rq_arg.head[0].iov_len - hdr;
+	rqstp->rq_vec[0].iov_len = head->iov_len - hdr;
 	v = 0;
 	while (len > rqstp->rq_vec[v].iov_len) {
 		len -= rqstp->rq_vec[v].iov_len;
@@ -478,6 +469,8 @@ nfs3svc_decode_symlinkargs(struct svc_rqst *rqstp, __be32 *p,
 	/* first copy and check from the first page */
 	old = (char*)p;
 	vec = &rqstp->rq_arg.head[0];
+	if ((void *)old > vec->iov_base + vec->iov_len)
+		return 0;
 	avail = vec->iov_len - (old - (char*)vec->iov_base);
 	while (len && avail && *old) {
 		*new++ = *old++;

@@ -24,6 +24,7 @@
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/ctype.h>
+#include <linux/string.h>
 
 #if 0
 #define DEBUGP printk
@@ -49,27 +50,29 @@ static inline int parameq(const char *input, const char *paramname)
 
 static int parse_one(char *param,
 		     char *val,
-		     struct kernel_param *params, 
+		     const char *doing,
+		     struct kernel_param *params,
 		     unsigned num_params,
-		     int (*handle_unknown)(char *param, char *val))
+		     int (*handle_unknown)(char *param, char *val,
+				     const char *doing))
 {
 	unsigned int i;
 
 	/* Find parameter */
 	for (i = 0; i < num_params; i++) {
 		if (parameq(param, params[i].name)) {
-			DEBUGP("They are equal!  Calling %p\n",
+			DEBUGP("handling %s with %p\n", param,
 			       params[i].set);
 			return params[i].set(val, &params[i]);
 		}
 	}
 
 	if (handle_unknown) {
-		DEBUGP("Unknown argument: calling %p\n", handle_unknown);
-		return handle_unknown(param, val);
+		DEBUGP("doing %s: %s='%s'\n", doing, param, val);
+		return handle_unknown(param, val, doing);
 	}
 
-	DEBUGP("Unknown argument `%s'\n", param);
+	DEBUGP("Unknown argument '%s'\n", param);
 	return -ENOENT;
 }
 
@@ -122,25 +125,23 @@ static char *next_arg(char *args, char **param, char **val)
 		next = args + i;
 
 	/* Chew up trailing spaces. */
-	while (isspace(*next))
-		next++;
-	return next;
+	return skip_spaces(next);
 }
 
 /* Args looks like "foo=bar,bar2 baz=fuz wiz". */
-int parse_args(const char *name,
+int parse_args(const char *doing,
 	       char *args,
 	       struct kernel_param *params,
 	       unsigned num,
-	       int (*unknown)(char *param, char *val))
+	       int (*unknown)(char *param, char *val, const char *doing))
 {
 	char *param, *val;
 
-	DEBUGP("Parsing ARGS: %s\n", args);
-
 	/* Chew leading spaces */
-	while (isspace(*args))
-		args++;
+	args = skip_spaces(args);
+
+	if (args && *args)
+		pr_debug("doing %s, parsing ARGS: '%s'\n", doing, args);
 
 	while (*args) {
 		int ret;
@@ -148,7 +149,8 @@ int parse_args(const char *name,
 
 		args = next_arg(args, &param, &val);
 		irq_was_disabled = irqs_disabled();
-		ret = parse_one(param, val, params, num, unknown);
+		ret = parse_one(param, val, doing, params, num,
+				unknown);
 		if (irq_was_disabled && !irqs_disabled()) {
 			printk(KERN_WARNING "parse_args(): option '%s' enabled "
 					"irq's!\n", param);
@@ -156,19 +158,19 @@ int parse_args(const char *name,
 		switch (ret) {
 		case -ENOENT:
 			printk(KERN_ERR "%s: Unknown parameter `%s'\n",
-			       name, param);
+			       doing, param);
 			return ret;
 		case -ENOSPC:
 			printk(KERN_ERR
 			       "%s: `%s' too large for parameter `%s'\n",
-			       name, val ?: "", param);
+			       doing, val ?: "", param);
 			return ret;
 		case 0:
 			break;
 		default:
 			printk(KERN_ERR
 			       "%s: `%s' invalid for parameter `%s'\n",
-			       name, val ?: "", param);
+			       doing, val ?: "", param);
 			return ret;
 		}
 	}
@@ -196,7 +198,7 @@ int parse_args(const char *name,
 		return sprintf(buffer, format, *((type *)kp->arg));	\
 	}
 
-STANDARD_PARAM_DEF(byte, unsigned char, "%c", unsigned long, strict_strtoul);
+STANDARD_PARAM_DEF(byte, unsigned char, "%hhu", unsigned long, strict_strtoul);
 STANDARD_PARAM_DEF(short, short, "%hi", long, strict_strtol);
 STANDARD_PARAM_DEF(ushort, unsigned short, "%hu", unsigned long, strict_strtoul);
 STANDARD_PARAM_DEF(int, int, "%i", long, strict_strtol);
@@ -607,9 +609,7 @@ void destroy_params(const struct kernel_param *params, unsigned num)
 	/* FIXME: This should free kmalloced charp parameters.  It doesn't. */
 }
 
-static void __init kernel_add_sysfs_param(const char *name,
-					  struct kernel_param *kparam,
-					  unsigned int name_skip)
+static struct module_kobject * __init locate_module_kobject(const char *name)
 {
 	struct module_kobject *mk;
 	struct kobject *kobj;
@@ -617,10 +617,7 @@ static void __init kernel_add_sysfs_param(const char *name,
 
 	kobj = kset_find_obj(module_kset, name);
 	if (kobj) {
-		/* We already have one.  Remove params so we can add more. */
 		mk = to_module_kobject(kobj);
-		/* We need to remove it before adding parameters. */
-		sysfs_remove_group(&mk->kobj, &mk->mp->grp);
 	} else {
 		mk = kzalloc(sizeof(struct module_kobject), GFP_KERNEL);
 		BUG_ON(!mk);
@@ -631,14 +628,35 @@ static void __init kernel_add_sysfs_param(const char *name,
 					   "%s", name);
 		if (err) {
 			kobject_put(&mk->kobj);
-			printk(KERN_ERR "Module '%s' failed add to sysfs, "
-			       "error number %d\n", name, err);
-			printk(KERN_ERR	"The system will be unstable now.\n");
-			return;
+			printk(KERN_ERR
+				"Module '%s' failed add to sysfs, error number %d\n",
+				name, err);
+			printk(KERN_ERR
+				"The system will be unstable now.\n");
+			return NULL;
 		}
-		/* So that exit path is even. */
+
+		/* So that we hold reference in both cases. */
 		kobject_get(&mk->kobj);
 	}
+
+	return mk;
+}
+
+static void __init kernel_add_sysfs_param(const char *name,
+					  struct kernel_param *kparam,
+					  unsigned int name_skip)
+{
+	struct module_kobject *mk;
+	int err;
+
+	mk = locate_module_kobject(name);
+	if (!mk)
+		return;
+
+	/* We need to remove old parameters before adding more. */
+	if (mk->mp)
+		sysfs_remove_group(&mk->kobj, &mk->mp->grp);
 
 	/* These should not fail at boot. */
 	err = add_sysfs_param(mk, kparam, kparam->name + name_skip);
@@ -684,6 +702,32 @@ static void __init param_sysfs_builtin(void)
 	}
 }
 
+ssize_t __modver_version_show(struct module_attribute *mattr,
+			      struct module *mod, char *buf)
+{
+	struct module_version_attribute *vattr =
+		container_of(mattr, struct module_version_attribute, mattr);
+
+	return sprintf(buf, "%s\n", vattr->version);
+}
+
+extern struct module_version_attribute __start___modver[], __stop___modver[];
+
+static void __init version_sysfs_builtin(void)
+{
+	const struct module_version_attribute *vattr;
+	struct module_kobject *mk;
+	int err;
+
+	for (vattr = __start___modver; vattr < __stop___modver; vattr++) {
+		mk = locate_module_kobject(vattr->module_name);
+		if (mk) {
+			err = sysfs_create_file(&mk->kobj, &vattr->mattr.attr);
+			kobject_uevent(&mk->kobj, KOBJ_ADD);
+			kobject_put(&mk->kobj);
+		}
+	}
+}
 
 /* module-related sysfs stuff */
 
@@ -725,7 +769,7 @@ static ssize_t module_attr_store(struct kobject *kobj,
 	return ret;
 }
 
-static struct sysfs_ops module_sysfs_ops = {
+static const struct sysfs_ops module_sysfs_ops = {
 	.show = module_attr_show,
 	.store = module_attr_store,
 };
@@ -763,6 +807,7 @@ static int __init param_sysfs_init(void)
 	}
 	module_sysfs_initialized = 1;
 
+	version_sysfs_builtin();
 	param_sysfs_builtin();
 
 	return 0;

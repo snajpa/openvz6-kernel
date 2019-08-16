@@ -1634,6 +1634,8 @@ static int hso_get_count(struct hso_serial *serial,
 	struct uart_icount cnow;
 	struct hso_tiocmget  *tiocmget = serial->tiocmget;
 
+	memset(&icount, 0, sizeof(struct serial_icounter_struct));
+
 	if (!tiocmget)
 		 return -ENOENT;
 	spin_lock_irq(&serial->serial_lock);
@@ -3267,6 +3269,7 @@ static struct usb_driver hso_driver = {
 	.resume = hso_resume,
 	.reset_resume = hso_resume,
 	.supports_autosuspend = 1,
+	.disable_hub_initiated_lpm = 1,
 };
 
 static int __init hso_init(void)

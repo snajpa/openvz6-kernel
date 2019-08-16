@@ -10,6 +10,8 @@
 #include <linux/timer.h>
 #include <linux/sysctl.h>
 
+#define IPV4_DEVCONF_MAX (__NET_IPV4_CONF_MAX - 1)
+
 struct ipv4_devconf
 {
 	void	*sysctl;
@@ -83,12 +85,15 @@ static inline void ipv4_devconf_setall(struct in_device *in_dev)
 #define IN_DEV_FORWARD(in_dev)		IN_DEV_CONF_GET((in_dev), FORWARDING)
 #define IN_DEV_MFORWARD(in_dev)		IN_DEV_ANDCONF((in_dev), MC_FORWARDING)
 #define IN_DEV_RPFILTER(in_dev)		IN_DEV_MAXCONF((in_dev), RP_FILTER)
+#define IN_DEV_SRC_VMARK(in_dev)    	IN_DEV_ORCONF((in_dev), SRC_VMARK)
 #define IN_DEV_SOURCE_ROUTE(in_dev)	IN_DEV_ANDCONF((in_dev), \
 						       ACCEPT_SOURCE_ROUTE)
+#define IN_DEV_ACCEPT_LOCAL(in_dev)	IN_DEV_ORCONF((in_dev), ACCEPT_LOCAL)
 #define IN_DEV_BOOTP_RELAY(in_dev)	IN_DEV_ANDCONF((in_dev), BOOTP_RELAY)
 
 #define IN_DEV_LOG_MARTIANS(in_dev)	IN_DEV_ORCONF((in_dev), LOG_MARTIANS)
 #define IN_DEV_PROXY_ARP(in_dev)	IN_DEV_ORCONF((in_dev), PROXY_ARP)
+#define IN_DEV_PROXY_ARP_PVLAN(in_dev)	IN_DEV_CONF_GET(in_dev, PROXY_ARP_PVLAN)
 #define IN_DEV_SHARED_MEDIA(in_dev)	IN_DEV_ORCONF((in_dev), SHARED_MEDIA)
 #define IN_DEV_TX_REDIRECTS(in_dev)	IN_DEV_ORCONF((in_dev), SEND_REDIRECTS)
 #define IN_DEV_SEC_REDIRECTS(in_dev)	IN_DEV_ORCONF((in_dev), \
@@ -98,6 +103,7 @@ static inline void ipv4_devconf_setall(struct in_device *in_dev)
 #define IN_DEV_PROMOTE_SECONDARIES(in_dev) \
 					IN_DEV_ORCONF((in_dev), \
 						      PROMOTE_SECONDARIES)
+#define IN_DEV_ROUTE_LOCALNET(in_dev)	IN_DEV_ORCONF(in_dev, ROUTE_LOCALNET)
 
 #define IN_DEV_RX_REDIRECTS(in_dev) \
 	((IN_DEV_FORWARD(in_dev) && \
@@ -191,6 +197,13 @@ static __inline__ struct in_device *
 __in_dev_get_rtnl(const struct net_device *dev)
 {
 	return (struct in_device*)dev->ip_ptr;
+}
+
+static inline struct neigh_parms *__in_dev_arp_parms_get_rcu(const struct net_device *dev)
+{
+	struct in_device *in_dev = __in_dev_get_rcu(dev);
+
+	return in_dev ? in_dev->arp_parms : NULL;
 }
 
 extern void in_dev_finish_destroy(struct in_device *idev);

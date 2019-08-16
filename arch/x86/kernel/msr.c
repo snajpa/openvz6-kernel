@@ -172,9 +172,12 @@ static long msr_ioctl(struct file *file, unsigned int ioc, unsigned long arg)
 
 static int msr_open(struct inode *inode, struct file *file)
 {
-	unsigned int cpu = iminor(file->f_path.dentry->d_inode);
-	struct cpuinfo_x86 *c = &cpu_data(cpu);
+	unsigned int cpu;
+	struct cpuinfo_x86 *c;
 	int ret = 0;
+
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
 
 	lock_kernel();
 	cpu = iminor(file->f_path.dentry->d_inode);
@@ -234,7 +237,7 @@ static int __cpuinit msr_class_cpu_callback(struct notifier_block *nfb,
 		msr_device_destroy(cpu);
 		break;
 	}
-	return err ? NOTIFY_BAD : NOTIFY_OK;
+	return notifier_from_errno(err);
 }
 
 static struct notifier_block __refdata msr_class_cpu_notifier = {
@@ -251,7 +254,7 @@ static int __init msr_init(void)
 	int i, err = 0;
 	i = 0;
 
-	if (register_chrdev(MSR_MAJOR, "cpu/msr", &msr_fops)) {
+	if (__register_chrdev(MSR_MAJOR, 0, NR_CPUS, "cpu/msr", &msr_fops)) {
 		printk(KERN_ERR "msr: unable to get major %d for msr\n",
 		       MSR_MAJOR);
 		err = -EBUSY;
@@ -279,7 +282,7 @@ out_class:
 		msr_device_destroy(i);
 	class_destroy(msr_class);
 out_chrdev:
-	unregister_chrdev(MSR_MAJOR, "cpu/msr");
+	__unregister_chrdev(MSR_MAJOR, 0, NR_CPUS, "cpu/msr");
 out:
 	return err;
 }
@@ -290,7 +293,7 @@ static void __exit msr_exit(void)
 	for_each_online_cpu(cpu)
 		msr_device_destroy(cpu);
 	class_destroy(msr_class);
-	unregister_chrdev(MSR_MAJOR, "cpu/msr");
+	__unregister_chrdev(MSR_MAJOR, 0, NR_CPUS, "cpu/msr");
 	unregister_hotcpu_notifier(&msr_class_cpu_notifier);
 }
 

@@ -82,6 +82,7 @@
 #include <net/tcp.h>
 #include <net/udp.h>
 #include <net/raw.h>
+#include <net/ping.h>
 #include <linux/skbuff.h>
 #include <net/sock.h>
 #include <linux/errno.h>
@@ -376,6 +377,8 @@ static void icmp_reply(struct icmp_bxm *icmp_param, struct sk_buff *skb)
 	daddr = ipc.addr = rt->rt_src;
 	ipc.opt = NULL;
 	ipc.shtx.flags = 0;
+	ipc.ttl = 0;
+	ipc.tos = -1;
 	if (icmp_param->replyopts.optlen) {
 		ipc.opt = &icmp_param->replyopts;
 		if (ipc.opt->srr)
@@ -534,6 +537,8 @@ void icmp_send(struct sk_buff *skb_in, int type, int code, __be32 info)
 	ipc.addr = iph->saddr;
 	ipc.opt = &icmp_param.replyopts;
 	ipc.shtx.flags = 0;
+	ipc.ttl = 0;
+	ipc.tos = -1;
 
 	{
 		struct flowi fl = {
@@ -684,7 +689,9 @@ static void icmp_unreach(struct sk_buff *skb)
 		case ICMP_PORT_UNREACH:
 			break;
 		case ICMP_FRAG_NEEDED:
-			if (ipv4_config.no_pmtu_disc) {
+			if (net->sysctl_ip_no_pmtu_disc == 2) {
+				goto out;
+			} else if (net->sysctl_ip_no_pmtu_disc) {
 				LIMIT_NETDEBUG(KERN_INFO "ICMP: %pI4: fragmentation needed and DF set.\n",
 					       &iph->daddr);
 			} else {
@@ -799,6 +806,15 @@ static void icmp_redirect(struct sk_buff *skb)
 			       iph->saddr, skb->dev);
 		break;
 	}
+
+	/* Ping wants to see redirects.
+         * Let's pretend they are errors of sorts... */
+	if (iph->protocol == IPPROTO_ICMP &&
+	    iph->ihl >= 5 &&
+	    pskb_may_pull(skb, (iph->ihl<<2)+8)) {
+		ping_err(skb, icmp_hdr(skb)->un.gateway);
+	}
+
 out:
 	return;
 out_err:
@@ -1061,7 +1077,7 @@ error:
  */
 static const struct icmp_control icmp_pointers[NR_ICMP_TYPES + 1] = {
 	[ICMP_ECHOREPLY] = {
-		.handler = icmp_discard,
+		.handler = ping_rcv,
 	},
 	[1] = {
 		.handler = icmp_discard,

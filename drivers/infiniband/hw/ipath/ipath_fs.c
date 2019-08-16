@@ -80,14 +80,13 @@ static int create_file(const char *name, mode_t mode,
 {
 	int error;
 
-	*dentry = NULL;
 	mutex_lock(&parent->d_inode->i_mutex);
 	*dentry = lookup_one_len(name, parent, strlen(name));
 	if (!IS_ERR(*dentry))
 		error = ipathfs_mknod(parent->d_inode, *dentry,
 				      mode, fops, data);
 	else
-		error = PTR_ERR(dentry);
+		error = PTR_ERR(*dentry);
 	mutex_unlock(&parent->d_inode->i_mutex);
 
 	return error;
@@ -274,7 +273,7 @@ static int remove_file(struct dentry *parent, char *name)
 
 	spin_lock(&dcache_lock);
 	spin_lock(&tmp->d_lock);
-	if (!(d_unhashed(tmp) && tmp->d_inode)) {
+	if (!d_unhashed(tmp) && tmp->d_inode) {
 		dget_locked(tmp);
 		__d_drop(tmp);
 		spin_unlock(&tmp->d_lock);
@@ -346,10 +345,8 @@ static int ipathfs_fill_super(struct super_block *sb, void *data,
 	list_for_each_entry_safe(dd, tmp, &ipath_dev_list, ipath_list) {
 		spin_unlock_irqrestore(&ipath_devs_lock, flags);
 		ret = create_device_files(sb, dd);
-		if (ret) {
-			deactivate_locked_super(sb);
+		if (ret)
 			goto bail;
-		}
 		spin_lock_irqsave(&ipath_devs_lock, flags);
 	}
 

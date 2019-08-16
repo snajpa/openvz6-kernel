@@ -81,20 +81,23 @@ static inline int tty_put_user(struct tty_struct *tty, unsigned char x,
 }
 
 /**
- *	n_tty_set__room	-	receive space
+ *	n_tty_set_room	-	receive space
  *	@tty: terminal
  *
- *	Called by the driver to find out how much data it is
- *	permitted to feed to the line discipline without any being lost
- *	and thus to manage flow control. Not serialized. Answers for the
- *	"instant".
+ *	Sets tty->receive_room to reflect the currently available space
+ *	in the input buffer.
+ *
+ *	Locks: Concurrent update is protected with read_lock
  */
 
 static void n_tty_set_room(struct tty_struct *tty)
 {
-	/* tty->read_cnt is not read locked ? */
-	int	left = N_TTY_BUF_SIZE - tty->read_cnt - 1;
+	int left;
+	unsigned long flags;
 
+	spin_lock_irqsave(&tty->read_lock, flags);
+
+	left = N_TTY_BUF_SIZE - tty->read_cnt - 1;
 	/*
 	 * If we are doing input canonicalization, and there are no
 	 * pending newlines, let characters through without limit, so
@@ -104,6 +107,8 @@ static void n_tty_set_room(struct tty_struct *tty)
 	if (left <= 0)
 		left = tty->icanon && !tty->canon_data;
 	tty->receive_room = left;
+
+	spin_unlock_irqrestore(&tty->read_lock, flags);
 }
 
 static void put_tty_queue_nolock(unsigned char c, struct tty_struct *tty)
@@ -1419,8 +1424,14 @@ static void n_tty_receive_buf(struct tty_struct *tty, const unsigned char *cp,
 	 * mode.  We don't want to throttle the driver if we're in
 	 * canonical mode and don't have a newline yet!
 	 */
-	if (tty->receive_room < TTY_THRESHOLD_THROTTLE)
-		tty_throttle(tty);
+	while (1) {
+		tty_set_flow_change(tty, TTY_THROTTLE_SAFE);
+		if (tty->receive_room >= TTY_THRESHOLD_THROTTLE)
+			break;
+		if (!tty_throttle_safe(tty))
+			break;
+	}
+	__tty_set_flow_change(tty, 0);
 }
 
 int is_ignored(int sig)
@@ -1650,10 +1661,9 @@ extern ssize_t redirected_tty_write(struct file *, const char __user *,
  *	and if appropriate send any needed signals and return a negative
  *	error code if action should be taken.
  *
- *	FIXME:
- *	Locking: None - redirected write test is safe, testing
- *	current->signal should possibly lock current->sighand
- *	pgrp locking ?
+ *	Locking: redirected write test is safe
+ *		 current->signal->tty check is safe
+ *		 ctrl_lock to safely reference tty->pgrp
  */
 
 static int job_control(struct tty_struct *tty, struct file *file)
@@ -1663,19 +1673,22 @@ static int job_control(struct tty_struct *tty, struct file *file)
 	/* NOTE: not yet done after every sleep pending a thorough
 	   check of the logic of this change. -- jlc */
 	/* don't stop on /dev/console */
-	if (file->f_op->write != redirected_tty_write &&
-	    current->signal->tty == tty) {
-		if (!tty->pgrp)
-			printk(KERN_ERR "n_tty_read: no tty->pgrp!\n");
-		else if (task_pgrp(current) != tty->pgrp) {
-			if (is_ignored(SIGTTIN) ||
-			    is_current_pgrp_orphaned())
-				return -EIO;
-			kill_pgrp(task_pgrp(current), SIGTTIN, 1);
-			set_thread_flag(TIF_SIGPENDING);
-			return -ERESTARTSYS;
-		}
+	if (file->f_op->write == redirected_tty_write ||
+	    current->signal->tty != tty)
+		return 0;
+
+	spin_lock_irq(&tty->ctrl_lock);
+	if (!tty->pgrp)
+		printk(KERN_ERR "n_tty_read: no tty->pgrp!\n");
+	else if (task_pgrp(current) != tty->pgrp) {
+		spin_unlock_irq(&tty->ctrl_lock);
+		if (is_ignored(SIGTTIN) || is_current_pgrp_orphaned())
+			return -EIO;
+		kill_pgrp(task_pgrp(current), SIGTTIN, 1);
+		set_thread_flag(TIF_SIGPENDING);
+		return -ERESTARTSYS;
 	}
+	spin_unlock_irq(&tty->ctrl_lock);
 	return 0;
 }
 
@@ -1710,7 +1723,8 @@ static ssize_t n_tty_read(struct tty_struct *tty, struct file *file,
 
 do_it_again:
 
-	BUG_ON(!tty->read_buf);
+	if (WARN_ON(!tty->read_buf))
+		return -EAGAIN;
 
 	c = job_control(tty, file);
 	if (c < 0)
@@ -1794,7 +1808,6 @@ do_it_again:
 				retval = -ERESTARTSYS;
 				break;
 			}
-			/* FIXME: does n_tty_set_room need locking ? */
 			n_tty_set_room(tty);
 			timeout = schedule_timeout(timeout);
 			continue;
@@ -1813,13 +1826,13 @@ do_it_again:
 
 		if (tty->icanon) {
 			/* N.B. avoid overrun if nr == 0 */
+			spin_lock_irqsave(&tty->read_lock, flags);
 			while (nr && tty->read_cnt) {
 				int eol;
 
 				eol = test_and_clear_bit(tty->read_tail,
 						tty->read_flags);
 				c = tty->read_buf[tty->read_tail];
-				spin_lock_irqsave(&tty->read_lock, flags);
 				tty->read_tail = ((tty->read_tail+1) &
 						  (N_TTY_BUF_SIZE-1));
 				tty->read_cnt--;
@@ -1837,15 +1850,19 @@ do_it_again:
 					if (tty_put_user(tty, c, b++)) {
 						retval = -EFAULT;
 						b--;
+						spin_lock_irqsave(&tty->read_lock, flags);
 						break;
 					}
 					nr--;
 				}
 				if (eol) {
 					tty_audit_push(tty);
+					spin_lock_irqsave(&tty->read_lock, flags);
 					break;
 				}
+				spin_lock_irqsave(&tty->read_lock, flags);
 			}
+			spin_unlock_irqrestore(&tty->read_lock, flags);
 			if (retval)
 				break;
 		} else {
@@ -1867,10 +1884,17 @@ do_it_again:
 		 * longer than TTY_THRESHOLD_UNTHROTTLE in canonical mode,
 		 * we won't get any more characters.
 		 */
-		if (n_tty_chars_in_buffer(tty) <= TTY_THRESHOLD_UNTHROTTLE) {
+		while (1) {
+			tty_set_flow_change(tty, TTY_UNTHROTTLE_SAFE);
+			if (n_tty_chars_in_buffer(tty) > TTY_THRESHOLD_UNTHROTTLE)
+				break;
+			if (!tty->count)
+				break;
 			n_tty_set_room(tty);
-			check_unthrottle(tty);
+			if (!tty_unthrottle_safe(tty))
+				break;
 		}
+		__tty_set_flow_change(tty, 0);
 
 		if (b - buf >= minimum)
 			break;
@@ -1969,7 +1993,9 @@ static ssize_t n_tty_write(struct tty_struct *tty, struct file *file,
 				tty->ops->flush_chars(tty);
 		} else {
 			while (nr > 0) {
+				mutex_lock(&tty->output_lock);
 				c = tty->ops->write(tty, b, nr);
+				mutex_unlock(&tty->output_lock);
 				if (c < 0) {
 					retval = c;
 					goto break_out;

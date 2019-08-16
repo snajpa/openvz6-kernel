@@ -75,7 +75,7 @@ nul_marshal(struct rpc_task *task, __be32 *p)
 static int
 nul_refresh(struct rpc_task *task)
 {
-	set_bit(RPCAUTH_CRED_UPTODATE, &task->tk_msg.rpc_cred->cr_flags);
+	set_bit(RPCAUTH_CRED_UPTODATE, &task->tk_rqstp->rq_cred->cr_flags);
 	return 0;
 }
 
@@ -88,13 +88,13 @@ nul_validate(struct rpc_task *task, __be32 *p)
 	flavor = ntohl(*p++);
 	if (flavor != RPC_AUTH_NULL) {
 		printk("RPC: bad verf flavor: %u\n", flavor);
-		return NULL;
+		return ERR_PTR(-EIO);
 	}
 
 	size = ntohl(*p++);
 	if (size != 0) {
 		printk("RPC: bad verf size: %u\n", size);
-		return NULL;
+		return ERR_PTR(-EIO);
 	}
 
 	return p;
@@ -113,6 +113,7 @@ static
 struct rpc_auth null_auth = {
 	.au_cslack	= 4,
 	.au_rslack	= 2,
+	.au_flags	= RPCAUTH_AUTH_NO_CRKEY_TIMEOUT,
 	.au_ops		= &authnull_ops,
 	.au_flavor	= RPC_AUTH_NULL,
 	.au_count	= ATOMIC_INIT(0),

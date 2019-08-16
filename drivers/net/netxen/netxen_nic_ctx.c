@@ -14,12 +14,10 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place - Suite 330, Boston,
- * MA  02111-1307, USA.
+ * along with this program; if not, see <http://www.gnu.org/licenses/>.
  *
  * The full GNU General Public License is included in this distribution
- * in the file called LICENSE.
+ * in the file called "COPYING".
  *
  */
 
@@ -48,28 +46,27 @@ netxen_poll_rsp(struct netxen_adapter *adapter)
 }
 
 static u32
-netxen_issue_cmd(struct netxen_adapter *adapter,
-	u32 pci_fn, u32 version, u32 arg1, u32 arg2, u32 arg3, u32 cmd)
+netxen_issue_cmd(struct netxen_adapter *adapter, struct netxen_cmd_args *cmd)
 {
 	u32 rsp;
 	u32 signature = 0;
 	u32 rcode = NX_RCODE_SUCCESS;
 
-	signature = NX_CDRP_SIGNATURE_MAKE(pci_fn, version);
-
+	signature = NX_CDRP_SIGNATURE_MAKE(adapter->ahw.pci_func,
+						NXHAL_VERSION);
 	/* Acquire semaphore before accessing CRB */
 	if (netxen_api_lock(adapter))
 		return NX_RCODE_TIMEOUT;
 
 	NXWR32(adapter, NX_SIGN_CRB_OFFSET, signature);
 
-	NXWR32(adapter, NX_ARG1_CRB_OFFSET, arg1);
+	NXWR32(adapter, NX_ARG1_CRB_OFFSET, cmd->req.arg1);
 
-	NXWR32(adapter, NX_ARG2_CRB_OFFSET, arg2);
+	NXWR32(adapter, NX_ARG2_CRB_OFFSET, cmd->req.arg2);
 
-	NXWR32(adapter, NX_ARG3_CRB_OFFSET, arg3);
+	NXWR32(adapter, NX_ARG3_CRB_OFFSET, cmd->req.arg3);
 
-	NXWR32(adapter, NX_CDRP_CRB_OFFSET, NX_CDRP_FORM_CMD(cmd));
+	NXWR32(adapter, NX_CDRP_CRB_OFFSET, NX_CDRP_FORM_CMD(cmd->req.cmd));
 
 	rsp = netxen_poll_rsp(adapter);
 
@@ -83,33 +80,198 @@ netxen_issue_cmd(struct netxen_adapter *adapter,
 
 		printk(KERN_ERR "%s: failed card response code:0x%x\n",
 				netxen_nic_driver_name, rcode);
+	} else if (rsp == NX_CDRP_RSP_OK) {
+		cmd->rsp.cmd = NX_RCODE_SUCCESS;
+		if (cmd->rsp.arg2)
+			cmd->rsp.arg2 = NXRD32(adapter, NX_ARG2_CRB_OFFSET);
+		if (cmd->rsp.arg3)
+			cmd->rsp.arg3 = NXRD32(adapter, NX_ARG3_CRB_OFFSET);
 	}
 
+	if (cmd->rsp.arg1)
+		cmd->rsp.arg1 = NXRD32(adapter, NX_ARG1_CRB_OFFSET);
 	/* Release semaphore */
 	netxen_api_unlock(adapter);
 
 	return rcode;
 }
 
+static int
+netxen_get_minidump_template_size(struct netxen_adapter *adapter)
+{
+	struct netxen_cmd_args cmd;
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.req.cmd = NX_CDRP_CMD_TEMP_SIZE;
+	memset(&cmd.rsp, 1, sizeof(struct _cdrp_cmd));
+	netxen_issue_cmd(adapter, &cmd);
+	if (cmd.rsp.cmd != NX_RCODE_SUCCESS) {
+		dev_info(&adapter->pdev->dev,
+			"Can't get template size %d\n", cmd.rsp.cmd);
+		return -EIO;
+	}
+	adapter->mdump.md_template_size = cmd.rsp.arg2;
+	adapter->mdump.md_template_ver = cmd.rsp.arg3;
+	return 0;
+}
+
+static int
+netxen_get_minidump_template(struct netxen_adapter *adapter)
+{
+	dma_addr_t md_template_addr;
+	void *addr;
+	u32 size;
+	struct netxen_cmd_args cmd;
+	size = adapter->mdump.md_template_size;
+
+	if (size == 0) {
+		dev_err(&adapter->pdev->dev, "Can not capture Minidump "
+			"template. Invalid template size.\n");
+		return NX_RCODE_INVALID_ARGS;
+	}
+
+	addr = pci_alloc_consistent(adapter->pdev, size, &md_template_addr);
+
+	if (!addr) {
+		dev_err(&adapter->pdev->dev, "Unable to allocate dmable memory for template.\n");
+		return -ENOMEM;
+	}
+
+	memset(addr, 0, size);
+	memset(&cmd, 0, sizeof(cmd));
+	memset(&cmd.rsp, 1, sizeof(struct _cdrp_cmd));
+	cmd.req.cmd = NX_CDRP_CMD_GET_TEMP_HDR;
+	cmd.req.arg1 = LSD(md_template_addr);
+	cmd.req.arg2 = MSD(md_template_addr);
+	cmd.req.arg3 |= size;
+	netxen_issue_cmd(adapter, &cmd);
+
+	if ((cmd.rsp.cmd == NX_RCODE_SUCCESS) && (size == cmd.rsp.arg2)) {
+		memcpy(adapter->mdump.md_template, addr, size);
+	} else {
+		dev_err(&adapter->pdev->dev, "Failed to get minidump template, "
+			"err_code : %d, requested_size : %d, actual_size : %d\n ",
+			cmd.rsp.cmd, size, cmd.rsp.arg2);
+	}
+	pci_free_consistent(adapter->pdev, size, addr, md_template_addr);
+	return 0;
+}
+
+static u32
+netxen_check_template_checksum(struct netxen_adapter *adapter)
+{
+	u64 sum =  0 ;
+	u32 *buff = adapter->mdump.md_template;
+	int count =  adapter->mdump.md_template_size/sizeof(uint32_t) ;
+
+	while (count-- > 0)
+		sum += *buff++ ;
+	while (sum >> 32)
+		sum = (sum & 0xFFFFFFFF) +  (sum >> 32) ;
+
+	return ~sum;
+}
+
+int
+netxen_setup_minidump(struct netxen_adapter *adapter)
+{
+	int err = 0, i;
+	u32 *template, *tmp_buf;
+	struct netxen_minidump_template_hdr *hdr;
+	err = netxen_get_minidump_template_size(adapter);
+	if (err) {
+		adapter->mdump.fw_supports_md = 0;
+		if ((err == NX_RCODE_CMD_INVALID) ||
+			(err == NX_RCODE_CMD_NOT_IMPL)) {
+			dev_info(&adapter->pdev->dev,
+				"Flashed firmware version does not support minidump, "
+				"minimum version required is [ %u.%u.%u ].\n ",
+				NX_MD_SUPPORT_MAJOR, NX_MD_SUPPORT_MINOR,
+				NX_MD_SUPPORT_SUBVERSION);
+		}
+		return err;
+	}
+
+	if (!adapter->mdump.md_template_size) {
+		dev_err(&adapter->pdev->dev, "Error : Invalid template size "
+		",should be non-zero.\n");
+		return -EIO;
+	}
+	adapter->mdump.md_template =
+		kmalloc(adapter->mdump.md_template_size, GFP_KERNEL);
+
+	if (!adapter->mdump.md_template) {
+		dev_err(&adapter->pdev->dev, "Unable to allocate memory "
+			"for minidump template.\n");
+		return -ENOMEM;
+	}
+
+	err = netxen_get_minidump_template(adapter);
+	if (err) {
+		if (err == NX_RCODE_CMD_NOT_IMPL)
+			adapter->mdump.fw_supports_md = 0;
+		goto free_template;
+	}
+
+	if (netxen_check_template_checksum(adapter)) {
+		dev_err(&adapter->pdev->dev, "Minidump template checksum Error\n");
+		err = -EIO;
+		goto free_template;
+	}
+
+	adapter->mdump.md_capture_mask = NX_DUMP_MASK_DEF;
+	tmp_buf = (u32 *) adapter->mdump.md_template;
+	template = (u32 *) adapter->mdump.md_template;
+	for (i = 0; i < adapter->mdump.md_template_size/sizeof(u32); i++)
+		*template++ = __le32_to_cpu(*tmp_buf++);
+	hdr = (struct netxen_minidump_template_hdr *)
+				adapter->mdump.md_template;
+	adapter->mdump.md_capture_buff = NULL;
+	adapter->mdump.fw_supports_md = 1;
+	adapter->mdump.md_enabled = 0;
+
+	return err;
+
+free_template:
+	kfree(adapter->mdump.md_template);
+	adapter->mdump.md_template = NULL;
+	return err;
+}
+
+
 int
 nx_fw_cmd_set_mtu(struct netxen_adapter *adapter, int mtu)
 {
 	u32 rcode = NX_RCODE_SUCCESS;
 	struct netxen_recv_context *recv_ctx = &adapter->recv_ctx;
+	struct netxen_cmd_args cmd;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.req.cmd = NX_CDRP_CMD_SET_MTU;
+	cmd.req.arg1 = recv_ctx->context_id;
+	cmd.req.arg2 = mtu;
+	cmd.req.arg3 = 0;
 
 	if (recv_ctx->state == NX_HOST_CTX_STATE_ACTIVE)
-		rcode = netxen_issue_cmd(adapter,
-				adapter->ahw.pci_func,
-				NXHAL_VERSION,
-				recv_ctx->context_id,
-				mtu,
-				0,
-				NX_CDRP_CMD_SET_MTU);
+		netxen_issue_cmd(adapter, &cmd);
 
 	if (rcode != NX_RCODE_SUCCESS)
 		return -EIO;
 
 	return 0;
+}
+
+int
+nx_fw_cmd_set_gbe_port(struct netxen_adapter *adapter,
+			u32 speed, u32 duplex, u32 autoneg)
+{
+	struct netxen_cmd_args cmd;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.req.cmd = NX_CDRP_CMD_CONFIG_GBE_PORT;
+	cmd.req.arg1 = speed;
+	cmd.req.arg2 = duplex;
+	cmd.req.arg3 = autoneg;
+	return netxen_issue_cmd(adapter, &cmd);
 }
 
 static int
@@ -124,6 +286,7 @@ nx_fw_cmd_create_rx_ctx(struct netxen_adapter *adapter)
 	nx_cardrsp_sds_ring_t *prsp_sds;
 	struct nx_host_rds_ring *rds_ring;
 	struct nx_host_sds_ring *sds_ring;
+	struct netxen_cmd_args cmd;
 
 	dma_addr_t hostrq_phys_addr, cardrsp_phys_addr;
 	u64 phys_addr;
@@ -148,7 +311,7 @@ nx_fw_cmd_create_rx_ctx(struct netxen_adapter *adapter)
 				rq_size, &hostrq_phys_addr);
 	if (addr == NULL)
 		return -ENOMEM;
-	prq = (nx_hostrq_rx_ctx_t *)addr;
+	prq = addr;
 
 	addr = pci_alloc_consistent(adapter->pdev,
 			rsp_size, &cardrsp_phys_addr);
@@ -156,12 +319,15 @@ nx_fw_cmd_create_rx_ctx(struct netxen_adapter *adapter)
 		err = -ENOMEM;
 		goto out_free_rq;
 	}
-	prsp = (nx_cardrsp_rx_ctx_t *)addr;
+	prsp = addr;
 
 	prq->host_rsp_dma_addr = cpu_to_le64(cardrsp_phys_addr);
 
 	cap = (NX_CAP0_LEGACY_CONTEXT | NX_CAP0_LEGACY_MN);
 	cap |= (NX_CAP0_JUMBO_CONTIGUOUS | NX_CAP0_LRO_CONTIGUOUS);
+
+	if (adapter->flags & NETXEN_FW_MSS_CAP)
+		cap |= NX_CAP0_HW_LRO_MSS;
 
 	prq->capabilities[0] = cpu_to_le32(cap);
 	prq->host_int_crb_mode =
@@ -203,13 +369,12 @@ nx_fw_cmd_create_rx_ctx(struct netxen_adapter *adapter)
 	}
 
 	phys_addr = hostrq_phys_addr;
-	err = netxen_issue_cmd(adapter,
-			adapter->ahw.pci_func,
-			NXHAL_VERSION,
-			(u32)(phys_addr >> 32),
-			(u32)(phys_addr & 0xffffffff),
-			rq_size,
-			NX_CDRP_CMD_CREATE_RX_CTX);
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.req.arg1 = (u32)(phys_addr >> 32);
+	cmd.req.arg2 = (u32)(phys_addr & 0xffffffff);
+	cmd.req.arg3 = rq_size;
+	cmd.req.cmd = NX_CDRP_CMD_CREATE_RX_CTX;
+	err = netxen_issue_cmd(adapter, &cmd);
 	if (err) {
 		printk(KERN_WARNING
 			"Failed to create rx ctx in firmware%d\n", err);
@@ -258,15 +423,15 @@ static void
 nx_fw_cmd_destroy_rx_ctx(struct netxen_adapter *adapter)
 {
 	struct netxen_recv_context *recv_ctx = &adapter->recv_ctx;
+	struct netxen_cmd_args cmd;
 
-	if (netxen_issue_cmd(adapter,
-			adapter->ahw.pci_func,
-			NXHAL_VERSION,
-			recv_ctx->context_id,
-			NX_DESTROY_CTX_RESET,
-			0,
-			NX_CDRP_CMD_DESTROY_RX_CTX)) {
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.req.arg1 = recv_ctx->context_id;
+	cmd.req.arg2 = NX_DESTROY_CTX_RESET;
+	cmd.req.arg3 = 0;
+	cmd.req.cmd = NX_CDRP_CMD_DESTROY_RX_CTX;
 
+	if (netxen_issue_cmd(adapter, &cmd)) {
 		printk(KERN_WARNING
 			"%s: Failed to destroy rx ctx in firmware\n",
 			netxen_nic_driver_name);
@@ -287,6 +452,7 @@ nx_fw_cmd_create_tx_ctx(struct netxen_adapter *adapter)
 	dma_addr_t	rq_phys_addr, rsp_phys_addr;
 	struct nx_host_tx_ring *tx_ring = adapter->tx_ring;
 	struct netxen_recv_context *recv_ctx = &adapter->recv_ctx;
+	struct netxen_cmd_args cmd;
 
 	rq_size = SIZEOF_HOSTRQ_TX(nx_hostrq_tx_ctx_t);
 	rq_addr = pci_alloc_consistent(adapter->pdev,
@@ -303,10 +469,10 @@ nx_fw_cmd_create_tx_ctx(struct netxen_adapter *adapter)
 	}
 
 	memset(rq_addr, 0, rq_size);
-	prq = (nx_hostrq_tx_ctx_t *)rq_addr;
+	prq = rq_addr;
 
 	memset(rsp_addr, 0, rsp_size);
-	prsp = (nx_cardrsp_tx_ctx_t *)rsp_addr;
+	prsp = rsp_addr;
 
 	prq->host_rsp_dma_addr = cpu_to_le64(rsp_phys_addr);
 
@@ -330,13 +496,12 @@ nx_fw_cmd_create_tx_ctx(struct netxen_adapter *adapter)
 	prq_cds->ring_size = cpu_to_le32(tx_ring->num_desc);
 
 	phys_addr = rq_phys_addr;
-	err = netxen_issue_cmd(adapter,
-			adapter->ahw.pci_func,
-			NXHAL_VERSION,
-			(u32)(phys_addr >> 32),
-			((u32)phys_addr & 0xffffffff),
-			rq_size,
-			NX_CDRP_CMD_CREATE_TX_CTX);
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.req.arg1 = (u32)(phys_addr >> 32);
+	cmd.req.arg2 = ((u32)phys_addr & 0xffffffff);
+	cmd.req.arg3 = rq_size;
+	cmd.req.cmd = NX_CDRP_CMD_CREATE_TX_CTX;
+	err = netxen_issue_cmd(adapter, &cmd);
 
 	if (err == NX_RCODE_SUCCESS) {
 		temp = le32_to_cpu(prsp->cds_ring.host_producer_crb);
@@ -365,14 +530,14 @@ out_free_rq:
 static void
 nx_fw_cmd_destroy_tx_ctx(struct netxen_adapter *adapter)
 {
-	if (netxen_issue_cmd(adapter,
-			adapter->ahw.pci_func,
-			NXHAL_VERSION,
-			adapter->tx_context_id,
-			NX_DESTROY_CTX_RESET,
-			0,
-			NX_CDRP_CMD_DESTROY_TX_CTX)) {
+	struct netxen_cmd_args cmd;
 
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.req.arg1 = adapter->tx_context_id;
+	cmd.req.arg2 = NX_DESTROY_CTX_RESET;
+	cmd.req.arg3 = 0;
+	cmd.req.cmd = NX_CDRP_CMD_DESTROY_TX_CTX;
+	if (netxen_issue_cmd(adapter, &cmd)) {
 		printk(KERN_WARNING
 			"%s: Failed to destroy tx ctx in firmware\n",
 			netxen_nic_driver_name);
@@ -383,34 +548,37 @@ int
 nx_fw_cmd_query_phy(struct netxen_adapter *adapter, u32 reg, u32 *val)
 {
 	u32 rcode;
+	struct netxen_cmd_args cmd;
 
-	rcode = netxen_issue_cmd(adapter,
-			adapter->ahw.pci_func,
-			NXHAL_VERSION,
-			reg,
-			0,
-			0,
-			NX_CDRP_CMD_READ_PHY);
-
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.req.arg1 = reg;
+	cmd.req.arg2 = 0;
+	cmd.req.arg3 = 0;
+	cmd.req.cmd = NX_CDRP_CMD_READ_PHY;
+	cmd.rsp.arg1 = 1;
+	rcode = netxen_issue_cmd(adapter, &cmd);
 	if (rcode != NX_RCODE_SUCCESS)
 		return -EIO;
 
-	return NXRD32(adapter, NX_ARG1_CRB_OFFSET);
+	if (val == NULL)
+		return -EIO;
+
+	*val = cmd.rsp.arg1;
+	return 0;
 }
 
 int
 nx_fw_cmd_set_phy(struct netxen_adapter *adapter, u32 reg, u32 val)
 {
 	u32 rcode;
+	struct netxen_cmd_args cmd;
 
-	rcode = netxen_issue_cmd(adapter,
-			adapter->ahw.pci_func,
-			NXHAL_VERSION,
-			reg,
-			val,
-			0,
-			NX_CDRP_CMD_WRITE_PHY);
-
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.req.arg1 = reg;
+	cmd.req.arg2 = val;
+	cmd.req.arg3 = 0;
+	cmd.req.cmd = NX_CDRP_CMD_WRITE_PHY;
+	rcode = netxen_issue_cmd(adapter, &cmd);
 	if (rcode != NX_RCODE_SUCCESS)
 		return -EIO;
 
@@ -614,7 +782,7 @@ int netxen_alloc_hw_resources(struct netxen_adapter *adapter)
 	}
 
 	memset(addr, 0, sizeof(struct netxen_ring_ctx));
-	recv_ctx->hwctx = (struct netxen_ring_ctx *)addr;
+	recv_ctx->hwctx = addr;
 	recv_ctx->hwctx->ctx_id = cpu_to_le32(port);
 	recv_ctx->hwctx->cmd_consumer_offset =
 		cpu_to_le64(recv_ctx->phys_addr +
@@ -629,10 +797,11 @@ int netxen_alloc_hw_resources(struct netxen_adapter *adapter)
 	if (addr == NULL) {
 		dev_err(&pdev->dev, "%s: failed to allocate tx desc ring\n",
 				netdev->name);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto err_out_free;
 	}
 
-	tx_ring->desc_head = (struct cmd_desc_type0 *)addr;
+	tx_ring->desc_head = addr;
 
 	for (ring = 0; ring < adapter->max_rds_rings; ring++) {
 		rds_ring = &recv_ctx->rds_rings[ring];
@@ -646,7 +815,7 @@ int netxen_alloc_hw_resources(struct netxen_adapter *adapter)
 			err = -ENOMEM;
 			goto err_out_free;
 		}
-		rds_ring->desc_head = (struct rcv_desc *)addr;
+		rds_ring->desc_head = addr;
 
 		if (NX_IS_REVISION_P2(adapter->ahw.revision_id))
 			rds_ring->crb_rcv_producer =
@@ -667,22 +836,23 @@ int netxen_alloc_hw_resources(struct netxen_adapter *adapter)
 			err = -ENOMEM;
 			goto err_out_free;
 		}
-		sds_ring->desc_head = (struct status_desc *)addr;
+		sds_ring->desc_head = addr;
 
-		sds_ring->crb_sts_consumer =
-			netxen_get_ioaddr(adapter,
-			recv_crb_registers[port].crb_sts_consumer[ring]);
+		if (NX_IS_REVISION_P2(adapter->ahw.revision_id)) {
+			sds_ring->crb_sts_consumer =
+				netxen_get_ioaddr(adapter,
+				recv_crb_registers[port].crb_sts_consumer[ring]);
 
-		sds_ring->crb_intr_mask =
-			netxen_get_ioaddr(adapter,
-			recv_crb_registers[port].sw_int_mask[ring]);
+			sds_ring->crb_intr_mask =
+				netxen_get_ioaddr(adapter,
+				recv_crb_registers[port].sw_int_mask[ring]);
+		}
 	}
 
 
 	if (!NX_IS_REVISION_P2(adapter->ahw.revision_id)) {
 		if (test_and_set_bit(__NX_FW_ATTACHED, &adapter->state))
 			goto done;
-
 		err = nx_fw_cmd_create_rx_ctx(adapter);
 		if (err)
 			goto err_out_free;

@@ -67,6 +67,8 @@ extern u8 acpi_gbl_leave_wake_gpes_disabled;
 extern u8 acpi_gbl_use_default_register_widths;
 extern acpi_name acpi_gbl_trace_method_name;
 extern u32 acpi_gbl_trace_flags;
+extern u8 acpi_gbl_truncate_io_addresses;
+extern u8 acpi_gbl_osi_data;
 
 extern u32 acpi_current_gpe_count;
 extern struct acpi_table_fadt acpi_gbl_FADT;
@@ -111,6 +113,11 @@ void *acpi_allocate(u32 size);
 void *acpi_callocate(u32 size);
 
 void acpi_free(void *address);
+
+u32
+acpi_check_address_range(acpi_adr_space_type space_id,
+			 acpi_physical_address address,
+			 acpi_size length, u8 warn);
 
 /*
  * ACPI table manipulation interfaces

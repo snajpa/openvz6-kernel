@@ -214,7 +214,7 @@ int __ref cb_alloc(struct pcmcia_socket * s)
 	unsigned int max, pass;
 
 	s->functions = pci_scan_slot(bus, PCI_DEVFN(0, 0));
-//	pcibios_fixup_bus(bus);
+	pci_fixup_cardbus(bus);
 
 	max = bus->secondary;
 	for (pass = 0; pass < 2; pass++)
@@ -243,10 +243,19 @@ int __ref cb_alloc(struct pcmcia_socket * s)
 
 void cb_free(struct pcmcia_socket * s)
 {
-	struct pci_dev *bridge = s->cb_dev;
+	struct pci_dev *bridge, *dev, *tmp;
+	struct pci_bus *bus;
 
 	cb_release_cis_mem(s);
 
-	if (bridge)
-		pci_remove_behind_bridge(bridge);
+	bridge = s->cb_dev;
+	if (!bridge)
+		return;
+
+	bus = bridge->subordinate;
+	if (!bus)
+		return;
+
+	list_for_each_entry_safe(dev, tmp, &bus->devices, bus_list)
+		pci_stop_and_remove_bus_device(dev);
 }

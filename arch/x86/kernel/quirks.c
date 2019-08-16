@@ -3,8 +3,10 @@
  */
 #include <linux/pci.h>
 #include <linux/irq.h>
-
+#include <linux/dmar.h>
 #include <asm/hpet.h>
+
+struct pci_dev *mcp55_rewrite = NULL;
 
 #if defined(CONFIG_X86_IO_APIC) && defined(CONFIG_SMP) && defined(CONFIG_PCI)
 
@@ -45,12 +47,72 @@ static void __devinit quirk_intel_irqbalance(struct pci_dev *dev)
 	if (!(config & 0x2))
 		pci_write_config_byte(dev, 0xf4, config);
 }
+
+static void __devinit check_mcp55_legacy_irq_routing(struct pci_dev *dev)
+{
+	u32 cfg;
+	printk(KERN_WARNING "FOUND MCP55 CHIP\n");
+	/*
+	 *Some MCP55 chips have a legacy irq routing config register, and most
+	 *BIOS engineers have set it so that legacy interrupts are only routed
+	 *to the BSP. While this makes sense in most cases, it doesn't work
+	 *for kexec, since we might wind up booting on a processor other than
+	 *the BSP.  The right fix for this is to move to symmetric io mode,
+	 *and enable the ioapics very early in the boot process.
+	 *That seems like far to invasive a fix in RHEL5, so here, we're just
+	 *going to check for the appropriate configuration, and tell kexec to
+	 *rewrite the config register if we find that we need to broadcast
+	 *legacy interrupts.
+	 */
+	pci_read_config_dword(dev, 0x74, &cfg);
+	/*
+	 * We expect legacy interrupts to be routed to INTIN0 on the lapics of
+	 * all processors (not just the BSP).  To ensure this, bit 2 must be
+	 * clear, and bit 15 must be clear.  if either of these conditions is
+	 * not met, we have fixups we need to preform a fixup on crash
+	 */
+	if (cfg & ((1 << 2) | (1 << 15))) {
+		/*
+		 * Either bit 2 or 15 wasn't clear, so we need to
+		 * rewrite this cfg register when starting kexec
+		 */
+		printk(KERN_WARNING
+			"DETECTED RESTRICTED ROUTING ON MCP55!  FLAGGING\n");
+		mcp55_rewrite = dev;
+	}
+}
+
+
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_E7320_MCH,
 			quirk_intel_irqbalance);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_E7525_MCH,
 			quirk_intel_irqbalance);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_E7520_MCH,
 			quirk_intel_irqbalance);
+DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_NVIDIA, 0x0360,
+			check_mcp55_legacy_irq_routing);
+DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_NVIDIA, 0x0364,
+			check_mcp55_legacy_irq_routing);
+#endif
+
+#ifdef CONFIG_INTR_REMAP
+static void intel_remapping_check(struct pci_dev *dev)
+{
+	u8 revision;
+
+	pci_read_config_byte(dev, PCI_REVISION_ID, &revision);
+
+	if ((revision <= 0x13) && intr_remapping_enabled) {
+		pr_warn(HW_ERR "This system BIOS has enabled interrupt remapping\n"
+			"on a chipset that contains an errata making that\n"
+			"feature unstable.  Please reboot with intremap=off\n"
+			"added to the kernel command line and contact\n"
+			"your BIOS vendor for an update");
+	}
+}
+
+DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_5520_IOHUB, intel_remapping_check);
+DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_5500_IOHUB, intel_remapping_check);
 #endif
 
 #if defined(CONFIG_HPET_TIMER)
@@ -491,6 +553,19 @@ void force_hpet_resume(void)
 		break;
 	}
 }
+
+/*
+ * HPET MSI on some boards (ATI SB700/SB800) has side effect on
+ * floppy DMA. Disable HPET MSI on such platforms.
+ */
+static void force_disable_hpet_msi(struct pci_dev *unused)
+{
+	hpet_msi_disable = 1;
+}
+
+DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_ATI, PCI_DEVICE_ID_ATI_SBX00_SMBUS,
+			 force_disable_hpet_msi);
+
 #endif
 
 #if defined(CONFIG_PCI) && defined(CONFIG_NUMA)
@@ -499,6 +574,7 @@ static void __init quirk_amd_nb_node(struct pci_dev *dev)
 {
 	struct pci_dev *nb_ht;
 	unsigned int devfn;
+	u32 node;
 	u32 val;
 
 	devfn = PCI_DEVFN(PCI_SLOT(dev->devfn), 0);
@@ -507,7 +583,13 @@ static void __init quirk_amd_nb_node(struct pci_dev *dev)
 		return;
 
 	pci_read_config_dword(nb_ht, 0x60, &val);
-	set_dev_node(&dev->dev, val & 7);
+	node = val & 7;
+	/*
+	 * Some hardware may return an invalid node ID,
+	 * so check it first:
+	 */
+	if (node_online(node))
+		set_dev_node(&dev->dev, node);
 	pci_dev_put(nb_ht);
 }
 
@@ -529,4 +611,60 @@ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_10H_NB_MISC,
 			quirk_amd_nb_node);
 DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_10H_NB_LINK,
 			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_15H_NB_F0,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_15H_NB_F1,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_15H_NB_F2,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_15H_NB_F3,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_15H_NB_F4,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_15H_NB_F5,
+			quirk_amd_nb_node);
+
+static void quirk_intel_soc_ixgbe_variant(struct pci_dev *dev)
+{
+	/* Only mark Broadwell-DE SoC unsupported */
+	if (boot_cpu_data.x86_model != 86)
+		return;
+	mark_hardware_unsupported("Intel ixgbe device");
+}
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x15AE,
+			quirk_intel_soc_ixgbe_variant);
+
+/*
+ * This "quirk" ensures that Intel Skylake systems are not paired with a
+ * Kaby Lake PCH.
+ *
+ * quirk_intel_skylake_check_supported() verifies that if the processor is
+ * an Intel Skylake that the PCH is a Sunrise Point PCH by verifying it has
+ * a device ID in the range of 0xA141 to 0xA15F.  If this is not the case
+ * the hardware is marked as not supported.
+ *
+ * The current Intel datasheet, page 26, documents the acceptable range as
+ * 0x141-0x15F:
+ *
+ * http://www.intel.com/content/www/us/en/chipsets/100-series-chipset-datasheet-vol-1.html?wapkw=intel+100+series
+ *
+ */
+static void quirk_intel_skylake_check_supported(struct pci_dev *dev)
+{
+	if (boot_cpu_data.x86_model != 78 && boot_cpu_data.x86_model != 94)
+		return;
+
+	if (((dev->class >> 8) & 0xffff) != PCI_CLASS_BRIDGE_ISA)
+		return;
+
+	if (dev->device >= 0xA141 && dev->device <= 0xA15F)
+		return;
+
+	pr_crit("Unknown Intel PCH (0x%0x) detected\n",	dev->device);
+	mark_hardware_unsupported("Intel Skylake processor with unknown PCH");
+}
+
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, PCI_ANY_ID,
+			quirk_intel_skylake_check_supported);
+
 #endif

@@ -559,3 +559,50 @@ unsigned int kstat_irqs_cpu(unsigned int irq, int cpu)
 }
 EXPORT_SYMBOL(kstat_irqs_cpu);
 
+
+#ifdef CONFIG_GENERIC_HARDIRQS
+unsigned int kstat_irqs(unsigned int irq)
+{
+	struct irq_desc *desc = irq_to_desc(irq);
+	int cpu;
+	int sum = 0;
+
+	if (!desc)
+		return 0;
+	for_each_possible_cpu(cpu)
+		sum += desc->kstat_irqs[cpu];
+	return sum;
+}
+EXPORT_SYMBOL(kstat_irqs);
+
+#endif /* CONFIG_GENERIC_HARDIRQS */
+
+#ifdef CONFIG_SPARSE_IRQ
+unsigned int kstat_irqs_usr(unsigned int irq)
+{
+	int sum;
+	unsigned long flags;
+
+	if (!irq_to_desc(irq))
+		return 0;
+
+	spin_lock_irqsave(&sparse_irq_lock, flags);
+	sum = kstat_irqs(irq);
+	spin_unlock_irqrestore(&sparse_irq_lock, flags);
+
+	return sum;
+}
+EXPORT_SYMBOL(kstat_irqs_usr);
+
+unsigned int kstat_irqs_usr_nolock(unsigned int irq)
+{
+	int sum;
+
+	if (!irq_to_desc(irq))
+		return 0;
+
+	sum = kstat_irqs(irq);
+	return sum;
+}
+EXPORT_SYMBOL(kstat_irqs_usr_nolock);
+#endif

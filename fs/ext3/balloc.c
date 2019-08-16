@@ -19,6 +19,8 @@
 #include <linux/ext3_jbd.h>
 #include <linux/quotaops.h>
 #include <linux/buffer_head.h>
+#include <linux/blkdev.h>
+#include <trace/events/ext3.h>
 
 /*
  * balloc.c contains the blocks allocation and deallocation routines
@@ -37,6 +39,21 @@
 
 
 #define in_range(b, first, len)	((b) >= (first) && (b) <= (first) + (len) - 1)
+
+/*
+ * Calculate the block group number and offset, given a block number
+ */
+static void ext3_get_group_no_and_offset(struct super_block *sb,
+	ext3_fsblk_t blocknr, unsigned long *blockgrpp, ext3_grpblk_t *offsetp)
+{
+	struct ext3_super_block *es = EXT3_SB(sb)->s_es;
+
+	blocknr = blocknr - le32_to_cpu(es->s_first_data_block);
+	if (offsetp)
+		*offsetp = blocknr % EXT3_BLOCKS_PER_GROUP(sb);
+	if (blockgrpp)
+		*blockgrpp = blocknr / EXT3_BLOCKS_PER_GROUP(sb);
+}
 
 /**
  * ext3_get_group_desc() -- load group descriptor from disk
@@ -144,6 +161,7 @@ read_block_bitmap(struct super_block *sb, unsigned int block_group)
 	desc = ext3_get_group_desc(sb, block_group, NULL);
 	if (!desc)
 		return NULL;
+	trace_ext3_read_block_bitmap(sb, block_group);
 	bitmap_blk = le32_to_cpu(desc->bg_block_bitmap);
 	bh = sb_getblk(sb, bitmap_blk);
 	if (unlikely(!bh)) {
@@ -334,6 +352,7 @@ void ext3_rsv_window_add(struct super_block *sb,
 	struct rb_node * parent = NULL;
 	struct ext3_reserve_window_node *this;
 
+	trace_ext3_rsv_window_add(sb, rsv);
 	while (*p)
 	{
 		parent = *p;
@@ -459,8 +478,10 @@ void ext3_discard_reservation(struct inode *inode)
 	rsv = &block_i->rsv_window_node;
 	if (!rsv_is_empty(&rsv->rsv_window)) {
 		spin_lock(rsv_lock);
-		if (!rsv_is_empty(&rsv->rsv_window))
+		if (!rsv_is_empty(&rsv->rsv_window)) {
+			trace_ext3_discard_reservation(inode, rsv);
 			rsv_window_remove(inode->i_sb, rsv);
+		}
 		spin_unlock(rsv_lock);
 	}
 }
@@ -666,14 +687,10 @@ error_return:
 void ext3_free_blocks(handle_t *handle, struct inode *inode,
 			ext3_fsblk_t block, unsigned long count)
 {
-	struct super_block * sb;
+	struct super_block *sb = inode->i_sb;
 	unsigned long dquot_freed_blocks;
 
-	sb = inode->i_sb;
-	if (!sb) {
-		printk ("ext3_free_blocks: nonexistent device");
-		return;
-	}
+	trace_ext3_free_blocks(inode, block, count);
 	ext3_free_blocks_sb(handle, sb, block, count, &dquot_freed_blocks);
 	if (dquot_freed_blocks)
 		vfs_dq_free_block(inode, dquot_freed_blocks);
@@ -1116,6 +1133,7 @@ static int alloc_new_reservation(struct ext3_reserve_window_node *my_rsv,
 	else
 		start_block = grp_goal + group_first_block;
 
+	trace_ext3_alloc_new_reservation(sb, start_block);
 	size = my_rsv->rsv_goal_size;
 
 	if (!rsv_is_empty(&my_rsv->rsv_window)) {
@@ -1210,8 +1228,11 @@ retry:
 	 * check if the first free block is within the
 	 * free space we just reserved
 	 */
-	if (start_block >= my_rsv->rsv_start && start_block <= my_rsv->rsv_end)
+	if (start_block >= my_rsv->rsv_start &&
+	    start_block <= my_rsv->rsv_end) {
+		trace_ext3_reserved(sb, start_block, my_rsv);
 		return 0;		/* success */
+	}
 	/*
 	 * if the first free bit we found is out of the reservable space
 	 * continue search for next reservable space,
@@ -1415,14 +1436,14 @@ out:
  *
  * Check if filesystem has at least 1 free block available for allocation.
  */
-static int ext3_has_free_blocks(struct ext3_sb_info *sbi)
+static int ext3_has_free_blocks(struct ext3_sb_info *sbi, int use_reservation)
 {
 	ext3_fsblk_t free_blocks, root_blocks;
 
 	free_blocks = percpu_counter_read_positive(&sbi->s_freeblocks_counter);
 	root_blocks = le32_to_cpu(sbi->s_es->s_r_blocks_count);
 	if (free_blocks < root_blocks + 1 && !capable(CAP_SYS_RESOURCE) &&
-		sbi->s_resuid != current_fsuid() &&
+		!use_reservation && sbi->s_resuid != current_fsuid() &&
 		(sbi->s_resgid == 0 || !in_group_p (sbi->s_resgid))) {
 		return 0;
 	}
@@ -1443,7 +1464,7 @@ static int ext3_has_free_blocks(struct ext3_sb_info *sbi)
  */
 int ext3_should_retry_alloc(struct super_block *sb, int *retries)
 {
-	if (!ext3_has_free_blocks(EXT3_SB(sb)) || (*retries)++ > 3)
+	if (!ext3_has_free_blocks(EXT3_SB(sb), 0) || (*retries)++ > 3)
 		return 0;
 
 	jbd_debug(1, "%s: retrying operation after ENOSPC\n", sb->s_id);
@@ -1494,10 +1515,6 @@ ext3_fsblk_t ext3_new_blocks(handle_t *handle, struct inode *inode,
 
 	*errp = -ENOSPC;
 	sb = inode->i_sb;
-	if (!sb) {
-		printk("ext3_new_block: nonexistent device");
-		return 0;
-	}
 
 	/*
 	 * Check quota for allocation of this block.
@@ -1507,8 +1524,10 @@ ext3_fsblk_t ext3_new_blocks(handle_t *handle, struct inode *inode,
 		return 0;
 	}
 
+	trace_ext3_request_blocks(inode, goal, num);
+
 	sbi = EXT3_SB(sb);
-	es = EXT3_SB(sb)->s_es;
+	es = sbi->s_es;
 	ext3_debug("goal=%lu.\n", goal);
 	/*
 	 * Allocate a block from reservation only when
@@ -1522,7 +1541,7 @@ ext3_fsblk_t ext3_new_blocks(handle_t *handle, struct inode *inode,
 	if (block_i && ((windowsz = block_i->rsv_window_node.rsv_goal_size) > 0))
 		my_rsv = &block_i->rsv_window_node;
 
-	if (!ext3_has_free_blocks(sbi)) {
+	if (!ext3_has_free_blocks(sbi, IS_NOQUOTA(inode))) {
 		*errp = -ENOSPC;
 		goto out;
 	}
@@ -1713,8 +1732,15 @@ allocated:
 
 	*errp = 0;
 	brelse(bitmap_bh);
-	vfs_dq_free_block(inode, *count-num);
-	*count = num;
+
+	if (num < *count) {
+		vfs_dq_free_block(inode, *count-num);
+		*count = num;
+	}
+
+	trace_ext3_allocate_blocks(inode, goal, num,
+				   (unsigned long long)ret_block);
+
 	return ret_block;
 
 io_error:
@@ -1873,4 +1899,259 @@ unsigned long ext3_bg_num_gdb(struct super_block *sb, int group)
 
 	return ext3_bg_num_gdb_meta(sb,group);
 
+}
+
+/**
+ * ext3_trim_all_free -- function to trim all free space in alloc. group
+ * @sb:			super block for file system
+ * @group:		allocation group to trim
+ * @start:		first group block to examine
+ * @max:		last group block to examine
+ * @gdp:		allocation group description structure
+ * @minblocks:		minimum extent block count
+ *
+ * ext3_trim_all_free walks through group's block bitmap searching for free
+ * blocks. When the free block is found, it tries to allocate this block and
+ * consequent free block to get the biggest free extent possible, until it
+ * reaches any used block. Then issue a TRIM command on this extent and free
+ * the extent in the block bitmap. This is done until whole group is scanned.
+ */
+static ext3_grpblk_t ext3_trim_all_free(struct super_block *sb,
+					unsigned int group,
+					ext3_grpblk_t start, ext3_grpblk_t max,
+					ext3_grpblk_t minblocks)
+{
+	handle_t *handle;
+	ext3_grpblk_t next, free_blocks, bit, freed, count = 0;
+	ext3_fsblk_t discard_block;
+	struct ext3_sb_info *sbi;
+	struct buffer_head *gdp_bh, *bitmap_bh = NULL;
+	struct ext3_group_desc *gdp;
+	int err = 0, ret = 0;
+
+	/*
+	 * We will update one block bitmap, and one group descriptor
+	 */
+	handle = ext3_journal_start_sb(sb, 2);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+
+	bitmap_bh = read_block_bitmap(sb, group);
+	if (!bitmap_bh) {
+		err = -EIO;
+		goto err_out;
+	}
+
+	BUFFER_TRACE(bitmap_bh, "getting undo access");
+	err = ext3_journal_get_undo_access(handle, bitmap_bh);
+	if (err)
+		goto err_out;
+
+	gdp = ext3_get_group_desc(sb, group, &gdp_bh);
+	if (!gdp) {
+		err = -EIO;
+		goto err_out;
+	}
+
+	BUFFER_TRACE(gdp_bh, "get_write_access");
+	err = ext3_journal_get_write_access(handle, gdp_bh);
+	if (err)
+		goto err_out;
+
+	free_blocks = le16_to_cpu(gdp->bg_free_blocks_count);
+	sbi = EXT3_SB(sb);
+
+	 /* Walk through the whole group */
+	while (start < max) {
+		start = bitmap_search_next_usable_block(start, bitmap_bh, max);
+		if (start < 0)
+			break;
+		next = start;
+
+		/*
+		 * Allocate contiguous free extents by setting bits in the
+		 * block bitmap
+		 */
+		while (next < max
+			&& claim_block(sb_bgl_lock(sbi, group),
+					next, bitmap_bh)) {
+			next++;
+		}
+
+		 /* We did not claim any blocks */
+		if (next == start)
+			continue;
+
+		discard_block = (ext3_fsblk_t)start +
+				ext3_group_first_block_no(sb, group);
+
+		/* Update counters */
+		spin_lock(sb_bgl_lock(sbi, group));
+		le16_add_cpu(&gdp->bg_free_blocks_count, start - next);
+		spin_unlock(sb_bgl_lock(sbi, group));
+		percpu_counter_sub(&sbi->s_freeblocks_counter, next - start);
+
+		free_blocks -= next - start;
+		/* Do not issue a TRIM on extents smaller than minblocks */
+		if ((next - start) < minblocks)
+			goto free_extent;
+
+		trace_ext3_discard_blocks(sb, discard_block, next - start);
+		 /* Send the TRIM command down to the device */
+		err = sb_issue_discard(sb, discard_block, next - start,
+				       GFP_NOFS, 0);
+		count += (next - start);
+free_extent:
+		freed = 0;
+
+		/*
+		 * Clear bits in the bitmap
+		 */
+		for (bit = start; bit < next; bit++) {
+			BUFFER_TRACE(bitmap_bh, "clear bit");
+			if (!ext3_clear_bit_atomic(sb_bgl_lock(sbi, group),
+						bit, bitmap_bh->b_data)) {
+				ext3_error(sb, __func__,
+					"bit already cleared for block "E3FSBLK,
+					 (unsigned long)bit);
+				BUFFER_TRACE(bitmap_bh, "bit already cleared");
+			} else {
+				freed++;
+			}
+		}
+
+		/* Update couters */
+		spin_lock(sb_bgl_lock(sbi, group));
+		le16_add_cpu(&gdp->bg_free_blocks_count, freed);
+		spin_unlock(sb_bgl_lock(sbi, group));
+		percpu_counter_add(&sbi->s_freeblocks_counter, freed);
+
+		start = next;
+		if (err < 0) {
+			if (err != -EOPNOTSUPP)
+				ext3_warning(sb, __func__, "Discard command "
+					     "returned error %d\n", err);
+			break;
+		}
+
+		if (fatal_signal_pending(current)) {
+			err = -ERESTARTSYS;
+			break;
+		}
+
+		cond_resched();
+
+		/* No more suitable extents */
+		if (free_blocks < minblocks)
+			break;
+	}
+
+	/* We dirtied the bitmap block */
+	BUFFER_TRACE(bitmap_bh, "dirtied bitmap block");
+	ret = ext3_journal_dirty_metadata(handle, bitmap_bh);
+	if (!err)
+		err = ret;
+
+	/* And the group descriptor block */
+	BUFFER_TRACE(gdp_bh, "dirtied group descriptor block");
+	ret = ext3_journal_dirty_metadata(handle, gdp_bh);
+	if (!err)
+		err = ret;
+
+	ext3_debug("trimmed %d blocks in the group %d\n",
+		count, group);
+
+err_out:
+	if (err)
+		count = err;
+	ext3_journal_stop(handle);
+	brelse(bitmap_bh);
+
+	return count;
+}
+
+/**
+ * ext3_trim_fs() -- trim ioctl handle function
+ * @sb:			superblock for filesystem
+ * @start:		First Byte to trim
+ * @len:		number of Bytes to trim from start
+ * @minlen:		minimum extent length in Bytes
+ *
+ * ext3_trim_fs goes through all allocation groups containing Bytes from
+ * start to start+len. For each such a group ext3_trim_all_free function
+ * is invoked to trim all free space.
+ */
+int ext3_trim_fs(struct super_block *sb, struct fstrim_range *range)
+{
+	ext3_grpblk_t last_block, first_block;
+	unsigned long group, first_group, last_group;
+	struct ext3_group_desc *gdp;
+	struct ext3_super_block *es = EXT3_SB(sb)->s_es;
+	uint64_t start, minlen, end, trimmed = 0;
+	ext3_fsblk_t first_data_blk =
+			le32_to_cpu(EXT3_SB(sb)->s_es->s_first_data_block);
+	ext3_fsblk_t max_blks = le32_to_cpu(es->s_blocks_count);
+	int ret = 0;
+
+	start = range->start >> sb->s_blocksize_bits;
+	end = start + (range->len >> sb->s_blocksize_bits) - 1;
+	minlen = range->minlen >> sb->s_blocksize_bits;
+
+	if (minlen > EXT3_BLOCKS_PER_GROUP(sb) ||
+	    start >= max_blks ||
+	    range->len < sb->s_blocksize)
+		return -EINVAL;
+	if (unlikely(end >= max_blks))
+		end = max_blks - 1;
+	if (end <= first_data_blk)
+		return 0;
+	if (start < first_data_blk)
+		start = first_data_blk;
+
+	smp_rmb();
+
+	/* Determine first and last group to examine based on start and len */
+	ext3_get_group_no_and_offset(sb, (ext3_fsblk_t) start,
+				     &first_group, &first_block);
+	ext3_get_group_no_and_offset(sb, (ext3_fsblk_t) end,
+				     &last_group, &last_block);
+
+	/* The last block to discard in the group */
+	end = EXT3_BLOCKS_PER_GROUP(sb);
+
+	for (group = first_group; group <= last_group; group++) {
+		gdp = ext3_get_group_desc(sb, group, NULL);
+		if (!gdp)
+			break;
+
+		if (le16_to_cpu(gdp->bg_free_blocks_count) < minlen)
+			continue;
+
+		/*
+		 * For all the groups except the last one, last block will
+		 * always be EXT3_BLOCKS_PER_GROUP(sb), so we only need to
+		 * change it for the last group, note that last_block is
+		 * already computed earlier by ext3_get_group_no_and_offset()
+		 */
+		if (group == last_group)
+			end = last_block;
+
+		ret = ext3_trim_all_free(sb, group, first_block,
+					 end, minlen);
+		if (ret < 0)
+			break;
+		trimmed += ret;
+
+		/*
+		 * For every group except the first one, we are sure
+		 * that the first block to discard will be block #0.
+		 */
+		first_block = 0;
+	}
+
+	if (ret > 0)
+		ret = 0;
+	range->len = trimmed * sb->s_blocksize;
+
+	return ret;
 }

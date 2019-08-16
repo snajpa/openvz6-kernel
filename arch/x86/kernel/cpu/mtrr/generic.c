@@ -65,6 +65,19 @@ static inline void k8_check_syscfg_dram_mod_en(void)
 	}
 }
 
+/* Get the size of contiguous MTRR range */
+static u64 get_mtrr_size(u64 mask)
+{
+	u64 size;
+
+	mask >>= PAGE_SHIFT;
+	mask |= size_or_mask;
+	size = -mask;
+	size <<= PAGE_SHIFT;
+	return size;
+}
+
+
 /*
  * Returns the effective MTRR type for the region
  * Error returns:
@@ -74,7 +87,6 @@ static inline void k8_check_syscfg_dram_mod_en(void)
 u8 mtrr_type_lookup(u64 start, u64 end)
 {
 	int i;
-	u64 base, mask;
 	u8 prev_match, curr_match;
 
 	if (!mtrr_state_set)
@@ -115,22 +127,24 @@ u8 mtrr_type_lookup(u64 start, u64 end)
 
 	prev_match = 0xFF;
 	for (i = 0; i < num_var_ranges; ++i) {
-		unsigned short start_state, end_state;
+		u64 mtrr_start, mtrr_end, mask;
 
 		if (!(mtrr_state.var_ranges[i].mask_lo & (1 << 11)))
 			continue;
 
-		base = (((u64)mtrr_state.var_ranges[i].base_hi) << 32) +
-		       (mtrr_state.var_ranges[i].base_lo & PAGE_MASK);
 		mask = (((u64)mtrr_state.var_ranges[i].mask_hi) << 32) +
 		       (mtrr_state.var_ranges[i].mask_lo & PAGE_MASK);
+		mtrr_start = (((u64)mtrr_state.var_ranges[i].base_hi) << 32) +
+			     (mtrr_state.var_ranges[i].base_lo & PAGE_MASK);
+		mtrr_end = mtrr_start + get_mtrr_size(mask);
 
-		start_state = ((start & mask) == (base & mask));
-		end_state = ((end & mask) == (base & mask));
-		if (start_state != end_state)
-			return 0xFE;
-
-		if ((start & mask) != (base & mask))
+		/*
+		 * Handle the case where the range overlap several mtrr, for
+		 * which we will consider all mtrr two by two and use the
+		 * lowest common denominator (uncache being lower, then write
+		 * through then write back).
+		 */
+		if (end < mtrr_start || start > mtrr_end)
 			continue;
 
 		curr_match = mtrr_state.var_ranges[i].base_lo & 0xff;
@@ -432,8 +446,9 @@ generic_get_free_region(unsigned long base, unsigned long size, int replace_reg)
 static void generic_get_mtrr(unsigned int reg, unsigned long *base,
 			     unsigned long *size, mtrr_type *type)
 {
-	unsigned int mask_lo, mask_hi, base_lo, base_hi;
-	unsigned int tmp, hi;
+	u32 mask_lo, mask_hi, base_lo, base_hi;
+	unsigned int hi;
+	u64 tmp, mask;
 	int cpu;
 
 	/*
@@ -455,17 +470,18 @@ static void generic_get_mtrr(unsigned int reg, unsigned long *base,
 	rdmsr(MTRRphysBase_MSR(reg), base_lo, base_hi);
 
 	/* Work out the shifted address mask: */
-	tmp = mask_hi << (32 - PAGE_SHIFT) | mask_lo >> PAGE_SHIFT;
-	mask_lo = size_or_mask | tmp;
+	tmp = (u64)mask_hi << (32 - PAGE_SHIFT) | mask_lo >> PAGE_SHIFT;
+	mask = size_or_mask | tmp;
 
 	/* Expand tmp with high bits to all 1s: */
-	hi = fls(tmp);
+	hi = fls64(tmp);
 	if (hi > 0) {
-		tmp |= ~((1<<(hi - 1)) - 1);
+		tmp |= ~((1ULL<<(hi - 1)) - 1);
 
-		if (tmp != mask_lo) {
-			WARN_ONCE(1, KERN_INFO "mtrr: your BIOS has set up an incorrect mask, fixing it up.\n");
-			mask_lo = tmp;
+		if (tmp != mask) {
+			printk(KERN_WARNING "mtrr: your BIOS has configured an incorrect mask, fixing it.\n");
+			add_taint(TAINT_FIRMWARE_WORKAROUND);
+			mask = tmp;
 		}
 	}
 
@@ -473,8 +489,8 @@ static void generic_get_mtrr(unsigned int reg, unsigned long *base,
 	 * This works correctly if size is a power of two, i.e. a
 	 * contiguous range:
 	 */
-	*size = -mask_lo;
-	*base = base_hi << (32 - PAGE_SHIFT) | base_lo >> PAGE_SHIFT;
+	*size = -mask;
+	*base = (u64)base_hi << (32 - PAGE_SHIFT) | base_lo >> PAGE_SHIFT;
 	*type = base_lo & 0xff;
 
 out_put_cpu:

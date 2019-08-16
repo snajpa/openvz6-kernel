@@ -23,40 +23,62 @@
  * Authors: Dave Airlie
  *          Alex Deucher
  */
-#include "drmP.h"
-#include "drm_crtc_helper.h"
-#include "radeon_drm.h"
+#include <drm/drmP.h>
+#include <drm/drm_crtc_helper.h>
+#include <drm/radeon_drm.h>
 #include "radeon.h"
 #include "atom.h"
+#include <linux/backlight.h>
+#ifdef CONFIG_PMAC_BACKLIGHT
+#include <asm/backlight.h>
+#endif
 
 static void radeon_legacy_encoder_disable(struct drm_encoder *encoder)
 {
 	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
-	struct drm_encoder_helper_funcs *encoder_funcs;
+	const struct drm_encoder_helper_funcs *encoder_funcs;
 
 	encoder_funcs = encoder->helper_private;
 	encoder_funcs->dpms(encoder, DRM_MODE_DPMS_OFF);
 	radeon_encoder->active_device = 0;
 }
 
-static void radeon_legacy_lvds_dpms(struct drm_encoder *encoder, int mode)
+static void radeon_legacy_lvds_update(struct drm_encoder *encoder, int mode)
 {
 	struct drm_device *dev = encoder->dev;
 	struct radeon_device *rdev = dev->dev_private;
 	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
 	uint32_t lvds_gen_cntl, lvds_pll_cntl, pixclks_cntl, disp_pwr_man;
 	int panel_pwr_delay = 2000;
-	DRM_DEBUG("\n");
+	bool is_mac = false;
+	uint8_t backlight_level;
+	DRM_DEBUG_KMS("\n");
+
+	lvds_gen_cntl = RREG32(RADEON_LVDS_GEN_CNTL);
+	backlight_level = (lvds_gen_cntl >> RADEON_LVDS_BL_MOD_LEVEL_SHIFT) & 0xff;
 
 	if (radeon_encoder->enc_priv) {
 		if (rdev->is_atom_bios) {
 			struct radeon_encoder_atom_dig *lvds = radeon_encoder->enc_priv;
 			panel_pwr_delay = lvds->panel_pwr_delay;
+			if (lvds->bl_dev)
+				backlight_level = lvds->backlight_level;
 		} else {
 			struct radeon_encoder_lvds *lvds = radeon_encoder->enc_priv;
 			panel_pwr_delay = lvds->panel_pwr_delay;
+			if (lvds->bl_dev)
+				backlight_level = lvds->backlight_level;
 		}
 	}
+
+	/* macs (and possibly some x86 oem systems?) wire up LVDS strangely
+	 * Taken from radeonfb.
+	 */
+	if ((rdev->mode_info.connector_table == CT_IBOOK) ||
+	    (rdev->mode_info.connector_table == CT_POWERBOOK_EXTERNAL) ||
+	    (rdev->mode_info.connector_table == CT_POWERBOOK_INTERNAL) ||
+	    (rdev->mode_info.connector_table == CT_POWERBOOK_VGA))
+		is_mac = true;
 
 	switch (mode) {
 	case DRM_MODE_DPMS_ON:
@@ -66,16 +88,20 @@ static void radeon_legacy_lvds_dpms(struct drm_encoder *encoder, int mode)
 		lvds_pll_cntl = RREG32(RADEON_LVDS_PLL_CNTL);
 		lvds_pll_cntl |= RADEON_LVDS_PLL_EN;
 		WREG32(RADEON_LVDS_PLL_CNTL, lvds_pll_cntl);
-		udelay(1000);
+		mdelay(1);
 
 		lvds_pll_cntl = RREG32(RADEON_LVDS_PLL_CNTL);
 		lvds_pll_cntl &= ~RADEON_LVDS_PLL_RESET;
 		WREG32(RADEON_LVDS_PLL_CNTL, lvds_pll_cntl);
 
-		lvds_gen_cntl = RREG32(RADEON_LVDS_GEN_CNTL);
-		lvds_gen_cntl |= (RADEON_LVDS_ON | RADEON_LVDS_EN | RADEON_LVDS_DIGON | RADEON_LVDS_BLON);
-		lvds_gen_cntl &= ~(RADEON_LVDS_DISPLAY_DIS);
-		udelay(panel_pwr_delay * 1000);
+		lvds_gen_cntl &= ~(RADEON_LVDS_DISPLAY_DIS |
+				   RADEON_LVDS_BL_MOD_LEVEL_MASK);
+		lvds_gen_cntl |= (RADEON_LVDS_ON | RADEON_LVDS_EN |
+				  RADEON_LVDS_DIGON | RADEON_LVDS_BLON |
+				  (backlight_level << RADEON_LVDS_BL_MOD_LEVEL_SHIFT));
+		if (is_mac)
+			lvds_gen_cntl |= RADEON_LVDS_BL_MOD_EN;
+		mdelay(panel_pwr_delay);
 		WREG32(RADEON_LVDS_GEN_CNTL, lvds_gen_cntl);
 		break;
 	case DRM_MODE_DPMS_STANDBY:
@@ -83,12 +109,19 @@ static void radeon_legacy_lvds_dpms(struct drm_encoder *encoder, int mode)
 	case DRM_MODE_DPMS_OFF:
 		pixclks_cntl = RREG32_PLL(RADEON_PIXCLKS_CNTL);
 		WREG32_PLL_P(RADEON_PIXCLKS_CNTL, 0, ~RADEON_PIXCLK_LVDS_ALWAYS_ONb);
-		lvds_gen_cntl = RREG32(RADEON_LVDS_GEN_CNTL);
 		lvds_gen_cntl |= RADEON_LVDS_DISPLAY_DIS;
-		lvds_gen_cntl &= ~(RADEON_LVDS_ON | RADEON_LVDS_BLON | RADEON_LVDS_EN | RADEON_LVDS_DIGON);
-		udelay(panel_pwr_delay * 1000);
+		if (is_mac) {
+			lvds_gen_cntl &= ~RADEON_LVDS_BL_MOD_EN;
+			WREG32(RADEON_LVDS_GEN_CNTL, lvds_gen_cntl);
+			lvds_gen_cntl &= ~(RADEON_LVDS_ON | RADEON_LVDS_EN);
+		} else {
+			WREG32(RADEON_LVDS_GEN_CNTL, lvds_gen_cntl);
+			lvds_gen_cntl &= ~(RADEON_LVDS_ON | RADEON_LVDS_BLON | RADEON_LVDS_EN | RADEON_LVDS_DIGON);
+		}
+		mdelay(panel_pwr_delay);
 		WREG32(RADEON_LVDS_GEN_CNTL, lvds_gen_cntl);
 		WREG32_PLL(RADEON_PIXCLKS_CNTL, pixclks_cntl);
+		mdelay(panel_pwr_delay);
 		break;
 	}
 
@@ -96,6 +129,26 @@ static void radeon_legacy_lvds_dpms(struct drm_encoder *encoder, int mode)
 		radeon_atombios_encoder_dpms_scratch_regs(encoder, (mode == DRM_MODE_DPMS_ON) ? true : false);
 	else
 		radeon_combios_encoder_dpms_scratch_regs(encoder, (mode == DRM_MODE_DPMS_ON) ? true : false);
+
+}
+
+static void radeon_legacy_lvds_dpms(struct drm_encoder *encoder, int mode)
+{
+	struct radeon_device *rdev = encoder->dev->dev_private;
+	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
+	DRM_DEBUG("\n");
+
+	if (radeon_encoder->enc_priv) {
+		if (rdev->is_atom_bios) {
+			struct radeon_encoder_atom_dig *lvds = radeon_encoder->enc_priv;
+			lvds->dpms_mode = mode;
+		} else {
+			struct radeon_encoder_lvds *lvds = radeon_encoder->enc_priv;
+			lvds->dpms_mode = mode;
+		}
+	}
+
+	radeon_legacy_lvds_update(encoder, mode);
 }
 
 static void radeon_legacy_lvds_prepare(struct drm_encoder *encoder)
@@ -130,16 +183,23 @@ static void radeon_legacy_lvds_mode_set(struct drm_encoder *encoder,
 	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
 	uint32_t lvds_pll_cntl, lvds_gen_cntl, lvds_ss_gen_cntl;
 
-	DRM_DEBUG("\n");
+	DRM_DEBUG_KMS("\n");
 
 	lvds_pll_cntl = RREG32(RADEON_LVDS_PLL_CNTL);
 	lvds_pll_cntl &= ~RADEON_LVDS_PLL_EN;
 
 	lvds_ss_gen_cntl = RREG32(RADEON_LVDS_SS_GEN_CNTL);
-	if ((!rdev->is_atom_bios)) {
+	if (rdev->is_atom_bios) {
+		/* LVDS_GEN_CNTL parameters are computed in LVDSEncoderControl
+		 * need to call that on resume to set up the reg properly.
+		 */
+		radeon_encoder->pixel_clock = adjusted_mode->clock;
+		atombios_digital_setup(encoder, PANEL_ENCODER_ACTION_ENABLE);
+		lvds_gen_cntl = RREG32(RADEON_LVDS_GEN_CNTL);
+	} else {
 		struct radeon_encoder_lvds *lvds = (struct radeon_encoder_lvds *)radeon_encoder->enc_priv;
 		if (lvds) {
-			DRM_DEBUG("bios LVDS_GEN_CNTL: 0x%x\n", lvds->lvds_gen_cntl);
+			DRM_DEBUG_KMS("bios LVDS_GEN_CNTL: 0x%x\n", lvds->lvds_gen_cntl);
 			lvds_gen_cntl = lvds->lvds_gen_cntl;
 			lvds_ss_gen_cntl &= ~((0xf << RADEON_LVDS_PWRSEQ_DELAY1_SHIFT) |
 					      (0xf << RADEON_LVDS_PWRSEQ_DELAY2_SHIFT));
@@ -147,8 +207,7 @@ static void radeon_legacy_lvds_mode_set(struct drm_encoder *encoder,
 					     (lvds->panel_blon_delay << RADEON_LVDS_PWRSEQ_DELAY2_SHIFT));
 		} else
 			lvds_gen_cntl = RREG32(RADEON_LVDS_GEN_CNTL);
-	} else
-		lvds_gen_cntl = RREG32(RADEON_LVDS_GEN_CNTL);
+	}
 	lvds_gen_cntl |= RADEON_LVDS_DISPLAY_DIS;
 	lvds_gen_cntl &= ~(RADEON_LVDS_ON |
 			   RADEON_LVDS_BLON |
@@ -184,9 +243,9 @@ static void radeon_legacy_lvds_mode_set(struct drm_encoder *encoder,
 		radeon_combios_encoder_crtc_scratch_regs(encoder, radeon_crtc->crtc_id);
 }
 
-static bool radeon_legacy_lvds_mode_fixup(struct drm_encoder *encoder,
-					  struct drm_display_mode *mode,
-					  struct drm_display_mode *adjusted_mode)
+static bool radeon_legacy_mode_fixup(struct drm_encoder *encoder,
+				     const struct drm_display_mode *mode,
+				     struct drm_display_mode *adjusted_mode)
 {
 	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
 
@@ -194,36 +253,258 @@ static bool radeon_legacy_lvds_mode_fixup(struct drm_encoder *encoder,
 	radeon_encoder_set_active_device(encoder);
 	drm_mode_set_crtcinfo(adjusted_mode, 0);
 
-	if (radeon_encoder->rmx_type != RMX_OFF)
-		radeon_rmx_mode_fixup(encoder, mode, adjusted_mode);
+	/* get the native mode for LVDS */
+	if (radeon_encoder->active_device & (ATOM_DEVICE_LCD_SUPPORT))
+		radeon_panel_mode_fixup(encoder, adjusted_mode);
 
 	return true;
 }
 
 static const struct drm_encoder_helper_funcs radeon_legacy_lvds_helper_funcs = {
 	.dpms = radeon_legacy_lvds_dpms,
-	.mode_fixup = radeon_legacy_lvds_mode_fixup,
+	.mode_fixup = radeon_legacy_mode_fixup,
 	.prepare = radeon_legacy_lvds_prepare,
 	.mode_set = radeon_legacy_lvds_mode_set,
 	.commit = radeon_legacy_lvds_commit,
 	.disable = radeon_legacy_encoder_disable,
 };
 
+u8
+radeon_legacy_get_backlight_level(struct radeon_encoder *radeon_encoder)
+{
+	struct drm_device *dev = radeon_encoder->base.dev;
+	struct radeon_device *rdev = dev->dev_private;
+	u8 backlight_level;
 
-static const struct drm_encoder_funcs radeon_legacy_lvds_enc_funcs = {
-	.destroy = radeon_enc_destroy,
+	backlight_level = (RREG32(RADEON_LVDS_GEN_CNTL) >>
+			   RADEON_LVDS_BL_MOD_LEVEL_SHIFT) & 0xff;
+
+	return backlight_level;
+}
+
+void
+radeon_legacy_set_backlight_level(struct radeon_encoder *radeon_encoder, u8 level)
+{
+	struct drm_device *dev = radeon_encoder->base.dev;
+	struct radeon_device *rdev = dev->dev_private;
+	int dpms_mode = DRM_MODE_DPMS_ON;
+
+	if (radeon_encoder->enc_priv) {
+		if (rdev->is_atom_bios) {
+			struct radeon_encoder_atom_dig *lvds = radeon_encoder->enc_priv;
+			if (lvds->backlight_level > 0)
+				dpms_mode = lvds->dpms_mode;
+			else
+				dpms_mode = DRM_MODE_DPMS_OFF;
+			lvds->backlight_level = level;
+		} else {
+			struct radeon_encoder_lvds *lvds = radeon_encoder->enc_priv;
+			if (lvds->backlight_level > 0)
+				dpms_mode = lvds->dpms_mode;
+			else
+				dpms_mode = DRM_MODE_DPMS_OFF;
+			lvds->backlight_level = level;
+		}
+	}
+
+	radeon_legacy_lvds_update(&radeon_encoder->base, dpms_mode);
+}
+
+#if defined(CONFIG_BACKLIGHT_CLASS_DEVICE) || defined(CONFIG_BACKLIGHT_CLASS_DEVICE_MODULE)
+
+static uint8_t radeon_legacy_lvds_level(struct backlight_device *bd)
+{
+	struct radeon_backlight_privdata *pdata = bl_get_data(bd);
+	uint8_t level;
+
+	/* Convert brightness to hardware level */
+	if (bd->props.brightness < 0)
+		level = 0;
+	else if (bd->props.brightness > RADEON_MAX_BL_LEVEL)
+		level = RADEON_MAX_BL_LEVEL;
+	else
+		level = bd->props.brightness;
+
+	if (pdata->negative)
+		level = RADEON_MAX_BL_LEVEL - level;
+
+	return level;
+}
+
+static int radeon_legacy_backlight_update_status(struct backlight_device *bd)
+{
+	struct radeon_backlight_privdata *pdata = bl_get_data(bd);
+	struct radeon_encoder *radeon_encoder = pdata->encoder;
+
+	radeon_legacy_set_backlight_level(radeon_encoder,
+					  radeon_legacy_lvds_level(bd));
+
+	return 0;
+}
+
+static int radeon_legacy_backlight_get_brightness(struct backlight_device *bd)
+{
+	struct radeon_backlight_privdata *pdata = bl_get_data(bd);
+	struct radeon_encoder *radeon_encoder = pdata->encoder;
+	struct drm_device *dev = radeon_encoder->base.dev;
+	struct radeon_device *rdev = dev->dev_private;
+	uint8_t backlight_level;
+
+	backlight_level = (RREG32(RADEON_LVDS_GEN_CNTL) >>
+			   RADEON_LVDS_BL_MOD_LEVEL_SHIFT) & 0xff;
+
+	return pdata->negative ? RADEON_MAX_BL_LEVEL - backlight_level : backlight_level;
+}
+
+static struct backlight_ops radeon_backlight_ops = {
+	.get_brightness = radeon_legacy_backlight_get_brightness,
+	.update_status	= radeon_legacy_backlight_update_status,
 };
 
-static bool radeon_legacy_primary_dac_mode_fixup(struct drm_encoder *encoder,
-						 struct drm_display_mode *mode,
-						 struct drm_display_mode *adjusted_mode)
+void radeon_legacy_backlight_init(struct radeon_encoder *radeon_encoder,
+				  struct drm_connector *drm_connector)
 {
-	/* set the active encoder to connector routing */
-	radeon_encoder_set_active_device(encoder);
-	drm_mode_set_crtcinfo(adjusted_mode, 0);
+	struct drm_device *dev = radeon_encoder->base.dev;
+	struct radeon_device *rdev = dev->dev_private;
+	struct backlight_device *bd;
+	struct radeon_backlight_privdata *pdata;
+	uint8_t backlight_level;
+	char bl_name[16];
 
-	return true;
+	if (!radeon_encoder->enc_priv)
+		return;
+
+#ifdef CONFIG_PMAC_BACKLIGHT
+	if (!pmac_has_backlight_type("ati") &&
+	    !pmac_has_backlight_type("mnca"))
+		return;
+#endif
+
+	pdata = kmalloc(sizeof(struct radeon_backlight_privdata), GFP_KERNEL);
+	if (!pdata) {
+		DRM_ERROR("Memory allocation failed\n");
+		goto error;
+	}
+
+	snprintf(bl_name, sizeof(bl_name),
+		 "radeon_bl%d", dev->primary->index);
+	bd = backlight_device_register(bl_name, drm_connector->kdev,
+				       pdata, &radeon_backlight_ops);
+	if (IS_ERR(bd)) {
+		DRM_ERROR("Backlight registration failed\n");
+		goto error;
+	}
+
+	pdata->encoder = radeon_encoder;
+
+	backlight_level = (RREG32(RADEON_LVDS_GEN_CNTL) >>
+			   RADEON_LVDS_BL_MOD_LEVEL_SHIFT) & 0xff;
+
+	/* First, try to detect backlight level sense based on the assumption
+	 * that firmware set it up at full brightness
+	 */
+	if (backlight_level == 0)
+		pdata->negative = true;
+	else if (backlight_level == 0xff)
+		pdata->negative = false;
+	else {
+		/* XXX hack... maybe some day we can figure out in what direction
+		 * backlight should work on a given panel?
+		 */
+		pdata->negative = (rdev->family != CHIP_RV200 &&
+				   rdev->family != CHIP_RV250 &&
+				   rdev->family != CHIP_RV280 &&
+				   rdev->family != CHIP_RV350);
+
+#ifdef CONFIG_PMAC_BACKLIGHT
+		pdata->negative = (pdata->negative ||
+				   of_machine_is_compatible("PowerBook4,3") ||
+				   of_machine_is_compatible("PowerBook6,3") ||
+				   of_machine_is_compatible("PowerBook6,5"));
+#endif
+	}
+
+	if (rdev->is_atom_bios) {
+		struct radeon_encoder_atom_dig *lvds = radeon_encoder->enc_priv;
+		lvds->bl_dev = bd;
+	} else {
+		struct radeon_encoder_lvds *lvds = radeon_encoder->enc_priv;
+		lvds->bl_dev = bd;
+	}
+
+	bd->props.brightness = radeon_legacy_backlight_get_brightness(bd);
+	bd->props.max_brightness = RADEON_MAX_BL_LEVEL;
+	bd->props.power = FB_BLANK_UNBLANK;
+	backlight_update_status(bd);
+
+	DRM_INFO("radeon legacy LVDS backlight initialized\n");
+	rdev->mode_info.bl_encoder = radeon_encoder;
+
+	return;
+
+error:
+	kfree(pdata);
+	return;
 }
+
+static void radeon_legacy_backlight_exit(struct radeon_encoder *radeon_encoder)
+{
+	struct drm_device *dev = radeon_encoder->base.dev;
+	struct radeon_device *rdev = dev->dev_private;
+	struct backlight_device *bd = NULL;
+
+	if (!radeon_encoder->enc_priv)
+		return;
+
+	if (rdev->is_atom_bios) {
+		struct radeon_encoder_atom_dig *lvds = radeon_encoder->enc_priv;
+		bd = lvds->bl_dev;
+		lvds->bl_dev = NULL;
+	} else {
+		struct radeon_encoder_lvds *lvds = radeon_encoder->enc_priv;
+		bd = lvds->bl_dev;
+		lvds->bl_dev = NULL;
+	}
+
+	if (bd) {
+		struct radeon_backlight_privdata *pdata;
+
+		pdata = bl_get_data(bd);
+		backlight_device_unregister(bd);
+		kfree(pdata);
+
+		DRM_INFO("radeon legacy LVDS backlight unloaded\n");
+	}
+}
+
+#else /* !CONFIG_BACKLIGHT_CLASS_DEVICE */
+
+void radeon_legacy_backlight_init(struct radeon_encoder *encoder)
+{
+}
+
+static void radeon_legacy_backlight_exit(struct radeon_encoder *encoder)
+{
+}
+
+#endif
+
+
+static void radeon_lvds_enc_destroy(struct drm_encoder *encoder)
+{
+	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
+
+	if (radeon_encoder->enc_priv) {
+		radeon_legacy_backlight_exit(radeon_encoder);
+		kfree(radeon_encoder->enc_priv);
+	}
+	drm_encoder_cleanup(encoder);
+	kfree(radeon_encoder);
+}
+
+static const struct drm_encoder_funcs radeon_legacy_lvds_enc_funcs = {
+	.destroy = radeon_lvds_enc_destroy,
+};
 
 static void radeon_legacy_primary_dac_dpms(struct drm_encoder *encoder, int mode)
 {
@@ -233,7 +514,7 @@ static void radeon_legacy_primary_dac_dpms(struct drm_encoder *encoder, int mode
 	uint32_t dac_cntl = RREG32(RADEON_DAC_CNTL);
 	uint32_t dac_macro_cntl = RREG32(RADEON_DAC_MACRO_CNTL);
 
-	DRM_DEBUG("\n");
+	DRM_DEBUG_KMS("\n");
 
 	switch (mode) {
 	case DRM_MODE_DPMS_ON:
@@ -254,7 +535,9 @@ static void radeon_legacy_primary_dac_dpms(struct drm_encoder *encoder, int mode
 		break;
 	}
 
-	WREG32(RADEON_CRTC_EXT_CNTL, crtc_ext_cntl);
+	/* handled in radeon_crtc_dpms() */
+	if (!(rdev->flags & RADEON_SINGLE_CRTC))
+		WREG32(RADEON_CRTC_EXT_CNTL, crtc_ext_cntl);
 	WREG32(RADEON_DAC_CNTL, dac_cntl);
 	WREG32(RADEON_DAC_MACRO_CNTL, dac_macro_cntl);
 
@@ -262,6 +545,7 @@ static void radeon_legacy_primary_dac_dpms(struct drm_encoder *encoder, int mode
 		radeon_atombios_encoder_dpms_scratch_regs(encoder, (mode == DRM_MODE_DPMS_ON) ? true : false);
 	else
 		radeon_combios_encoder_dpms_scratch_regs(encoder, (mode == DRM_MODE_DPMS_ON) ? true : false);
+
 }
 
 static void radeon_legacy_primary_dac_prepare(struct drm_encoder *encoder)
@@ -297,7 +581,7 @@ static void radeon_legacy_primary_dac_mode_set(struct drm_encoder *encoder,
 	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
 	uint32_t disp_output_cntl, dac_cntl, dac2_cntl, dac_macro_cntl;
 
-	DRM_DEBUG("\n");
+	DRM_DEBUG_KMS("\n");
 
 	if (radeon_crtc->crtc_id == 0) {
 		if (rdev->family == CHIP_R200 || ASIC_IS_R300(rdev)) {
@@ -354,6 +638,14 @@ static enum drm_connector_status radeon_legacy_primary_dac_detect(struct drm_enc
 	enum drm_connector_status found = connector_status_disconnected;
 	bool color = true;
 
+	/* just don't bother on RN50 those chip are often connected to remoting
+	 * console hw and often we get failure to load detect those. So to make
+	 * everyone happy report the encoder as always connected.
+	 */
+	if (ASIC_IS_RN50(rdev)) {
+		return connector_status_connected;
+	}
+
 	/* save the regs we need */
 	vclk_ecp_cntl = RREG32_PLL(RADEON_VCLK_ECP_CNTL);
 	crtc_ext_cntl = RREG32(RADEON_CRTC_EXT_CNTL);
@@ -378,6 +670,8 @@ static enum drm_connector_status radeon_legacy_primary_dac_detect(struct drm_enc
 
 	if (ASIC_IS_R300(rdev))
 		tmp |= (0x1b6 << RADEON_DAC_FORCE_DATA_SHIFT);
+	else if (ASIC_IS_RV100(rdev))
+		tmp |= (0x1ac << RADEON_DAC_FORCE_DATA_SHIFT);
 	else
 		tmp |= (0x180 << RADEON_DAC_FORCE_DATA_SHIFT);
 
@@ -387,13 +681,14 @@ static enum drm_connector_status radeon_legacy_primary_dac_detect(struct drm_enc
 	tmp |= RADEON_DAC_RANGE_CNTL_PS2 | RADEON_DAC_CMP_EN;
 	WREG32(RADEON_DAC_CNTL, tmp);
 
+	tmp = dac_macro_cntl;
 	tmp &= ~(RADEON_DAC_PDWN_R |
 		 RADEON_DAC_PDWN_G |
 		 RADEON_DAC_PDWN_B);
 
 	WREG32(RADEON_DAC_MACRO_CNTL, tmp);
 
-	udelay(2000);
+	mdelay(2);
 
 	if (RREG32(RADEON_DAC_CNTL) & RADEON_DAC_CMP_OUTPUT)
 		found = connector_status_connected;
@@ -410,7 +705,7 @@ static enum drm_connector_status radeon_legacy_primary_dac_detect(struct drm_enc
 
 static const struct drm_encoder_helper_funcs radeon_legacy_primary_dac_helper_funcs = {
 	.dpms = radeon_legacy_primary_dac_dpms,
-	.mode_fixup = radeon_legacy_primary_dac_mode_fixup,
+	.mode_fixup = radeon_legacy_mode_fixup,
 	.prepare = radeon_legacy_primary_dac_prepare,
 	.mode_set = radeon_legacy_primary_dac_mode_set,
 	.commit = radeon_legacy_primary_dac_commit,
@@ -423,22 +718,12 @@ static const struct drm_encoder_funcs radeon_legacy_primary_dac_enc_funcs = {
 	.destroy = radeon_enc_destroy,
 };
 
-static bool radeon_legacy_tmds_int_mode_fixup(struct drm_encoder *encoder,
-					      struct drm_display_mode *mode,
-					      struct drm_display_mode *adjusted_mode)
-{
-
-	drm_mode_set_crtcinfo(adjusted_mode, 0);
-
-	return true;
-}
-
 static void radeon_legacy_tmds_int_dpms(struct drm_encoder *encoder, int mode)
 {
 	struct drm_device *dev = encoder->dev;
 	struct radeon_device *rdev = dev->dev_private;
 	uint32_t fp_gen_cntl = RREG32(RADEON_FP_GEN_CNTL);
-	DRM_DEBUG("\n");
+	DRM_DEBUG_KMS("\n");
 
 	switch (mode) {
 	case DRM_MODE_DPMS_ON:
@@ -457,6 +742,7 @@ static void radeon_legacy_tmds_int_dpms(struct drm_encoder *encoder, int mode)
 		radeon_atombios_encoder_dpms_scratch_regs(encoder, (mode == DRM_MODE_DPMS_ON) ? true : false);
 	else
 		radeon_combios_encoder_dpms_scratch_regs(encoder, (mode == DRM_MODE_DPMS_ON) ? true : false);
+
 }
 
 static void radeon_legacy_tmds_int_prepare(struct drm_encoder *encoder)
@@ -493,7 +779,7 @@ static void radeon_legacy_tmds_int_mode_set(struct drm_encoder *encoder,
 	uint32_t tmp, tmds_pll_cntl, tmds_transmitter_cntl, fp_gen_cntl;
 	int i;
 
-	DRM_DEBUG("\n");
+	DRM_DEBUG_KMS("\n");
 
 	tmp = tmds_pll_cntl = RREG32(RADEON_TMDS_PLL_CNTL);
 	tmp &= 0xfffff;
@@ -584,7 +870,7 @@ static void radeon_legacy_tmds_int_mode_set(struct drm_encoder *encoder,
 
 static const struct drm_encoder_helper_funcs radeon_legacy_tmds_int_helper_funcs = {
 	.dpms = radeon_legacy_tmds_int_dpms,
-	.mode_fixup = radeon_legacy_tmds_int_mode_fixup,
+	.mode_fixup = radeon_legacy_mode_fixup,
 	.prepare = radeon_legacy_tmds_int_prepare,
 	.mode_set = radeon_legacy_tmds_int_mode_set,
 	.commit = radeon_legacy_tmds_int_commit,
@@ -596,23 +882,12 @@ static const struct drm_encoder_funcs radeon_legacy_tmds_int_enc_funcs = {
 	.destroy = radeon_enc_destroy,
 };
 
-static bool radeon_legacy_tmds_ext_mode_fixup(struct drm_encoder *encoder,
-					      struct drm_display_mode *mode,
-					      struct drm_display_mode *adjusted_mode)
-{
-	/* set the active encoder to connector routing */
-	radeon_encoder_set_active_device(encoder);
-	drm_mode_set_crtcinfo(adjusted_mode, 0);
-
-	return true;
-}
-
 static void radeon_legacy_tmds_ext_dpms(struct drm_encoder *encoder, int mode)
 {
 	struct drm_device *dev = encoder->dev;
 	struct radeon_device *rdev = dev->dev_private;
 	uint32_t fp2_gen_cntl = RREG32(RADEON_FP2_GEN_CNTL);
-	DRM_DEBUG("\n");
+	DRM_DEBUG_KMS("\n");
 
 	switch (mode) {
 	case DRM_MODE_DPMS_ON:
@@ -633,6 +908,7 @@ static void radeon_legacy_tmds_ext_dpms(struct drm_encoder *encoder, int mode)
 		radeon_atombios_encoder_dpms_scratch_regs(encoder, (mode == DRM_MODE_DPMS_ON) ? true : false);
 	else
 		radeon_combios_encoder_dpms_scratch_regs(encoder, (mode == DRM_MODE_DPMS_ON) ? true : false);
+
 }
 
 static void radeon_legacy_tmds_ext_prepare(struct drm_encoder *encoder)
@@ -667,11 +943,11 @@ static void radeon_legacy_tmds_ext_mode_set(struct drm_encoder *encoder,
 	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
 	uint32_t fp2_gen_cntl;
 
-	DRM_DEBUG("\n");
+	DRM_DEBUG_KMS("\n");
 
 	if (rdev->is_atom_bios) {
 		radeon_encoder->pixel_clock = adjusted_mode->clock;
-		atombios_external_tmds_setup(encoder, ATOM_ENABLE);
+		atombios_dvo_setup(encoder, ATOM_ENABLE);
 		fp2_gen_cntl = RREG32(RADEON_FP2_GEN_CNTL);
 	} else {
 		fp2_gen_cntl = RREG32(RADEON_FP2_GEN_CNTL);
@@ -697,6 +973,8 @@ static void radeon_legacy_tmds_ext_mode_set(struct drm_encoder *encoder,
 			/*if (mode->clock > 165000)
 			  fp2_gen_cntl |= R300_FP2_DVO_DUAL_CHANNEL_EN;*/
 		}
+		if (!radeon_combios_external_tmds_setup(encoder))
+			radeon_external_tmds_setup(encoder);
 	}
 
 	if (radeon_crtc->crtc_id == 0) {
@@ -724,9 +1002,18 @@ static void radeon_legacy_tmds_ext_mode_set(struct drm_encoder *encoder,
 		radeon_combios_encoder_crtc_scratch_regs(encoder, radeon_crtc->crtc_id);
 }
 
+static void radeon_ext_tmds_enc_destroy(struct drm_encoder *encoder)
+{
+	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
+	/* don't destroy the i2c bus record here, this will be done in radeon_i2c_fini */
+	kfree(radeon_encoder->enc_priv);
+	drm_encoder_cleanup(encoder);
+	kfree(radeon_encoder);
+}
+
 static const struct drm_encoder_helper_funcs radeon_legacy_tmds_ext_helper_funcs = {
 	.dpms = radeon_legacy_tmds_ext_dpms,
-	.mode_fixup = radeon_legacy_tmds_ext_mode_fixup,
+	.mode_fixup = radeon_legacy_mode_fixup,
 	.prepare = radeon_legacy_tmds_ext_prepare,
 	.mode_set = radeon_legacy_tmds_ext_mode_set,
 	.commit = radeon_legacy_tmds_ext_commit,
@@ -735,19 +1022,8 @@ static const struct drm_encoder_helper_funcs radeon_legacy_tmds_ext_helper_funcs
 
 
 static const struct drm_encoder_funcs radeon_legacy_tmds_ext_enc_funcs = {
-	.destroy = radeon_enc_destroy,
+	.destroy = radeon_ext_tmds_enc_destroy,
 };
-
-static bool radeon_legacy_tv_dac_mode_fixup(struct drm_encoder *encoder,
-					    struct drm_display_mode *mode,
-					    struct drm_display_mode *adjusted_mode)
-{
-	/* set the active encoder to connector routing */
-	radeon_encoder_set_active_device(encoder);
-	drm_mode_set_crtcinfo(adjusted_mode, 0);
-
-	return true;
-}
 
 static void radeon_legacy_tv_dac_dpms(struct drm_encoder *encoder, int mode)
 {
@@ -757,7 +1033,7 @@ static void radeon_legacy_tv_dac_dpms(struct drm_encoder *encoder, int mode)
 	uint32_t fp2_gen_cntl = 0, crtc2_gen_cntl = 0, tv_dac_cntl = 0;
 	uint32_t tv_master_cntl = 0;
 	bool is_tv;
-	DRM_DEBUG("\n");
+	DRM_DEBUG_KMS("\n");
 
 	is_tv = radeon_encoder->active_device & ATOM_DEVICE_TV_SUPPORT ? true : false;
 
@@ -807,8 +1083,8 @@ static void radeon_legacy_tv_dac_dpms(struct drm_encoder *encoder, int mode)
 				crtc2_gen_cntl &= ~RADEON_CRTC2_CRT2_ON;
 
 			if (rdev->family == CHIP_R420 ||
-					rdev->family == CHIP_R423 ||
-					rdev->family == CHIP_RV410)
+			    rdev->family == CHIP_R423 ||
+			    rdev->family == CHIP_RV410)
 				tv_dac_cntl |= (R420_TV_DAC_RDACPD |
 						R420_TV_DAC_GDACPD |
 						R420_TV_DAC_BDACPD |
@@ -827,7 +1103,8 @@ static void radeon_legacy_tv_dac_dpms(struct drm_encoder *encoder, int mode)
 	} else {
 		if (is_tv)
 			WREG32(RADEON_TV_MASTER_CNTL, tv_master_cntl);
-		else
+		/* handled in radeon_crtc_dpms() */
+		else if (!(rdev->flags & RADEON_SINGLE_CRTC))
 			WREG32(RADEON_CRTC2_GEN_CNTL, crtc2_gen_cntl);
 		WREG32(RADEON_TV_DAC_CNTL, tv_dac_cntl);
 	}
@@ -836,6 +1113,7 @@ static void radeon_legacy_tv_dac_dpms(struct drm_encoder *encoder, int mode)
 		radeon_atombios_encoder_dpms_scratch_regs(encoder, (mode == DRM_MODE_DPMS_ON) ? true : false);
 	else
 		radeon_combios_encoder_dpms_scratch_regs(encoder, (mode == DRM_MODE_DPMS_ON) ? true : false);
+
 }
 
 static void radeon_legacy_tv_dac_prepare(struct drm_encoder *encoder)
@@ -874,42 +1152,50 @@ static void radeon_legacy_tv_dac_mode_set(struct drm_encoder *encoder,
 	uint32_t disp_hw_debug = 0, fp2_gen_cntl = 0, disp_tv_out_cntl = 0;
 	bool is_tv = false;
 
-	DRM_DEBUG("\n");
+	DRM_DEBUG_KMS("\n");
 
 	is_tv = radeon_encoder->active_device & ATOM_DEVICE_TV_SUPPORT ? true : false;
 
 	if (rdev->family != CHIP_R200) {
 		tv_dac_cntl = RREG32(RADEON_TV_DAC_CNTL);
 		if (rdev->family == CHIP_R420 ||
-				rdev->family == CHIP_R423 ||
-				rdev->family == CHIP_RV410) {
+		    rdev->family == CHIP_R423 ||
+		    rdev->family == CHIP_RV410) {
 			tv_dac_cntl &= ~(RADEON_TV_DAC_STD_MASK |
-					RADEON_TV_DAC_BGADJ_MASK |
-					R420_TV_DAC_DACADJ_MASK |
-					R420_TV_DAC_RDACPD |
-					R420_TV_DAC_GDACPD |
-					R420_TV_DAC_BDACPD |
-					R420_TV_DAC_TVENABLE);
+					 RADEON_TV_DAC_BGADJ_MASK |
+					 R420_TV_DAC_DACADJ_MASK |
+					 R420_TV_DAC_RDACPD |
+					 R420_TV_DAC_GDACPD |
+					 R420_TV_DAC_BDACPD |
+					 R420_TV_DAC_TVENABLE);
 		} else {
 			tv_dac_cntl &= ~(RADEON_TV_DAC_STD_MASK |
-					RADEON_TV_DAC_BGADJ_MASK |
-					RADEON_TV_DAC_DACADJ_MASK |
-					RADEON_TV_DAC_RDACPD |
-					RADEON_TV_DAC_GDACPD |
-					RADEON_TV_DAC_BDACPD);
+					 RADEON_TV_DAC_BGADJ_MASK |
+					 RADEON_TV_DAC_DACADJ_MASK |
+					 RADEON_TV_DAC_RDACPD |
+					 RADEON_TV_DAC_GDACPD |
+					 RADEON_TV_DAC_BDACPD);
 		}
 
-		/*  FIXME TV */
-		if (tv_dac) {
-			struct radeon_encoder_tv_dac *tv_dac = radeon_encoder->enc_priv;
-			tv_dac_cntl |= (RADEON_TV_DAC_NBLANK |
-					RADEON_TV_DAC_NHOLD |
-					RADEON_TV_DAC_STD_PS2 |
-					tv_dac->ps2_tvdac_adj);
+		tv_dac_cntl |= RADEON_TV_DAC_NBLANK | RADEON_TV_DAC_NHOLD;
+
+		if (is_tv) {
+			if (tv_dac->tv_std == TV_STD_NTSC ||
+			    tv_dac->tv_std == TV_STD_NTSC_J ||
+			    tv_dac->tv_std == TV_STD_PAL_M ||
+			    tv_dac->tv_std == TV_STD_PAL_60)
+				tv_dac_cntl |= tv_dac->ntsc_tvdac_adj;
+			else
+				tv_dac_cntl |= tv_dac->pal_tvdac_adj;
+
+			if (tv_dac->tv_std == TV_STD_NTSC ||
+			    tv_dac->tv_std == TV_STD_NTSC_J)
+				tv_dac_cntl |= RADEON_TV_DAC_STD_NTSC;
+			else
+				tv_dac_cntl |= RADEON_TV_DAC_STD_PAL;
 		} else
-			tv_dac_cntl |= (RADEON_TV_DAC_NBLANK |
-					RADEON_TV_DAC_NHOLD |
-					RADEON_TV_DAC_STD_PS2);
+			tv_dac_cntl |= (RADEON_TV_DAC_STD_PS2 |
+					tv_dac->ps2_tvdac_adj);
 
 		WREG32(RADEON_TV_DAC_CNTL, tv_dac_cntl);
 	}
@@ -917,15 +1203,13 @@ static void radeon_legacy_tv_dac_mode_set(struct drm_encoder *encoder,
 	if (ASIC_IS_R300(rdev)) {
 		gpiopad_a = RREG32(RADEON_GPIOPAD_A) | 1;
 		disp_output_cntl = RREG32(RADEON_DISP_OUTPUT_CNTL);
-	}
-
-	if (rdev->family == CHIP_R200 || ASIC_IS_R300(rdev))
-		disp_tv_out_cntl = RREG32(RADEON_DISP_TV_OUT_CNTL);
-	else
+	} else if (rdev->family != CHIP_R200)
 		disp_hw_debug = RREG32(RADEON_DISP_HW_DEBUG);
-
-	if (rdev->family == CHIP_R200)
+	else if (rdev->family == CHIP_R200)
 		fp2_gen_cntl = RREG32(RADEON_FP2_GEN_CNTL);
+
+	if (rdev->family >= CHIP_R200)
+		disp_tv_out_cntl = RREG32(RADEON_DISP_TV_OUT_CNTL);
 
 	if (is_tv) {
 		uint32_t dac_cntl;
@@ -991,15 +1275,13 @@ static void radeon_legacy_tv_dac_mode_set(struct drm_encoder *encoder,
 	if (ASIC_IS_R300(rdev)) {
 		WREG32_P(RADEON_GPIOPAD_A, gpiopad_a, ~1);
 		WREG32(RADEON_DISP_OUTPUT_CNTL, disp_output_cntl);
-	}
+	} else if (rdev->family != CHIP_R200)
+		WREG32(RADEON_DISP_HW_DEBUG, disp_hw_debug);
+	else if (rdev->family == CHIP_R200)
+		WREG32(RADEON_FP2_GEN_CNTL, fp2_gen_cntl);
 
 	if (rdev->family >= CHIP_R200)
 		WREG32(RADEON_DISP_TV_OUT_CNTL, disp_tv_out_cntl);
-	else
-		WREG32(RADEON_DISP_HW_DEBUG, disp_hw_debug);
-
-	if (rdev->family == CHIP_R200)
-		WREG32(RADEON_FP2_GEN_CNTL, fp2_gen_cntl);
 
 	if (is_tv)
 		radeon_legacy_tv_mode_set(encoder, mode, adjusted_mode);
@@ -1067,10 +1349,10 @@ static bool r300_legacy_tv_detect(struct drm_encoder *encoder,
 	tmp = RREG32(RADEON_TV_DAC_CNTL);
 	if ((tmp & RADEON_TV_DAC_GDACDET) != 0) {
 		found = true;
-		DRM_DEBUG("S-video TV connection detected\n");
+		DRM_DEBUG_KMS("S-video TV connection detected\n");
 	} else if ((tmp & RADEON_TV_DAC_BDACDET) != 0) {
 		found = true;
-		DRM_DEBUG("Composite TV connection detected\n");
+		DRM_DEBUG_KMS("Composite TV connection detected\n");
 	}
 
 	WREG32(RADEON_TV_DAC_CNTL, tv_dac_cntl);
@@ -1133,10 +1415,10 @@ static bool radeon_legacy_tv_detect(struct drm_encoder *encoder,
 	tmp = RREG32(RADEON_TV_DAC_CNTL);
 	if (tmp & RADEON_TV_DAC_GDACDET) {
 		found = true;
-		DRM_DEBUG("S-video TV connection detected\n");
+		DRM_DEBUG_KMS("S-video TV connection detected\n");
 	} else if ((tmp & RADEON_TV_DAC_BDACDET) != 0) {
 		found = true;
-		DRM_DEBUG("Composite TV connection detected\n");
+		DRM_DEBUG_KMS("Composite TV connection detected\n");
 	}
 
 	WREG32(RADEON_TV_PRE_DAC_MUX_CNTL, tv_pre_dac_mux_cntl);
@@ -1146,17 +1428,119 @@ static bool radeon_legacy_tv_detect(struct drm_encoder *encoder,
 	return found;
 }
 
+static bool radeon_legacy_ext_dac_detect(struct drm_encoder *encoder,
+					 struct drm_connector *connector)
+{
+	struct drm_device *dev = encoder->dev;
+	struct radeon_device *rdev = dev->dev_private;
+	uint32_t gpio_monid, fp2_gen_cntl, disp_output_cntl, crtc2_gen_cntl;
+	uint32_t disp_lin_trans_grph_a, disp_lin_trans_grph_b, disp_lin_trans_grph_c;
+	uint32_t disp_lin_trans_grph_d, disp_lin_trans_grph_e, disp_lin_trans_grph_f;
+	uint32_t tmp, crtc2_h_total_disp, crtc2_v_total_disp;
+	uint32_t crtc2_h_sync_strt_wid, crtc2_v_sync_strt_wid;
+	bool found = false;
+	int i;
+
+	/* save the regs we need */
+	gpio_monid = RREG32(RADEON_GPIO_MONID);
+	fp2_gen_cntl = RREG32(RADEON_FP2_GEN_CNTL);
+	disp_output_cntl = RREG32(RADEON_DISP_OUTPUT_CNTL);
+	crtc2_gen_cntl = RREG32(RADEON_CRTC2_GEN_CNTL);
+	disp_lin_trans_grph_a = RREG32(RADEON_DISP_LIN_TRANS_GRPH_A);
+	disp_lin_trans_grph_b = RREG32(RADEON_DISP_LIN_TRANS_GRPH_B);
+	disp_lin_trans_grph_c = RREG32(RADEON_DISP_LIN_TRANS_GRPH_C);
+	disp_lin_trans_grph_d = RREG32(RADEON_DISP_LIN_TRANS_GRPH_D);
+	disp_lin_trans_grph_e = RREG32(RADEON_DISP_LIN_TRANS_GRPH_E);
+	disp_lin_trans_grph_f = RREG32(RADEON_DISP_LIN_TRANS_GRPH_F);
+	crtc2_h_total_disp = RREG32(RADEON_CRTC2_H_TOTAL_DISP);
+	crtc2_v_total_disp = RREG32(RADEON_CRTC2_V_TOTAL_DISP);
+	crtc2_h_sync_strt_wid = RREG32(RADEON_CRTC2_H_SYNC_STRT_WID);
+	crtc2_v_sync_strt_wid = RREG32(RADEON_CRTC2_V_SYNC_STRT_WID);
+
+	tmp = RREG32(RADEON_GPIO_MONID);
+	tmp &= ~RADEON_GPIO_A_0;
+	WREG32(RADEON_GPIO_MONID, tmp);
+
+	WREG32(RADEON_FP2_GEN_CNTL, (RADEON_FP2_ON |
+				     RADEON_FP2_PANEL_FORMAT |
+				     R200_FP2_SOURCE_SEL_TRANS_UNIT |
+				     RADEON_FP2_DVO_EN |
+				     R200_FP2_DVO_RATE_SEL_SDR));
+
+	WREG32(RADEON_DISP_OUTPUT_CNTL, (RADEON_DISP_DAC_SOURCE_RMX |
+					 RADEON_DISP_TRANS_MATRIX_GRAPHICS));
+
+	WREG32(RADEON_CRTC2_GEN_CNTL, (RADEON_CRTC2_EN |
+				       RADEON_CRTC2_DISP_REQ_EN_B));
+
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_A, 0x00000000);
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_B, 0x000003f0);
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_C, 0x00000000);
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_D, 0x000003f0);
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_E, 0x00000000);
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_F, 0x000003f0);
+
+	WREG32(RADEON_CRTC2_H_TOTAL_DISP, 0x01000008);
+	WREG32(RADEON_CRTC2_H_SYNC_STRT_WID, 0x00000800);
+	WREG32(RADEON_CRTC2_V_TOTAL_DISP, 0x00080001);
+	WREG32(RADEON_CRTC2_V_SYNC_STRT_WID, 0x00000080);
+
+	for (i = 0; i < 200; i++) {
+		tmp = RREG32(RADEON_GPIO_MONID);
+		if (tmp & RADEON_GPIO_Y_0)
+			found = true;
+
+		if (found)
+			break;
+
+		if (!drm_can_sleep())
+			mdelay(1);
+		else
+			msleep(1);
+	}
+
+	/* restore the regs we used */
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_A, disp_lin_trans_grph_a);
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_B, disp_lin_trans_grph_b);
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_C, disp_lin_trans_grph_c);
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_D, disp_lin_trans_grph_d);
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_E, disp_lin_trans_grph_e);
+	WREG32(RADEON_DISP_LIN_TRANS_GRPH_F, disp_lin_trans_grph_f);
+	WREG32(RADEON_CRTC2_H_TOTAL_DISP, crtc2_h_total_disp);
+	WREG32(RADEON_CRTC2_V_TOTAL_DISP, crtc2_v_total_disp);
+	WREG32(RADEON_CRTC2_H_SYNC_STRT_WID, crtc2_h_sync_strt_wid);
+	WREG32(RADEON_CRTC2_V_SYNC_STRT_WID, crtc2_v_sync_strt_wid);
+	WREG32(RADEON_CRTC2_GEN_CNTL, crtc2_gen_cntl);
+	WREG32(RADEON_DISP_OUTPUT_CNTL, disp_output_cntl);
+	WREG32(RADEON_FP2_GEN_CNTL, fp2_gen_cntl);
+	WREG32(RADEON_GPIO_MONID, gpio_monid);
+
+	return found;
+}
+
 static enum drm_connector_status radeon_legacy_tv_dac_detect(struct drm_encoder *encoder,
 							     struct drm_connector *connector)
 {
 	struct drm_device *dev = encoder->dev;
 	struct radeon_device *rdev = dev->dev_private;
-	uint32_t crtc2_gen_cntl, tv_dac_cntl, dac_cntl2, dac_ext_cntl;
-	uint32_t disp_hw_debug, disp_output_cntl, gpiopad_a, pixclks_cntl, tmp;
+	uint32_t crtc2_gen_cntl = 0, tv_dac_cntl, dac_cntl2, dac_ext_cntl;
+	uint32_t gpiopad_a = 0, pixclks_cntl, tmp;
+	uint32_t disp_output_cntl = 0, disp_hw_debug = 0, crtc_ext_cntl = 0;
 	enum drm_connector_status found = connector_status_disconnected;
 	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
 	struct radeon_encoder_tv_dac *tv_dac = radeon_encoder->enc_priv;
 	bool color = true;
+	struct drm_crtc *crtc;
+
+	/* find out if crtc2 is in use or if this encoder is using it */
+	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
+		struct radeon_crtc *radeon_crtc = to_radeon_crtc(crtc);
+		if ((radeon_crtc->crtc_id == 1) && crtc->enabled) {
+			if (encoder->crtc != crtc) {
+				return connector_status_disconnected;
+			}
+		}
+	}
 
 	if (connector->connector_type == DRM_MODE_CONNECTOR_SVIDEO ||
 	    connector->connector_type == DRM_MODE_CONNECTOR_Composite ||
@@ -1178,12 +1562,27 @@ static enum drm_connector_status radeon_legacy_tv_dac_detect(struct drm_encoder 
 		return connector_status_disconnected;
 	}
 
+	/* R200 uses an external DAC for secondary DAC */
+	if (rdev->family == CHIP_R200) {
+		if (radeon_legacy_ext_dac_detect(encoder, connector))
+			found = connector_status_connected;
+		return found;
+	}
+
 	/* save the regs we need */
 	pixclks_cntl = RREG32_PLL(RADEON_PIXCLKS_CNTL);
-	gpiopad_a = ASIC_IS_R300(rdev) ? RREG32(RADEON_GPIOPAD_A) : 0;
-	disp_output_cntl = ASIC_IS_R300(rdev) ? RREG32(RADEON_DISP_OUTPUT_CNTL) : 0;
-	disp_hw_debug = ASIC_IS_R300(rdev) ? 0 : RREG32(RADEON_DISP_HW_DEBUG);
-	crtc2_gen_cntl = RREG32(RADEON_CRTC2_GEN_CNTL);
+
+	if (rdev->flags & RADEON_SINGLE_CRTC) {
+		crtc_ext_cntl = RREG32(RADEON_CRTC_EXT_CNTL);
+	} else {
+		if (ASIC_IS_R300(rdev)) {
+			gpiopad_a = RREG32(RADEON_GPIOPAD_A);
+			disp_output_cntl = RREG32(RADEON_DISP_OUTPUT_CNTL);
+		} else {
+			disp_hw_debug = RREG32(RADEON_DISP_HW_DEBUG);
+		}
+		crtc2_gen_cntl = RREG32(RADEON_CRTC2_GEN_CNTL);
+	}
 	tv_dac_cntl = RREG32(RADEON_TV_DAC_CNTL);
 	dac_ext_cntl = RREG32(RADEON_DAC_EXT_CNTL);
 	dac_cntl2 = RREG32(RADEON_DAC_CNTL2);
@@ -1192,22 +1591,24 @@ static enum drm_connector_status radeon_legacy_tv_dac_detect(struct drm_encoder 
 			       | RADEON_PIX2CLK_DAC_ALWAYS_ONb);
 	WREG32_PLL(RADEON_PIXCLKS_CNTL, tmp);
 
-	if (ASIC_IS_R300(rdev))
-		WREG32_P(RADEON_GPIOPAD_A, 1, ~1);
-
-	tmp = crtc2_gen_cntl & ~RADEON_CRTC2_PIX_WIDTH_MASK;
-	tmp |= RADEON_CRTC2_CRT2_ON |
-		(2 << RADEON_CRTC2_PIX_WIDTH_SHIFT);
-
-	WREG32(RADEON_CRTC2_GEN_CNTL, tmp);
-
-	if (ASIC_IS_R300(rdev)) {
-		tmp = disp_output_cntl & ~RADEON_DISP_TVDAC_SOURCE_MASK;
-		tmp |= RADEON_DISP_TVDAC_SOURCE_CRTC2;
-		WREG32(RADEON_DISP_OUTPUT_CNTL, tmp);
+	if (rdev->flags & RADEON_SINGLE_CRTC) {
+		tmp = crtc_ext_cntl | RADEON_CRTC_CRT_ON;
+		WREG32(RADEON_CRTC_EXT_CNTL, tmp);
 	} else {
-		tmp = disp_hw_debug & ~RADEON_CRT2_DISP1_SEL;
-		WREG32(RADEON_DISP_HW_DEBUG, tmp);
+		tmp = crtc2_gen_cntl & ~RADEON_CRTC2_PIX_WIDTH_MASK;
+		tmp |= RADEON_CRTC2_CRT2_ON |
+			(2 << RADEON_CRTC2_PIX_WIDTH_SHIFT);
+		WREG32(RADEON_CRTC2_GEN_CNTL, tmp);
+
+		if (ASIC_IS_R300(rdev)) {
+			WREG32_P(RADEON_GPIOPAD_A, 1, ~1);
+			tmp = disp_output_cntl & ~RADEON_DISP_TVDAC_SOURCE_MASK;
+			tmp |= RADEON_DISP_TVDAC_SOURCE_CRTC2;
+			WREG32(RADEON_DISP_OUTPUT_CNTL, tmp);
+		} else {
+			tmp = disp_hw_debug & ~RADEON_CRT2_DISP1_SEL;
+			WREG32(RADEON_DISP_HW_DEBUG, tmp);
+		}
 	}
 
 	tmp = RADEON_TV_DAC_NBLANK |
@@ -1235,7 +1636,7 @@ static enum drm_connector_status radeon_legacy_tv_dac_detect(struct drm_encoder 
 	tmp = dac_cntl2 | RADEON_DAC2_DAC2_CLK_SEL | RADEON_DAC2_CMP_EN;
 	WREG32(RADEON_DAC_CNTL2, tmp);
 
-	udelay(10000);
+	mdelay(10);
 
 	if (ASIC_IS_R300(rdev)) {
 		if (RREG32(RADEON_DAC_CNTL2) & RADEON_DAC2_CMP_OUT_B)
@@ -1249,14 +1650,19 @@ static enum drm_connector_status radeon_legacy_tv_dac_detect(struct drm_encoder 
 	WREG32(RADEON_DAC_CNTL2, dac_cntl2);
 	WREG32(RADEON_DAC_EXT_CNTL, dac_ext_cntl);
 	WREG32(RADEON_TV_DAC_CNTL, tv_dac_cntl);
-	WREG32(RADEON_CRTC2_GEN_CNTL, crtc2_gen_cntl);
 
-	if (ASIC_IS_R300(rdev)) {
-		WREG32(RADEON_DISP_OUTPUT_CNTL, disp_output_cntl);
-		WREG32_P(RADEON_GPIOPAD_A, gpiopad_a, ~1);
+	if (rdev->flags & RADEON_SINGLE_CRTC) {
+		WREG32(RADEON_CRTC_EXT_CNTL, crtc_ext_cntl);
 	} else {
-		WREG32(RADEON_DISP_HW_DEBUG, disp_hw_debug);
+		WREG32(RADEON_CRTC2_GEN_CNTL, crtc2_gen_cntl);
+		if (ASIC_IS_R300(rdev)) {
+			WREG32(RADEON_DISP_OUTPUT_CNTL, disp_output_cntl);
+			WREG32_P(RADEON_GPIOPAD_A, gpiopad_a, ~1);
+		} else {
+			WREG32(RADEON_DISP_HW_DEBUG, disp_hw_debug);
+		}
 	}
+
 	WREG32_PLL(RADEON_PIXCLKS_CNTL, pixclks_cntl);
 
 	return found;
@@ -1265,7 +1671,7 @@ static enum drm_connector_status radeon_legacy_tv_dac_detect(struct drm_encoder 
 
 static const struct drm_encoder_helper_funcs radeon_legacy_tv_dac_helper_funcs = {
 	.dpms = radeon_legacy_tv_dac_dpms,
-	.mode_fixup = radeon_legacy_tv_dac_mode_fixup,
+	.mode_fixup = radeon_legacy_mode_fixup,
 	.prepare = radeon_legacy_tv_dac_prepare,
 	.mode_set = radeon_legacy_tv_dac_mode_set,
 	.commit = radeon_legacy_tv_dac_commit,
@@ -1302,8 +1708,31 @@ static struct radeon_encoder_int_tmds *radeon_legacy_get_tmds_info(struct radeon
 	return tmds;
 }
 
+static struct radeon_encoder_ext_tmds *radeon_legacy_get_ext_tmds_info(struct radeon_encoder *encoder)
+{
+	struct drm_device *dev = encoder->base.dev;
+	struct radeon_device *rdev = dev->dev_private;
+	struct radeon_encoder_ext_tmds *tmds = NULL;
+	bool ret;
+
+	if (rdev->is_atom_bios)
+		return NULL;
+
+	tmds = kzalloc(sizeof(struct radeon_encoder_ext_tmds), GFP_KERNEL);
+
+	if (!tmds)
+		return NULL;
+
+	ret = radeon_legacy_get_ext_tmds_info_from_combios(encoder, tmds);
+
+	if (ret == false)
+		radeon_legacy_get_ext_tmds_info_from_table(encoder, tmds);
+
+	return tmds;
+}
+
 void
-radeon_add_legacy_encoder(struct drm_device *dev, uint32_t encoder_id, uint32_t supported_device)
+radeon_add_legacy_encoder(struct drm_device *dev, uint32_t encoder_enum, uint32_t supported_device)
 {
 	struct radeon_device *rdev = dev->dev_private;
 	struct drm_encoder *encoder;
@@ -1312,7 +1741,7 @@ radeon_add_legacy_encoder(struct drm_device *dev, uint32_t encoder_id, uint32_t 
 	/* see if we already added it */
 	list_for_each_entry(encoder, &dev->mode_config.encoder_list, head) {
 		radeon_encoder = to_radeon_encoder(encoder);
-		if (radeon_encoder->encoder_id == encoder_id) {
+		if (radeon_encoder->encoder_enum == encoder_enum) {
 			radeon_encoder->devices |= supported_device;
 			return;
 		}
@@ -1329,11 +1758,11 @@ radeon_add_legacy_encoder(struct drm_device *dev, uint32_t encoder_id, uint32_t 
 		encoder->possible_crtcs = 0x1;
 	else
 		encoder->possible_crtcs = 0x3;
-	encoder->possible_clones = 0;
 
 	radeon_encoder->enc_priv = NULL;
 
-	radeon_encoder->encoder_id = encoder_id;
+	radeon_encoder->encoder_enum = encoder_enum;
+	radeon_encoder->encoder_id = (encoder_enum & OBJECT_ID_MASK) >> OBJECT_ID_SHIFT;
 	radeon_encoder->devices = supported_device;
 	radeon_encoder->rmx_type = RMX_OFF;
 
@@ -1373,7 +1802,7 @@ radeon_add_legacy_encoder(struct drm_device *dev, uint32_t encoder_id, uint32_t 
 		drm_encoder_init(dev, encoder, &radeon_legacy_tmds_ext_enc_funcs, DRM_MODE_ENCODER_TMDS);
 		drm_encoder_helper_add(encoder, &radeon_legacy_tmds_ext_helper_funcs);
 		if (!rdev->is_atom_bios)
-			radeon_combios_get_ext_tmds_info(radeon_encoder);
+			radeon_encoder->enc_priv = radeon_legacy_get_ext_tmds_info(radeon_encoder);
 		break;
 	}
 }

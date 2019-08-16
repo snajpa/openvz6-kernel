@@ -132,10 +132,12 @@ struct usb_device_id {
 #define USB_DEVICE_ID_MATCH_INT_PROTOCOL	0x0200
 
 #define HID_ANY_ID				(~0)
+#define HID_BUS_ANY				0xffff
+#define HID_GROUP_ANY				0x0000
 
 struct hid_device_id {
 	__u16 bus;
-	__u16 pad1;
+	__u16 group;
 	__u32 vendor;
 	__u32 product;
 	kernel_ulong_t driver_data
@@ -382,11 +384,37 @@ struct ssb_device_id {
 #define SSB_ANY_ID		0xFFFF
 #define SSB_ANY_REV		0xFF
 
+/* Broadcom's specific AMBA core, see drivers/bcma/ */
+struct bcma_device_id {
+	__u16	manuf;
+	__u16	id;
+	__u8	rev;
+	__u8	class;
+};
+#define BCMA_CORE(_manuf, _id, _rev, _class)  \
+	{ .manuf = _manuf, .id = _id, .rev = _rev, .class = _class, }
+#define BCMA_CORETABLE_END  \
+	{ 0, },
+
+#define BCMA_ANY_MANUF		0xFFFF
+#define BCMA_ANY_ID		0xFFFF
+#define BCMA_ANY_REV		0xFF
+#define BCMA_ANY_CLASS		0xFF
+
 struct virtio_device_id {
 	__u32 device;
 	__u32 vendor;
 };
 #define VIRTIO_DEV_ANY_ID	0xffffffff
+
+/*
+ * For Hyper-V devices we use the device guid as the id.
+ */
+struct hv_vmbus_device_id {
+	__u8 guid[16];
+	kernel_ulong_t driver_data	/* Data private to the driver */
+			__attribute__((aligned(sizeof(kernel_ulong_t))));
+};
 
 /* i2c */
 
@@ -431,13 +459,22 @@ enum dmi_field {
 	DMI_CHASSIS_VERSION,
 	DMI_CHASSIS_SERIAL,
 	DMI_CHASSIS_ASSET_TAG,
+#ifndef __GENKSYMS__
+	DMI_SMBIOS_VERSION, /* RH - must not be used in dmi_match search */
+#endif
 	DMI_STRING_MAX,
 };
 
 struct dmi_strmatch {
+#define __DMI_MATCH_EXACT 0x80
 	unsigned char slot;
 	char substr[79];
 };
+
+static inline unsigned char dmi_strmatch_slot(const struct dmi_strmatch *m)
+{
+	return m->slot & ~__DMI_MATCH_EXACT;
+}
 
 #ifndef __KERNEL__
 struct dmi_system_id {
@@ -463,7 +500,8 @@ struct dmi_system_id {
 #define dmi_device_id dmi_system_id
 #endif
 
-#define DMI_MATCH(a, b)	{ a, b }
+#define DMI_MATCH(a, b)	{ .slot = a, .substr = b, }
+#define DMI_EXACT_MATCH(a, b)	{ .slot = ((a) | __DMI_MATCH_EXACT), .substr = b, }
 
 #define PLATFORM_NAME_SIZE	20
 #define PLATFORM_MODULE_PREFIX	"platform:"
@@ -473,5 +511,52 @@ struct platform_device_id {
 	kernel_ulong_t driver_data
 			__attribute__((aligned(sizeof(kernel_ulong_t))));
 };
+
+#define MDIO_MODULE_PREFIX	"mdio:"
+
+#define MDIO_ID_FMT "%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d%d"
+#define MDIO_ID_ARGS(_id) \
+	(_id)>>31, ((_id)>>30) & 1, ((_id)>>29) & 1, ((_id)>>28) & 1,	\
+	((_id)>>27) & 1, ((_id)>>26) & 1, ((_id)>>25) & 1, ((_id)>>24) & 1, \
+	((_id)>>23) & 1, ((_id)>>22) & 1, ((_id)>>21) & 1, ((_id)>>20) & 1, \
+	((_id)>>19) & 1, ((_id)>>18) & 1, ((_id)>>17) & 1, ((_id)>>16) & 1, \
+	((_id)>>15) & 1, ((_id)>>14) & 1, ((_id)>>13) & 1, ((_id)>>12) & 1, \
+	((_id)>>11) & 1, ((_id)>>10) & 1, ((_id)>>9) & 1, ((_id)>>8) & 1, \
+	((_id)>>7) & 1, ((_id)>>6) & 1, ((_id)>>5) & 1, ((_id)>>4) & 1, \
+	((_id)>>3) & 1, ((_id)>>2) & 1, ((_id)>>1) & 1, (_id) & 1
+
+/**
+ * struct mdio_device_id - identifies PHY devices on an MDIO/MII bus
+ * @phy_id: The result of
+ *     (mdio_read(&MII_PHYSID1) << 16 | mdio_read(&PHYSID2)) & @phy_id_mask
+ *     for this PHY type
+ * @phy_id_mask: Defines the significant bits of @phy_id.  A value of 0
+ *     is used to terminate an array of struct mdio_device_id.
+ */
+struct mdio_device_id {
+	__u32 phy_id;
+	__u32 phy_id_mask;
+};
+
+/*
+ * Match x86 CPUs for CPU specific drivers.
+ * See documentation of "x86_match_cpu" for details.
+ */
+
+struct x86_cpu_id {
+	__u16 vendor;
+	__u16 family;
+	__u16 model;
+	__u16 feature;	/* bit index */
+	kernel_ulong_t driver_data;
+};
+
+#define X86_FEATURE_MATCH(x) \
+	{ X86_VENDOR_ANY, X86_FAMILY_ANY, X86_MODEL_ANY, x }
+
+#define X86_VENDOR_ANY 0xffff
+#define X86_FAMILY_ANY 0
+#define X86_MODEL_ANY  0
+#define X86_FEATURE_ANY 0	/* Same as FPU, you can't test for that */
 
 #endif /* LINUX_MOD_DEVICETABLE_H */

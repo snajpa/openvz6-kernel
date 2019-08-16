@@ -53,6 +53,7 @@
 #include <asm/sections.h>
 #include <asm/spu.h>
 #include <asm/udbg.h>
+#include <asm/fadump.h>
 
 #ifdef DEBUG
 #define DBG(fmt...) udbg_printf(fmt)
@@ -541,11 +542,11 @@ static unsigned long __init htab_get_table_size(void)
 }
 
 #ifdef CONFIG_MEMORY_HOTPLUG
-void create_section_mapping(unsigned long start, unsigned long end)
+int create_section_mapping(unsigned long start, unsigned long end)
 {
-	BUG_ON(htab_bolt_mapping(start, end, __pa(start),
+	return htab_bolt_mapping(start, end, __pa(start),
 				 pgprot_val(PAGE_KERNEL), mmu_linear_psize,
-				 mmu_kernel_ssize));
+				 mmu_kernel_ssize);
 }
 
 int remove_section_mapping(unsigned long start, unsigned long end)
@@ -625,6 +626,16 @@ static void __init htab_initialize(void)
 		/* Using a hypervisor which owns the htab */
 		htab_address = NULL;
 		_SDR1 = 0; 
+#ifdef CONFIG_FA_DUMP
+		/*
+		 * If firmware assisted dump is active firmware preserves
+		 * the contents of htab along with entire partition memory.
+		 * Clear the htab if firmware assisted dump is active so
+		 * that we dont end up using old mappings.
+		 */
+		if (is_fadump_active() && ppc_md.hpte_clear_all)
+			ppc_md.hpte_clear_all();
+#endif
 	} else {
 		/* Find storage for the HPT.  Must be contiguous in
 		 * the absolute address space. On cell we want it to be
@@ -879,6 +890,18 @@ static inline int subpage_protection(pgd_t *pgdir, unsigned long ea)
 }
 #endif
 
+void hash_failure_debug(unsigned long ea, unsigned long access,
+			unsigned long vsid, unsigned long trap,
+			int ssize, int psize, unsigned long pte)
+{
+	if (!printk_ratelimit())
+		return;
+	pr_info("mm: Hashing failure ! EA=0x%lx access=0x%lx current=%s\n",
+		ea, access, current->comm);
+	pr_info("    trap=0x%lx vsid=0x%lx ssize=%d psize=%d pte=0x%lx\n",
+		trap, vsid, ssize, psize, pte);
+}
+
 /* Result code is:
  *  0 - handled
  *  1 - normal page fault
@@ -1039,6 +1062,12 @@ int hash_page(unsigned long ea, unsigned long access, unsigned long trap)
 					    local, ssize, spp);
 	}
 
+	/* Dump some info in case of hash insertion failure, they should
+	 * never happen so it is really useful to know if/when they do
+	 */
+	if (rc == -1)
+		hash_failure_debug(ea, access, vsid, trap, ssize, psize,
+				   pte_val(*ptep));
 #ifndef CONFIG_PPC_64K_PAGES
 	DBG_LOW(" o-pte: %016lx\n", pte_val(*ptep));
 #else
@@ -1057,8 +1086,7 @@ void hash_preload(struct mm_struct *mm, unsigned long ea,
 	void *pgdir;
 	pte_t *ptep;
 	unsigned long flags;
-	int local = 0;
-	int ssize;
+	int rc, ssize, local = 0;
 
 	BUG_ON(REGION_ID(ea) != USER_REGION_ID);
 
@@ -1104,11 +1132,18 @@ void hash_preload(struct mm_struct *mm, unsigned long ea,
 	/* Hash it in */
 #ifdef CONFIG_PPC_HAS_HASH_64K
 	if (mm->context.user_psize == MMU_PAGE_64K)
-		__hash_page_64K(ea, access, vsid, ptep, trap, local, ssize);
+		rc = __hash_page_64K(ea, access, vsid, ptep, trap, local, ssize);
 	else
 #endif /* CONFIG_PPC_HAS_HASH_64K */
-		__hash_page_4K(ea, access, vsid, ptep, trap, local, ssize,
-			       subpage_protection(pgdir, ea));
+		rc = __hash_page_4K(ea, access, vsid, ptep, trap, local, ssize,
+				    subpage_protection(pgdir, ea));
+
+	/* Dump some info in case of hash insertion failure, they should
+	 * never happen so it is really useful to know if/when they do
+	 */
+	if (rc == -1)
+		hash_failure_debug(ea, access, vsid, trap, ssize,
+				   mm->context.user_psize, pte_val(*ptep));
 
 	local_irq_restore(flags);
 }

@@ -22,6 +22,7 @@
 #include <linux/string.h>
 #include <linux/if_arp.h>
 #include <linux/firmware.h>
+#include <net/cfg80211.h>
 #include "zd1201.h"
 
 static struct usb_device_id zd1201_table[] = {
@@ -96,9 +97,11 @@ static int zd1201_fw_upload(struct usb_device *dev, int apfw)
 		goto exit;
 
 	err = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0), 0x4,
-	    USB_DIR_IN | 0x40, 0,0, &ret, sizeof(ret), ZD1201_FW_TIMEOUT);
+	    USB_DIR_IN | 0x40, 0, 0, buf, sizeof(ret), ZD1201_FW_TIMEOUT);
 	if (err < 0)
 		goto exit;
+
+	memcpy(&ret, buf, sizeof(ret));
 
 	if (ret & 0x80) {
 		err = -EIO;
@@ -913,7 +916,7 @@ static int zd1201_set_freq(struct net_device *dev,
 	if (freq->e == 0)
 		channel = freq->m;
 	else {
-		channel = ieee80211_freq_to_dsss_chan(freq->m);
+		channel = ieee80211_frequency_to_channel(freq->m);
 		if (channel < 0)
 			channel = 0;
 	}
@@ -1906,6 +1909,7 @@ static struct usb_driver zd1201_usb = {
 	.id_table = zd1201_table,
 	.suspend = zd1201_suspend,
 	.resume = zd1201_resume,
+	.disable_hub_initiated_lpm = 1,
 };
 
 static int __init zd1201_init(void)

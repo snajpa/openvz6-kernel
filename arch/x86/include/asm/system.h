@@ -23,6 +23,7 @@ struct task_struct *__switch_to(struct task_struct *prev,
 struct tss_struct;
 void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p,
 		      struct tss_struct *tss);
+extern void show_regs_common(void);
 
 #ifdef CONFIG_X86_32
 
@@ -128,8 +129,6 @@ do {									\
 	     "movq %%rsp,%P[threadrsp](%[prev])\n\t" /* save RSP */	  \
 	     "movq %P[threadrsp](%[next]),%%rsp\n\t" /* restore RSP */	  \
 	     "call __switch_to\n\t"					  \
-	     ".globl thread_return\n"					  \
-	     "thread_return:\n\t"					  \
 	     "movq "__percpu_arg([current_task])",%%rsi\n\t"		  \
 	     __switch_canary						  \
 	     "movq %P[thread_info](%%rsi),%%r8\n\t"			  \
@@ -366,6 +365,8 @@ void stop_this_cpu(void *dummy);
 #define wmb()	asm volatile("sfence" ::: "memory")
 #endif
 
+#define gmb() alternative(ASM_NOP3, "lfence", X86_FEATURE_LFENCE_RDTSC)
+
 /**
  * read_barrier_depends - Flush all pending reads that subsequents reads
  * depend on.
@@ -451,7 +452,6 @@ void stop_this_cpu(void *dummy);
  */
 static inline void rdtsc_barrier(void)
 {
-	alternative(ASM_NOP3, "mfence", X86_FEATURE_MFENCE_RDTSC);
 	alternative(ASM_NOP3, "lfence", X86_FEATURE_LFENCE_RDTSC);
 }
 

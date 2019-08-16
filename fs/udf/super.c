@@ -54,9 +54,11 @@
 #include <linux/vmalloc.h>
 #include <linux/errno.h>
 #include <linux/mount.h>
+#include <linux/quotaops.h>
 #include <linux/seq_file.h>
 #include <linux/bitmap.h>
 #include <linux/crc-itu-t.h>
+#include <linux/log2.h>
 #include <asm/byteorder.h>
 
 #include "udf_sb.h"
@@ -119,7 +121,7 @@ static struct file_system_type udf_fstype = {
 	.name		= "udf",
 	.get_sb		= udf_get_sb,
 	.kill_sb	= kill_block_super,
-	.fs_flags	= FS_REQUIRES_DEV,
+	.fs_flags	= FS_REQUIRES_DEV | FS_HANDLE_QUOTA,
 };
 
 static struct kmem_cache *udf_inode_cachep;
@@ -557,6 +559,7 @@ static int udf_remount_fs(struct super_block *sb, int *flags, char *options)
 {
 	struct udf_options uopt;
 	struct udf_sb_info *sbi = UDF_SB(sb);
+	int error = 0;
 
 	uopt.flags = sbi->s_flags;
 	uopt.uid   = sbi->s_uid;
@@ -582,17 +585,26 @@ static int udf_remount_fs(struct super_block *sb, int *flags, char *options)
 			*flags |= MS_RDONLY;
 	}
 
-	if ((*flags & MS_RDONLY) == (sb->s_flags & MS_RDONLY)) {
-		unlock_kernel();
-		return 0;
-	}
-	if (*flags & MS_RDONLY)
+	if ((*flags & MS_RDONLY) == (sb->s_flags & MS_RDONLY))
+		goto out_unlock;
+
+	if (*flags & MS_RDONLY) {
 		udf_close_lvid(sb);
-	else
+
+		error = vfs_dq_off(sb, 1);
+		if (error < 0 && error != -ENOSYS)
+			error = -EBUSY;
+	} else {
 		udf_open_lvid(sb);
 
+		/* mark the fs r/w for quota activity */
+		sb->s_flags &= ~MS_RDONLY;
+		vfs_dq_quota_on_remount(sb);
+	}
+
+out_unlock:
 	unlock_kernel();
-	return 0;
+	return error;
 }
 
 /* Check Volume Structure Descriptors (ECMA 167 2/9.1) */
@@ -1078,21 +1090,39 @@ static int udf_fill_partdesc_info(struct super_block *sb,
 	return 0;
 }
 
+static void udf_find_vat_block(struct super_block *sb, int p_index,
+			       int type1_index, sector_t start_block)
+{
+	struct udf_sb_info *sbi = UDF_SB(sb);
+	struct udf_part_map *map = &sbi->s_partmaps[p_index];
+	sector_t vat_block;
+	struct kernel_lb_addr ino;
+
+	/*
+	 * VAT file entry is in the last recorded block. Some broken disks have
+	 * it a few blocks before so try a bit harder...
+	 */
+	ino.partitionReferenceNum = type1_index;
+	for (vat_block = start_block;
+	     vat_block >= map->s_partition_root &&
+	     vat_block >= start_block - 3 &&
+	     !sbi->s_vat_inode; vat_block--) {
+		ino.logicalBlockNum = vat_block - map->s_partition_root;
+		sbi->s_vat_inode = udf_iget(sb, &ino);
+	}
+}
+
 static int udf_load_vat(struct super_block *sb, int p_index, int type1_index)
 {
 	struct udf_sb_info *sbi = UDF_SB(sb);
 	struct udf_part_map *map = &sbi->s_partmaps[p_index];
-	struct kernel_lb_addr ino;
 	struct buffer_head *bh = NULL;
 	struct udf_inode_info *vati;
 	uint32_t pos;
 	struct virtualAllocationTable20 *vat20;
 	sector_t blocks = sb->s_bdev->bd_inode->i_size >> sb->s_blocksize_bits;
 
-	/* VAT file entry is in the last recorded block */
-	ino.partitionReferenceNum = type1_index;
-	ino.logicalBlockNum = sbi->s_last_block - map->s_partition_root;
-	sbi->s_vat_inode = udf_iget(sb, &ino);
+	udf_find_vat_block(sb, p_index, type1_index, sbi->s_last_block);
 	if (!sbi->s_vat_inode &&
 	    sbi->s_last_block != blocks - 1) {
 		printk(KERN_NOTICE "UDF-fs: Failed to read VAT inode from the"
@@ -1100,9 +1130,7 @@ static int udf_load_vat(struct super_block *sb, int p_index, int type1_index)
 		       "block of the device (%lu).\n",
 		       (unsigned long)sbi->s_last_block,
 		       (unsigned long)blocks - 1);
-		ino.partitionReferenceNum = type1_index;
-		ino.logicalBlockNum = blocks - 1 - map->s_partition_root;
-		sbi->s_vat_inode = udf_iget(sb, &ino);
+		udf_find_vat_block(sb, p_index, type1_index, blocks - 1);
 	}
 	if (!sbi->s_vat_inode)
 		return 1;
@@ -1223,16 +1251,65 @@ out_bh:
 	return ret;
 }
 
+static int udf_load_sparable_map(struct super_block *sb,
+				 struct udf_part_map *map,
+				 struct sparablePartitionMap *spm)
+{
+	uint32_t loc;
+	uint16_t ident;
+	struct sparingTable *st;
+	struct udf_sparing_data *sdata = &map->s_type_specific.s_sparing;
+	int i;
+	struct buffer_head *bh;
+
+	map->s_partition_type = UDF_SPARABLE_MAP15;
+	sdata->s_packet_len = le16_to_cpu(spm->packetLength);
+	if (!is_power_of_2(sdata->s_packet_len)) {
+		udf_error(sb, __func__, "error loading logical volume descriptor: "
+			  "Invalid packet length %u\n",
+			  (unsigned)sdata->s_packet_len);
+		return -EIO;
+	}
+	if (spm->numSparingTables > 4) {
+		udf_error(sb, __func__, "error loading logical volume descriptor: "
+			  "Too many sparing tables (%d)\n",
+			  (int)spm->numSparingTables);
+		return -EIO;
+	}
+
+	for (i = 0; i < spm->numSparingTables; i++) {
+		loc = le32_to_cpu(spm->locSparingTable[i]);
+		bh = udf_read_tagged(sb, loc, loc, &ident);
+		if (!bh)
+			continue;
+
+		st = (struct sparingTable *)bh->b_data;
+		if (ident != 0 ||
+		    strncmp(st->sparingIdent.ident, UDF_ID_SPARING,
+			    strlen(UDF_ID_SPARING)) ||
+		    sizeof(*st) + le16_to_cpu(st->reallocationTableLen) >
+							sb->s_blocksize) {
+			brelse(bh);
+			continue;
+		}
+
+		sdata->s_spar_map[i] = bh;
+	}
+	map->s_partition_func = udf_get_pblock_spar15;
+	return 0;
+}
+
 static int udf_load_logicalvol(struct super_block *sb, sector_t block,
 			       struct kernel_lb_addr *fileset)
 {
 	struct logicalVolDesc *lvd;
-	int i, j, offset;
+	int i, offset;
 	uint8_t type;
 	struct udf_sb_info *sbi = UDF_SB(sb);
 	struct genericPartitionMap *gpm;
 	uint16_t ident;
 	struct buffer_head *bh;
+	unsigned int table_len;
 	int ret = 0;
 
 	bh = udf_read_tagged(sb, block, block, &ident);
@@ -1240,15 +1317,21 @@ static int udf_load_logicalvol(struct super_block *sb, sector_t block,
 		return 1;
 	BUG_ON(ident != TAG_IDENT_LVD);
 	lvd = (struct logicalVolDesc *)bh->b_data;
-
-	i = udf_sb_alloc_partition_maps(sb, le32_to_cpu(lvd->numPartitionMaps));
-	if (i != 0) {
-		ret = i;
+	table_len = le32_to_cpu(lvd->mapTableLength);
+	if (table_len > sb->s_blocksize - sizeof(*lvd)) {
+		udf_error(sb, __func__, "error loading logical volume descriptor: "
+			  "Partition table too long (%u > %lu)\n", table_len,
+			  sb->s_blocksize - sizeof(*lvd));
+		ret = 1;
 		goto out_bh;
 	}
 
+	ret = udf_sb_alloc_partition_maps(sb, le32_to_cpu(lvd->numPartitionMaps));
+	if (ret)
+		goto out_bh;
+
 	for (i = 0, offset = 0;
-	     i < sbi->s_partitions && offset < le32_to_cpu(lvd->mapTableLength);
+	     i < sbi->s_partitions && offset < table_len;
 	     i++, offset += gpm->partitionMapLength) {
 		struct udf_part_map *map = &sbi->s_partmaps[i];
 		gpm = (struct genericPartitionMap *)
@@ -1283,38 +1366,11 @@ static int udf_load_logicalvol(struct super_block *sb, sector_t block,
 			} else if (!strncmp(upm2->partIdent.ident,
 						UDF_ID_SPARABLE,
 						strlen(UDF_ID_SPARABLE))) {
-				uint32_t loc;
-				struct sparingTable *st;
-				struct sparablePartitionMap *spm =
-					(struct sparablePartitionMap *)gpm;
-
-				map->s_partition_type = UDF_SPARABLE_MAP15;
-				map->s_type_specific.s_sparing.s_packet_len =
-						le16_to_cpu(spm->packetLength);
-				for (j = 0; j < spm->numSparingTables; j++) {
-					struct buffer_head *bh2;
-
-					loc = le32_to_cpu(
-						spm->locSparingTable[j]);
-					bh2 = udf_read_tagged(sb, loc, loc,
-							     &ident);
-					map->s_type_specific.s_sparing.
-							s_spar_map[j] = bh2;
-
-					if (bh2 == NULL)
-						continue;
-
-					st = (struct sparingTable *)bh2->b_data;
-					if (ident != 0 || strncmp(
-						st->sparingIdent.ident,
-						UDF_ID_SPARING,
-						strlen(UDF_ID_SPARING))) {
-						brelse(bh2);
-						map->s_type_specific.s_sparing.
-							s_spar_map[j] = NULL;
-					}
+				if (udf_load_sparable_map(sb, map,
+				    (struct sparablePartitionMap *)gpm) < 0) {
+					ret = 1;
+					goto out_bh;
 				}
-				map->s_partition_func = udf_get_pblock_spar15;
 			} else if (!strncmp(upm2->partIdent.ident,
 						UDF_ID_METADATA,
 						strlen(UDF_ID_METADATA))) {
@@ -2242,6 +2298,7 @@ static unsigned int udf_count_free(struct super_block *sb)
 			(struct logicalVolIntegrityDesc *)
 			sbi->s_lvid_bh->b_data;
 		if (le32_to_cpu(lvid->numOfPartitions) > sbi->s_partition) {
+			gmb();
 			accum = le32_to_cpu(
 					lvid->freeSpaceTable[sbi->s_partition]);
 			if (accum == 0xFFFFFFFF)

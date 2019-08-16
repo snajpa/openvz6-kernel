@@ -288,7 +288,8 @@ int tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)
 	left = tp->snd_cwnd - in_flight;
 	if (sk_can_gso(sk) &&
 	    left * sysctl_tcp_tso_win_divisor < tp->snd_cwnd &&
-	    left * tp->mss_cache < sk->sk_gso_max_size)
+	    left * tp->mss_cache < sk->sk_gso_max_size &&
+	    left < sk_extended(sk)->sk_gso_max_segs)
 		return 1;
 	return left <= tcp_max_burst(tp);
 }
@@ -304,6 +305,13 @@ EXPORT_SYMBOL_GPL(tcp_is_cwnd_limited);
 void tcp_slow_start(struct tcp_sock *tp)
 {
 	int cnt; /* increase in packets */
+	unsigned int delta = 0;
+	u32 snd_cwnd = tp->snd_cwnd;
+
+	if (unlikely(!snd_cwnd)) {
+		pr_err_once("snd_cwnd is nul, please report this bug.\n");
+		snd_cwnd = 1U;
+	}
 
 	/* RFC3465: ABC Slow start
 	 * Increase only after a full MSS of bytes is acked
@@ -318,7 +326,7 @@ void tcp_slow_start(struct tcp_sock *tp)
 	if (sysctl_tcp_max_ssthresh > 0 && tp->snd_cwnd > sysctl_tcp_max_ssthresh)
 		cnt = sysctl_tcp_max_ssthresh >> 1;	/* limited slow start */
 	else
-		cnt = tp->snd_cwnd;			/* exponential increase */
+		cnt = snd_cwnd;				/* exponential increase */
 
 	/* RFC3465: ABC
 	 * We MAY increase by 2 if discovered delayed ack
@@ -328,11 +336,11 @@ void tcp_slow_start(struct tcp_sock *tp)
 	tp->bytes_acked = 0;
 
 	tp->snd_cwnd_cnt += cnt;
-	while (tp->snd_cwnd_cnt >= tp->snd_cwnd) {
-		tp->snd_cwnd_cnt -= tp->snd_cwnd;
-		if (tp->snd_cwnd < tp->snd_cwnd_clamp)
-			tp->snd_cwnd++;
+	while (tp->snd_cwnd_cnt >= snd_cwnd) {
+		tp->snd_cwnd_cnt -= snd_cwnd;
+		delta++;
 	}
+	tp->snd_cwnd = min(snd_cwnd + delta, tp->snd_cwnd_clamp);
 }
 EXPORT_SYMBOL_GPL(tcp_slow_start);
 

@@ -31,9 +31,7 @@
 #include "ehea_phyp.h"
 #include "ehea_qmr.h"
 
-struct ehea_bmap *ehea_bmap = NULL;
-
-
+static struct ehea_bmap *ehea_bmap;
 
 static void *hw_qpageit_get_inc(struct hw_queue *queue)
 {
@@ -210,7 +208,7 @@ out_nomem:
 	return NULL;
 }
 
-u64 ehea_destroy_cq_res(struct ehea_cq *cq, u64 force)
+static u64 ehea_destroy_cq_res(struct ehea_cq *cq, u64 force)
 {
 	u64 hret;
 	u64 adapter_handle = cq->adapter->handle;
@@ -228,14 +226,14 @@ u64 ehea_destroy_cq_res(struct ehea_cq *cq, u64 force)
 
 int ehea_destroy_cq(struct ehea_cq *cq)
 {
-	u64 hret;
+	u64 hret, aer, aerr;
 	if (!cq)
 		return 0;
 
 	hcp_epas_dtor(&cq->epas);
 	hret = ehea_destroy_cq_res(cq, NORMAL_FREE);
 	if (hret == H_R_STATE) {
-		ehea_error_data(cq->adapter, cq->fw_handle);
+		ehea_error_data(cq->adapter, cq->fw_handle, &aer, &aerr);
 		hret = ehea_destroy_cq_res(cq, FORCE_FREE);
 	}
 
@@ -335,7 +333,7 @@ struct ehea_eqe *ehea_poll_eq(struct ehea_eq *eq)
 	return eqe;
 }
 
-u64 ehea_destroy_eq_res(struct ehea_eq *eq, u64 force)
+static u64 ehea_destroy_eq_res(struct ehea_eq *eq, u64 force)
 {
 	u64 hret;
 	unsigned long flags;
@@ -356,7 +354,7 @@ u64 ehea_destroy_eq_res(struct ehea_eq *eq, u64 force)
 
 int ehea_destroy_eq(struct ehea_eq *eq)
 {
-	u64 hret;
+	u64 hret, aer, aerr;
 	if (!eq)
 		return 0;
 
@@ -364,7 +362,7 @@ int ehea_destroy_eq(struct ehea_eq *eq)
 
 	hret = ehea_destroy_eq_res(eq, NORMAL_FREE);
 	if (hret == H_R_STATE) {
-		ehea_error_data(eq->adapter, eq->fw_handle);
+		ehea_error_data(eq->adapter, eq->fw_handle, &aer, &aerr);
 		hret = ehea_destroy_eq_res(eq, FORCE_FREE);
 	}
 
@@ -379,7 +377,7 @@ int ehea_destroy_eq(struct ehea_eq *eq)
 /**
  * allocates memory for a queue and registers pages in phyp
  */
-int ehea_qp_alloc_register(struct ehea_qp *qp, struct hw_queue *hw_queue,
+static int ehea_qp_alloc_register(struct ehea_qp *qp, struct hw_queue *hw_queue,
 			   int nr_pages, int wqe_size, int act_nr_sges,
 			   struct ehea_adapter *adapter, int h_call_q_selector)
 {
@@ -514,7 +512,7 @@ out_freemem:
 	return NULL;
 }
 
-u64 ehea_destroy_qp_res(struct ehea_qp *qp, u64 force)
+static u64 ehea_destroy_qp_res(struct ehea_qp *qp, u64 force)
 {
 	u64 hret;
 	struct ehea_qp_init_attr *qp_attr = &qp->init_attr;
@@ -539,7 +537,7 @@ u64 ehea_destroy_qp_res(struct ehea_qp *qp, u64 force)
 
 int ehea_destroy_qp(struct ehea_qp *qp)
 {
-	u64 hret;
+	u64 hret, aer, aerr;
 	if (!qp)
 		return 0;
 
@@ -547,7 +545,7 @@ int ehea_destroy_qp(struct ehea_qp *qp)
 
 	hret = ehea_destroy_qp_res(qp, NORMAL_FREE);
 	if (hret == H_R_STATE) {
-		ehea_error_data(qp->adapter, qp->fw_handle);
+		ehea_error_data(qp->adapter, qp->fw_handle, &aer, &aerr);
 		hret = ehea_destroy_qp_res(qp, FORCE_FREE);
 	}
 
@@ -974,7 +972,7 @@ int ehea_gen_smr(struct ehea_adapter *adapter, struct ehea_mr *old_mr,
 	return 0;
 }
 
-void print_error_data(u64 *data)
+static void print_error_data(u64 *data)
 {
 	int length;
 	u64 type = EHEA_BMASK_GET(ERROR_DATA_TYPE, data[2]);
@@ -985,42 +983,45 @@ void print_error_data(u64 *data)
 	if (length > EHEA_PAGESIZE)
 		length = EHEA_PAGESIZE;
 
-	if (type == 0x8) /* Queue Pair */
+	if (type == EHEA_AER_RESTYPE_QP)
 		ehea_error("QP (resource=%llX) state: AER=0x%llX, AERR=0x%llX, "
 			   "port=%llX", resource, data[6], data[12], data[22]);
-
-	if (type == 0x4) /* Completion Queue */
+	else if (type == EHEA_AER_RESTYPE_CQ)
 		ehea_error("CQ (resource=%llX) state: AER=0x%llX", resource,
 			   data[6]);
-
-	if (type == 0x3) /* Event Queue */
+	else if (type == EHEA_AER_RESTYPE_EQ)
 		ehea_error("EQ (resource=%llX) state: AER=0x%llX", resource,
 			   data[6]);
 
 	ehea_dump(data, length, "error data");
 }
 
-void ehea_error_data(struct ehea_adapter *adapter, u64 res_handle)
+u64 ehea_error_data(struct ehea_adapter *adapter, u64 res_handle,
+		    u64 *aer, u64 *aerr)
 {
 	unsigned long ret;
 	u64 *rblock;
+	u64 type = 0;
 
 	rblock = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!rblock) {
 		ehea_error("Cannot allocate rblock memory.");
-		return;
+		goto out;
 	}
 
-	ret = ehea_h_error_data(adapter->handle,
-				res_handle,
-				rblock);
+	ret = ehea_h_error_data(adapter->handle, res_handle, rblock);
 
-	if (ret == H_R_STATE)
-		ehea_error("No error data is available: %llX.", res_handle);
-	else if (ret == H_SUCCESS)
+	if (ret == H_SUCCESS) {
+		type = EHEA_BMASK_GET(ERROR_DATA_TYPE, rblock[2]);
+		*aer = rblock[6];
+		*aerr = rblock[12];
 		print_error_data(rblock);
-	else
+	} else if (ret == H_R_STATE) {
+		ehea_error("No error data available: %llX.", res_handle);
+	} else
 		ehea_error("Error data could not be fetched: %llX", res_handle);
 
 	free_page((unsigned long)rblock);
+out:
+	return type;
 }

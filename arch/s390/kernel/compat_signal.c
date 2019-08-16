@@ -52,6 +52,19 @@ typedef struct
 	__u32 gprs_high[NUM_GPRS];
 } rt_sigframe32;
 
+static inline void sigset_to_sigset32(unsigned long *set64,
+				      compat_sigset_word *set32)
+{
+	set32[0] = (compat_sigset_word) set64[0];
+	set32[1] = (compat_sigset_word)(set64[0] >> 32);
+}
+
+static inline void sigset32_to_sigset(compat_sigset_word *set32,
+				      unsigned long *set64)
+{
+	set64[0] = (unsigned long) set32[0] | ((unsigned long) set32[1] << 32);
+}
+
 int copy_siginfo_to_user32(compat_siginfo_t __user *to, siginfo_t *from)
 {
 	int err;
@@ -297,51 +310,55 @@ sys32_sigaltstack(const stack_t32 __user *uss, stack_t32 __user *uoss)
 
 static int save_sigregs32(struct pt_regs *regs, _sigregs32 __user *sregs)
 {
-	_s390_regs_common32 regs32;
-	int err, i;
+	_sigregs32 user_sregs;
+	int i;
 
-	regs32.psw.mask = PSW32_MASK_MERGE(psw32_user_bits,
-					   (__u32)(regs->psw.mask >> 32));
-	regs32.psw.addr = PSW32_ADDR_AMODE31 | (__u32) regs->psw.addr;
+	user_sregs.regs.psw.mask = PSW32_MASK_MERGE(psw32_user_bits,
+					(__u32)(regs->psw.mask >> 32));
+	user_sregs.regs.psw.addr = PSW32_ADDR_AMODE31 | (__u32) regs->psw.addr;
 	for (i = 0; i < NUM_GPRS; i++)
-		regs32.gprs[i] = (__u32) regs->gprs[i];
+		user_sregs.regs.gprs[i] = (__u32) regs->gprs[i];
 	save_access_regs(current->thread.acrs);
-	memcpy(regs32.acrs, current->thread.acrs, sizeof(regs32.acrs));
-	err = __copy_to_user(&sregs->regs, &regs32, sizeof(regs32));
-	if (err)
-		return err;
-	save_fp_regs(&current->thread.fp_regs);
-	/* s390_fp_regs and _s390_fp_regs32 are the same ! */
-	return __copy_to_user(&sregs->fpregs, &current->thread.fp_regs,
-			      sizeof(_s390_fp_regs32));
+	memcpy(&user_sregs.regs.acrs, current->thread.acrs,
+	       sizeof(user_sregs.regs.acrs));
+	save_fp_ctl(&current->thread.fp_regs.fpc);
+	save_fp_regs(current->thread.fp_regs.fprs);
+	memcpy(&user_sregs.fpregs, &current->thread.fp_regs,
+	       sizeof(user_sregs.fpregs));
+	if (__copy_to_user(sregs, &user_sregs, sizeof(_sigregs32)))
+		return -EFAULT;
+	return 0;
 }
 
 static int restore_sigregs32(struct pt_regs *regs,_sigregs32 __user *sregs)
 {
-	_s390_regs_common32 regs32;
-	int err, i;
+	_sigregs32 user_sregs;
+	int i;
 
 	/* Alwys make any pending restarted system call return -EINTR */
 	current_thread_info()->restart_block.fn = do_no_restart_syscall;
 
-	err = __copy_from_user(&regs32, &sregs->regs, sizeof(regs32));
-	if (err)
-		return err;
+	if (__copy_from_user(&user_sregs, &sregs->regs, sizeof(user_sregs)))
+		return -EFAULT;
+
+	/* Loading the floating-point-control word can fail. Do that first. */
+	if (restore_fp_ctl(&user_sregs.fpregs.fpc))
+		return -EINVAL;
+
+	/* Use regs->psw.mask instead of PSW_USER_BITS to preserve PER bit. */
 	regs->psw.mask = PSW_MASK_MERGE(regs->psw.mask,
-				        (__u64)regs32.psw.mask << 32);
-	regs->psw.addr = (__u64)(regs32.psw.addr & PSW32_ADDR_INSN);
+				(__u64) user_sregs.regs.psw.mask << 32);
+	regs->psw.addr = (__u64)(user_sregs.regs.psw.addr & PSW32_ADDR_INSN);
 	for (i = 0; i < NUM_GPRS; i++)
-		regs->gprs[i] = (__u64) regs32.gprs[i];
-	memcpy(current->thread.acrs, regs32.acrs, sizeof(current->thread.acrs));
+		regs->gprs[i] = (__u64) user_sregs.regs.gprs[i];
+	memcpy(&current->thread.acrs, user_sregs.regs.acrs,
+	       sizeof(current->thread.acrs));
 	restore_access_regs(current->thread.acrs);
 
-	err = __copy_from_user(&current->thread.fp_regs, &sregs->fpregs,
-			       sizeof(_s390_fp_regs32));
-	current->thread.fp_regs.fpc &= FPC_VALID_MASK;
-	if (err)
-		return err;
+	memcpy(&current->thread.fp_regs, &user_sregs.fpregs,
+	       sizeof(current->thread.fp_regs));
 
-	restore_fp_regs(&current->thread.fp_regs);
+	restore_fp_regs(current->thread.fp_regs.fprs);
 	regs->svcnr = 0;	/* disable syscall checks */
 	return 0;
 }
@@ -353,18 +370,18 @@ static int save_sigregs_gprs_high(struct pt_regs *regs, __u32 __user *uregs)
 
 	for (i = 0; i < NUM_GPRS; i++)
 		gprs_high[i] = regs->gprs[i] >> 32;
-
-	return __copy_to_user(uregs, &gprs_high, sizeof(gprs_high));
+	if (__copy_to_user(uregs, &gprs_high, sizeof(gprs_high)))
+		return -EFAULT;
+	return 0;
 }
 
 static int restore_sigregs_gprs_high(struct pt_regs *regs, __u32 __user *uregs)
 {
 	__u32 gprs_high[NUM_GPRS];
-	int err, i;
+	int i;
 
-	err = __copy_from_user(&gprs_high, uregs, sizeof(gprs_high));
-	if (err)
-		return err;
+	if (__copy_from_user(&gprs_high, uregs, sizeof(gprs_high)))
+		return -EFAULT;
 	for (i = 0; i < NUM_GPRS; i++)
 		*(__u32 *)&regs->gprs[i] = gprs_high[i];
 	return 0;
@@ -374,12 +391,14 @@ asmlinkage long sys32_sigreturn(void)
 {
 	struct pt_regs *regs = task_pt_regs(current);
 	sigframe32 __user *frame = (sigframe32 __user *)regs->gprs[15];
+	compat_sigset_t cset;
 	sigset_t set;
 
 	if (!access_ok(VERIFY_READ, frame, sizeof(*frame)))
 		goto badframe;
-	if (__copy_from_user(&set.sig, &frame->sc.oldmask, _SIGMASK_COPY_SIZE32))
+	if (__copy_from_user(&cset.sig, &frame->sc.oldmask, _SIGMASK_COPY_SIZE32))
 		goto badframe;
+	sigset32_to_sigset(cset.sig, set.sig);
 
 	sigdelsetmask(&set, ~_BLOCKABLE);
 	spin_lock_irq(&current->sighand->siglock);
@@ -403,6 +422,7 @@ asmlinkage long sys32_rt_sigreturn(void)
 {
 	struct pt_regs *regs = task_pt_regs(current);
 	rt_sigframe32 __user *frame = (rt_sigframe32 __user *)regs->gprs[15];
+	compat_sigset_t cset;
 	sigset_t set;
 	stack_t st;
 	__u32 ss_sp;
@@ -411,8 +431,9 @@ asmlinkage long sys32_rt_sigreturn(void)
 
 	if (!access_ok(VERIFY_READ, frame, sizeof(*frame)))
 		goto badframe;
-	if (__copy_from_user(&set, &frame->uc.uc_sigmask, sizeof(set)))
+	if (__copy_from_user(&cset, &frame->uc.uc_sigmask, sizeof(cset)))
 		goto badframe;
+	sigset32_to_sigset(cset.sig, set.sig);
 
 	sigdelsetmask(&set, ~_BLOCKABLE);
 	spin_lock_irq(&current->sighand->siglock);
@@ -493,13 +514,16 @@ static int setup_frame32(int sig, struct k_sigaction *ka,
 			sigset_t *set, struct pt_regs * regs)
 {
 	sigframe32 __user *frame = get_sigframe(ka, regs, sizeof(sigframe32));
+	compat_sigset_t cset;
+
 	if (!access_ok(VERIFY_WRITE, frame, sizeof(sigframe32)))
 		goto give_sigsegv;
 
 	if (frame == (void __user *) -1UL)
 		goto give_sigsegv;
 
-	if (__copy_to_user(&frame->sc.oldmask, &set->sig, _SIGMASK_COPY_SIZE32))
+	sigset_to_sigset32(set->sig, cset.sig);
+	if (__copy_to_user(&frame->sc.oldmask, &cset.sig, _SIGMASK_COPY_SIZE32))
 		goto give_sigsegv;
 
 	if (save_sigregs32(regs, &frame->sregs))
@@ -551,6 +575,8 @@ static int setup_rt_frame32(int sig, struct k_sigaction *ka, siginfo_t *info,
 {
 	int err = 0;
 	rt_sigframe32 __user *frame = get_sigframe(ka, regs, sizeof(rt_sigframe32));
+	compat_sigset_t cset;
+
 	if (!access_ok(VERIFY_WRITE, frame, sizeof(rt_sigframe32)))
 		goto give_sigsegv;
 
@@ -561,6 +587,7 @@ static int setup_rt_frame32(int sig, struct k_sigaction *ka, siginfo_t *info,
 		goto give_sigsegv;
 
 	/* Create the ucontext.  */
+	sigset_to_sigset32(set->sig, cset.sig);
 	err |= __put_user(UC_EXTENDED, &frame->uc.uc_flags);
 	err |= __put_user(0, &frame->uc.uc_link);
 	err |= __put_user(current->sas_ss_sp, &frame->uc.uc_stack.ss_sp);
@@ -569,7 +596,7 @@ static int setup_rt_frame32(int sig, struct k_sigaction *ka, siginfo_t *info,
 	err |= __put_user(current->sas_ss_size, &frame->uc.uc_stack.ss_size);
 	err |= save_sigregs32(regs, &frame->uc.uc_mcontext);
 	err |= save_sigregs_gprs_high(regs, frame->gprs_high);
-	err |= __copy_to_user(&frame->uc.uc_sigmask, set, sizeof(*set));
+	err |= __copy_to_user(&frame->uc.uc_sigmask, &cset, sizeof(*set));
 	if (err)
 		goto give_sigsegv;
 

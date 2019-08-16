@@ -3,28 +3,7 @@
 #include "exec_cmd.h"
 #include "levenshtein.h"
 #include "help.h"
-
-/* most GUI terminals set COLUMNS (although some don't export it) */
-static int term_columns(void)
-{
-	char *col_string = getenv("COLUMNS");
-	int n_cols;
-
-	if (col_string && (n_cols = atoi(col_string)) > 0)
-		return n_cols;
-
-#ifdef TIOCGWINSZ
-	{
-		struct winsize ws;
-		if (!ioctl(1, TIOCGWINSZ, &ws)) {
-			if (ws.ws_col)
-				return ws.ws_col;
-		}
-	}
-#endif
-
-	return 80;
-}
+#include <termios.h>
 
 void add_cmdname(struct cmdnames *cmds, const char *name, size_t len)
 {
@@ -43,8 +22,8 @@ static void clean_cmdnames(struct cmdnames *cmds)
 	unsigned int i;
 
 	for (i = 0; i < cmds->cnt; ++i)
-		free(cmds->names[i]);
-	free(cmds->names);
+		zfree(&cmds->names[i]);
+	zfree(&cmds->names);
 	cmds->cnt = 0;
 	cmds->alloc = 0;
 }
@@ -96,8 +75,12 @@ static void pretty_print_string_list(struct cmdnames *cmds, int longest)
 {
 	int cols = 1, rows;
 	int space = longest + 1; /* min 1 SP between words */
-	int max_cols = term_columns() - 1; /* don't print *on* the edge */
+	struct winsize win;
+	int max_cols;
 	int i, j;
+
+	get_term_dimensions(&win);
+	max_cols = win.ws_col - 1; /* don't print *on* the edge */
 
 	if (space < max_cols)
 		cols = max_cols / space;
@@ -280,9 +263,8 @@ static void add_cmd_list(struct cmdnames *cmds, struct cmdnames *old)
 
 	for (i = 0; i < old->cnt; i++)
 		cmds->names[cmds->cnt++] = old->names[i];
-	free(old->names);
+	zfree(&old->names);
 	old->cnt = 0;
-	old->names = NULL;
 }
 
 const char *help_unknown_cmd(const char *cmd)
@@ -324,7 +306,7 @@ const char *help_unknown_cmd(const char *cmd)
 
 		main_cmds.names[0] = NULL;
 		clean_cmdnames(&main_cmds);
-		fprintf(stderr, "WARNING: You called a Git program named '%s', "
+		fprintf(stderr, "WARNING: You called a perf program named '%s', "
 			"which does not exist.\n"
 			"Continuing under the assumption that you meant '%s'\n",
 			cmd, assumed);
@@ -349,7 +331,8 @@ const char *help_unknown_cmd(const char *cmd)
 	exit(1);
 }
 
-int cmd_version(int argc __used, const char **argv __used, const char *prefix __used)
+int cmd_version(int argc __maybe_unused, const char **argv __maybe_unused,
+		const char *prefix __maybe_unused)
 {
 	printf("perf version %s\n", perf_version_string);
 	return 0;

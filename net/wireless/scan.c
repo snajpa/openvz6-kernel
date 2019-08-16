@@ -2,8 +2,10 @@
  * cfg80211 scan result handling
  *
  * Copyright 2008 Johannes Berg <johannes@sipsolutions.net>
+ * Copyright 2013-2014  Intel Mobile Communications GmbH
  */
 #include <linux/kernel.h>
+#include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/wireless.h>
@@ -11,64 +13,215 @@
 #include <linux/etherdevice.h>
 #include <net/arp.h>
 #include <net/cfg80211.h>
+#include <net/cfg80211-wext.h>
 #include <net/iw_handler.h>
 #include "core.h"
 #include "nl80211.h"
 #include "wext-compat.h"
+#include "rdev-ops.h"
 
-#define IEEE80211_SCAN_RESULT_EXPIRE	(15 * HZ)
+/**
+ * DOC: BSS tree/list structure
+ *
+ * At the top level, the BSS list is kept in both a list in each
+ * registered device (@bss_list) as well as an RB-tree for faster
+ * lookup. In the RB-tree, entries can be looked up using their
+ * channel, MESHID, MESHCONF (for MBSSes) or channel, BSSID, SSID
+ * for other BSSes.
+ *
+ * Due to the possibility of hidden SSIDs, there's a second level
+ * structure, the "hidden_list" and "hidden_beacon_bss" pointer.
+ * The hidden_list connects all BSSes belonging to a single AP
+ * that has a hidden SSID, and connects beacon and probe response
+ * entries. For a probe response entry for a hidden SSID, the
+ * hidden_beacon_bss pointer points to the BSS struct holding the
+ * beacon's information.
+ *
+ * Reference counting is done for all these references except for
+ * the hidden_list, so that a beacon BSS struct that is otherwise
+ * not referenced has one reference for being on the bss_list and
+ * one for each probe response entry that points to it using the
+ * hidden_beacon_bss pointer. When a BSS struct that has such a
+ * pointer is get/put, the refcount update is also propagated to
+ * the referenced struct, this ensure that it cannot get removed
+ * while somebody is using the probe response version.
+ *
+ * Note that the hidden_beacon_bss pointer never changes, due to
+ * the reference counting. Therefore, no locking is needed for
+ * it.
+ *
+ * Also note that the hidden_beacon_bss pointer is only relevant
+ * if the driver uses something other than the IEs, e.g. private
+ * data stored stored in the BSS struct, since the beacon IEs are
+ * also linked into the probe response struct.
+ */
 
-void ___cfg80211_scan_done(struct cfg80211_registered_device *rdev, bool leak)
+#define IEEE80211_SCAN_RESULT_EXPIRE	(30 * HZ)
+
+static void bss_free(struct cfg80211_internal_bss *bss)
+{
+	struct cfg80211_bss_ies *ies;
+
+	if (WARN_ON(atomic_read(&bss->hold)))
+		return;
+
+	ies = (void *)rcu_access_pointer(bss->pub.beacon_ies);
+	if (ies && !bss->pub.hidden_beacon_bss)
+		kfree_rcu(ies, rcu_head);
+	ies = (void *)rcu_access_pointer(bss->pub.proberesp_ies);
+	if (ies)
+		kfree_rcu(ies, rcu_head);
+
+	/*
+	 * This happens when the module is removed, it doesn't
+	 * really matter any more save for completeness
+	 */
+	if (!list_empty(&bss->hidden_list))
+		list_del(&bss->hidden_list);
+
+	kfree(bss);
+}
+
+static inline void bss_ref_get(struct cfg80211_registered_device *rdev,
+			       struct cfg80211_internal_bss *bss)
+{
+	lockdep_assert_held(&rdev->bss_lock);
+
+	bss->refcount++;
+	if (bss->pub.hidden_beacon_bss) {
+		bss = container_of(bss->pub.hidden_beacon_bss,
+				   struct cfg80211_internal_bss,
+				   pub);
+		bss->refcount++;
+	}
+}
+
+static inline void bss_ref_put(struct cfg80211_registered_device *rdev,
+			       struct cfg80211_internal_bss *bss)
+{
+	lockdep_assert_held(&rdev->bss_lock);
+
+	if (bss->pub.hidden_beacon_bss) {
+		struct cfg80211_internal_bss *hbss;
+		hbss = container_of(bss->pub.hidden_beacon_bss,
+				    struct cfg80211_internal_bss,
+				    pub);
+		hbss->refcount--;
+		if (hbss->refcount == 0)
+			bss_free(hbss);
+	}
+	bss->refcount--;
+	if (bss->refcount == 0)
+		bss_free(bss);
+}
+
+static bool __cfg80211_unlink_bss(struct cfg80211_registered_device *rdev,
+				  struct cfg80211_internal_bss *bss)
+{
+	lockdep_assert_held(&rdev->bss_lock);
+
+	if (!list_empty(&bss->hidden_list)) {
+		/*
+		 * don't remove the beacon entry if it has
+		 * probe responses associated with it
+		 */
+		if (!bss->pub.hidden_beacon_bss)
+			return false;
+		/*
+		 * if it's a probe response entry break its
+		 * link to the other entries in the group
+		 */
+		list_del_init(&bss->hidden_list);
+	}
+
+	list_del_init(&bss->list);
+	rb_erase(&bss->rbn, &rdev->bss_tree);
+	bss_ref_put(rdev, bss);
+	return true;
+}
+
+static void __cfg80211_bss_expire(struct cfg80211_registered_device *rdev,
+				  unsigned long expire_time)
+{
+	struct cfg80211_internal_bss *bss, *tmp;
+	bool expired = false;
+
+	lockdep_assert_held(&rdev->bss_lock);
+
+	list_for_each_entry_safe(bss, tmp, &rdev->bss_list, list) {
+		if (atomic_read(&bss->hold))
+			continue;
+		if (!time_after(expire_time, bss->ts))
+			continue;
+
+		if (__cfg80211_unlink_bss(rdev, bss))
+			expired = true;
+	}
+
+	if (expired)
+		rdev->bss_generation++;
+}
+
+void ___cfg80211_scan_done(struct cfg80211_registered_device *rdev,
+			   bool send_message)
 {
 	struct cfg80211_scan_request *request;
-	struct net_device *dev;
-#ifdef CONFIG_WIRELESS_EXT
+	struct wireless_dev *wdev;
+	struct sk_buff *msg;
+#ifdef CONFIG_CFG80211_WEXT
 	union iwreq_data wrqu;
 #endif
 
-	ASSERT_RDEV_LOCK(rdev);
+	ASSERT_RTNL();
+
+	if (rdev->scan_msg) {
+		nl80211_send_scan_result(rdev, rdev->scan_msg);
+		rdev->scan_msg = NULL;
+		return;
+	}
 
 	request = rdev->scan_req;
-
 	if (!request)
 		return;
 
-	dev = request->dev;
+	wdev = request->wdev;
 
 	/*
 	 * This must be before sending the other events!
 	 * Otherwise, wpa_supplicant gets completely confused with
 	 * wext events.
 	 */
-	cfg80211_sme_scan_done(dev);
+	if (wdev->netdev)
+		cfg80211_sme_scan_done(wdev->netdev);
 
-	if (request->aborted)
-		nl80211_send_scan_aborted(rdev, dev);
-	else
-		nl80211_send_scan_done(rdev, dev);
+	if (!request->aborted &&
+	    request->flags & NL80211_SCAN_FLAG_FLUSH) {
+		/* flush entries from previous scans */
+		spin_lock_bh(&rdev->bss_lock);
+		__cfg80211_bss_expire(rdev, request->scan_start);
+		spin_unlock_bh(&rdev->bss_lock);
+	}
 
-#ifdef CONFIG_WIRELESS_EXT
-	if (!request->aborted) {
+	msg = nl80211_build_scan_msg(rdev, wdev, request->aborted);
+
+#ifdef CONFIG_CFG80211_WEXT
+	if (wdev->netdev && !request->aborted) {
 		memset(&wrqu, 0, sizeof(wrqu));
 
-		wireless_send_event(dev, SIOCGIWSCAN, &wrqu, NULL);
+		wireless_send_event(wdev->netdev, SIOCGIWSCAN, &wrqu, NULL);
 	}
 #endif
 
-	dev_put(dev);
+	if (wdev->netdev)
+		dev_put(wdev->netdev);
 
 	rdev->scan_req = NULL;
+	kfree(request);
 
-	/*
-	 * OK. If this is invoked with "leak" then we can't
-	 * free this ... but we've cleaned it up anyway. The
-	 * driver failed to call the scan_done callback, so
-	 * all bets are off, it might still be trying to use
-	 * the scan request or not ... if it accesses the dev
-	 * in there (it shouldn't anyway) then it may crash.
-	 */
-	if (!leak)
-		kfree(request);
+	if (!send_message)
+		rdev->scan_msg = msg;
+	else
+		nl80211_send_scan_result(rdev, msg);
 }
 
 void __cfg80211_scan_done(struct work_struct *wk)
@@ -78,72 +231,129 @@ void __cfg80211_scan_done(struct work_struct *wk)
 	rdev = container_of(wk, struct cfg80211_registered_device,
 			    scan_done_wk);
 
-	cfg80211_lock_rdev(rdev);
-	___cfg80211_scan_done(rdev, false);
-	cfg80211_unlock_rdev(rdev);
+	rtnl_lock();
+	___cfg80211_scan_done(rdev, true);
+	rtnl_unlock();
 }
 
 void cfg80211_scan_done(struct cfg80211_scan_request *request, bool aborted)
 {
-	WARN_ON(request != wiphy_to_dev(request->wiphy)->scan_req);
+	trace_cfg80211_scan_done(request, aborted);
+	WARN_ON(request != wiphy_to_rdev(request->wiphy)->scan_req);
 
 	request->aborted = aborted;
-	schedule_work(&wiphy_to_dev(request->wiphy)->scan_done_wk);
+	request->notified = true;
+	queue_work(cfg80211_wq, &wiphy_to_rdev(request->wiphy)->scan_done_wk);
 }
 EXPORT_SYMBOL(cfg80211_scan_done);
 
-static void bss_release(struct kref *ref)
+void __cfg80211_sched_scan_results(struct work_struct *wk)
 {
-	struct cfg80211_internal_bss *bss;
+	struct cfg80211_registered_device *rdev;
+	struct cfg80211_sched_scan_request *request;
 
-	bss = container_of(ref, struct cfg80211_internal_bss, ref);
-	if (bss->pub.free_priv)
-		bss->pub.free_priv(&bss->pub);
+	rdev = container_of(wk, struct cfg80211_registered_device,
+			    sched_scan_results_wk);
 
-	if (bss->ies_allocated)
-		kfree(bss->pub.information_elements);
+	rtnl_lock();
 
-	BUG_ON(atomic_read(&bss->hold));
+	request = rtnl_dereference(rdev->sched_scan_req);
 
-	kfree(bss);
+	/* we don't have sched_scan_req anymore if the scan is stopping */
+	if (request) {
+		if (request->flags & NL80211_SCAN_FLAG_FLUSH) {
+			/* flush entries from previous scans */
+			spin_lock_bh(&rdev->bss_lock);
+			__cfg80211_bss_expire(rdev, request->scan_start);
+			spin_unlock_bh(&rdev->bss_lock);
+			request->scan_start =
+				jiffies + msecs_to_jiffies(request->interval);
+		}
+		nl80211_send_sched_scan_results(rdev, request->dev);
+	}
+
+	rtnl_unlock();
 }
 
-/* must hold dev->bss_lock! */
-void cfg80211_bss_age(struct cfg80211_registered_device *dev,
+void cfg80211_sched_scan_results(struct wiphy *wiphy)
+{
+	trace_cfg80211_sched_scan_results(wiphy);
+	/* ignore if we're not scanning */
+
+	if (rcu_access_pointer(wiphy_to_rdev(wiphy)->sched_scan_req))
+		queue_work(cfg80211_wq,
+			   &wiphy_to_rdev(wiphy)->sched_scan_results_wk);
+}
+EXPORT_SYMBOL(cfg80211_sched_scan_results);
+
+void cfg80211_sched_scan_stopped_rtnl(struct wiphy *wiphy)
+{
+	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+
+	ASSERT_RTNL();
+
+	trace_cfg80211_sched_scan_stopped(wiphy);
+
+	__cfg80211_stop_sched_scan(rdev, true);
+}
+EXPORT_SYMBOL(cfg80211_sched_scan_stopped_rtnl);
+
+void cfg80211_sched_scan_stopped(struct wiphy *wiphy)
+{
+	rtnl_lock();
+	cfg80211_sched_scan_stopped_rtnl(wiphy);
+	rtnl_unlock();
+}
+EXPORT_SYMBOL(cfg80211_sched_scan_stopped);
+
+int __cfg80211_stop_sched_scan(struct cfg80211_registered_device *rdev,
+			       bool driver_initiated)
+{
+	struct cfg80211_sched_scan_request *sched_scan_req;
+	struct net_device *dev;
+
+	ASSERT_RTNL();
+
+	if (!rdev->sched_scan_req)
+		return -ENOENT;
+
+	sched_scan_req = rtnl_dereference(rdev->sched_scan_req);
+	dev = sched_scan_req->dev;
+
+	if (!driver_initiated) {
+		int err = rdev_sched_scan_stop(rdev, dev);
+		if (err)
+			return err;
+	}
+
+	nl80211_send_sched_scan(rdev, dev, NL80211_CMD_SCHED_SCAN_STOPPED);
+
+	RCU_INIT_POINTER(rdev->sched_scan_req, NULL);
+	kfree_rcu(sched_scan_req, rcu_head);
+
+	return 0;
+}
+
+void cfg80211_bss_age(struct cfg80211_registered_device *rdev,
                       unsigned long age_secs)
 {
 	struct cfg80211_internal_bss *bss;
 	unsigned long age_jiffies = msecs_to_jiffies(age_secs * MSEC_PER_SEC);
 
-	list_for_each_entry(bss, &dev->bss_list, list) {
+	spin_lock_bh(&rdev->bss_lock);
+	list_for_each_entry(bss, &rdev->bss_list, list)
 		bss->ts -= age_jiffies;
-	}
+	spin_unlock_bh(&rdev->bss_lock);
 }
 
-/* must hold dev->bss_lock! */
-void cfg80211_bss_expire(struct cfg80211_registered_device *dev)
+void cfg80211_bss_expire(struct cfg80211_registered_device *rdev)
 {
-	struct cfg80211_internal_bss *bss, *tmp;
-	bool expired = false;
-
-	list_for_each_entry_safe(bss, tmp, &dev->bss_list, list) {
-		if (atomic_read(&bss->hold))
-			continue;
-		if (!time_after(jiffies, bss->ts + IEEE80211_SCAN_RESULT_EXPIRE))
-			continue;
-		list_del(&bss->list);
-		rb_erase(&bss->rbn, &dev->bss_tree);
-		kref_put(&bss->ref, bss_release);
-		expired = true;
-	}
-
-	if (expired)
-		dev->bss_generation++;
+	__cfg80211_bss_expire(rdev, jiffies - IEEE80211_SCAN_RESULT_EXPIRE);
 }
 
-static u8 *find_ie(u8 num, u8 *ies, int len)
+const u8 *cfg80211_find_ie(u8 eid, const u8 *ies, int len)
 {
-	while (len > 2 && ies[0] != num) {
+	while (len > 2 && ies[0] != eid) {
 		len -= ies[1] + 2;
 		ies += ies[1] + 2;
 	}
@@ -153,39 +363,55 @@ static u8 *find_ie(u8 num, u8 *ies, int len)
 		return NULL;
 	return ies;
 }
+EXPORT_SYMBOL(cfg80211_find_ie);
 
-static int cmp_ies(u8 num, u8 *ies1, size_t len1, u8 *ies2, size_t len2)
+const u8 *cfg80211_find_vendor_ie(unsigned int oui, u8 oui_type,
+				  const u8 *ies, int len)
 {
-	const u8 *ie1 = find_ie(num, ies1, len1);
-	const u8 *ie2 = find_ie(num, ies2, len2);
-	int r;
+	struct ieee80211_vendor_ie *ie;
+	const u8 *pos = ies, *end = ies + len;
+	int ie_oui;
 
-	if (!ie1 && !ie2)
-		return 0;
-	if (!ie1 || !ie2)
-		return -1;
+	while (pos < end) {
+		pos = cfg80211_find_ie(WLAN_EID_VENDOR_SPECIFIC, pos,
+				       end - pos);
+		if (!pos)
+			return NULL;
 
-	r = memcmp(ie1 + 2, ie2 + 2, min(ie1[1], ie2[1]));
-	if (r == 0 && ie1[1] != ie2[1])
-		return ie2[1] - ie1[1];
-	return r;
+		ie = (struct ieee80211_vendor_ie *)pos;
+
+		/* make sure we can access ie->len */
+		BUILD_BUG_ON(offsetof(struct ieee80211_vendor_ie, len) != 1);
+
+		if (ie->len < sizeof(*ie))
+			goto cont;
+
+		ie_oui = ie->oui[0] << 16 | ie->oui[1] << 8 | ie->oui[2];
+		if (ie_oui == oui && ie->oui_type == oui_type)
+			return pos;
+cont:
+		pos += 2 + ie->len;
+	}
+	return NULL;
 }
+EXPORT_SYMBOL(cfg80211_find_vendor_ie);
 
-static bool is_bss(struct cfg80211_bss *a,
-		   const u8 *bssid,
+static bool is_bss(struct cfg80211_bss *a, const u8 *bssid,
 		   const u8 *ssid, size_t ssid_len)
 {
+	const struct cfg80211_bss_ies *ies;
 	const u8 *ssidie;
 
-	if (bssid && compare_ether_addr(a->bssid, bssid))
+	if (bssid && !ether_addr_equal(a->bssid, bssid))
 		return false;
 
 	if (!ssid)
 		return true;
 
-	ssidie = find_ie(WLAN_EID_SSID,
-			 a->information_elements,
-			 a->len_information_elements);
+	ies = rcu_access_pointer(a->ies);
+	if (!ies)
+		return false;
+	ssidie = cfg80211_find_ie(WLAN_EID_SSID, ies->data, ies->len);
 	if (!ssidie)
 		return false;
 	if (ssidie[1] != ssid_len)
@@ -193,137 +419,218 @@ static bool is_bss(struct cfg80211_bss *a,
 	return memcmp(ssidie + 2, ssid, ssid_len) == 0;
 }
 
-static bool is_mesh(struct cfg80211_bss *a,
-		    const u8 *meshid, size_t meshidlen,
-		    const u8 *meshcfg)
-{
-	const u8 *ie;
-
-	if (!is_zero_ether_addr(a->bssid))
-		return false;
-
-	ie = find_ie(WLAN_EID_MESH_ID,
-		     a->information_elements,
-		     a->len_information_elements);
-	if (!ie)
-		return false;
-	if (ie[1] != meshidlen)
-		return false;
-	if (memcmp(ie + 2, meshid, meshidlen))
-		return false;
-
-	ie = find_ie(WLAN_EID_MESH_CONFIG,
-		     a->information_elements,
-		     a->len_information_elements);
-	if (!ie)
-		return false;
-	if (ie[1] != IEEE80211_MESH_CONFIG_LEN)
-		return false;
-
-	/*
-	 * Ignore mesh capability (last two bytes of the IE) when
-	 * comparing since that may differ between stations taking
-	 * part in the same mesh.
-	 */
-	return memcmp(ie + 2, meshcfg, IEEE80211_MESH_CONFIG_LEN - 2) == 0;
-}
+/**
+ * enum bss_compare_mode - BSS compare mode
+ * @BSS_CMP_REGULAR: regular compare mode (for insertion and normal find)
+ * @BSS_CMP_HIDE_ZLEN: find hidden SSID with zero-length mode
+ * @BSS_CMP_HIDE_NUL: find hidden SSID with NUL-ed out mode
+ */
+enum bss_compare_mode {
+	BSS_CMP_REGULAR,
+	BSS_CMP_HIDE_ZLEN,
+	BSS_CMP_HIDE_NUL,
+};
 
 static int cmp_bss(struct cfg80211_bss *a,
-		   struct cfg80211_bss *b)
+		   struct cfg80211_bss *b,
+		   enum bss_compare_mode mode)
 {
-	int r;
+	const struct cfg80211_bss_ies *a_ies, *b_ies;
+	const u8 *ie1 = NULL;
+	const u8 *ie2 = NULL;
+	int i, r;
 
 	if (a->channel != b->channel)
 		return b->channel->center_freq - a->channel->center_freq;
 
-	r = memcmp(a->bssid, b->bssid, ETH_ALEN);
+	a_ies = rcu_access_pointer(a->ies);
+	if (!a_ies)
+		return -1;
+	b_ies = rcu_access_pointer(b->ies);
+	if (!b_ies)
+		return 1;
+
+	if (WLAN_CAPABILITY_IS_STA_BSS(a->capability))
+		ie1 = cfg80211_find_ie(WLAN_EID_MESH_ID,
+				       a_ies->data, a_ies->len);
+	if (WLAN_CAPABILITY_IS_STA_BSS(b->capability))
+		ie2 = cfg80211_find_ie(WLAN_EID_MESH_ID,
+				       b_ies->data, b_ies->len);
+	if (ie1 && ie2) {
+		int mesh_id_cmp;
+
+		if (ie1[1] == ie2[1])
+			mesh_id_cmp = memcmp(ie1 + 2, ie2 + 2, ie1[1]);
+		else
+			mesh_id_cmp = ie2[1] - ie1[1];
+
+		ie1 = cfg80211_find_ie(WLAN_EID_MESH_CONFIG,
+				       a_ies->data, a_ies->len);
+		ie2 = cfg80211_find_ie(WLAN_EID_MESH_CONFIG,
+				       b_ies->data, b_ies->len);
+		if (ie1 && ie2) {
+			if (mesh_id_cmp)
+				return mesh_id_cmp;
+			if (ie1[1] != ie2[1])
+				return ie2[1] - ie1[1];
+			return memcmp(ie1 + 2, ie2 + 2, ie1[1]);
+		}
+	}
+
+	r = memcmp(a->bssid, b->bssid, sizeof(a->bssid));
 	if (r)
 		return r;
 
-	if (is_zero_ether_addr(a->bssid)) {
-		r = cmp_ies(WLAN_EID_MESH_ID,
-			    a->information_elements,
-			    a->len_information_elements,
-			    b->information_elements,
-			    b->len_information_elements);
-		if (r)
-			return r;
-		return cmp_ies(WLAN_EID_MESH_CONFIG,
-			       a->information_elements,
-			       a->len_information_elements,
-			       b->information_elements,
-			       b->len_information_elements);
-	}
+	ie1 = cfg80211_find_ie(WLAN_EID_SSID, a_ies->data, a_ies->len);
+	ie2 = cfg80211_find_ie(WLAN_EID_SSID, b_ies->data, b_ies->len);
 
-	return cmp_ies(WLAN_EID_SSID,
-		       a->information_elements,
-		       a->len_information_elements,
-		       b->information_elements,
-		       b->len_information_elements);
+	if (!ie1 && !ie2)
+		return 0;
+
+	/*
+	 * Note that with "hide_ssid", the function returns a match if
+	 * the already-present BSS ("b") is a hidden SSID beacon for
+	 * the new BSS ("a").
+	 */
+
+	/* sort missing IE before (left of) present IE */
+	if (!ie1)
+		return -1;
+	if (!ie2)
+		return 1;
+
+	switch (mode) {
+	case BSS_CMP_HIDE_ZLEN:
+		/*
+		 * In ZLEN mode we assume the BSS entry we're
+		 * looking for has a zero-length SSID. So if
+		 * the one we're looking at right now has that,
+		 * return 0. Otherwise, return the difference
+		 * in length, but since we're looking for the
+		 * 0-length it's really equivalent to returning
+		 * the length of the one we're looking at.
+		 *
+		 * No content comparison is needed as we assume
+		 * the content length is zero.
+		 */
+		return ie2[1];
+	case BSS_CMP_REGULAR:
+	default:
+		/* sort by length first, then by contents */
+		if (ie1[1] != ie2[1])
+			return ie2[1] - ie1[1];
+		return memcmp(ie1 + 2, ie2 + 2, ie1[1]);
+	case BSS_CMP_HIDE_NUL:
+		if (ie1[1] != ie2[1])
+			return ie2[1] - ie1[1];
+		/* this is equivalent to memcmp(zeroes, ie2 + 2, len) */
+		for (i = 0; i < ie2[1]; i++)
+			if (ie2[i + 2])
+				return -1;
+		return 0;
+	}
 }
 
+static bool cfg80211_bss_type_match(u16 capability,
+				    enum ieee80211_band band,
+				    enum ieee80211_bss_type bss_type)
+{
+	bool ret = true;
+	u16 mask, val;
+
+	if (bss_type == IEEE80211_BSS_TYPE_ANY)
+		return ret;
+
+	if (band == IEEE80211_BAND_60GHZ) {
+		mask = WLAN_CAPABILITY_DMG_TYPE_MASK;
+		switch (bss_type) {
+		case IEEE80211_BSS_TYPE_ESS:
+			val = WLAN_CAPABILITY_DMG_TYPE_AP;
+			break;
+		case IEEE80211_BSS_TYPE_PBSS:
+			val = WLAN_CAPABILITY_DMG_TYPE_PBSS;
+			break;
+		case IEEE80211_BSS_TYPE_IBSS:
+			val = WLAN_CAPABILITY_DMG_TYPE_IBSS;
+			break;
+		default:
+			return false;
+		}
+	} else {
+		mask = WLAN_CAPABILITY_ESS | WLAN_CAPABILITY_IBSS;
+		switch (bss_type) {
+		case IEEE80211_BSS_TYPE_ESS:
+			val = WLAN_CAPABILITY_ESS;
+			break;
+		case IEEE80211_BSS_TYPE_IBSS:
+			val = WLAN_CAPABILITY_IBSS;
+			break;
+		case IEEE80211_BSS_TYPE_MBSS:
+			val = 0;
+			break;
+		default:
+			return false;
+		}
+	}
+
+	ret = ((capability & mask) == val);
+	return ret;
+}
+
+/* Returned bss is reference counted and must be cleaned up appropriately. */
 struct cfg80211_bss *cfg80211_get_bss(struct wiphy *wiphy,
 				      struct ieee80211_channel *channel,
 				      const u8 *bssid,
 				      const u8 *ssid, size_t ssid_len,
-				      u16 capa_mask, u16 capa_val)
+				      enum ieee80211_bss_type bss_type,
+				      enum ieee80211_privacy privacy)
 {
-	struct cfg80211_registered_device *dev = wiphy_to_dev(wiphy);
+	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
 	struct cfg80211_internal_bss *bss, *res = NULL;
+	unsigned long now = jiffies;
+	int bss_privacy;
 
-	spin_lock_bh(&dev->bss_lock);
+	trace_cfg80211_get_bss(wiphy, channel, bssid, ssid, ssid_len, bss_type,
+			       privacy);
 
-	list_for_each_entry(bss, &dev->bss_list, list) {
-		if ((bss->pub.capability & capa_mask) != capa_val)
+	spin_lock_bh(&rdev->bss_lock);
+
+	list_for_each_entry(bss, &rdev->bss_list, list) {
+		if (!cfg80211_bss_type_match(bss->pub.capability,
+					     bss->pub.channel->band, bss_type))
+			continue;
+
+		bss_privacy = (bss->pub.capability & WLAN_CAPABILITY_PRIVACY);
+		if ((privacy == IEEE80211_PRIVACY_ON && !bss_privacy) ||
+		    (privacy == IEEE80211_PRIVACY_OFF && bss_privacy))
 			continue;
 		if (channel && bss->pub.channel != channel)
 			continue;
+		if (!is_valid_ether_addr(bss->pub.bssid))
+			continue;
+		/* Don't get expired BSS structs */
+		if (time_after(now, bss->ts + IEEE80211_SCAN_RESULT_EXPIRE) &&
+		    !atomic_read(&bss->hold))
+			continue;
 		if (is_bss(&bss->pub, bssid, ssid, ssid_len)) {
 			res = bss;
-			kref_get(&res->ref);
+			bss_ref_get(rdev, res);
 			break;
 		}
 	}
 
-	spin_unlock_bh(&dev->bss_lock);
+	spin_unlock_bh(&rdev->bss_lock);
 	if (!res)
 		return NULL;
+	trace_cfg80211_return_bss(&res->pub);
 	return &res->pub;
 }
 EXPORT_SYMBOL(cfg80211_get_bss);
 
-struct cfg80211_bss *cfg80211_get_mesh(struct wiphy *wiphy,
-				       struct ieee80211_channel *channel,
-				       const u8 *meshid, size_t meshidlen,
-				       const u8 *meshcfg)
-{
-	struct cfg80211_registered_device *dev = wiphy_to_dev(wiphy);
-	struct cfg80211_internal_bss *bss, *res = NULL;
-
-	spin_lock_bh(&dev->bss_lock);
-
-	list_for_each_entry(bss, &dev->bss_list, list) {
-		if (channel && bss->pub.channel != channel)
-			continue;
-		if (is_mesh(&bss->pub, meshid, meshidlen, meshcfg)) {
-			res = bss;
-			kref_get(&res->ref);
-			break;
-		}
-	}
-
-	spin_unlock_bh(&dev->bss_lock);
-	if (!res)
-		return NULL;
-	return &res->pub;
-}
-EXPORT_SYMBOL(cfg80211_get_mesh);
-
-
-static void rb_insert_bss(struct cfg80211_registered_device *dev,
+static void rb_insert_bss(struct cfg80211_registered_device *rdev,
 			  struct cfg80211_internal_bss *bss)
 {
-	struct rb_node **p = &dev->bss_tree.rb_node;
+	struct rb_node **p = &rdev->bss_tree.rb_node;
 	struct rb_node *parent = NULL;
 	struct cfg80211_internal_bss *tbss;
 	int cmp;
@@ -332,7 +639,7 @@ static void rb_insert_bss(struct cfg80211_registered_device *dev,
 		parent = *p;
 		tbss = rb_entry(parent, struct cfg80211_internal_bss, rbn);
 
-		cmp = cmp_bss(&bss->pub, &tbss->pub);
+		cmp = cmp_bss(&bss->pub, &tbss->pub, BSS_CMP_REGULAR);
 
 		if (WARN_ON(!cmp)) {
 			/* will sort of leak this BSS */
@@ -346,20 +653,21 @@ static void rb_insert_bss(struct cfg80211_registered_device *dev,
 	}
 
 	rb_link_node(&bss->rbn, parent, p);
-	rb_insert_color(&bss->rbn, &dev->bss_tree);
+	rb_insert_color(&bss->rbn, &rdev->bss_tree);
 }
 
 static struct cfg80211_internal_bss *
-rb_find_bss(struct cfg80211_registered_device *dev,
-	    struct cfg80211_internal_bss *res)
+rb_find_bss(struct cfg80211_registered_device *rdev,
+	    struct cfg80211_internal_bss *res,
+	    enum bss_compare_mode mode)
 {
-	struct rb_node *n = dev->bss_tree.rb_node;
+	struct rb_node *n = rdev->bss_tree.rb_node;
 	struct cfg80211_internal_bss *bss;
 	int r;
 
 	while (n) {
 		bss = rb_entry(n, struct cfg80211_internal_bss, rbn);
-		r = cmp_bss(&res->pub, &bss->pub);
+		r = cmp_bss(&res->pub, &bss->pub, mode);
 
 		if (r == 0)
 			return bss;
@@ -372,207 +680,465 @@ rb_find_bss(struct cfg80211_registered_device *dev,
 	return NULL;
 }
 
+static bool cfg80211_combine_bsses(struct cfg80211_registered_device *rdev,
+				   struct cfg80211_internal_bss *new)
+{
+	const struct cfg80211_bss_ies *ies;
+	struct cfg80211_internal_bss *bss;
+	const u8 *ie;
+	int i, ssidlen;
+	u8 fold = 0;
+
+	ies = rcu_access_pointer(new->pub.beacon_ies);
+	if (WARN_ON(!ies))
+		return false;
+
+	ie = cfg80211_find_ie(WLAN_EID_SSID, ies->data, ies->len);
+	if (!ie) {
+		/* nothing to do */
+		return true;
+	}
+
+	ssidlen = ie[1];
+	for (i = 0; i < ssidlen; i++)
+		fold |= ie[2 + i];
+
+	if (fold) {
+		/* not a hidden SSID */
+		return true;
+	}
+
+	/* This is the bad part ... */
+
+	list_for_each_entry(bss, &rdev->bss_list, list) {
+		if (!ether_addr_equal(bss->pub.bssid, new->pub.bssid))
+			continue;
+		if (bss->pub.channel != new->pub.channel)
+			continue;
+		if (bss->pub.scan_width != new->pub.scan_width)
+			continue;
+		if (rcu_access_pointer(bss->pub.beacon_ies))
+			continue;
+		ies = rcu_access_pointer(bss->pub.ies);
+		if (!ies)
+			continue;
+		ie = cfg80211_find_ie(WLAN_EID_SSID, ies->data, ies->len);
+		if (!ie)
+			continue;
+		if (ssidlen && ie[1] != ssidlen)
+			continue;
+		if (WARN_ON_ONCE(bss->pub.hidden_beacon_bss))
+			continue;
+		if (WARN_ON_ONCE(!list_empty(&bss->hidden_list)))
+			list_del(&bss->hidden_list);
+		/* combine them */
+		list_add(&bss->hidden_list, &new->hidden_list);
+		bss->pub.hidden_beacon_bss = &new->pub;
+		new->refcount += bss->refcount;
+		rcu_assign_pointer(bss->pub.beacon_ies,
+				   new->pub.beacon_ies);
+	}
+
+	return true;
+}
+
+/* Returned bss is reference counted and must be cleaned up appropriately. */
 static struct cfg80211_internal_bss *
-cfg80211_bss_update(struct cfg80211_registered_device *dev,
-		    struct cfg80211_internal_bss *res,
-		    bool overwrite)
+cfg80211_bss_update(struct cfg80211_registered_device *rdev,
+		    struct cfg80211_internal_bss *tmp,
+		    bool signal_valid)
 {
 	struct cfg80211_internal_bss *found = NULL;
-	const u8 *meshid, *meshcfg;
 
-	/*
-	 * The reference to "res" is donated to this function.
-	 */
+	if (WARN_ON(!tmp->pub.channel))
+		return NULL;
 
-	if (WARN_ON(!res->pub.channel)) {
-		kref_put(&res->ref, bss_release);
+	tmp->ts = jiffies;
+
+	spin_lock_bh(&rdev->bss_lock);
+
+	if (WARN_ON(!rcu_access_pointer(tmp->pub.ies))) {
+		spin_unlock_bh(&rdev->bss_lock);
 		return NULL;
 	}
 
-	res->ts = jiffies;
-
-	if (is_zero_ether_addr(res->pub.bssid)) {
-		/* must be mesh, verify */
-		meshid = find_ie(WLAN_EID_MESH_ID, res->pub.information_elements,
-				 res->pub.len_information_elements);
-		meshcfg = find_ie(WLAN_EID_MESH_CONFIG,
-				  res->pub.information_elements,
-				  res->pub.len_information_elements);
-		if (!meshid || !meshcfg ||
-		    meshcfg[1] != IEEE80211_MESH_CONFIG_LEN) {
-			/* bogus mesh */
-			kref_put(&res->ref, bss_release);
-			return NULL;
-		}
-	}
-
-	spin_lock_bh(&dev->bss_lock);
-
-	found = rb_find_bss(dev, res);
+	found = rb_find_bss(rdev, tmp, BSS_CMP_REGULAR);
 
 	if (found) {
-		found->pub.beacon_interval = res->pub.beacon_interval;
-		found->pub.tsf = res->pub.tsf;
-		found->pub.signal = res->pub.signal;
-		found->pub.capability = res->pub.capability;
-		found->ts = res->ts;
+		/* Update IEs */
+		if (rcu_access_pointer(tmp->pub.proberesp_ies)) {
+			const struct cfg80211_bss_ies *old;
 
-		/* overwrite IEs */
-		if (overwrite) {
-			size_t used = dev->wiphy.bss_priv_size + sizeof(*res);
-			size_t ielen = res->pub.len_information_elements;
+			old = rcu_access_pointer(found->pub.proberesp_ies);
 
-			if (!found->ies_allocated && ksize(found) >= used + ielen) {
-				memcpy(found->pub.information_elements,
-				       res->pub.information_elements, ielen);
-				found->pub.len_information_elements = ielen;
-			} else {
-				u8 *ies = found->pub.information_elements;
+			rcu_assign_pointer(found->pub.proberesp_ies,
+					   tmp->pub.proberesp_ies);
+			/* Override possible earlier Beacon frame IEs */
+			rcu_assign_pointer(found->pub.ies,
+					   tmp->pub.proberesp_ies);
+			if (old)
+				kfree_rcu((struct cfg80211_bss_ies *)old,
+					  rcu_head);
+		} else if (rcu_access_pointer(tmp->pub.beacon_ies)) {
+			const struct cfg80211_bss_ies *old;
+			struct cfg80211_internal_bss *bss;
 
-				if (found->ies_allocated)
-					ies = krealloc(ies, ielen, GFP_ATOMIC);
-				else
-					ies = kmalloc(ielen, GFP_ATOMIC);
+			if (found->pub.hidden_beacon_bss &&
+			    !list_empty(&found->hidden_list)) {
+				const struct cfg80211_bss_ies *f;
 
-				if (ies) {
-					memcpy(ies, res->pub.information_elements, ielen);
-					found->ies_allocated = true;
-					found->pub.information_elements = ies;
-					found->pub.len_information_elements = ielen;
-				}
+				/*
+				 * The found BSS struct is one of the probe
+				 * response members of a group, but we're
+				 * receiving a beacon (beacon_ies in the tmp
+				 * bss is used). This can only mean that the
+				 * AP changed its beacon from not having an
+				 * SSID to showing it, which is confusing so
+				 * drop this information.
+				 */
+
+				f = rcu_access_pointer(tmp->pub.beacon_ies);
+				kfree_rcu((struct cfg80211_bss_ies *)f,
+					  rcu_head);
+				goto drop;
+			}
+
+			old = rcu_access_pointer(found->pub.beacon_ies);
+
+			rcu_assign_pointer(found->pub.beacon_ies,
+					   tmp->pub.beacon_ies);
+
+			/* Override IEs if they were from a beacon before */
+			if (old == rcu_access_pointer(found->pub.ies))
+				rcu_assign_pointer(found->pub.ies,
+						   tmp->pub.beacon_ies);
+
+			/* Assign beacon IEs to all sub entries */
+			list_for_each_entry(bss, &found->hidden_list,
+					    hidden_list) {
+				const struct cfg80211_bss_ies *ies;
+
+				ies = rcu_access_pointer(bss->pub.beacon_ies);
+				WARN_ON(ies != old);
+
+				rcu_assign_pointer(bss->pub.beacon_ies,
+						   tmp->pub.beacon_ies);
+			}
+
+			if (old)
+				kfree_rcu((struct cfg80211_bss_ies *)old,
+					  rcu_head);
+		}
+
+		found->pub.beacon_interval = tmp->pub.beacon_interval;
+		/*
+		 * don't update the signal if beacon was heard on
+		 * adjacent channel.
+		 */
+		if (signal_valid)
+			found->pub.signal = tmp->pub.signal;
+		found->pub.capability = tmp->pub.capability;
+		found->ts = tmp->ts;
+	} else {
+		struct cfg80211_internal_bss *new;
+		struct cfg80211_internal_bss *hidden;
+		struct cfg80211_bss_ies *ies;
+
+		/*
+		 * create a copy -- the "res" variable that is passed in
+		 * is allocated on the stack since it's not needed in the
+		 * more common case of an update
+		 */
+		new = kzalloc(sizeof(*new) + rdev->wiphy.bss_priv_size,
+			      GFP_ATOMIC);
+		if (!new) {
+			ies = (void *)rcu_dereference(tmp->pub.beacon_ies);
+			if (ies)
+				kfree_rcu(ies, rcu_head);
+			ies = (void *)rcu_dereference(tmp->pub.proberesp_ies);
+			if (ies)
+				kfree_rcu(ies, rcu_head);
+			goto drop;
+		}
+		memcpy(new, tmp, sizeof(*new));
+		new->refcount = 1;
+		INIT_LIST_HEAD(&new->hidden_list);
+
+		if (rcu_access_pointer(tmp->pub.proberesp_ies)) {
+			hidden = rb_find_bss(rdev, tmp, BSS_CMP_HIDE_ZLEN);
+			if (!hidden)
+				hidden = rb_find_bss(rdev, tmp,
+						     BSS_CMP_HIDE_NUL);
+			if (hidden) {
+				new->pub.hidden_beacon_bss = &hidden->pub;
+				list_add(&new->hidden_list,
+					 &hidden->hidden_list);
+				hidden->refcount++;
+				rcu_assign_pointer(new->pub.beacon_ies,
+						   hidden->pub.beacon_ies);
+			}
+		} else {
+			/*
+			 * Ok so we found a beacon, and don't have an entry. If
+			 * it's a beacon with hidden SSID, we might be in for an
+			 * expensive search for any probe responses that should
+			 * be grouped with this beacon for updates ...
+			 */
+			if (!cfg80211_combine_bsses(rdev, new)) {
+				kfree(new);
+				goto drop;
 			}
 		}
 
-		kref_put(&res->ref, bss_release);
-	} else {
-		/* this "consumes" the reference */
-		list_add_tail(&res->list, &dev->bss_list);
-		rb_insert_bss(dev, res);
-		found = res;
+		list_add_tail(&new->list, &rdev->bss_list);
+		rb_insert_bss(rdev, new);
+		found = new;
 	}
 
-	dev->bss_generation++;
-	spin_unlock_bh(&dev->bss_lock);
+	rdev->bss_generation++;
+	bss_ref_get(rdev, found);
+	spin_unlock_bh(&rdev->bss_lock);
 
-	kref_get(&found->ref);
 	return found;
+ drop:
+	spin_unlock_bh(&rdev->bss_lock);
+	return NULL;
 }
 
-struct cfg80211_bss*
-cfg80211_inform_bss(struct wiphy *wiphy,
-		    struct ieee80211_channel *channel,
-		    const u8 *bssid,
-		    u64 timestamp, u16 capability, u16 beacon_interval,
-		    const u8 *ie, size_t ielen,
-		    s32 signal, gfp_t gfp)
+static struct ieee80211_channel *
+cfg80211_get_bss_channel(struct wiphy *wiphy, const u8 *ie, size_t ielen,
+			 struct ieee80211_channel *channel)
 {
-	struct cfg80211_internal_bss *res;
-	size_t privsz;
+	const u8 *tmp;
+	u32 freq;
+	int channel_number = -1;
+
+	tmp = cfg80211_find_ie(WLAN_EID_DS_PARAMS, ie, ielen);
+	if (tmp && tmp[1] == 1) {
+		channel_number = tmp[2];
+	} else {
+		tmp = cfg80211_find_ie(WLAN_EID_HT_OPERATION, ie, ielen);
+		if (tmp && tmp[1] >= sizeof(struct ieee80211_ht_operation)) {
+			struct ieee80211_ht_operation *htop = (void *)(tmp + 2);
+
+			channel_number = htop->primary_chan;
+		}
+	}
+
+	if (channel_number < 0)
+		return channel;
+
+	freq = ieee80211_channel_to_frequency(channel_number, channel->band);
+	channel = ieee80211_get_channel(wiphy, freq);
+	if (!channel)
+		return NULL;
+	if (channel->flags & IEEE80211_CHAN_DISABLED)
+		return NULL;
+	return channel;
+}
+
+/* Returned bss is reference counted and must be cleaned up appropriately. */
+struct cfg80211_bss*
+cfg80211_inform_bss_width(struct wiphy *wiphy,
+			  struct ieee80211_channel *rx_channel,
+			  enum nl80211_bss_scan_width scan_width,
+			  enum cfg80211_bss_frame_type ftype,
+			  const u8 *bssid, u64 tsf, u16 capability,
+			  u16 beacon_interval, const u8 *ie, size_t ielen,
+			  s32 signal, gfp_t gfp)
+{
+	struct cfg80211_bss_ies *ies;
+	struct ieee80211_channel *channel;
+	struct cfg80211_internal_bss tmp = {}, *res;
+	int bss_type;
+	bool signal_valid;
 
 	if (WARN_ON(!wiphy))
 		return NULL;
 
-	privsz = wiphy->bss_priv_size;
-
-	if (WARN_ON(wiphy->signal_type == NL80211_BSS_SIGNAL_UNSPEC &&
+	if (WARN_ON(wiphy->signal_type == CFG80211_SIGNAL_TYPE_UNSPEC &&
 			(signal < 0 || signal > 100)))
 		return NULL;
 
-	res = kzalloc(sizeof(*res) + privsz + ielen, gfp);
+	channel = cfg80211_get_bss_channel(wiphy, ie, ielen, rx_channel);
+	if (!channel)
+		return NULL;
+
+	memcpy(tmp.pub.bssid, bssid, ETH_ALEN);
+	tmp.pub.channel = channel;
+	tmp.pub.scan_width = scan_width;
+	tmp.pub.signal = signal;
+	tmp.pub.beacon_interval = beacon_interval;
+	tmp.pub.capability = capability;
+	/*
+	 * If we do not know here whether the IEs are from a Beacon or Probe
+	 * Response frame, we need to pick one of the options and only use it
+	 * with the driver that does not provide the full Beacon/Probe Response
+	 * frame. Use Beacon frame pointer to avoid indicating that this should
+	 * override the IEs pointer should we have received an earlier
+	 * indication of Probe Response data.
+	 */
+	ies = kzalloc(sizeof(*ies) + ielen, gfp);
+	if (!ies)
+		return NULL;
+	ies->len = ielen;
+	ies->tsf = tsf;
+	ies->from_beacon = false;
+	memcpy(ies->data, ie, ielen);
+
+	switch (ftype) {
+	case CFG80211_BSS_FTYPE_BEACON:
+		ies->from_beacon = true;
+		/* fall through to assign */
+	case CFG80211_BSS_FTYPE_UNKNOWN:
+		rcu_assign_pointer(tmp.pub.beacon_ies, ies);
+		break;
+	case CFG80211_BSS_FTYPE_PRESP:
+		rcu_assign_pointer(tmp.pub.proberesp_ies, ies);
+		break;
+	}
+	rcu_assign_pointer(tmp.pub.ies, ies);
+
+	signal_valid = abs(rx_channel->center_freq - channel->center_freq) <=
+		wiphy->max_adj_channel_rssi_comp;
+	res = cfg80211_bss_update(wiphy_to_rdev(wiphy), &tmp, signal_valid);
 	if (!res)
 		return NULL;
 
-	memcpy(res->pub.bssid, bssid, ETH_ALEN);
-	res->pub.channel = channel;
-	res->pub.signal = signal;
-	res->pub.tsf = timestamp;
-	res->pub.beacon_interval = beacon_interval;
-	res->pub.capability = capability;
-	/* point to after the private area */
-	res->pub.information_elements = (u8 *)res + sizeof(*res) + privsz;
-	memcpy(res->pub.information_elements, ie, ielen);
-	res->pub.len_information_elements = ielen;
+	if (channel->band == IEEE80211_BAND_60GHZ) {
+		bss_type = res->pub.capability & WLAN_CAPABILITY_DMG_TYPE_MASK;
+		if (bss_type == WLAN_CAPABILITY_DMG_TYPE_AP ||
+		    bss_type == WLAN_CAPABILITY_DMG_TYPE_PBSS)
+			regulatory_hint_found_beacon(wiphy, channel, gfp);
+	} else {
+		if (res->pub.capability & WLAN_CAPABILITY_ESS)
+			regulatory_hint_found_beacon(wiphy, channel, gfp);
+	}
 
-	kref_init(&res->ref);
-
-	res = cfg80211_bss_update(wiphy_to_dev(wiphy), res, 0);
-	if (!res)
-		return NULL;
-
-	if (res->pub.capability & WLAN_CAPABILITY_ESS)
-		regulatory_hint_found_beacon(wiphy, channel, gfp);
-
+	trace_cfg80211_return_bss(&res->pub);
 	/* cfg80211_bss_update gives us a referenced result */
 	return &res->pub;
 }
-EXPORT_SYMBOL(cfg80211_inform_bss);
+EXPORT_SYMBOL(cfg80211_inform_bss_width);
 
+/* Returned bss is reference counted and must be cleaned up appropriately. */
 struct cfg80211_bss *
-cfg80211_inform_bss_frame(struct wiphy *wiphy,
-			  struct ieee80211_channel *channel,
-			  struct ieee80211_mgmt *mgmt, size_t len,
-			  s32 signal, gfp_t gfp)
+cfg80211_inform_bss_width_frame(struct wiphy *wiphy,
+				struct ieee80211_channel *rx_channel,
+				enum nl80211_bss_scan_width scan_width,
+				struct ieee80211_mgmt *mgmt, size_t len,
+				s32 signal, gfp_t gfp)
 {
-	struct cfg80211_internal_bss *res;
+	struct cfg80211_internal_bss tmp = {}, *res;
+	struct cfg80211_bss_ies *ies;
+	struct ieee80211_channel *channel;
+	bool signal_valid;
 	size_t ielen = len - offsetof(struct ieee80211_mgmt,
 				      u.probe_resp.variable);
-	bool overwrite;
-	size_t privsz = wiphy->bss_priv_size;
+	int bss_type;
 
-	if (WARN_ON(wiphy->signal_type == NL80211_BSS_SIGNAL_UNSPEC &&
-	            (signal < 0 || signal > 100)))
+	BUILD_BUG_ON(offsetof(struct ieee80211_mgmt, u.probe_resp.variable) !=
+			offsetof(struct ieee80211_mgmt, u.beacon.variable));
+
+	trace_cfg80211_inform_bss_width_frame(wiphy, rx_channel, scan_width, mgmt,
+					      len, signal);
+
+	if (WARN_ON(!mgmt))
 		return NULL;
 
-	if (WARN_ON(!mgmt || !wiphy ||
-		    len < offsetof(struct ieee80211_mgmt, u.probe_resp.variable)))
+	if (WARN_ON(!wiphy))
 		return NULL;
 
-	res = kzalloc(sizeof(*res) + privsz + ielen, gfp);
+	if (WARN_ON(wiphy->signal_type == CFG80211_SIGNAL_TYPE_UNSPEC &&
+		    (signal < 0 || signal > 100)))
+		return NULL;
+
+	if (WARN_ON(len < offsetof(struct ieee80211_mgmt, u.probe_resp.variable)))
+		return NULL;
+
+	channel = cfg80211_get_bss_channel(wiphy, mgmt->u.beacon.variable,
+					   ielen, rx_channel);
+	if (!channel)
+		return NULL;
+
+	ies = kzalloc(sizeof(*ies) + ielen, gfp);
+	if (!ies)
+		return NULL;
+	ies->len = ielen;
+	ies->tsf = le64_to_cpu(mgmt->u.probe_resp.timestamp);
+	ies->from_beacon = ieee80211_is_beacon(mgmt->frame_control);
+	memcpy(ies->data, mgmt->u.probe_resp.variable, ielen);
+
+	if (ieee80211_is_probe_resp(mgmt->frame_control))
+		rcu_assign_pointer(tmp.pub.proberesp_ies, ies);
+	else
+		rcu_assign_pointer(tmp.pub.beacon_ies, ies);
+	rcu_assign_pointer(tmp.pub.ies, ies);
+	
+	memcpy(tmp.pub.bssid, mgmt->bssid, ETH_ALEN);
+	tmp.pub.channel = channel;
+	tmp.pub.scan_width = scan_width;
+	tmp.pub.signal = signal;
+	tmp.pub.beacon_interval = le16_to_cpu(mgmt->u.probe_resp.beacon_int);
+	tmp.pub.capability = le16_to_cpu(mgmt->u.probe_resp.capab_info);
+
+	signal_valid = abs(rx_channel->center_freq - channel->center_freq) <=
+		wiphy->max_adj_channel_rssi_comp;
+	res = cfg80211_bss_update(wiphy_to_rdev(wiphy), &tmp, signal_valid);
 	if (!res)
 		return NULL;
 
-	memcpy(res->pub.bssid, mgmt->bssid, ETH_ALEN);
-	res->pub.channel = channel;
-	res->pub.signal = signal;
-	res->pub.tsf = le64_to_cpu(mgmt->u.probe_resp.timestamp);
-	res->pub.beacon_interval = le16_to_cpu(mgmt->u.probe_resp.beacon_int);
-	res->pub.capability = le16_to_cpu(mgmt->u.probe_resp.capab_info);
-	/* point to after the private area */
-	res->pub.information_elements = (u8 *)res + sizeof(*res) + privsz;
-	memcpy(res->pub.information_elements, mgmt->u.probe_resp.variable, ielen);
-	res->pub.len_information_elements = ielen;
+	if (channel->band == IEEE80211_BAND_60GHZ) {
+		bss_type = res->pub.capability & WLAN_CAPABILITY_DMG_TYPE_MASK;
+		if (bss_type == WLAN_CAPABILITY_DMG_TYPE_AP ||
+		    bss_type == WLAN_CAPABILITY_DMG_TYPE_PBSS)
+			regulatory_hint_found_beacon(wiphy, channel, gfp);
+	} else {
+		if (res->pub.capability & WLAN_CAPABILITY_ESS)
+			regulatory_hint_found_beacon(wiphy, channel, gfp);
+	}
 
-	kref_init(&res->ref);
-
-	overwrite = ieee80211_is_probe_resp(mgmt->frame_control);
-
-	res = cfg80211_bss_update(wiphy_to_dev(wiphy), res, overwrite);
-	if (!res)
-		return NULL;
-
-	if (res->pub.capability & WLAN_CAPABILITY_ESS)
-		regulatory_hint_found_beacon(wiphy, channel, gfp);
-
+	trace_cfg80211_return_bss(&res->pub);
 	/* cfg80211_bss_update gives us a referenced result */
 	return &res->pub;
 }
-EXPORT_SYMBOL(cfg80211_inform_bss_frame);
+EXPORT_SYMBOL(cfg80211_inform_bss_width_frame);
 
-void cfg80211_put_bss(struct cfg80211_bss *pub)
+void cfg80211_ref_bss(struct wiphy *wiphy, struct cfg80211_bss *pub)
 {
+	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
 	struct cfg80211_internal_bss *bss;
 
 	if (!pub)
 		return;
 
 	bss = container_of(pub, struct cfg80211_internal_bss, pub);
-	kref_put(&bss->ref, bss_release);
+
+	spin_lock_bh(&rdev->bss_lock);
+	bss_ref_get(rdev, bss);
+	spin_unlock_bh(&rdev->bss_lock);
+}
+EXPORT_SYMBOL(cfg80211_ref_bss);
+
+void cfg80211_put_bss(struct wiphy *wiphy, struct cfg80211_bss *pub)
+{
+	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+	struct cfg80211_internal_bss *bss;
+
+	if (!pub)
+		return;
+
+	bss = container_of(pub, struct cfg80211_internal_bss, pub);
+
+	spin_lock_bh(&rdev->bss_lock);
+	bss_ref_put(rdev, bss);
+	spin_unlock_bh(&rdev->bss_lock);
 }
 EXPORT_SYMBOL(cfg80211_put_bss);
 
 void cfg80211_unlink_bss(struct wiphy *wiphy, struct cfg80211_bss *pub)
 {
-	struct cfg80211_registered_device *dev = wiphy_to_dev(wiphy);
+	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
 	struct cfg80211_internal_bss *bss;
 
 	if (WARN_ON(!pub))
@@ -580,19 +1146,35 @@ void cfg80211_unlink_bss(struct wiphy *wiphy, struct cfg80211_bss *pub)
 
 	bss = container_of(pub, struct cfg80211_internal_bss, pub);
 
-	spin_lock_bh(&dev->bss_lock);
-
-	list_del(&bss->list);
-	dev->bss_generation++;
-	rb_erase(&bss->rbn, &dev->bss_tree);
-
-	spin_unlock_bh(&dev->bss_lock);
-
-	kref_put(&bss->ref, bss_release);
+	spin_lock_bh(&rdev->bss_lock);
+	if (!list_empty(&bss->list)) {
+		if (__cfg80211_unlink_bss(rdev, bss))
+			rdev->bss_generation++;
+	}
+	spin_unlock_bh(&rdev->bss_lock);
 }
 EXPORT_SYMBOL(cfg80211_unlink_bss);
 
-#ifdef CONFIG_WIRELESS_EXT
+#ifdef CONFIG_CFG80211_WEXT
+static struct cfg80211_registered_device *
+cfg80211_get_dev_from_ifindex(struct net *net, int ifindex)
+{
+	struct cfg80211_registered_device *rdev;
+	struct net_device *dev;
+
+	ASSERT_RTNL();
+
+	dev = dev_get_by_index(net, ifindex);
+	if (!dev)
+		return ERR_PTR(-ENODEV);
+	if (dev->ieee80211_ptr)
+		rdev = wiphy_to_rdev(dev->ieee80211_ptr->wiphy);
+	else
+		rdev = ERR_PTR(-ENODEV);
+	dev_put(dev);
+	return rdev;
+}
+
 int cfg80211_wext_siwscan(struct net_device *dev,
 			  struct iw_request_info *info,
 			  union iwreq_data *wrqu, char *extra)
@@ -600,7 +1182,7 @@ int cfg80211_wext_siwscan(struct net_device *dev,
 	struct cfg80211_registered_device *rdev;
 	struct wiphy *wiphy;
 	struct iw_scan_req *wreq = NULL;
-	struct cfg80211_scan_request *creq;
+	struct cfg80211_scan_request *creq = NULL;
 	int i, err, n_channels = 0;
 	enum ieee80211_band band;
 
@@ -615,7 +1197,7 @@ int cfg80211_wext_siwscan(struct net_device *dev,
 	if (IS_ERR(rdev))
 		return PTR_ERR(rdev);
 
-	if (rdev->scan_req) {
+	if (rdev->scan_req || rdev->scan_msg) {
 		err = -EBUSY;
 		goto out;
 	}
@@ -625,11 +1207,8 @@ int cfg80211_wext_siwscan(struct net_device *dev,
 	/* Determine number of channels, needed to allocate creq */
 	if (wreq && wreq->num_channels)
 		n_channels = wreq->num_channels;
-	else {
-		for (band = 0; band < IEEE80211_NUM_BANDS; band++)
-			if (wiphy->bands[band])
-				n_channels += wiphy->bands[band]->n_channels;
-	}
+	else
+		n_channels = ieee80211_get_num_supported_channels(wiphy);
 
 	creq = kzalloc(sizeof(*creq) + sizeof(struct cfg80211_ssid) +
 		       n_channels * sizeof(void *),
@@ -640,19 +1219,26 @@ int cfg80211_wext_siwscan(struct net_device *dev,
 	}
 
 	creq->wiphy = wiphy;
-	creq->dev = dev;
+	creq->wdev = dev->ieee80211_ptr;
 	/* SSIDs come after channels */
 	creq->ssids = (void *)&creq->channels[n_channels];
 	creq->n_channels = n_channels;
 	creq->n_ssids = 1;
+	creq->scan_start = jiffies;
 
 	/* translate "Scan on frequencies" request */
 	i = 0;
 	for (band = 0; band < IEEE80211_NUM_BANDS; band++) {
 		int j;
+
 		if (!wiphy->bands[band])
 			continue;
+
 		for (j = 0; j < wiphy->bands[band]->n_channels; j++) {
+			/* ignore disabled channels */
+			if (wiphy->bands[band]->channels[j].flags &
+						IEEE80211_CHAN_DISABLED)
+				continue;
 
 			/* If we have a wireless request structure and the
 			 * wireless request specifies frequencies, then search
@@ -662,7 +1248,11 @@ int cfg80211_wext_siwscan(struct net_device *dev,
 				int k;
 				int wiphy_freq = wiphy->bands[band]->channels[j].center_freq;
 				for (k = 0; k < wreq->num_channels; k++) {
-					int wext_freq = cfg80211_wext_freq(wiphy, &wreq->channel_list[k]);
+					struct iw_freq *freq =
+						&wreq->channel_list[k];
+					int wext_freq =
+						cfg80211_wext_freq(freq);
+
 					if (wext_freq == wiphy_freq)
 						goto wext_freq_found;
 				}
@@ -687,8 +1277,10 @@ int cfg80211_wext_siwscan(struct net_device *dev,
 	/* translate "Scan for SSID" request */
 	if (wreq) {
 		if (wrqu->data.flags & IW_SCAN_THIS_ESSID) {
-			if (wreq->essid_len > IEEE80211_MAX_SSID_LEN)
-				return -EINVAL;
+			if (wreq->essid_len > IEEE80211_MAX_SSID_LEN) {
+				err = -EINVAL;
+				goto out;
+			}
 			memcpy(creq->ssids[0].ssid, wreq->essid, wreq->essid_len);
 			creq->ssids[0].ssid_len = wreq->essid_len;
 		}
@@ -696,38 +1288,43 @@ int cfg80211_wext_siwscan(struct net_device *dev,
 			creq->n_ssids = 0;
 	}
 
+	for (i = 0; i < IEEE80211_NUM_BANDS; i++)
+		if (wiphy->bands[i])
+			creq->rates[i] = (1 << wiphy->bands[i]->n_bitrates) - 1;
+
 	rdev->scan_req = creq;
-	err = rdev->ops->scan(wiphy, dev, creq);
+	err = rdev_scan(rdev, creq);
 	if (err) {
 		rdev->scan_req = NULL;
-		kfree(creq);
+		/* creq will be freed below */
 	} else {
-		nl80211_send_scan_start(rdev, dev);
+		nl80211_send_scan_start(rdev, dev->ieee80211_ptr);
+		/* creq now owned by driver */
+		creq = NULL;
 		dev_hold(dev);
 	}
  out:
-	cfg80211_unlock_rdev(rdev);
+	kfree(creq);
 	return err;
 }
-EXPORT_SYMBOL_GPL(cfg80211_wext_siwscan);
+EXPORT_WEXT_HANDLER(cfg80211_wext_siwscan);
 
-static void ieee80211_scan_add_ies(struct iw_request_info *info,
-				   struct cfg80211_bss *bss,
-				   char **current_ev, char *end_buf)
+static char *ieee80211_scan_add_ies(struct iw_request_info *info,
+				    const struct cfg80211_bss_ies *ies,
+				    char *current_ev, char *end_buf)
 {
-	u8 *pos, *end, *next;
+	const u8 *pos, *end, *next;
 	struct iw_event iwe;
 
-	if (!bss->information_elements ||
-	    !bss->len_information_elements)
-		return;
+	if (!ies)
+		return current_ev;
 
 	/*
 	 * If needed, fragment the IEs buffer (at IE boundaries) into short
 	 * enough fragments to fit into IW_GENERIC_IE_MAX octet messages.
 	 */
-	pos = bss->information_elements;
-	end = pos + bss->len_information_elements;
+	pos = ies->data;
+	end = pos + ies->len;
 
 	while (end - pos > IW_GENERIC_IE_MAX) {
 		next = pos + 2 + pos[1];
@@ -737,9 +1334,11 @@ static void ieee80211_scan_add_ies(struct iw_request_info *info,
 		memset(&iwe, 0, sizeof(iwe));
 		iwe.cmd = IWEVGENIE;
 		iwe.u.data.length = next - pos;
-		*current_ev = iwe_stream_add_point(info, *current_ev,
-						   end_buf, &iwe, pos);
-
+		current_ev = iwe_stream_add_point_check(info, current_ev,
+							end_buf, &iwe,
+							(void *)pos);
+		if (IS_ERR(current_ev))
+			return current_ev;
 		pos = next;
 	}
 
@@ -747,19 +1346,14 @@ static void ieee80211_scan_add_ies(struct iw_request_info *info,
 		memset(&iwe, 0, sizeof(iwe));
 		iwe.cmd = IWEVGENIE;
 		iwe.u.data.length = end - pos;
-		*current_ev = iwe_stream_add_point(info, *current_ev,
-						   end_buf, &iwe, pos);
+		current_ev = iwe_stream_add_point_check(info, current_ev,
+							end_buf, &iwe,
+							(void *)pos);
+		if (IS_ERR(current_ev))
+			return current_ev;
 	}
-}
 
-static inline unsigned int elapsed_jiffies_msecs(unsigned long start)
-{
-	unsigned long end = jiffies;
-
-	if (end >= start)
-		return jiffies_to_msecs(end - start);
-
-	return jiffies_to_msecs(end + (MAX_JIFFY_OFFSET - start) + 1);
+	return current_ev;
 }
 
 static char *
@@ -767,32 +1361,40 @@ ieee80211_bss(struct wiphy *wiphy, struct iw_request_info *info,
 	      struct cfg80211_internal_bss *bss, char *current_ev,
 	      char *end_buf)
 {
+	const struct cfg80211_bss_ies *ies;
 	struct iw_event iwe;
-	u8 *buf, *cfg, *p;
-	u8 *ie = bss->pub.information_elements;
-	int rem = bss->pub.len_information_elements, i, sig;
+	const u8 *ie;
+	u8 buf[50];
+	u8 *cfg, *p, *tmp;
+	int rem, i, sig;
 	bool ismesh = false;
 
 	memset(&iwe, 0, sizeof(iwe));
 	iwe.cmd = SIOCGIWAP;
 	iwe.u.ap_addr.sa_family = ARPHRD_ETHER;
 	memcpy(iwe.u.ap_addr.sa_data, bss->pub.bssid, ETH_ALEN);
-	current_ev = iwe_stream_add_event(info, current_ev, end_buf, &iwe,
-					  IW_EV_ADDR_LEN);
+	current_ev = iwe_stream_add_event_check(info, current_ev, end_buf, &iwe,
+						IW_EV_ADDR_LEN);
+	if (IS_ERR(current_ev))
+		return current_ev;
 
 	memset(&iwe, 0, sizeof(iwe));
 	iwe.cmd = SIOCGIWFREQ;
 	iwe.u.freq.m = ieee80211_frequency_to_channel(bss->pub.channel->center_freq);
 	iwe.u.freq.e = 0;
-	current_ev = iwe_stream_add_event(info, current_ev, end_buf, &iwe,
-					  IW_EV_FREQ_LEN);
+	current_ev = iwe_stream_add_event_check(info, current_ev, end_buf, &iwe,
+						IW_EV_FREQ_LEN);
+	if (IS_ERR(current_ev))
+		return current_ev;
 
 	memset(&iwe, 0, sizeof(iwe));
 	iwe.cmd = SIOCGIWFREQ;
 	iwe.u.freq.m = bss->pub.channel->center_freq;
 	iwe.u.freq.e = 6;
-	current_ev = iwe_stream_add_event(info, current_ev, end_buf, &iwe,
-					  IW_EV_FREQ_LEN);
+	current_ev = iwe_stream_add_event_check(info, current_ev, end_buf, &iwe,
+						IW_EV_FREQ_LEN);
+	if (IS_ERR(current_ev))
+		return current_ev;
 
 	if (wiphy->signal_type != CFG80211_SIGNAL_TYPE_NONE) {
 		memset(&iwe, 0, sizeof(iwe));
@@ -821,8 +1423,11 @@ ieee80211_bss(struct wiphy *wiphy, struct iw_request_info *info,
 			/* not reached */
 			break;
 		}
-		current_ev = iwe_stream_add_event(info, current_ev, end_buf,
-						  &iwe, IW_EV_QUAL_LEN);
+		current_ev = iwe_stream_add_event_check(info, current_ev,
+							end_buf, &iwe,
+							IW_EV_QUAL_LEN);
+		if (IS_ERR(current_ev))
+			return current_ev;
 	}
 
 	memset(&iwe, 0, sizeof(iwe));
@@ -832,8 +1437,15 @@ ieee80211_bss(struct wiphy *wiphy, struct iw_request_info *info,
 	else
 		iwe.u.data.flags = IW_ENCODE_DISABLED;
 	iwe.u.data.length = 0;
-	current_ev = iwe_stream_add_point(info, current_ev, end_buf,
-					  &iwe, "");
+	current_ev = iwe_stream_add_point_check(info, current_ev, end_buf,
+						&iwe, "");
+	if (IS_ERR(current_ev))
+		return current_ev;
+
+	rcu_read_lock();
+	ies = rcu_dereference(bss->pub.ies);
+	rem = ies->len;
+	ie = ies->data;
 
 	while (rem >= 2) {
 		/* invalid data */
@@ -846,61 +1458,91 @@ ieee80211_bss(struct wiphy *wiphy, struct iw_request_info *info,
 			iwe.cmd = SIOCGIWESSID;
 			iwe.u.data.length = ie[1];
 			iwe.u.data.flags = 1;
-			current_ev = iwe_stream_add_point(info, current_ev, end_buf,
-							  &iwe, ie + 2);
+			current_ev = iwe_stream_add_point_check(info,
+								current_ev,
+								end_buf, &iwe,
+								(u8 *)ie + 2);
+			if (IS_ERR(current_ev))
+				goto unlock;
 			break;
 		case WLAN_EID_MESH_ID:
 			memset(&iwe, 0, sizeof(iwe));
 			iwe.cmd = SIOCGIWESSID;
 			iwe.u.data.length = ie[1];
 			iwe.u.data.flags = 1;
-			current_ev = iwe_stream_add_point(info, current_ev, end_buf,
-							  &iwe, ie + 2);
+			current_ev = iwe_stream_add_point_check(info,
+								current_ev,
+								end_buf, &iwe,
+								(u8 *)ie + 2);
+			if (IS_ERR(current_ev))
+				goto unlock;
 			break;
 		case WLAN_EID_MESH_CONFIG:
 			ismesh = true;
-			if (ie[1] != IEEE80211_MESH_CONFIG_LEN)
+			if (ie[1] != sizeof(struct ieee80211_meshconf_ie))
 				break;
-			buf = kmalloc(50, GFP_ATOMIC);
-			if (!buf)
-				break;
-			cfg = ie + 2;
+			cfg = (u8 *)ie + 2;
 			memset(&iwe, 0, sizeof(iwe));
 			iwe.cmd = IWEVCUSTOM;
-			sprintf(buf, "Mesh network (version %d)", cfg[0]);
+			sprintf(buf, "Mesh Network Path Selection Protocol ID: "
+				"0x%02X", cfg[0]);
 			iwe.u.data.length = strlen(buf);
-			current_ev = iwe_stream_add_point(info, current_ev,
-							  end_buf,
-							  &iwe, buf);
-			sprintf(buf, "Path Selection Protocol ID: "
-				"0x%02X%02X%02X%02X", cfg[1], cfg[2], cfg[3],
-							cfg[4]);
+			current_ev = iwe_stream_add_point_check(info,
+								current_ev,
+								end_buf,
+								&iwe, buf);
+			if (IS_ERR(current_ev))
+				goto unlock;
+			sprintf(buf, "Path Selection Metric ID: 0x%02X",
+				cfg[1]);
 			iwe.u.data.length = strlen(buf);
-			current_ev = iwe_stream_add_point(info, current_ev,
-							  end_buf,
-							  &iwe, buf);
-			sprintf(buf, "Path Selection Metric ID: "
-				"0x%02X%02X%02X%02X", cfg[5], cfg[6], cfg[7],
-							cfg[8]);
+			current_ev = iwe_stream_add_point_check(info,
+								current_ev,
+								end_buf,
+								&iwe, buf);
+			if (IS_ERR(current_ev))
+				goto unlock;
+			sprintf(buf, "Congestion Control Mode ID: 0x%02X",
+				cfg[2]);
 			iwe.u.data.length = strlen(buf);
-			current_ev = iwe_stream_add_point(info, current_ev,
-							  end_buf,
-							  &iwe, buf);
-			sprintf(buf, "Congestion Control Mode ID: "
-				"0x%02X%02X%02X%02X", cfg[9], cfg[10],
-							cfg[11], cfg[12]);
+			current_ev = iwe_stream_add_point_check(info,
+								current_ev,
+								end_buf,
+								&iwe, buf);
+			if (IS_ERR(current_ev))
+				goto unlock;
+			sprintf(buf, "Synchronization ID: 0x%02X", cfg[3]);
 			iwe.u.data.length = strlen(buf);
-			current_ev = iwe_stream_add_point(info, current_ev,
-							  end_buf,
-							  &iwe, buf);
-			sprintf(buf, "Channel Precedence: "
-				"0x%02X%02X%02X%02X", cfg[13], cfg[14],
-							cfg[15], cfg[16]);
+			current_ev = iwe_stream_add_point_check(info,
+								current_ev,
+								end_buf,
+								&iwe, buf);
+			if (IS_ERR(current_ev))
+				goto unlock;
+			sprintf(buf, "Authentication ID: 0x%02X", cfg[4]);
 			iwe.u.data.length = strlen(buf);
-			current_ev = iwe_stream_add_point(info, current_ev,
-							  end_buf,
-							  &iwe, buf);
-			kfree(buf);
+			current_ev = iwe_stream_add_point_check(info,
+								current_ev,
+								end_buf,
+								&iwe, buf);
+			if (IS_ERR(current_ev))
+				goto unlock;
+			sprintf(buf, "Formation Info: 0x%02X", cfg[5]);
+			iwe.u.data.length = strlen(buf);
+			current_ev = iwe_stream_add_point_check(info,
+								current_ev,
+								end_buf,
+								&iwe, buf);
+			if (IS_ERR(current_ev))
+				goto unlock;
+			sprintf(buf, "Capabilities: 0x%02X", cfg[6]);
+			iwe.u.data.length = strlen(buf);
+			current_ev = iwe_stream_add_point_check(info,
+								current_ev,
+								end_buf,
+								&iwe, buf);
+			if (IS_ERR(current_ev))
+				goto unlock;
 			break;
 		case WLAN_EID_SUPP_RATES:
 		case WLAN_EID_EXT_SUPP_RATES:
@@ -915,8 +1557,14 @@ ieee80211_bss(struct wiphy *wiphy, struct iw_request_info *info,
 			for (i = 0; i < ie[1]; i++) {
 				iwe.u.bitrate.value =
 					((ie[i + 2] & 0x7f) * 500000);
+				tmp = p;
 				p = iwe_stream_add_value(info, current_ev, p,
-						end_buf, &iwe, IW_EV_PARAM_LEN);
+							 end_buf, &iwe,
+							 IW_EV_PARAM_LEN);
+				if (p == tmp) {
+					current_ev = ERR_PTR(-E2BIG);
+					goto unlock;
+				}
 			}
 			current_ev = p;
 			break;
@@ -925,8 +1573,8 @@ ieee80211_bss(struct wiphy *wiphy, struct iw_request_info *info,
 		ie += ie[1] + 2;
 	}
 
-	if (bss->pub.capability & (WLAN_CAPABILITY_ESS | WLAN_CAPABILITY_IBSS)
-	    || ismesh) {
+	if (bss->pub.capability & (WLAN_CAPABILITY_ESS | WLAN_CAPABILITY_IBSS) ||
+	    ismesh) {
 		memset(&iwe, 0, sizeof(iwe));
 		iwe.cmd = SIOCGIWMODE;
 		if (ismesh)
@@ -935,54 +1583,67 @@ ieee80211_bss(struct wiphy *wiphy, struct iw_request_info *info,
 			iwe.u.mode = IW_MODE_MASTER;
 		else
 			iwe.u.mode = IW_MODE_ADHOC;
-		current_ev = iwe_stream_add_event(info, current_ev, end_buf,
-						  &iwe, IW_EV_UINT_LEN);
+		current_ev = iwe_stream_add_event_check(info, current_ev,
+							end_buf, &iwe,
+							IW_EV_UINT_LEN);
+		if (IS_ERR(current_ev))
+			goto unlock;
 	}
 
-	buf = kmalloc(30, GFP_ATOMIC);
-	if (buf) {
-		memset(&iwe, 0, sizeof(iwe));
-		iwe.cmd = IWEVCUSTOM;
-		sprintf(buf, "tsf=%016llx", (unsigned long long)(bss->pub.tsf));
-		iwe.u.data.length = strlen(buf);
-		current_ev = iwe_stream_add_point(info, current_ev, end_buf,
-						  &iwe, buf);
-		memset(&iwe, 0, sizeof(iwe));
-		iwe.cmd = IWEVCUSTOM;
-		sprintf(buf, " Last beacon: %ums ago",
-			elapsed_jiffies_msecs(bss->ts));
-		iwe.u.data.length = strlen(buf);
-		current_ev = iwe_stream_add_point(info, current_ev,
-						  end_buf, &iwe, buf);
-		kfree(buf);
-	}
+	memset(&iwe, 0, sizeof(iwe));
+	iwe.cmd = IWEVCUSTOM;
+	sprintf(buf, "tsf=%016llx", (unsigned long long)(ies->tsf));
+	iwe.u.data.length = strlen(buf);
+	current_ev = iwe_stream_add_point_check(info, current_ev, end_buf,
+						&iwe, buf);
+	if (IS_ERR(current_ev))
+		goto unlock;
+	memset(&iwe, 0, sizeof(iwe));
+	iwe.cmd = IWEVCUSTOM;
+	sprintf(buf, " Last beacon: %ums ago",
+		elapsed_jiffies_msecs(bss->ts));
+	iwe.u.data.length = strlen(buf);
+	current_ev = iwe_stream_add_point_check(info, current_ev,
+						end_buf, &iwe, buf);
+	if (IS_ERR(current_ev))
+		goto unlock;
 
-	ieee80211_scan_add_ies(info, &bss->pub, &current_ev, end_buf);
+	current_ev = ieee80211_scan_add_ies(info, ies, current_ev, end_buf);
 
+ unlock:
+	rcu_read_unlock();
 	return current_ev;
 }
 
 
-static int ieee80211_scan_results(struct cfg80211_registered_device *dev,
+static int ieee80211_scan_results(struct cfg80211_registered_device *rdev,
 				  struct iw_request_info *info,
 				  char *buf, size_t len)
 {
 	char *current_ev = buf;
 	char *end_buf = buf + len;
 	struct cfg80211_internal_bss *bss;
+	int err = 0;
 
-	spin_lock_bh(&dev->bss_lock);
-	cfg80211_bss_expire(dev);
+	spin_lock_bh(&rdev->bss_lock);
+	cfg80211_bss_expire(rdev);
 
-	list_for_each_entry(bss, &dev->bss_list, list) {
+	list_for_each_entry(bss, &rdev->bss_list, list) {
 		if (buf + len - current_ev <= IW_EV_ADDR_LEN) {
-			spin_unlock_bh(&dev->bss_lock);
-			return -E2BIG;
+			err = -E2BIG;
+			break;
 		}
-		current_ev = ieee80211_bss(&dev->wiphy, info, bss,
+		current_ev = ieee80211_bss(&rdev->wiphy, info, bss,
 					   current_ev, end_buf);
+		if (IS_ERR(current_ev)) {
+			err = PTR_ERR(current_ev);
+			break;
+		}
 	}
-	spin_unlock_bh(&dev->bss_lock);
+	spin_unlock_bh(&rdev->bss_lock);
+
+	if (err)
+		return err;
 	return current_ev - buf;
 }
 
@@ -1002,10 +1663,8 @@ int cfg80211_wext_giwscan(struct net_device *dev,
 	if (IS_ERR(rdev))
 		return PTR_ERR(rdev);
 
-	if (rdev->scan_req) {
-		res = -EAGAIN;
-		goto out;
-	}
+	if (rdev->scan_req || rdev->scan_msg)
+		return -EAGAIN;
 
 	res = ieee80211_scan_results(rdev, info, extra, data->length);
 	data->length = 0;
@@ -1014,9 +1673,7 @@ int cfg80211_wext_giwscan(struct net_device *dev,
 		res = 0;
 	}
 
- out:
-	cfg80211_unlock_rdev(rdev);
 	return res;
 }
-EXPORT_SYMBOL_GPL(cfg80211_wext_giwscan);
+EXPORT_WEXT_HANDLER(cfg80211_wext_giwscan);
 #endif

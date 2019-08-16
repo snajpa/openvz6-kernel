@@ -81,10 +81,18 @@ struct inet_bind_bucket {
 	struct net		*ib_net;
 #endif
 	unsigned short		port;
-	signed short		fastreuse;
+#ifndef __GENKSYMS__
+	signed char		fastreuse;
+	signed char		fastreuseport;
+#else
+	signed short            fastreuse;
+#endif
 	int			num_owners;
 	struct hlist_node	node;
 	struct hlist_head	owners;
+#ifndef __GENKSYMS__
+	uid_t			fastuid;
+#endif
 };
 
 static inline struct net *ib_net(struct inet_bind_bucket *ib)
@@ -245,27 +253,31 @@ static inline int inet_sk_listen_hashfn(const struct sock *sk)
 }
 
 /* Caller must disable local BH processing. */
-extern void __inet_inherit_port(struct sock *sk, struct sock *child);
+extern int __inet_inherit_port(struct sock *sk, struct sock *child);
 
 extern void inet_put_port(struct sock *sk);
 
 void inet_hashinfo_init(struct inet_hashinfo *h);
 
-extern void __inet_hash_nolisten(struct sock *sk);
+extern int __inet_hash_nolisten(struct sock *sk, struct inet_timewait_sock *tw);
 extern void inet_hash(struct sock *sk);
 extern void inet_unhash(struct sock *sk);
 
 extern struct sock *__inet_lookup_listener(struct net *net,
 					   struct inet_hashinfo *hashinfo,
+					   const __be32 saddr,
+					   const __be16 sport,
 					   const __be32 daddr,
 					   const unsigned short hnum,
 					   const int dif);
 
 static inline struct sock *inet_lookup_listener(struct net *net,
 		struct inet_hashinfo *hashinfo,
+		__be32 saddr, __be16 sport,
 		__be32 daddr, __be16 dport, int dif)
 {
-	return __inet_lookup_listener(net, hashinfo, daddr, ntohs(dport), dif);
+	return __inet_lookup_listener(net, hashinfo, saddr, sport,
+				      daddr, ntohs(dport), dif);
 }
 
 /* Socket demux engine toys. */
@@ -356,7 +368,8 @@ static inline struct sock *__inet_lookup(struct net *net,
 	struct sock *sk = __inet_lookup_established(net, hashinfo,
 				saddr, sport, daddr, hnum, dif);
 
-	return sk ? : __inet_lookup_listener(net, hashinfo, daddr, hnum, dif);
+	return sk ? : __inet_lookup_listener(net, hashinfo, saddr, sport,
+					     daddr, hnum, dif);
 }
 
 static inline struct sock *inet_lookup(struct net *net,
@@ -391,10 +404,12 @@ static inline struct sock *__inet_lookup_skb(struct inet_hashinfo *hashinfo,
 }
 
 extern int __inet_hash_connect(struct inet_timewait_death_row *death_row,
-		struct sock *sk, u32 port_offset,
+		struct sock *sk,
+		u32 port_offset,
 		int (*check_established)(struct inet_timewait_death_row *,
 			struct sock *, __u16, struct inet_timewait_sock **),
-			       void (*hash)(struct sock *sk));
+		int (*hash)(struct sock *sk, struct inet_timewait_sock *twp));
+
 extern int inet_hash_connect(struct inet_timewait_death_row *death_row,
 			     struct sock *sk);
 #endif /* _INET_HASHTABLES_H */

@@ -1,7 +1,9 @@
 
 # List of files in the vdso, has to be asm only for now
 
-obj-vdso32 = sigtramp.o gettimeofday.o datapage.o cacheflush.o note.o
+obj-vdso32-$(CONFIG_PPC64) = getcpu.o
+obj-vdso32 = sigtramp.o gettimeofday.o datapage.o cacheflush.o note.o \
+		$(obj-vdso32-y)
 
 # Build rules
 
@@ -41,7 +43,8 @@ $(obj-vdso32): %.o: %.S
 
 # actual build commands
 quiet_cmd_vdso32ld = VDSO32L $@
-      cmd_vdso32ld = $(CROSS32CC) $(c_flags) -Wl,-T $^ -o $@
+      cmd_vdso32ld = $(CROSS32CC) $(c_flags) -Wl,-T $^ -o $@ \
+		     $(if $(AFTER_LINK),; $(AFTER_LINK))
 quiet_cmd_vdso32as = VDSO32A $@
       cmd_vdso32as = $(CROSS32CC) $(a_flags) -c -o $@ $<
 

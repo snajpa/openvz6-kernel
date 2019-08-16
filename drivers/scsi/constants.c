@@ -141,6 +141,7 @@ static const struct value_name_pair serv_out12_arr[] = {
 static const struct value_name_pair serv_in16_arr[] = {
 	{0x10, "Read capacity(16)"},
 	{0x11, "Read long(16)"},
+	{0x12, "Get LBA status"},
 };
 #define SERV_IN16_SZ ARRAY_SIZE(serv_in16_arr)
 
@@ -218,18 +219,15 @@ static void print_opcode_name(unsigned char * cdbp, int cdb_len)
 			break;
 		}
 		sa = (cdbp[8] << 8) + cdbp[9];
-		name = get_sa_name(maint_in_arr, MAINT_IN_SZ, sa);
-		if (name) {
+		name = get_sa_name(variable_length_arr, VARIABLE_LENGTH_SZ, sa);
+		if (name)
 			printk("%s", name);
-			if ((cdb_len > 0) && (len != cdb_len))
-				printk(", in_cdb_len=%d, ext_len=%d",
-				       len, cdb_len);
-		} else {
+		else
 			printk("cdb[0]=0x%x, sa=0x%x", cdb0, sa);
-			if ((cdb_len > 0) && (len != cdb_len))
-				printk(", in_cdb_len=%d, ext_len=%d",
-				       len, cdb_len);
-		}
+
+		if ((cdb_len > 0) && (len != cdb_len))
+			printk(", in_cdb_len=%d, ext_len=%d", len, cdb_len);
+
 		break;
 	case MAINTENANCE_IN:
 		sa = cdbp[1] & 0x1f;
@@ -347,6 +345,9 @@ EXPORT_SYMBOL(__scsi_print_command);
 void scsi_print_command(struct scsi_cmnd *cmd)
 {
 	int k;
+
+	if (cmd->cmnd == NULL)
+		return;
 
 	scmd_printk(KERN_INFO, cmd, "CDB: ");
 	print_opcode_name(cmd->cmnd, cmd->cmd_len);
@@ -771,6 +772,7 @@ static const struct error_info additional[] =
 	{0x3802, "Esn - power management class event"},
 	{0x3804, "Esn - media class event"},
 	{0x3806, "Esn - device busy class event"},
+	{0x3807, "Thin Provisioning soft threshold reached"},
 
 	{0x3900, "Saving parameters not supported"},
 
@@ -1240,7 +1242,7 @@ scsi_show_extd_sense(unsigned char asc, unsigned char ascq)
 		if (asc >= 0x80)
 			printk("<<vendor>> ASC=0x%x ASCQ=0x%x", asc,
 			       ascq);
-		if (ascq >= 0x80)
+		else if (ascq >= 0x80)
 			printk("ASC=0x%x <<vendor>> ASCQ=0x%x", asc,
 			       ascq);
 		else
@@ -1403,13 +1405,13 @@ void scsi_print_sense(char *name, struct scsi_cmnd *cmd)
 {
 	struct scsi_sense_hdr sshdr;
 
-	scmd_printk(KERN_INFO, cmd, "");
+	scmd_printk(KERN_INFO, cmd, " ");
 	scsi_decode_sense_buffer(cmd->sense_buffer, SCSI_SENSE_BUFFERSIZE,
 				 &sshdr);
 	scsi_show_sense_hdr(&sshdr);
 	scsi_decode_sense_extras(cmd->sense_buffer, SCSI_SENSE_BUFFERSIZE,
 				 &sshdr);
-	scmd_printk(KERN_INFO, cmd, "");
+	scmd_printk(KERN_INFO, cmd, " ");
 	scsi_show_extd_sense(sshdr.asc, sshdr.ascq);
 }
 EXPORT_SYMBOL(scsi_print_sense);
@@ -1420,7 +1422,8 @@ static const char * const hostbyte_table[]={
 "DID_OK", "DID_NO_CONNECT", "DID_BUS_BUSY", "DID_TIME_OUT", "DID_BAD_TARGET",
 "DID_ABORT", "DID_PARITY", "DID_ERROR", "DID_RESET", "DID_BAD_INTR",
 "DID_PASSTHROUGH", "DID_SOFT_ERROR", "DID_IMM_RETRY", "DID_REQUEUE",
-"DID_TRANSPORT_DISRUPTED", "DID_TRANSPORT_FAILFAST" };
+"DID_TRANSPORT_DISRUPTED", "DID_TRANSPORT_FAILFAST", "DID_TARGET_FAILURE",
+"DID_NEXUS_FAILURE" };
 #define NUM_HOSTBYTE_STRS ARRAY_SIZE(hostbyte_table)
 
 static const char * const driverbyte_table[]={
@@ -1452,7 +1455,7 @@ EXPORT_SYMBOL(scsi_show_result);
 
 void scsi_print_result(struct scsi_cmnd *cmd)
 {
-	scmd_printk(KERN_INFO, cmd, "");
+	scmd_printk(KERN_INFO, cmd, " ");
 	scsi_show_result(cmd->result);
 }
 EXPORT_SYMBOL(scsi_print_result);

@@ -18,6 +18,7 @@
 #include "vxge-config.h"
 #include "vxge-version.h"
 #include <linux/list.h>
+#include <linux/u64_stats_sync.h>
 
 #define VXGE_DRIVER_NAME		"vxge"
 #define VXGE_DRIVER_VENDOR		"Neterion, Inc"
@@ -31,6 +32,7 @@
 #define PCI_DEVICE_ID_TITAN_UNI		0x5833
 #define	VXGE_USE_DEFAULT		0xffffffff
 #define VXGE_HW_VPATH_MSIX_ACTIVE	4
+#define VXGE_ALARM_MSIX_ID		2
 #define VXGE_HW_RXSYNC_FREQ_CNT		4
 #define VXGE_LL_WATCH_DOG_TIMEOUT	(15 * HZ)
 #define VXGE_LL_RX_COPY_THRESHOLD	256
@@ -89,6 +91,11 @@
 
 #define VXGE_LL_MAX_FRAME_SIZE(dev) ((dev)->mtu + VXGE_HW_MAC_HEADER_MAX_SIZE)
 
+#define is_sriov(function_mode) \
+	((function_mode == VXGE_HW_FUNCTION_MODE_SRIOV) || \
+	(function_mode == VXGE_HW_FUNCTION_MODE_SRIOV_8) || \
+	(function_mode == VXGE_HW_FUNCTION_MODE_SRIOV_4))
+
 enum vxge_reset_event {
 	/* reset events */
 	VXGE_LL_VPATH_RESET	= 0,
@@ -112,7 +119,6 @@ enum vxge_mac_addr_state {
 struct vxge_drv_config {
 	int config_dev_cnt;
 	int total_dev_cnt;
-	unsigned long inta_dev_open;
 	int g_no_cpus;
 	unsigned int vpath_per_dev;
 };
@@ -166,31 +172,14 @@ struct vxge_msix_entry {
 /* Software Statistics */
 
 struct vxge_sw_stats {
-	/* Network Stats (interface stats) */
-	struct net_device_stats net_stats;
-
-	/* Tx */
-	u64 tx_frms;
-	u64 tx_errors;
-	u64 tx_bytes;
-	u64 txd_not_free;
-	u64 txd_out_of_desc;
 
 	/* Virtual Path */
-	u64 vpaths_open;
-	u64 vpath_open_fail;
-
-	/* Rx */
-	u64 rx_frms;
-	u64 rx_errors;
-	u64 rx_bytes;
-	u64 rx_mcast;
+	unsigned long vpaths_open;
+	unsigned long vpath_open_fail;
 
 	/* Misc. */
-	u64 link_up;
-	u64 link_down;
-	u64 pci_map_fail;
-	u64 skb_alloc_fail;
+	unsigned long link_up;
+	unsigned long link_down;
 };
 
 struct vxge_mac_addrs {
@@ -203,12 +192,14 @@ struct vxge_mac_addrs {
 struct vxgedev;
 
 struct vxge_fifo_stats {
+	struct u64_stats_sync	syncp;
 	u64 tx_frms;
-	u64 tx_errors;
 	u64 tx_bytes;
-	u64 txd_not_free;
-	u64 txd_out_of_desc;
-	u64 pci_map_fail;
+
+	unsigned long tx_errors;
+	unsigned long txd_not_free;
+	unsigned long txd_out_of_desc;
+	unsigned long pci_map_fail;
 };
 
 struct vxge_fifo {
@@ -233,14 +224,16 @@ struct vxge_fifo {
 } ____cacheline_aligned;
 
 struct vxge_ring_stats {
-	u64 prev_rx_frms;
+	struct u64_stats_sync syncp;
 	u64 rx_frms;
-	u64 rx_errors;
-	u64 rx_dropped;
-	u64 rx_bytes;
 	u64 rx_mcast;
-	u64 pci_map_fail;
-	u64 skb_alloc_fail;
+	u64 rx_bytes;
+
+	unsigned long rx_errors;
+	unsigned long rx_dropped;
+	unsigned long prev_rx_frms;
+	unsigned long pci_map_fail;
+	unsigned long skb_alloc_fail;
 };
 
 struct vxge_ring {

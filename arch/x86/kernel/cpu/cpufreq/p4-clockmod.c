@@ -159,9 +159,9 @@ static unsigned int cpufreq_p4_get_frequency(struct cpuinfo_x86 *c)
 {
 	if (c->x86 == 0x06) {
 		if (cpu_has(c, X86_FEATURE_EST))
-			printk(KERN_WARNING PFX "Warning: EST-capable CPU "
-			       "detected. The acpi-cpufreq module offers "
-			       "voltage scaling in addition of frequency "
+			printk_once(KERN_WARNING PFX "Warning: EST-capable "
+			       "CPU detected. The acpi-cpufreq module offers "
+			       "voltage scaling in addition to frequency "
 			       "scaling. You should use that instead of "
 			       "p4-clockmod, if possible.\n");
 		switch (c->x86_model) {
@@ -179,13 +179,8 @@ static unsigned int cpufreq_p4_get_frequency(struct cpuinfo_x86 *c)
 		}
 	}
 
-	if (c->x86 != 0xF) {
-		if (!cpu_has(c, X86_FEATURE_EST))
-			printk(KERN_WARNING PFX "Unknown CPU. "
-				"Please send an e-mail to "
-				"<cpufreq@vger.kernel.org>\n");
+	if (c->x86 != 0xF)
 		return 0;
-	}
 
 	/* on P-4s, the TSC runs with constant frequency independent whether
 	 * throttling is active or not. */

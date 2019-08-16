@@ -219,7 +219,7 @@ MODULE_PARM_DESC(joystick, "Enable joystick.");
 #define	RINGB_EN_2CODEC		0x0020
 #define RINGB_SING_BIT_DUAL	0x0040
 
-/* ****Port Adresses**** */
+/* ****Port Addresses**** */
 
 /*   Write & Read */
 #define ESM_INDEX		0x02
@@ -1867,6 +1867,7 @@ static void snd_es1968_update_pcm(struct es1968 *chip, struct esschan *es)
 	es->count += diff;
 
 	if (es->count > es->frag_size) {
+		gmb();
 		spin_unlock(&chip->substream_lock);
 		snd_pcm_period_elapsed(subs);
 		spin_lock(&chip->substream_lock);
@@ -2259,7 +2260,7 @@ static void snd_es1968_chip_init(struct es1968 *chip)
 	outb(0x88, iobase+0x1f);
 
 	/* it appears some maestros (dell 7500) only work if these are set,
-	   regardless of wether we use the assp or not. */
+	   regardless of whether we use the assp or not. */
 
 	outb(0, iobase + ASSP_CONTROL_B);
 	outb(3, iobase + ASSP_CONTROL_A);	/* M: Reserved bits... */
@@ -2619,8 +2620,6 @@ static int __devinit snd_es1968_create(struct snd_card *card,
 		return err;
 	}
 
-	snd_card_set_dev(card, &pci->dev);
-
 	*chip_ret = chip;
 
 	return 0;
@@ -2645,7 +2644,8 @@ static int __devinit snd_es1968_probe(struct pci_dev *pci,
 		return -ENOENT;
 	}
 
-	err = snd_card_create(index[dev], id[dev], THIS_MODULE, 0, &card);
+	err = snd_card_new(&pci->dev, index[dev], id[dev], THIS_MODULE,
+			   0, &card);
 	if (err < 0)
 		return err;
                 

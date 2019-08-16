@@ -83,6 +83,8 @@
 
 #include <asm/microcode.h>
 #include <asm/processor.h>
+#include <asm/perf_event.h>
+#include <asm/spec_ctrl.h>
 
 MODULE_DESCRIPTION("Microcode Update Driver");
 MODULE_AUTHOR("Tigran Aivazian <tigran@aivazian.fsnet.co.uk>");
@@ -218,8 +220,10 @@ static ssize_t microcode_write(struct file *file, const char __user *buf,
 	get_online_cpus();
 	mutex_lock(&microcode_mutex);
 
-	if (do_microcode_update(buf, len) == 0)
+	if (do_microcode_update(buf, len) == 0) {
 		ret = (ssize_t)len;
+		spec_ctrl_rescan_cpuid();
+	}
 
 	mutex_unlock(&microcode_mutex);
 	put_online_cpus();
@@ -272,7 +276,6 @@ static int reload_for_cpu(int cpu)
 	struct ucode_cpu_info *uci = ucode_cpu_info + cpu;
 	int err = 0;
 
-	mutex_lock(&microcode_mutex);
 	if (uci->valid) {
 		enum ucode_state ustate;
 
@@ -283,7 +286,6 @@ static int reload_for_cpu(int cpu)
 			if (ustate == UCODE_ERROR)
 				err = -EINVAL;
 	}
-	mutex_unlock(&microcode_mutex);
 
 	return err;
 }
@@ -303,8 +305,14 @@ static ssize_t reload_store(struct sys_device *dev,
 
 	if (val == 1) {
 		get_online_cpus();
+		mutex_lock(&microcode_mutex);
 		if (cpu_online(cpu))
 			ret = reload_for_cpu(cpu);
+		if (!ret) {
+			perf_check_microcode();
+			spec_ctrl_rescan_cpuid();
+		}
+		mutex_unlock(&microcode_mutex);
 		put_online_cpus();
 	}
 
@@ -438,17 +446,8 @@ static int mc_sysdev_resume(struct sys_device *dev)
 	int cpu = dev->id;
 	struct ucode_cpu_info *uci = ucode_cpu_info + cpu;
 
-	if (!cpu_online(cpu))
+	if (cpu != smp_processor_id())
 		return 0;
-
-	/*
-	 * All non-bootup cpus are still disabled,
-	 * so only CPU 0 will apply ucode here.
-	 *
-	 * Moreover, there can be no concurrent
-	 * updates from any other places at this point.
-	 */
-	WARN_ON(cpu != 0);
 
 	if (uci->valid && uci->mc)
 		microcode_ops->apply_microcode(cpu);
@@ -520,11 +519,17 @@ static int __init microcode_init(void)
 		return PTR_ERR(microcode_pdev);
 	}
 
+	if (microcode_ops->init)
+		microcode_ops->init(&microcode_pdev->dev);
+
 	get_online_cpus();
 	mutex_lock(&microcode_mutex);
 
 	error = sysdev_driver_register(&cpu_sysdev_class, &mc_sysdev_driver);
-
+	if (!error) {
+		perf_check_microcode();
+		spec_ctrl_rescan_cpuid();
+	}
 	mutex_unlock(&microcode_mutex);
 	put_online_cpus();
 
@@ -562,6 +567,9 @@ static void __exit microcode_exit(void)
 	put_online_cpus();
 
 	platform_device_unregister(microcode_pdev);
+
+	if (microcode_ops->fini)
+		microcode_ops->fini();
 
 	microcode_ops = NULL;
 

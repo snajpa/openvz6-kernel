@@ -148,10 +148,7 @@ x2apic_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
 			break;
 	}
 
-	if (cpu < nr_cpu_ids)
-		return per_cpu(x86_cpu_to_logical_apicid, cpu);
-
-	return BAD_APICID;
+	return per_cpu(x86_cpu_to_logical_apicid, cpu);
 }
 
 static unsigned int x2apic_cluster_phys_get_apic_id(unsigned long x)
@@ -187,10 +184,15 @@ static void init_x2apic_ldr(void)
 	per_cpu(x86_cpu_to_logical_apicid, cpu) = apic_read(APIC_LDR);
 }
 
+static int x2apic_cluster_probe(void)
+{
+	return x2apic_mode;
+}
+
 struct apic apic_x2apic_cluster = {
 
 	.name				= "cluster x2apic",
-	.probe				= NULL,
+	.probe				= x2apic_cluster_probe,
 	.acpi_madt_oem_check		= x2apic_acpi_madt_oem_check,
 	.apic_id_registered		= x2apic_apic_id_registered,
 
@@ -240,6 +242,7 @@ struct apic apic_x2apic_cluster = {
 
 	.read				= native_apic_msr_read,
 	.write				= native_apic_msr_write,
+	.eoi_write			= native_apic_msr_eoi_write,
 	.icr_read			= native_x2apic_icr_read,
 	.icr_write			= native_x2apic_icr_write,
 	.wait_icr_idle			= native_x2apic_wait_icr_idle,

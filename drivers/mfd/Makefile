@@ -5,6 +5,10 @@
 obj-$(CONFIG_MFD_SM501)		+= sm501.o
 obj-$(CONFIG_MFD_ASIC3)		+= asic3.o
 
+rtsx_pci-objs			:= rtsx_pcr.o rtsx_gops.o rts5229.o rts5227.o rts5249.o
+obj-$(CONFIG_MFD_RTSX_PCI)	+= rtsx_pci.o
+obj-$(CONFIG_MFD_RTSX_USB)	+= rtsx_usb.o
+
 obj-$(CONFIG_HTC_EGPIO)		+= htc-egpio.o
 obj-$(CONFIG_HTC_PASIC3)	+= htc-pasic3.o
 
@@ -50,3 +54,5 @@ obj-$(CONFIG_PCF50633_ADC)	+= pcf50633-adc.o
 obj-$(CONFIG_PCF50633_GPIO)	+= pcf50633-gpio.o
 obj-$(CONFIG_AB3100_CORE)	+= ab3100-core.o
 obj-$(CONFIG_AB3100_OTP)	+= ab3100-otp.o
+obj-$(CONFIG_LPC_SCH)		+= lpc_sch.o
+obj-$(CONFIG_LPC_ICH)		+= lpc_ich.o

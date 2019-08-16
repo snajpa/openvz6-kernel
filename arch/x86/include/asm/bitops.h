@@ -15,6 +15,8 @@
 #include <linux/compiler.h>
 #include <asm/alternative.h>
 
+#define BIT_64(n)			(U64_C(1) << (n))
+
 /*
  * These have to be done with inline assembly: that way the bit-setting
  * is guaranteed to be atomic. All bit operations return 0 if the bit
@@ -262,6 +264,13 @@ static inline int test_and_clear_bit(int nr, volatile unsigned long *addr)
  * This operation is non-atomic and can be reordered.
  * If two examples of this operation race, one can appear to succeed
  * but actually fail.  You must protect multiple accesses with a lock.
+ *
+ * Note: the operation is performed atomically with respect to
+ * the local CPU, but not other CPUs. Portable code should not
+ * rely on this behaviour.
+ * KVM relies on this behaviour on x86 for modifying memory that is also
+ * accessed from a hypervisor on the same CPU if running in a VM: don't change
+ * this without also updating arch/x86/kernel/kvm.c
  */
 static inline int __test_and_clear_bit(int nr, volatile unsigned long *addr)
 {
@@ -306,13 +315,51 @@ static inline int test_and_change_bit(int nr, volatile unsigned long *addr)
 	return oldbit;
 }
 
+#ifdef CONFIG_X86_64
+#define INT_MAX ((int)(~0U>>1))
+#define LONG_INT_MAX ((long)INT_MAX)
+#define INT_MAX_PLUS_1 (LONG_INT_MAX + 1UL)
+
+static inline int test_and_set_bit_long(unsigned long nr, volatile unsigned long *addr)
+{
+        unsigned long oldbit;
+
+	if (unlikely(nr >= INT_MAX_PLUS_1)) {
+		addr += (nr / INT_MAX_PLUS_1) * (INT_MAX_PLUS_1 / BITS_PER_LONG);
+		nr &= INT_MAX;
+	}
+	asm volatile(LOCK_PREFIX "bts %2,%1\n\t"
+		     "sbb %0,%0"
+		     : "=r" (oldbit), ADDR : "Ir" (nr) : "memory");
+
+	return oldbit;
+}
+
+static inline int test_and_clear_bit_long(unsigned long nr, volatile unsigned long *addr)
+{
+        unsigned long oldbit;
+
+	if (unlikely (nr > LONG_INT_MAX)) {
+		while (nr > LONG_INT_MAX) {
+			nr -= LONG_INT_MAX + 1;
+			addr += ((LONG_INT_MAX + 1)/BITS_PER_LONG);
+		}
+	}
+        asm volatile(LOCK_PREFIX "btr %2,%1\n\t"
+                        "sbb %0,%0"
+                        : "=r" (oldbit), ADDR : "Ir" (nr) : "memory");
+
+        return oldbit;
+}
+#endif
+
 static __always_inline int constant_test_bit(unsigned int nr, const volatile unsigned long *addr)
 {
 	return ((1UL << (nr % BITS_PER_LONG)) &
 		(((unsigned long *)addr)[nr / BITS_PER_LONG])) != 0;
 }
 
-static inline int variable_test_bit(int nr, volatile const unsigned long *addr)
+static __always_inline int variable_test_bit(int nr, volatile const unsigned long *addr)
 {
 	int oldbit;
 

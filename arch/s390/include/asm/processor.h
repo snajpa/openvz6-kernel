@@ -18,6 +18,7 @@
 #include <asm/page.h>
 #include <asm/ptrace.h>
 #include <asm/setup.h>
+#include <asm/runtime_instr.h>
 
 #ifdef __KERNEL__
 /*
@@ -34,6 +35,10 @@ static inline void get_cpu_id(struct cpuid *ptr)
 extern void s390_adjust_jiffies(void);
 extern void print_cpu_info(void);
 extern int get_cpu_capability(unsigned int *);
+extern void __bpon(void);
+
+extern int s390_isolate_bp(void);
+extern int s390_isolate_bp_guest(void);
 
 /*
  * User space process size: 2GB for 31 bit, 4TB or 8PT for 64 bit.
@@ -86,7 +91,18 @@ struct thread_struct {
 	unsigned long ieee_instruction_pointer; 
         /* pfault_wait is used to block the process on a pfault event */
 	unsigned long pfault_wait;
+#ifndef __GENKSYMS__
+	/* cpu runtime instrumentation */
+	struct runtime_instr_cb *ri_cb;
+	int ri_signum;
+	unsigned long per_flags;	/* Flags to control debug behavior */
+#ifdef CONFIG_64BIT
+	unsigned char trap_tdb[256];	/* Transaction abort diagnose block */
+#endif
+#endif
 };
+
+#define PER_FLAG_NO_TE		1UL	/* Flag to disable transactions. */
 
 typedef struct thread_struct thread_struct;
 
@@ -130,7 +146,7 @@ struct stack_frame {
 	regs->psw.mask	= psw_user32_bits;			\
 	regs->psw.addr	= new_psw | PSW_ADDR_AMODE;		\
 	regs->gprs[15]	= new_stackp;				\
-	crst_table_downgrade(current->mm, 1UL << 31);		\
+	crst_table_downgrade(current->mm);			\
 } while (0)
 
 /* Forward declaration, a strange C thing */
@@ -149,11 +165,6 @@ extern int kernel_thread(int (*fn)(void *), void * arg, unsigned long flags);
  * Return saved PC of a blocked thread.
  */
 extern unsigned long thread_saved_pc(struct task_struct *t);
-
-/*
- * Print register of task into buffer. Used in fs/proc/array.c.
- */
-extern void task_show_regs(struct seq_file *m, struct task_struct *task);
 
 extern void show_code(struct pt_regs *regs);
 

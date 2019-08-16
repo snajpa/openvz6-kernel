@@ -32,12 +32,14 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define CH7xxx_REG_DID		0x4b
 
 #define CH7011_VID		0x83 /* 7010 as well */
+#define CH7010B_VID		0x05
 #define CH7009A_VID		0x84
 #define CH7009B_VID		0x85
 #define CH7301_VID		0x95
 
 #define CH7xxx_VID		0x84
 #define CH7xxx_DID		0x17
+#define CH7010_DID		0x16
 
 #define CH7xxx_NUM_REGS		0x4c
 
@@ -87,25 +89,23 @@ static struct ch7xxx_id_struct {
 	char *name;
 } ch7xxx_ids[] = {
 	{ CH7011_VID, "CH7011" },
+	{ CH7010B_VID, "CH7010B" },
 	{ CH7009A_VID, "CH7009A" },
 	{ CH7009B_VID, "CH7009B" },
 	{ CH7301_VID, "CH7301" },
 };
 
-struct ch7xxx_reg_state {
-    uint8_t regs[CH7xxx_NUM_REGS];
+static struct ch7xxx_did_struct {
+	uint8_t did;
+	char *name;
+} ch7xxx_dids[] = {
+	{ CH7xxx_DID, "CH7XXX" },
+	{ CH7010_DID, "CH7010B" },
 };
 
 struct ch7xxx_priv {
 	bool quiet;
-
-	struct ch7xxx_reg_state save_reg;
-	struct ch7xxx_reg_state mode_reg;
-	uint8_t save_TCTL, save_TPCP, save_TPD, save_TPVT;
-	uint8_t save_TLPF, save_TCT, save_PM, save_IDF;
 };
-
-static void ch7xxx_save(struct intel_dvo_device *dvo);
 
 static char *ch7xxx_get_id(uint8_t vid)
 {
@@ -119,12 +119,23 @@ static char *ch7xxx_get_id(uint8_t vid)
 	return NULL;
 }
 
+static char *ch7xxx_get_did(uint8_t did)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(ch7xxx_dids); i++) {
+		if (ch7xxx_dids[i].did == did)
+			return ch7xxx_dids[i].name;
+	}
+
+	return NULL;
+}
+
 /** Reads an 8 bit register */
 static bool ch7xxx_readb(struct intel_dvo_device *dvo, int addr, uint8_t *ch)
 {
-	struct ch7xxx_priv *ch7xxx= dvo->dev_priv;
+	struct ch7xxx_priv *ch7xxx = dvo->dev_priv;
 	struct i2c_adapter *adapter = dvo->i2c_bus;
-	struct intel_i2c_chan *i2cbus = container_of(adapter, struct intel_i2c_chan, adapter);
 	u8 out_buf[2];
 	u8 in_buf[2];
 
@@ -146,14 +157,14 @@ static bool ch7xxx_readb(struct intel_dvo_device *dvo, int addr, uint8_t *ch)
 	out_buf[0] = addr;
 	out_buf[1] = 0;
 
-	if (i2c_transfer(&i2cbus->adapter, msgs, 2) == 2) {
+	if (i2c_transfer(adapter, msgs, 2) == 2) {
 		*ch = in_buf[0];
 		return true;
-	};
+	}
 
 	if (!ch7xxx->quiet) {
-		DRM_DEBUG("Unable to read register 0x%02x from %s:%02x.\n",
-			  addr, i2cbus->adapter.name, dvo->slave_addr);
+		DRM_DEBUG_KMS("Unable to read register 0x%02x from %s:%02x.\n",
+			  addr, adapter->name, dvo->slave_addr);
 	}
 	return false;
 }
@@ -163,7 +174,6 @@ static bool ch7xxx_writeb(struct intel_dvo_device *dvo, int addr, uint8_t ch)
 {
 	struct ch7xxx_priv *ch7xxx = dvo->dev_priv;
 	struct i2c_adapter *adapter = dvo->i2c_bus;
-	struct intel_i2c_chan *i2cbus = container_of(adapter, struct intel_i2c_chan, adapter);
 	uint8_t out_buf[2];
 	struct i2c_msg msg = {
 		.addr = dvo->slave_addr,
@@ -175,12 +185,12 @@ static bool ch7xxx_writeb(struct intel_dvo_device *dvo, int addr, uint8_t ch)
 	out_buf[0] = addr;
 	out_buf[1] = ch;
 
-	if (i2c_transfer(&i2cbus->adapter, &msg, 1) == 1)
+	if (i2c_transfer(adapter, &msg, 1) == 1)
 		return true;
 
 	if (!ch7xxx->quiet) {
-		DRM_DEBUG("Unable to write register 0x%02x to %s:%d.\n",
-			  addr, i2cbus->adapter.name, dvo->slave_addr);
+		DRM_DEBUG_KMS("Unable to write register 0x%02x to %s:%d.\n",
+			  addr, adapter->name, dvo->slave_addr);
 	}
 
 	return false;
@@ -192,7 +202,7 @@ static bool ch7xxx_init(struct intel_dvo_device *dvo,
 	/* this will detect the CH7xxx chip on the specified i2c bus */
 	struct ch7xxx_priv *ch7xxx;
 	uint8_t vendor, device;
-	char *name;
+	char *name, *devid;
 
 	ch7xxx = kzalloc(sizeof(struct ch7xxx_priv), GFP_KERNEL);
 	if (ch7xxx == NULL)
@@ -207,7 +217,8 @@ static bool ch7xxx_init(struct intel_dvo_device *dvo,
 
 	name = ch7xxx_get_id(vendor);
 	if (!name) {
-		DRM_DEBUG("ch7xxx not detected; got 0x%02x from %s slave %d.\n",
+		DRM_DEBUG_KMS("ch7xxx not detected; got 0x%02x from %s "
+				"slave %d.\n",
 			  vendor, adapter->name, dvo->slave_addr);
 		goto out;
 	}
@@ -216,14 +227,16 @@ static bool ch7xxx_init(struct intel_dvo_device *dvo,
 	if (!ch7xxx_readb(dvo, CH7xxx_REG_DID, &device))
 		goto out;
 
-	if (device != CH7xxx_DID) {
-		DRM_DEBUG("ch7xxx not detected; got 0x%02x from %s slave %d.\n",
+	devid = ch7xxx_get_did(device);
+	if (!devid) {
+		DRM_DEBUG_KMS("ch7xxx not detected; got 0x%02x from %s "
+				"slave %d.\n",
 			  vendor, adapter->name, dvo->slave_addr);
 		goto out;
 	}
 
 	ch7xxx->quiet = false;
-	DRM_DEBUG("Detected %s chipset, vendor/device ID 0x%02x/0x%02x\n",
+	DRM_DEBUG_KMS("Detected %s chipset, vendor/device ID 0x%02x/0x%02x\n",
 		  name, vendor, device);
 	return true;
 out:
@@ -262,8 +275,8 @@ static enum drm_mode_status ch7xxx_mode_valid(struct intel_dvo_device *dvo,
 }
 
 static void ch7xxx_mode_set(struct intel_dvo_device *dvo,
-			    struct drm_display_mode *mode,
-			    struct drm_display_mode *adjusted_mode)
+			    const struct drm_display_mode *mode,
+			    const struct drm_display_mode *adjusted_mode)
 {
 	uint8_t tvco, tpcp, tpd, tlpf, idf;
 
@@ -294,56 +307,43 @@ static void ch7xxx_mode_set(struct intel_dvo_device *dvo,
 		idf |= CH7xxx_IDF_HSP;
 
 	if (mode->flags & DRM_MODE_FLAG_PVSYNC)
-		idf |= CH7xxx_IDF_HSP;
+		idf |= CH7xxx_IDF_VSP;
 
 	ch7xxx_writeb(dvo, CH7xxx_IDF, idf);
 }
 
 /* set the CH7xxx power state */
-static void ch7xxx_dpms(struct intel_dvo_device *dvo, int mode)
+static void ch7xxx_dpms(struct intel_dvo_device *dvo, bool enable)
 {
-	if (mode == DRM_MODE_DPMS_ON)
+	if (enable)
 		ch7xxx_writeb(dvo, CH7xxx_PM, CH7xxx_PM_DVIL | CH7xxx_PM_DVIP);
 	else
 		ch7xxx_writeb(dvo, CH7xxx_PM, CH7xxx_PM_FPD);
 }
 
+static bool ch7xxx_get_hw_state(struct intel_dvo_device *dvo)
+{
+	u8 val;
+
+	ch7xxx_readb(dvo, CH7xxx_PM, &val);
+
+	if (val & (CH7xxx_PM_DVIL | CH7xxx_PM_DVIP))
+		return true;
+	else
+		return false;
+}
+
 static void ch7xxx_dump_regs(struct intel_dvo_device *dvo)
 {
-	struct ch7xxx_priv *ch7xxx = dvo->dev_priv;
 	int i;
 
 	for (i = 0; i < CH7xxx_NUM_REGS; i++) {
-		if ((i % 8) == 0 )
-			DRM_DEBUG("\n %02X: ", i);
-		DRM_DEBUG("%02X ", ch7xxx->mode_reg.regs[i]);
+		uint8_t val;
+		if ((i % 8) == 0)
+			DRM_DEBUG_KMS("\n %02X: ", i);
+		ch7xxx_readb(dvo, i, &val);
+		DRM_DEBUG_KMS("%02X ", val);
 	}
-}
-
-static void ch7xxx_save(struct intel_dvo_device *dvo)
-{
-	struct ch7xxx_priv *ch7xxx= dvo->dev_priv;
-
-	ch7xxx_readb(dvo, CH7xxx_TCTL, &ch7xxx->save_TCTL);
-	ch7xxx_readb(dvo, CH7xxx_TPCP, &ch7xxx->save_TPCP);
-	ch7xxx_readb(dvo, CH7xxx_TPD, &ch7xxx->save_TPD);
-	ch7xxx_readb(dvo, CH7xxx_TPVT, &ch7xxx->save_TPVT);
-	ch7xxx_readb(dvo, CH7xxx_TLPF, &ch7xxx->save_TLPF);
-	ch7xxx_readb(dvo, CH7xxx_PM, &ch7xxx->save_PM);
-	ch7xxx_readb(dvo, CH7xxx_IDF, &ch7xxx->save_IDF);
-}
-
-static void ch7xxx_restore(struct intel_dvo_device *dvo)
-{
-	struct ch7xxx_priv *ch7xxx = dvo->dev_priv;
-
-	ch7xxx_writeb(dvo, CH7xxx_TCTL, ch7xxx->save_TCTL);
-	ch7xxx_writeb(dvo, CH7xxx_TPCP, ch7xxx->save_TPCP);
-	ch7xxx_writeb(dvo, CH7xxx_TPD, ch7xxx->save_TPD);
-	ch7xxx_writeb(dvo, CH7xxx_TPVT, ch7xxx->save_TPVT);
-	ch7xxx_writeb(dvo, CH7xxx_TLPF, ch7xxx->save_TLPF);
-	ch7xxx_writeb(dvo, CH7xxx_IDF, ch7xxx->save_IDF);
-	ch7xxx_writeb(dvo, CH7xxx_PM, ch7xxx->save_PM);
 }
 
 static void ch7xxx_destroy(struct intel_dvo_device *dvo)
@@ -362,8 +362,7 @@ struct intel_dvo_dev_ops ch7xxx_ops = {
 	.mode_valid = ch7xxx_mode_valid,
 	.mode_set = ch7xxx_mode_set,
 	.dpms = ch7xxx_dpms,
+	.get_hw_state = ch7xxx_get_hw_state,
 	.dump_regs = ch7xxx_dump_regs,
-	.save = ch7xxx_save,
-	.restore = ch7xxx_restore,
 	.destroy = ch7xxx_destroy,
 };

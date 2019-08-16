@@ -237,7 +237,8 @@ int snd_timer_open(struct snd_timer_instance **ti,
 		/* open a slave instance */
 		if (tid->dev_sclass <= SNDRV_TIMER_SCLASS_NONE ||
 		    tid->dev_sclass > SNDRV_TIMER_SCLASS_OSS_SEQUENCER) {
-			snd_printd("invalid slave class %i\n", tid->dev_sclass);
+			pr_debug("ALSA: timer: invalid slave class %i\n",
+				 tid->dev_sclass);
 			return -EINVAL;
 		}
 		mutex_lock(&register_mutex);
@@ -326,6 +327,8 @@ int snd_timer_close(struct snd_timer_instance *timeri)
 		mutex_unlock(&register_mutex);
 	} else {
 		timer = timeri->timer;
+		if (snd_BUG_ON(!timer))
+			goto out;
 		/* wait, until the active callback is finished */
 		spin_lock_irq(&timer->lock);
 		while (timeri->flags & SNDRV_TIMER_IFLG_CALLBACK) {
@@ -351,6 +354,7 @@ int snd_timer_close(struct snd_timer_instance *timeri)
 		}
 		mutex_unlock(&register_mutex);
 	}
+ out:
 	if (timeri->private_free)
 		timeri->private_free(timeri);
 	kfree(timeri->owner);
@@ -383,7 +387,7 @@ static void snd_timer_notify1(struct snd_timer_instance *ti, int event)
 	struct timespec tstamp;
 
 	if (timer_tstamp_monotonic)
-		do_posix_clock_monotonic_gettime(&tstamp);
+		ktime_get_ts(&tstamp);
 	else
 		getnstimeofday(&tstamp);
 	if (snd_BUG_ON(event < SNDRV_TIMER_EVENT_START ||
@@ -530,6 +534,8 @@ int snd_timer_stop(struct snd_timer_instance *timeri)
 	if (err < 0)
 		return err;
 	timer = timeri->timer;
+	if (!timer)
+		return -EINVAL;
 	spin_lock_irqsave(&timer->lock, flags);
 	timeri->cticks = timeri->ticks;
 	timeri->pticks = 0;
@@ -767,7 +773,7 @@ int snd_timer_new(struct snd_card *card, char *id, struct snd_timer_id *tid,
 		*rtimer = NULL;
 	timer = kzalloc(sizeof(*timer), GFP_KERNEL);
 	if (timer == NULL) {
-		snd_printk(KERN_ERR "timer: cannot allocate\n");
+		pr_err("ALSA: timer: cannot allocate\n");
 		return -ENOMEM;
 	}
 	timer->tmr_class = tid->dev_class;
@@ -806,7 +812,7 @@ static int snd_timer_free(struct snd_timer *timer)
 	if (! list_empty(&timer->open_list_head)) {
 		struct list_head *p, *n;
 		struct snd_timer_instance *ti;
-		snd_printk(KERN_WARNING "timer %p is busy?\n", timer);
+		pr_warn("ALSA: timer %p is busy?\n", timer);
 		list_for_each_safe(p, n, &timer->open_list_head) {
 			list_del_init(p);
 			ti = list_entry(p, struct snd_timer_instance, open_list);
@@ -1160,6 +1166,7 @@ static void snd_timer_user_ccallback(struct snd_timer_instance *timeri,
 {
 	struct snd_timer_user *tu = timeri->callback_data;
 	struct snd_timer_tread r1;
+	unsigned long flags;
 
 	if (event >= SNDRV_TIMER_EVENT_START &&
 	    event <= SNDRV_TIMER_EVENT_PAUSE)
@@ -1169,9 +1176,9 @@ static void snd_timer_user_ccallback(struct snd_timer_instance *timeri,
 	r1.event = event;
 	r1.tstamp = *tstamp;
 	r1.val = resolution;
-	spin_lock(&tu->qlock);
+	spin_lock_irqsave(&tu->qlock, flags);
 	snd_timer_user_append_to_tqueue(tu, &r1);
-	spin_unlock(&tu->qlock);
+	spin_unlock_irqrestore(&tu->qlock, flags);
 	kill_fasync(&tu->fasync, SIGIO, POLL_IN);
 	wake_up(&tu->qchange_sleep);
 }
@@ -1194,7 +1201,7 @@ static void snd_timer_user_tinterrupt(struct snd_timer_instance *timeri,
 	}
 	if (tu->last_resolution != resolution || ticks > 0) {
 		if (timer_tstamp_monotonic)
-			do_posix_clock_monotonic_gettime(&tstamp);
+			ktime_get_ts(&tstamp);
 		else
 			getnstimeofday(&tstamp);
 	}
@@ -1237,6 +1244,11 @@ static void snd_timer_user_tinterrupt(struct snd_timer_instance *timeri,
 static int snd_timer_user_open(struct inode *inode, struct file *file)
 {
 	struct snd_timer_user *tu;
+	int err;
+
+	err = nonseekable_open(inode, file);
+	if (err < 0)
+		return err;
 
 	tu = kzalloc(sizeof(*tu), GFP_KERNEL);
 	if (tu == NULL)
@@ -1921,6 +1933,7 @@ static const struct file_operations snd_timer_f_ops =
 	.read =		snd_timer_user_read,
 	.open =		snd_timer_user_open,
 	.release =	snd_timer_user_release,
+	.llseek =	no_llseek,
 	.poll =		snd_timer_user_poll,
 	.unlocked_ioctl =	snd_timer_user_ioctl,
 	.compat_ioctl =	snd_timer_user_ioctl_compat,
@@ -1941,12 +1954,10 @@ static int __init alsa_timer_init(void)
 #endif
 
 	if ((err = snd_timer_register_system()) < 0)
-		snd_printk(KERN_ERR "unable to register system timer (%i)\n",
-			   err);
+		pr_err("ALSA: unable to register system timer (%i)\n", err);
 	if ((err = snd_register_device(SNDRV_DEVICE_TYPE_TIMER, NULL, 0,
 				       &snd_timer_f_ops, NULL, "timer")) < 0)
-		snd_printk(KERN_ERR "unable to register timer device (%i)\n",
-			   err);
+		pr_err("ALSA: unable to register timer device (%i)\n", err);
 	snd_timer_proc_init();
 	return 0;
 }

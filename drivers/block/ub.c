@@ -647,7 +647,7 @@ static int ub_request_fn_1(struct ub_lun *lun, struct request *rq)
 		return 0;
 	}
 
-	if (lun->changed && !blk_pc_request(rq)) {
+	if (lun->changed && rq->cmd_type != REQ_TYPE_BLOCK_PC)
 		blk_start_request(rq);
 		ub_end_rq(rq, SAM_STAT_CHECK_CONDITION);
 		return 0;
@@ -683,7 +683,7 @@ static int ub_request_fn_1(struct ub_lun *lun, struct request *rq)
 	}
 	urq->nsg = n_elem;
 
-	if (blk_pc_request(rq)) {
+	if (rq->cmd_type == REQ_TYPE_BLOCK_PC) {
 		ub_cmd_build_packet(sc, lun, cmd, urq);
 	} else {
 		ub_cmd_build_block(sc, lun, cmd, urq);
@@ -780,7 +780,7 @@ static void ub_rw_cmd_done(struct ub_dev *sc, struct ub_scsi_cmd *cmd)
 	rq = urq->rq;
 
 	if (cmd->error == 0) {
-		if (blk_pc_request(rq)) {
+		if (rq->cmd_type == REQ_TYPE_BLOCK_PC) {
 			if (cmd->act_len >= rq->resid_len)
 				rq->resid_len = 0;
 			else
@@ -794,7 +794,7 @@ static void ub_rw_cmd_done(struct ub_dev *sc, struct ub_scsi_cmd *cmd)
 			}
 		}
 	} else {
-		if (blk_pc_request(rq)) {
+		if (rq->cmd_type == REQ_TYPE_BLOCK_PC) {
 			/* UB_SENSE_SIZE is smaller than SCSI_SENSE_BUFFERSIZE */
 			memcpy(rq->sense, sc->top_sense, UB_SENSE_SIZE);
 			rq->sense_len = UB_SENSE_SIZE;
@@ -1721,18 +1721,6 @@ static int ub_bd_release(struct gendisk *disk, fmode_t mode)
 }
 
 /*
- * The ioctl interface.
- */
-static int ub_bd_ioctl(struct block_device *bdev, fmode_t mode,
-    unsigned int cmd, unsigned long arg)
-{
-	struct gendisk *disk = bdev->bd_disk;
-	void __user *usermem = (void __user *) arg;
-
-	return scsi_cmd_ioctl(disk->queue, disk, mode, cmd, usermem);
-}
-
-/*
  * This is called by check_disk_change if we reported a media change.
  * The main onjective here is to discover the features of the media such as
  * the capacity, read-only status, etc. USB storage generally does not
@@ -1793,7 +1781,7 @@ static const struct block_device_operations ub_bd_fops = {
 	.owner		= THIS_MODULE,
 	.open		= ub_bd_open,
 	.release	= ub_bd_release,
-	.locked_ioctl	= ub_bd_ioctl,
+	.locked_ioctl	= scsi_cmd_blk_ioctl,
 	.media_changed	= ub_bd_media_changed,
 	.revalidate_disk = ub_bd_revalidate,
 };
@@ -2320,10 +2308,9 @@ static int ub_probe_lun(struct ub_dev *sc, int lnum)
 	disk->queue = q;
 
 	blk_queue_bounce_limit(q, BLK_BOUNCE_HIGH);
-	blk_queue_max_hw_segments(q, UB_MAX_REQ_SG);
-	blk_queue_max_phys_segments(q, UB_MAX_REQ_SG);
+	blk_queue_max_segments(q, UB_MAX_REQ_SG);
 	blk_queue_segment_boundary(q, 0xffffffff);	/* Dubious. */
-	blk_queue_max_sectors(q, UB_MAX_SECTORS);
+	blk_queue_max_hw_sectors(q, UB_MAX_SECTORS);
 	blk_queue_logical_block_size(q, lun->capacity.bsize);
 
 	lun->disk = disk;

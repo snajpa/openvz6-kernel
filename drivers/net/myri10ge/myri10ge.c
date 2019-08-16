@@ -368,7 +368,8 @@ static inline void put_be32(__be32 val, __be32 __iomem * p)
 	__raw_writel((__force __u32) val, (__force void __iomem *)p);
 }
 
-static struct net_device_stats *myri10ge_get_stats(struct net_device *dev);
+static struct rtnl_link_stats64 *myri10ge_get_stats(struct net_device *dev,
+						    struct rtnl_link_stats64 *stats);
 
 static int
 myri10ge_send_cmd(struct myri10ge_priv *mgp, u32 cmd,
@@ -977,7 +978,7 @@ static int myri10ge_reset(struct myri10ge_priv *mgp)
 		 * RX queues, so if we get an error, first retry using a
 		 * single TX queue before giving up */
 		if (status != 0 && mgp->dev->real_num_tx_queues > 1) {
-			mgp->dev->real_num_tx_queues = 1;
+			netif_set_real_num_tx_queues(mgp->dev, 1);
 			cmd.data0 = mgp->num_slices;
 			cmd.data1 = MXGEFW_SLICE_INTR_MODE_ONE_PER_SLICE;
 			status = myri10ge_send_cmd(mgp,
@@ -1826,13 +1827,14 @@ myri10ge_get_ethtool_stats(struct net_device *netdev,
 {
 	struct myri10ge_priv *mgp = netdev_priv(netdev);
 	struct myri10ge_slice_state *ss;
+	struct rtnl_link_stats64 link_stats;
 	int slice;
 	int i;
 
 	/* force stats update */
-	(void)myri10ge_get_stats(netdev);
+	(void)myri10ge_get_stats(netdev, &link_stats);
 	for (i = 0; i < MYRI10GE_NET_STATS_LEN; i++)
-		data[i] = ((unsigned long *)&mgp->stats)[i];
+		data[i] = ((u64 *)&link_stats)[i];
 
 	data[i++] = (unsigned int)mgp->tx_boundary;
 	data[i++] = (unsigned int)mgp->wc_enabled;
@@ -2998,11 +3000,11 @@ drop:
 	return NETDEV_TX_OK;
 }
 
-static struct net_device_stats *myri10ge_get_stats(struct net_device *dev)
+static struct rtnl_link_stats64 *myri10ge_get_stats(struct net_device *dev,
+						    struct rtnl_link_stats64 *stats)
 {
 	struct myri10ge_priv *mgp = netdev_priv(dev);
 	struct myri10ge_slice_netstats *slice_stats;
-	struct net_device_stats *stats = &mgp->stats;
 	int i;
 
 	spin_lock(&mgp->stats_lock);
@@ -3147,20 +3149,15 @@ static void myri10ge_enable_ecrc(struct myri10ge_priv *mgp)
 {
 	struct pci_dev *bridge = mgp->pdev->bus->self;
 	struct device *dev = &mgp->pdev->dev;
-	unsigned cap;
+	int cap;
 	unsigned err_cap;
-	u16 val;
-	u8 ext_type;
 	int ret;
 
 	if (!myri10ge_ecrc_enable || !bridge)
 		return;
 
 	/* check that the bridge is a root port */
-	cap = pci_find_capability(bridge, PCI_CAP_ID_EXP);
-	pci_read_config_word(bridge, cap + PCI_CAP_FLAGS, &val);
-	ext_type = (val & PCI_EXP_FLAGS_TYPE) >> 4;
-	if (ext_type != PCI_EXP_TYPE_ROOT_PORT) {
+	if (pci_pcie_type(bridge) != PCI_EXP_TYPE_ROOT_PORT) {
 		if (myri10ge_ecrc_enable > 1) {
 			struct pci_dev *prev_bridge, *old_bridge = bridge;
 
@@ -3175,12 +3172,8 @@ static void myri10ge_enable_ecrc(struct myri10ge_priv *mgp)
 						" to force ECRC\n");
 					return;
 				}
-				cap =
-				    pci_find_capability(bridge, PCI_CAP_ID_EXP);
-				pci_read_config_word(bridge,
-						     cap + PCI_CAP_FLAGS, &val);
-				ext_type = (val & PCI_EXP_FLAGS_TYPE) >> 4;
-			} while (ext_type != PCI_EXP_TYPE_ROOT_PORT);
+			} while (pci_pcie_type(bridge) !=
+				 PCI_EXP_TYPE_ROOT_PORT);
 
 			dev_info(dev,
 				 "Forcing ECRC on non-root port %s"
@@ -3294,11 +3287,10 @@ static void myri10ge_select_firmware(struct myri10ge_priv *mgp)
 	int overridden = 0;
 
 	if (myri10ge_force_firmware == 0) {
-		int link_width, exp_cap;
+		int link_width;
 		u16 lnk;
 
-		exp_cap = pci_find_capability(mgp->pdev, PCI_CAP_ID_EXP);
-		pci_read_config_word(mgp->pdev, exp_cap + PCI_EXP_LNKSTA, &lnk);
+		pcie_capability_read_word(mgp->pdev, PCI_EXP_LNKSTA, &lnk);
 		link_width = (lnk >> 4) & 0x3f;
 
 		/* Check to see if Link is less than 8 or if the
@@ -3808,11 +3800,15 @@ static const struct net_device_ops myri10ge_netdev_ops = {
 	.ndo_open		= myri10ge_open,
 	.ndo_stop		= myri10ge_close,
 	.ndo_start_xmit		= myri10ge_xmit,
-	.ndo_get_stats		= myri10ge_get_stats,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_change_mtu		= myri10ge_change_mtu,
 	.ndo_set_multicast_list = myri10ge_set_multicast_list,
 	.ndo_set_mac_address	= myri10ge_set_mac_address,
+};
+
+static const struct net_device_ops_ext myri10ge_netdev_ops_ext = {
+	.size			= sizeof(struct net_device_ops_ext),
+	.ndo_get_stats64	= myri10ge_get_stats,
 };
 
 static int myri10ge_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
@@ -3950,6 +3946,7 @@ static int myri10ge_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		myri10ge_initial_mtu = 68;
 
 	netdev->netdev_ops = &myri10ge_netdev_ops;
+	set_netdev_ops_ext(netdev, &myri10ge_netdev_ops_ext);
 	netdev->mtu = myri10ge_initial_mtu;
 	netdev->base_addr = mgp->iomem_base;
 	netdev->features = mgp->features;

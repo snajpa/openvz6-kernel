@@ -18,7 +18,7 @@
 #include <asm/dma.h>
 #include <asm/numa.h>
 #include <asm/acpi.h>
-#include <asm/k8.h>
+#include <asm/amd_nb.h>
 
 struct pglist_data *node_data[MAX_NUMNODES] __read_mostly;
 EXPORT_SYMBOL(node_data);
@@ -187,6 +187,7 @@ setup_node_bootmem(int nodeid, unsigned long start, unsigned long end)
 	unsigned long bootmap_start, nodedata_phys;
 	void *bootmap;
 	int nid;
+	unsigned long cache_alias_offset;
 
 	if (!end)
 		return;
@@ -198,17 +199,22 @@ setup_node_bootmem(int nodeid, unsigned long start, unsigned long end)
 	if (end && (end - start) < NODE_MIN_SIZE)
 		return;
 
-	start = roundup(start, ZONE_ALIGN);
-
 	printk(KERN_INFO "Bootmem setup node %d %016lx-%016lx\n", nodeid,
 	       start, end);
 
 	start_pfn = start >> PAGE_SHIFT;
 	last_pfn = end >> PAGE_SHIFT;
 
-	node_data[nodeid] = early_node_mem(nodeid, start, end, pgdat_size,
+	/*
+	 * Allocate an extra cacheline per node to reduce cacheline
+	 * aliasing when scanning all node's node_data.
+	 */
+	cache_alias_offset = nodeid * SMP_CACHE_BYTES;
+	node_data[nodeid] = cache_alias_offset +
+			    early_node_mem(nodeid, start, end,
+					   pgdat_size + cache_alias_offset,
 					   SMP_CACHE_BYTES);
-	if (node_data[nodeid] == NULL)
+	if (node_data[nodeid] == (void *)cache_alias_offset)
 		return;
 	nodedata_phys = __pa(node_data[nodeid]);
 	printk(KERN_INFO "  NODE_DATA [%016lx - %016lx]\n", nodedata_phys,
@@ -216,8 +222,6 @@ setup_node_bootmem(int nodeid, unsigned long start, unsigned long end)
 
 	memset(NODE_DATA(nodeid), 0, sizeof(pg_data_t));
 	NODE_DATA(nodeid)->bdata = &bootmem_node_data[nodeid];
-	NODE_DATA(nodeid)->node_start_pfn = start_pfn;
-	NODE_DATA(nodeid)->node_spanned_pages = last_pfn - start_pfn;
 
 	/*
 	 * Find a place for the bootmem map
@@ -546,8 +550,8 @@ void __init initmem_init(unsigned long start_pfn, unsigned long last_pfn)
 	nodes_clear(node_online_map);
 #endif
 
-#ifdef CONFIG_K8_NUMA
-	if (!numa_off && !k8_scan_nodes(start_pfn<<PAGE_SHIFT,
+#ifdef CONFIG_AMD_NUMA
+	if (!numa_off && !amd_scan_nodes(start_pfn<<PAGE_SHIFT,
 					last_pfn<<PAGE_SHIFT))
 		return;
 	nodes_clear(node_possible_map);

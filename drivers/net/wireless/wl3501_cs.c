@@ -45,6 +45,7 @@
 #include <linux/string.h>
 #include <linux/wireless.h>
 #include <linux/ieee80211.h>
+#include <net/cfg80211.h>
 
 #include <net/iw_handler.h>
 
@@ -381,7 +382,7 @@ static void wl3501_free_tx_buffer(struct wl3501_card *this, u16 ptr)
 
 static int wl3501_esbq_req_test(struct wl3501_card *this)
 {
-	u8 tmp;
+	u8 tmp = 0;
 
 	wl3501_get_from_wla(this, this->esbq_req_head + 3, &tmp, sizeof(tmp));
 	return tmp & 0x80;
@@ -1499,7 +1500,8 @@ static int wl3501_get_freq(struct net_device *dev, struct iw_request_info *info,
 {
 	struct wl3501_card *this = netdev_priv(dev);
 
-	wrqu->freq.m = ieee80211_dsss_chan_to_freq(this->chan) * 100000;
+	wrqu->freq.m = 100000 *
+		ieee80211_channel_to_frequency(this->chan, IEEE80211_BAND_2GHZ);
 	wrqu->freq.e = 1;
 	return 0;
 }

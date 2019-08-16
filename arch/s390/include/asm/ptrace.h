@@ -201,6 +201,9 @@ typedef union
 typedef struct
 {
 	__u32   fpc;
+#ifndef __GENKSYMS__
+	__u32	pad;
+#endif
 	freg_t  fprs[NUM_FPRS];              
 } s390_fp_regs;
 
@@ -208,7 +211,6 @@ typedef struct
 #define FPC_FLAGS_MASK          0x00F80000
 #define FPC_DXC_MASK            0x0000FF00
 #define FPC_RM_MASK             0x00000003
-#define FPC_VALID_MASK          0xF8F8FF03
 
 /* this typedef defines how a Program Status Word looks like */
 typedef struct 
@@ -236,6 +238,7 @@ typedef struct
 #define PSW_MASK_ASC		0x0000C000UL
 #define PSW_MASK_CC		0x00003000UL
 #define PSW_MASK_PM		0x00000F00UL
+#define PSW_MASK_RI		0x00000000UL
 
 #define PSW_ADDR_AMODE		0x80000000UL
 #define PSW_ADDR_INSN		0x7FFFFFFFUL
@@ -261,6 +264,7 @@ typedef struct
 #define PSW_MASK_ASC		0x0000C00000000000UL
 #define PSW_MASK_CC		0x0000300000000000UL
 #define PSW_MASK_PM		0x00000F0000000000UL
+#define PSW_MASK_RI		0x0000008000000000UL
 
 #define PSW_ADDR_AMODE		0x0000000000000000UL
 #define PSW_ADDR_INSN		0xFFFFFFFFFFFFFFFFUL
@@ -290,7 +294,7 @@ extern long psw_user32_bits;
    is the condition code and the program mask bits.  */
 #define PSW_MASK_MERGE(CURRENT,NEW) \
 	(((CURRENT) & ~(PSW_MASK_CC|PSW_MASK_PM)) | \
-	 ((NEW) & (PSW_MASK_CC|PSW_MASK_PM)))
+	 ((NEW) & (PSW_MASK_CC|PSW_MASK_PM|PSW_MASK_RI)))
 
 /*
  * The s390_regs structure is used to define the elf_gregset_t.
@@ -341,7 +345,7 @@ typedef struct
 	unsigned long cr[NUM_CR_WORDS];
 } per_cr_words;
 
-#define PER_EM_MASK 0xE8000000UL
+#define PER_EM_MASK 0xEB000000UL
 
 typedef	struct
 {
@@ -357,9 +361,17 @@ typedef	struct
 	unsigned em_storage_alteration : 1;
 	unsigned em_gpr_alt_unused     : 1;
 	unsigned em_store_real_address : 1;
+#ifdef __GENKSYMS__
 	unsigned                       : 3;
 	unsigned branch_addr_ctl       : 1;
 	unsigned                       : 1;
+#else
+	unsigned                       : 1;
+	unsigned em_transaction_end    : 1;
+	unsigned em_nullification      : 1;
+	unsigned branch_addr_ctl       : 1;
+	unsigned suspension_ctl        : 1;
+#endif
 	unsigned storage_alt_space_ctl : 1;
 	unsigned                       : 21;
 	unsigned long starting_addr;
@@ -436,6 +448,9 @@ typedef struct
 #define PTRACE_PEEKDATA_AREA	      0x5003
 #define PTRACE_POKETEXT_AREA	      0x5004
 #define PTRACE_POKEDATA_AREA 	      0x5005
+#define PTRACE_GET_LAST_BREAK	      0x5006
+#define PTRACE_ENABLE_TE	      0x5009
+#define PTRACE_DISABLE_TE	      0x5010
 
 /*
  * PT_PROT definition is loosely based on hppa bsd definition in
@@ -496,8 +511,13 @@ extern void user_disable_single_step(struct task_struct *);
 #define user_mode(regs) (((regs)->psw.mask & PSW_MASK_PSTATE) != 0)
 #define instruction_pointer(regs) ((regs)->psw.addr & PSW_ADDR_INSN)
 #define user_stack_pointer(regs)((regs)->gprs[15])
-#define regs_return_value(regs)((regs)->gprs[2])
 #define profile_pc(regs) instruction_pointer(regs)
+
+static inline long regs_return_value(struct pt_regs *regs)
+{
+	return regs->gprs[2];
+}
+
 extern void show_regs(struct pt_regs * regs);
 #endif /* __KERNEL__ */
 #endif /* __ASSEMBLY__ */

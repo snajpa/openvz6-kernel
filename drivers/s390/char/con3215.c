@@ -87,6 +87,7 @@ struct raw3215_info {
 	struct tty_struct *tty;	      /* pointer to tty structure if present */
 	struct raw3215_req *queued_read; /* pointer to queued read requests */
 	struct raw3215_req *queued_write;/* pointer to queued write requests */
+	struct tasklet_struct tlet;   /* tasklet to invoke tty_wakeup */
 	wait_queue_head_t empty_wait; /* wait queue for flushing */
 	struct timer_list timer;      /* timer for delayed output */
 	int line_pos;		      /* position on the line (for tabs) */
@@ -289,12 +290,16 @@ static void raw3215_timeout(unsigned long __data)
 	unsigned long flags;
 
 	spin_lock_irqsave(get_ccwdev_lock(raw->cdev), flags);
-	if (raw->flags & RAW3215_TIMER_RUNS) {
-		del_timer(&raw->timer);
-		raw->flags &= ~RAW3215_TIMER_RUNS;
-		if (!(raw->flags & RAW3215_FROZEN)) {
-			raw3215_mk_write_req(raw);
-			raw3215_start_io(raw);
+	raw->flags &= ~RAW3215_TIMER_RUNS;
+	if (!(raw->flags & RAW3215_FROZEN)) {
+		raw3215_mk_write_req(raw);
+		raw3215_start_io(raw);
+		if ((raw->queued_read || raw->queued_write) &&
+		    !(raw->flags & RAW3215_WORKING) &&
+		    !(raw->flags & RAW3215_TIMER_RUNS)) {
+			raw->timer.expires = RAW3215_TIMEOUT + jiffies;
+			add_timer(&raw->timer);
+			raw->flags |= RAW3215_TIMER_RUNS;
 		}
 	}
 	spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
@@ -317,20 +322,32 @@ static inline void raw3215_try_io(struct raw3215_info *raw)
 		    (raw->flags & RAW3215_FLUSHING)) {
 			/* execute write requests bigger than minimum size */
 			raw3215_start_io(raw);
-			if (raw->flags & RAW3215_TIMER_RUNS) {
-				del_timer(&raw->timer);
-				raw->flags &= ~RAW3215_TIMER_RUNS;
-			}
-		} else if (!(raw->flags & RAW3215_TIMER_RUNS)) {
-			/* delay small writes */
-			init_timer(&raw->timer);
-			raw->timer.expires = RAW3215_TIMEOUT + jiffies;
-			raw->timer.data = (unsigned long) raw;
-			raw->timer.function = raw3215_timeout;
-			add_timer(&raw->timer);
-			raw->flags |= RAW3215_TIMER_RUNS;
 		}
 	}
+	if ((raw->queued_read || raw->queued_write) &&
+	    !(raw->flags & RAW3215_WORKING) &&
+	    !(raw->flags & RAW3215_TIMER_RUNS)) {
+		init_timer(&raw->timer);
+		raw->timer.expires = RAW3215_TIMEOUT + jiffies;
+		raw->timer.data = (unsigned long) raw;
+		raw->timer.function = raw3215_timeout;
+		add_timer(&raw->timer);
+		raw->flags |= RAW3215_TIMER_RUNS;
+	}
+}
+
+/*
+ * Call tty_wakeup from tasklet context
+ */
+static void raw3215_wakeup(unsigned long data)
+{
+	struct raw3215_info *raw = (struct raw3215_info *) data;
+	struct tty_struct *tty;
+
+	tty = raw->tty;
+	barrier();
+	if (tty && !tty->closing)
+		tty_wakeup(tty);
 }
 
 /*
@@ -338,15 +355,10 @@ static inline void raw3215_try_io(struct raw3215_info *raw)
  */
 static void raw3215_next_io(struct raw3215_info *raw)
 {
-	struct tty_struct *tty;
-
 	raw3215_mk_write_req(raw);
 	raw3215_try_io(raw);
-	tty = raw->tty;
-	if (tty != NULL &&
-	    RAW3215_BUFFER_SIZE - raw->count >= RAW3215_MIN_SPACE) {
-	    	tty_wakeup(tty);
-	}
+	if (raw->tty && RAW3215_BUFFER_SIZE - raw->count >= RAW3215_MIN_SPACE)
+		tasklet_schedule(&raw->tlet);
 }
 
 /*
@@ -682,6 +694,7 @@ static int raw3215_probe (struct ccw_device *cdev)
 		return -ENOMEM;
 	}
 	init_waitqueue_head(&raw->empty_wait);
+	tasklet_init(&raw->tlet, raw3215_wakeup, (unsigned long) raw);
 
 	dev_set_drvdata(&cdev->dev, raw);
 	cdev->handler = raw3215_irq;
@@ -899,6 +912,7 @@ static int __init con3215_init(void)
 
 	raw->flags |= RAW3215_FIXED;
 	init_waitqueue_head(&raw->empty_wait);
+	tasklet_init(&raw->tlet, raw3215_wakeup, (unsigned long) raw);
 
 	/* Request the console irq */
 	if (raw3215_startup(raw) != 0) {
@@ -964,8 +978,9 @@ static void tty3215_close(struct tty_struct *tty, struct file * filp)
 	tty->closing = 1;
 	/* Shutdown the terminal */
 	raw3215_shutdown(raw);
-	tty->closing = 0;
+	tasklet_kill(&raw->tlet);
 	raw->tty = NULL;
+	tty->closing = 0;
 }
 
 /*

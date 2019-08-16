@@ -40,6 +40,11 @@ struct cpa_data {
 };
 
 /*
+ * Allowable kernel _PAGE_GLOBAL flag.
+ */
+pgprotval_t kernel_page_global __read_mostly;
+
+/*
  * Serialize cpa() (for !DEBUG_PAGEALLOC which uses large identity mappings)
  * using cpa_lock. So that we don't allow any other cpu, with stale large tlb
  * entries change the page attribute in parallel to some other cpu
@@ -56,12 +61,10 @@ static unsigned long direct_pages_count[PG_LEVEL_NUM];
 
 void update_page_count(int level, unsigned long pages)
 {
-	unsigned long flags;
-
 	/* Protect against CPA */
-	spin_lock_irqsave(&pgd_lock, flags);
+	spin_lock(&pgd_lock);
 	direct_pages_count[level] += pages;
-	spin_unlock_irqrestore(&pgd_lock, flags);
+	spin_unlock(&pgd_lock);
 }
 
 static void split_page_count(int level)
@@ -279,6 +282,44 @@ static inline pgprot_t static_protections(pgprot_t prot, unsigned long address,
 		   __pa((unsigned long)__end_rodata) >> PAGE_SHIFT))
 		pgprot_val(forbidden) |= _PAGE_RW;
 
+#if defined(CONFIG_X86_64) && defined(CONFIG_DEBUG_RODATA)
+	/*
+	 * Once the kernel maps the text as RO (kernel_set_to_readonly is set),
+	 * kernel text mappings for the large page aligned text, rodata sections
+	 * will be always read-only. For the kernel identity mappings covering
+	 * the holes caused by this alignment can be anything that user asks.
+
+	 *
+	 * This will preserve the large page mappings for kernel text/data
+	 * at no extra cost.
+	 */
+	if (kernel_set_to_readonly &&
+	    within(address, (unsigned long)_text,
+		   (unsigned long)__end_rodata_hpage_align)) {
+		unsigned int level;
+
+		/*
+		 * Don't enforce the !RW mapping for the kernel text mapping,
+		 * if the current mapping is already using small page mapping.
+		 * No need to work hard to preserve large page mappings in this
+		 * case.
+		 *
+		 * This also fixes the Linux Xen paravirt guest boot failure
+		 * (because of unexpected read-only mappings for kernel identity
+		 * mappings). In this paravirt guest case, the kernel text
+		 * mapping and the kernel identity mapping share the same
+		 * page-table pages. Thus we can't really use different
+		 * protections for the kernel text and identity mappings. Also,
+		 * these shared mappings are made of small page mappings.
+		 * Thus this don't enforce !RW mapping for small page kernel
+		 * text mapping logic will help Linux Xen parvirt guest boot
+		 * aswell.
+		 */
+		if (lookup_address(address, &level) && (level != PG_LEVEL_4K))
+			pgprot_val(forbidden) |= _PAGE_RW;
+	}
+#endif
+
 	prot = __pgprot(pgprot_val(prot) & ~pgprot_val(forbidden));
 
 	return prot;
@@ -354,7 +395,7 @@ static int
 try_preserve_large_page(pte_t *kpte, unsigned long address,
 			struct cpa_data *cpa)
 {
-	unsigned long nextpage_addr, numpages, pmask, psize, flags, addr, pfn;
+	unsigned long nextpage_addr, numpages, pmask, psize, addr, pfn;
 	pte_t new_pte, old_pte, *tmp;
 	pgprot_t old_prot, new_prot;
 	int i, do_split = 1;
@@ -363,7 +404,7 @@ try_preserve_large_page(pte_t *kpte, unsigned long address,
 	if (cpa->force_split)
 		return 1;
 
-	spin_lock_irqsave(&pgd_lock, flags);
+	spin_lock(&pgd_lock);
 	/*
 	 * Check for races, another CPU might have split this page
 	 * up already:
@@ -405,6 +446,19 @@ try_preserve_large_page(pte_t *kpte, unsigned long address,
 
 	pgprot_val(new_prot) &= ~pgprot_val(cpa->mask_clr);
 	pgprot_val(new_prot) |= pgprot_val(cpa->mask_set);
+
+	/*
+	 * Set the PSE and GLOBAL flags only if the PRESENT flag is
+	 * set otherwise pmd_present/pmd_huge will return true even on
+	 * a non present pmd. The canon_pgprot will clear _PAGE_GLOBAL
+	 * for the ancient hardware that doesn't support it.
+	 */
+	if (pgprot_val(new_prot) & _PAGE_PRESENT)
+		pgprot_val(new_prot) |= _PAGE_PSE | kernel_page_global;
+	else
+		pgprot_val(new_prot) &= ~(_PAGE_PSE | kernel_page_global);
+
+	new_prot = canon_pgprot(new_prot);
 
 	/*
 	 * old_pte points to the large page base address. So we need
@@ -451,21 +505,21 @@ try_preserve_large_page(pte_t *kpte, unsigned long address,
 		 * The address is aligned and the number of pages
 		 * covers the full page.
 		 */
-		new_pte = pfn_pte(pte_pfn(old_pte), canon_pgprot(new_prot));
+		new_pte = pfn_pte(pte_pfn(old_pte), new_prot);
 		__set_pmd_pte(kpte, address, new_pte);
 		cpa->flags |= CPA_FLUSHTLB;
 		do_split = 0;
 	}
 
 out_unlock:
-	spin_unlock_irqrestore(&pgd_lock, flags);
+	spin_unlock(&pgd_lock);
 
 	return do_split;
 }
 
 static int split_large_page(pte_t *kpte, unsigned long address)
 {
-	unsigned long flags, pfn, pfninc = 1;
+	unsigned long pfn, pfninc = 1;
 	unsigned int i, level;
 	pte_t *pbase, *tmp;
 	pgprot_t ref_prot;
@@ -479,7 +533,7 @@ static int split_large_page(pte_t *kpte, unsigned long address)
 	if (!base)
 		return -ENOMEM;
 
-	spin_lock_irqsave(&pgd_lock, flags);
+	spin_lock(&pgd_lock);
 	/*
 	 * Check for races, another CPU might have split this page
 	 * up for us already:
@@ -502,16 +556,35 @@ static int split_large_page(pte_t *kpte, unsigned long address)
 #ifdef CONFIG_X86_64
 	if (level == PG_LEVEL_1G) {
 		pfninc = PMD_PAGE_SIZE >> PAGE_SHIFT;
-		pgprot_val(ref_prot) |= _PAGE_PSE;
+		/*
+		 * Set the PSE flags only if the PRESENT flag is set
+		 * otherwise pmd_present/pmd_huge will return true
+		 * even on a non present pmd.
+		 */
+		if (pgprot_val(ref_prot) & _PAGE_PRESENT)
+			pgprot_val(ref_prot) |= _PAGE_PSE;
+		else
+			pgprot_val(ref_prot) &= ~_PAGE_PSE;
 	}
 #endif
+
+	/*
+	 * Set the GLOBAL flags only if the PRESENT flag is set
+	 * otherwise pmd/pte_present will return true even on a non
+	 * present pmd/pte. The canon_pgprot will clear _PAGE_GLOBAL
+	 * for the ancient hardware that doesn't support it.
+	 */
+	if (pgprot_val(ref_prot) & _PAGE_PRESENT)
+		pgprot_val(ref_prot) |= kernel_page_global;
+	else
+		pgprot_val(ref_prot) &= ~kernel_page_global;
 
 	/*
 	 * Get the target pfn from the original entry:
 	 */
 	pfn = pte_pfn(*kpte);
 	for (i = 0; i < PTRS_PER_PTE; i++, pfn += pfninc)
-		set_pte(&pbase[i], pfn_pte(pfn, ref_prot));
+		set_pte(&pbase[i], pfn_pte(pfn, canon_pgprot(ref_prot)));
 
 	if (address >= (unsigned long)__va(0) &&
 		address < (unsigned long)__va(max_low_pfn_mapped << PAGE_SHIFT))
@@ -551,7 +624,7 @@ out_unlock:
 	 */
 	if (base)
 		__free_page(base);
-	spin_unlock_irqrestore(&pgd_lock, flags);
+	spin_unlock(&pgd_lock);
 
 	return 0;
 }
@@ -620,6 +693,18 @@ repeat:
 		pgprot_val(new_prot) |= pgprot_val(cpa->mask_set);
 
 		new_prot = static_protections(new_prot, address, pfn);
+
+		/*
+		 * Set the GLOBAL flags only if the PRESENT flag is
+		 * set otherwise pte_present will return true even on
+		 * a non present pte. The canon_pgprot will clear
+		 * _PAGE_GLOBAL for the ancient hardware that doesn't
+		 * support it.
+		 */
+		if (pgprot_val(new_prot) & _PAGE_PRESENT)
+			pgprot_val(new_prot) |= kernel_page_global;
+		else
+			pgprot_val(new_prot) &= ~kernel_page_global;
 
 		/*
 		 * We need to keep the pfn from the existing PTE,
@@ -960,7 +1045,8 @@ out_err:
 }
 EXPORT_SYMBOL(set_memory_uc);
 
-int set_memory_array_uc(unsigned long *addr, int addrinarray)
+int _set_memory_array(unsigned long *addr, int addrinarray,
+		unsigned long new_type)
 {
 	int i, j;
 	int ret;
@@ -970,13 +1056,19 @@ int set_memory_array_uc(unsigned long *addr, int addrinarray)
 	 */
 	for (i = 0; i < addrinarray; i++) {
 		ret = reserve_memtype(__pa(addr[i]), __pa(addr[i]) + PAGE_SIZE,
-					_PAGE_CACHE_UC_MINUS, NULL);
+					new_type, NULL);
 		if (ret)
 			goto out_free;
 	}
 
 	ret = change_page_attr_set(addr, addrinarray,
 				    __pgprot(_PAGE_CACHE_UC_MINUS), 1);
+
+	if (!ret && new_type == _PAGE_CACHE_WC)
+		ret = change_page_attr_set_clr(addr, addrinarray,
+					       __pgprot(_PAGE_CACHE_WC),
+					       __pgprot(_PAGE_CACHE_MASK),
+					       0, CPA_ARRAY, NULL);
 	if (ret)
 		goto out_free;
 
@@ -988,7 +1080,18 @@ out_free:
 
 	return ret;
 }
+
+int set_memory_array_uc(unsigned long *addr, int addrinarray)
+{
+	return _set_memory_array(addr, addrinarray, _PAGE_CACHE_UC_MINUS);
+}
 EXPORT_SYMBOL(set_memory_array_uc);
+
+int set_memory_array_wc(unsigned long *addr, int addrinarray)
+{
+	return _set_memory_array(addr, addrinarray, _PAGE_CACHE_WC);
+}
+EXPORT_SYMBOL(set_memory_array_wc);
 
 int _set_memory_wc(unsigned long addr, int numpages)
 {
@@ -1110,26 +1213,34 @@ int set_pages_uc(struct page *page, int numpages)
 }
 EXPORT_SYMBOL(set_pages_uc);
 
-int set_pages_array_uc(struct page **pages, int addrinarray)
+static int _set_pages_array(struct page **pages, int addrinarray,
+		unsigned long new_type)
 {
 	unsigned long start;
 	unsigned long end;
 	int i;
 	int free_idx;
+	int ret;
 
 	for (i = 0; i < addrinarray; i++) {
 		if (PageHighMem(pages[i]))
 			continue;
 		start = page_to_pfn(pages[i]) << PAGE_SHIFT;
 		end = start + PAGE_SIZE;
-		if (reserve_memtype(start, end, _PAGE_CACHE_UC_MINUS, NULL))
+		if (reserve_memtype(start, end, new_type, NULL))
 			goto err_out;
 	}
 
-	if (cpa_set_pages_array(pages, addrinarray,
-			__pgprot(_PAGE_CACHE_UC_MINUS)) == 0) {
-		return 0; /* Success */
-	}
+	ret = cpa_set_pages_array(pages, addrinarray,
+			__pgprot(_PAGE_CACHE_UC_MINUS));
+	if (!ret && new_type == _PAGE_CACHE_WC)
+		ret = change_page_attr_set_clr(NULL, addrinarray,
+					       __pgprot(_PAGE_CACHE_WC),
+					       __pgprot(_PAGE_CACHE_MASK),
+					       0, CPA_PAGES_ARRAY, pages);
+	if (ret)
+		goto err_out;
+	return 0; /* Success */
 err_out:
 	free_idx = i;
 	for (i = 0; i < free_idx; i++) {
@@ -1141,7 +1252,18 @@ err_out:
 	}
 	return -EINVAL;
 }
+
+int set_pages_array_uc(struct page **pages, int addrinarray)
+{
+	return _set_pages_array(pages, addrinarray, _PAGE_CACHE_UC_MINUS);
+}
 EXPORT_SYMBOL(set_pages_array_uc);
+
+int set_pages_array_wc(struct page **pages, int addrinarray)
+{
+	return _set_pages_array(pages, addrinarray, _PAGE_CACHE_WC);
+}
+EXPORT_SYMBOL(set_pages_array_wc);
 
 int set_pages_wb(struct page *page, int numpages)
 {

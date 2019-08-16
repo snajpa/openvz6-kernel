@@ -59,6 +59,9 @@ static struct usb_device_id btusb_table[] = {
 	/* Generic Bluetooth USB device */
 	{ USB_DEVICE_INFO(0xe0, 0x01, 0x01) },
 
+	/* Broadcom SoftSailing reporting vendor specific */
+	{ USB_DEVICE(0x0a5c, 0x21e1) },
+
 	/* AVM BlueFRITZ! USB v2.0 */
 	{ USB_DEVICE(0x057c, 0x3800) },
 
@@ -74,6 +77,16 @@ static struct usb_device_id btusb_table[] = {
 
 	/* Canyon CN-BTU1 with HID interfaces */
 	{ USB_DEVICE(0x0c10, 0x0000) },
+
+	/* Broadcom BCM20702A0 */
+	{ USB_DEVICE(0x0489, 0xe042) },
+	{ USB_DEVICE(0x413c, 0x8197) },
+
+	/* Foxconn - Hon Hai */
+	{ USB_VENDOR_AND_INTERFACE_INFO(0x0489, 0xff, 0x01, 0x01) },
+
+	/*Broadcom devices with vendor specific id */
+	{ USB_VENDOR_AND_INTERFACE_INFO(0x0a5c, 0xff, 0x01, 0x01) },
 
 	{ }	/* Terminating entry */
 };
@@ -307,6 +320,7 @@ static void btusb_bulk_complete(struct urb *urb)
 		return;
 
 	usb_anchor_urb(urb, &data->bulk_anchor);
+	usb_mark_last_busy(data->udev);
 
 	err = usb_submit_urb(urb, GFP_ATOMIC);
 	if (err < 0) {
@@ -1166,6 +1180,7 @@ static struct usb_driver btusb_driver = {
 #endif
 	.id_table	= btusb_table,
 	.supports_autosuspend = 1,
+	.disable_hub_initiated_lpm = 1,
 };
 
 static int __init btusb_init(void)

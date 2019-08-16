@@ -102,7 +102,7 @@
 #define	EWOULDBLOCK	EAGAIN	/* Operation would block */
 #define	EALREADY	149	/* Operation already in progress */
 #define	EINPROGRESS	150	/* Operation now in progress */
-#define	ESTALE		151	/* Stale NFS file handle */
+#define	ESTALE		151	/* Stale file handle */
 #define ECANCELED	158	/* AIO operation canceled */
 
 /*
@@ -120,6 +120,8 @@
 #define	ENOTRECOVERABLE	166	/* State not recoverable */
 
 #define	ERFKILL		167	/* Operation not possible due to RF-kill */
+
+#define EHWPOISON	168	/* Memory page has hardware error */
 
 #define EDQUOT		1133	/* Quota exceeded */
 

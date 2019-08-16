@@ -18,7 +18,10 @@
 
 extern int sysctl_overcommit_memory;
 extern int sysctl_overcommit_ratio;
+extern unsigned long sysctl_overcommit_kbytes;
 extern struct percpu_counter vm_committed_as;
+
+unsigned long vm_memory_committed(void);
 
 static inline void vm_acct_memory(long pages)
 {
@@ -89,5 +92,7 @@ calc_vm_flag_bits(unsigned long flags)
 	       _calc_vm_trans(flags, MAP_EXECUTABLE, VM_EXECUTABLE) |
 	       _calc_vm_trans(flags, MAP_LOCKED,     VM_LOCKED    );
 }
+
+unsigned long vm_commit_limit(void);
 #endif /* __KERNEL__ */
 #endif /* _LINUX_MMAN_H */

@@ -20,6 +20,7 @@
 #include <linux/init.h>
 #include <linux/pci.h>
 #include <linux/string.h>
+#include <linux/vmalloc.h>
 
 #include <asm/pci-bridge.h>
 #include <linux/mutex.h>
@@ -387,7 +388,7 @@ int dlpar_remove_pci_slot(char *drc_name, struct device_node *dn)
 	BUG_ON(!bus->self);
 	pr_debug("PCI: Now removing bridge device %s\n", pci_name(bus->self));
 	eeh_remove_bus_device(bus->self);
-	pci_remove_bus_device(bus->self);
+	pci_stop_and_remove_bus_device(bus->self);
 
 	return 0;
 }
@@ -430,6 +431,8 @@ int dlpar_remove_slot(char *drc_name)
 			rc = dlpar_remove_pci_slot(drc_name, dn);
 			break;
 	}
+	vm_unmap_aliases();
+
 	printk(KERN_INFO "%s: slot %s removed\n", DLPAR_MODULE_NAME, drc_name);
 exit:
 	mutex_unlock(&rpadlpar_mutex);

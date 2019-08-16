@@ -39,6 +39,8 @@
 
 #include "libata.h"
 
+static struct workqueue_struct *ata_sff_wq;
+
 const struct ata_port_operations ata_sff_port_ops = {
 	.inherits		= &ata_base_port_ops,
 
@@ -387,7 +389,7 @@ int ata_sff_busy_sleep(struct ata_port *ap,
 	timeout = ata_deadline(timer_start, tmout_pat);
 	while (status != 0xff && (status & ATA_BUSY) &&
 	       time_before(jiffies, timeout)) {
-		msleep(50);
+		ata_msleep(ap, 50);
 		status = ata_sff_busy_wait(ap, ATA_BUSY, 3);
 	}
 
@@ -399,7 +401,7 @@ int ata_sff_busy_sleep(struct ata_port *ap,
 	timeout = ata_deadline(timer_start, tmout);
 	while (status != 0xff && (status & ATA_BUSY) &&
 	       time_before(jiffies, timeout)) {
-		msleep(50);
+		ata_msleep(ap, 50);
 		status = ap->ops->sff_check_status(ap);
 	}
 
@@ -504,7 +506,7 @@ void ata_dev_select(struct ata_port *ap, unsigned int device,
 
 	if (wait) {
 		if (can_sleep && ap->link.device[device].class == ATA_DEV_ATAPI)
-			msleep(150);
+			ata_msleep(ap, 150);
 		ata_wait_idle(ap);
 	}
 }
@@ -893,6 +895,9 @@ static void ata_pio_sector(struct ata_queued_cmd *qc)
 				       do_write);
 	}
 
+	if (!do_write && !PageSlab(page))
+		flush_dcache_page(page);
+
 	qc->curbytes += qc->sect_size;
 	qc->cursg_ofs += qc->sect_size;
 
@@ -1149,12 +1154,9 @@ static inline int ata_hsm_ok_in_wq(struct ata_port *ap,
 static void ata_hsm_qc_complete(struct ata_queued_cmd *qc, int in_wq)
 {
 	struct ata_port *ap = qc->ap;
-	unsigned long flags;
 
 	if (ap->ops->error_handler) {
 		if (in_wq) {
-			spin_lock_irqsave(ap->lock, flags);
-
 			/* EH might have kicked in while host lock is
 			 * released.
 			 */
@@ -1166,8 +1168,6 @@ static void ata_hsm_qc_complete(struct ata_queued_cmd *qc, int in_wq)
 				} else
 					ata_port_freeze(ap);
 			}
-
-			spin_unlock_irqrestore(ap->lock, flags);
 		} else {
 			if (likely(!(qc->err_mask & AC_ERR_HSM)))
 				ata_qc_complete(qc);
@@ -1176,10 +1176,8 @@ static void ata_hsm_qc_complete(struct ata_queued_cmd *qc, int in_wq)
 		}
 	} else {
 		if (in_wq) {
-			spin_lock_irqsave(ap->lock, flags);
 			ap->ops->sff_irq_on(ap);
 			ata_qc_complete(qc);
-			spin_unlock_irqrestore(ap->lock, flags);
 		} else
 			ata_qc_complete(qc);
 	}
@@ -1199,8 +1197,9 @@ int ata_sff_hsm_move(struct ata_port *ap, struct ata_queued_cmd *qc,
 		     u8 status, int in_wq)
 {
 	struct ata_eh_info *ehi = &ap->link.eh_info;
-	unsigned long flags = 0;
 	int poll_next;
+
+	lockdep_assert_held(ap->lock);
 
 	WARN_ON_ONCE((qc->flags & ATA_QCFLAG_ACTIVE) == 0);
 
@@ -1263,14 +1262,6 @@ fsm_start:
 			}
 		}
 
-		/* Send the CDB (atapi) or the first data block (ata pio out).
-		 * During the state transition, interrupt handler shouldn't
-		 * be invoked before the data transfer is complete and
-		 * hsm_task_state is changed. Hence, the following locking.
-		 */
-		if (in_wq)
-			spin_lock_irqsave(ap->lock, flags);
-
 		if (qc->tf.protocol == ATA_PROT_PIO) {
 			/* PIO data out protocol.
 			 * send first data block.
@@ -1286,10 +1277,7 @@ fsm_start:
 			/* send CDB */
 			atapi_send_cdb(ap, qc);
 
-		if (in_wq)
-			spin_unlock_irqrestore(ap->lock, flags);
-
-		/* if polling, ata_pio_task() handles the rest.
+		/* if polling, ata_sff_pio_task() handles the rest.
 		 * otherwise, interrupt handler takes over from here.
 		 */
 		break;
@@ -1447,20 +1435,58 @@ fsm_start:
 		break;
 	default:
 		poll_next = 0;
-		BUG();
+		WARN(true, "ata%d: SFF host state machine in invalid state %d",
+		     ap->print_id, ap->hsm_task_state);
 	}
 
 	return poll_next;
 }
 EXPORT_SYMBOL_GPL(ata_sff_hsm_move);
 
-void ata_pio_task(struct work_struct *work)
+void ata_sff_queue_pio_task(struct ata_port *ap, unsigned long delay)
+{
+	/* may fail if ata_sff_flush_pio_task() in progress */
+	queue_delayed_work(ata_sff_wq, &ap->sff_pio_task,
+			   msecs_to_jiffies(delay));
+}
+EXPORT_SYMBOL_GPL(ata_sff_queue_pio_task);
+
+void ata_sff_flush_pio_task(struct ata_port *ap)
+{
+	DPRINTK("ENTER\n");
+
+	cancel_rearming_delayed_work(&ap->sff_pio_task);
+
+	/*
+	 * We wanna reset the HSM state to IDLE.  If we do so without
+	 * grabbing the port lock, critical sections protected by it which
+	 * expect the HSM state to stay stable may get surprised.  For
+	 * example, we may set IDLE in between the time
+	 * __ata_sff_port_intr() checks for HSM_ST_IDLE and before it calls
+	 * ata_sff_hsm_move() causing ata_sff_hsm_move() to BUG().
+	 */
+	spin_lock_irq(ap->lock);
+	ap->hsm_task_state = HSM_ST_IDLE;
+	spin_unlock_irq(ap->lock);
+
+	if (ata_msg_ctl(ap))
+		ata_port_printk(ap, KERN_DEBUG, "%s: EXIT\n", __func__);
+}
+
+static void ata_sff_pio_task(struct work_struct *work)
 {
 	struct ata_port *ap =
-		container_of(work, struct ata_port, port_task.work);
-	struct ata_queued_cmd *qc = ap->port_task_data;
+		container_of(work, struct ata_port, sff_pio_task.work);
+	struct ata_queued_cmd *qc;
 	u8 status;
 	int poll_next;
+
+	spin_lock_irq(ap->lock);
+
+	/* qc can be NULL if timeout occurred */
+	qc = ata_qc_from_tag(ap, ap->link.active_tag);
+	if (!qc)
+		goto out_unlock;
 
 fsm_start:
 	WARN_ON_ONCE(ap->hsm_task_state == HSM_ST_IDLE);
@@ -1474,11 +1500,14 @@ fsm_start:
 	 */
 	status = ata_sff_busy_wait(ap, ATA_BUSY, 5);
 	if (status & ATA_BUSY) {
-		msleep(2);
+		spin_unlock_irq(ap->lock);
+		ata_msleep(ap, 2);
+		spin_lock_irq(ap->lock);
+
 		status = ata_sff_busy_wait(ap, ATA_BUSY, 10);
 		if (status & ATA_BUSY) {
-			ata_pio_queue_task(ap, qc, ATA_SHORT_PAUSE);
-			return;
+			ata_sff_queue_pio_task(ap, ATA_SHORT_PAUSE);
+			goto out_unlock;
 		}
 	}
 
@@ -1490,6 +1519,8 @@ fsm_start:
 	 */
 	if (poll_next)
 		goto fsm_start;
+out_unlock:
+	spin_unlock_irq(ap->lock);
 }
 
 /**
@@ -1547,7 +1578,7 @@ unsigned int ata_sff_qc_issue(struct ata_queued_cmd *qc)
 		ap->hsm_task_state = HSM_ST_LAST;
 
 		if (qc->tf.flags & ATA_TFLAG_POLLING)
-			ata_pio_queue_task(ap, qc, 0);
+			ata_sff_queue_pio_task(ap, 0);
 
 		break;
 
@@ -1569,20 +1600,21 @@ unsigned int ata_sff_qc_issue(struct ata_queued_cmd *qc)
 		if (qc->tf.flags & ATA_TFLAG_WRITE) {
 			/* PIO data out protocol */
 			ap->hsm_task_state = HSM_ST_FIRST;
-			ata_pio_queue_task(ap, qc, 0);
+			ata_sff_queue_pio_task(ap, 0);
 
-			/* always send first data block using
-			 * the ata_pio_task() codepath.
+			/* always send first data block using the
+			 * ata_sff_pio_task() codepath.
 			 */
 		} else {
 			/* PIO data in protocol */
 			ap->hsm_task_state = HSM_ST;
 
 			if (qc->tf.flags & ATA_TFLAG_POLLING)
-				ata_pio_queue_task(ap, qc, 0);
+				ata_sff_queue_pio_task(ap, 0);
 
-			/* if polling, ata_pio_task() handles the rest.
-			 * otherwise, interrupt handler takes over from here.
+			/* if polling, ata_sff_pio_task() handles the
+			 * rest.  otherwise, interrupt handler takes
+			 * over from here.
 			 */
 		}
 
@@ -1600,7 +1632,7 @@ unsigned int ata_sff_qc_issue(struct ata_queued_cmd *qc)
 		/* send cdb by polling if no cdb interrupt */
 		if ((!(qc->dev->flags & ATA_DFLAG_CDB_INTR)) ||
 		    (qc->tf.flags & ATA_TFLAG_POLLING))
-			ata_pio_queue_task(ap, qc, 0);
+			ata_sff_queue_pio_task(ap, 0);
 		break;
 
 	case ATAPI_PROT_DMA:
@@ -1612,7 +1644,7 @@ unsigned int ata_sff_qc_issue(struct ata_queued_cmd *qc)
 
 		/* send cdb by polling if no cdb interrupt */
 		if (!(qc->dev->flags & ATA_DFLAG_CDB_INTR))
-			ata_pio_queue_task(ap, qc, 0);
+			ata_sff_queue_pio_task(ap, 0);
 		break;
 
 	default:
@@ -1767,18 +1799,13 @@ irqreturn_t ata_sff_interrupt(int irq, void *dev_instance)
 	spin_lock_irqsave(&host->lock, flags);
 
 	for (i = 0; i < host->n_ports; i++) {
-		struct ata_port *ap;
+		struct ata_port *ap = host->ports[i];
+		struct ata_queued_cmd *qc;
 
-		ap = host->ports[i];
-		if (ap &&
-		    !(ap->flags & ATA_FLAG_DISABLED)) {
-			struct ata_queued_cmd *qc;
-
-			qc = ata_qc_from_tag(ap, ap->link.active_tag);
-			if (qc && (!(qc->tf.flags & ATA_TFLAG_POLLING)) &&
-			    (qc->flags & ATA_QCFLAG_ACTIVE))
-				handled |= ata_sff_host_intr(ap, qc);
-		}
+		qc = ata_qc_from_tag(ap, ap->link.active_tag);
+		if (qc && (!(qc->tf.flags & ATA_TFLAG_POLLING)) &&
+		    (qc->flags & ATA_QCFLAG_ACTIVE))
+			handled |= ata_sff_host_intr(ap, qc);
 	}
 
 	spin_unlock_irqrestore(&host->lock, flags);
@@ -1807,11 +1834,8 @@ void ata_sff_lost_interrupt(struct ata_port *ap)
 
 	/* Only one outstanding command per SFF channel */
 	qc = ata_qc_from_tag(ap, ap->link.active_tag);
-	/* Check we have a live one.. */
-	if (qc == NULL ||  !(qc->flags & ATA_QCFLAG_ACTIVE))
-		return;
-	/* We cannot lose an interrupt on a polled command */
-	if (qc->tf.flags & ATA_TFLAG_POLLING)
+	/* We cannot lose an interrupt on a non-existent or polled command */
+	if (!qc || qc->tf.flags & ATA_TFLAG_POLLING)
 		return;
 	/* See if the controller thinks it is still busy - if so the command
 	   isn't a lost IRQ but is still in progress */
@@ -2057,7 +2081,7 @@ int ata_sff_wait_after_reset(struct ata_link *link, unsigned int devmask,
 	unsigned int dev1 = devmask & (1 << 1);
 	int rc, ret = 0;
 
-	msleep(ATA_WAIT_AFTER_RESET);
+	ata_msleep(ap, ATA_WAIT_AFTER_RESET);
 
 	/* always check readiness of the master device */
 	rc = ata_sff_wait_ready(link, deadline);
@@ -2086,7 +2110,7 @@ int ata_sff_wait_after_reset(struct ata_link *link, unsigned int devmask,
 			lbal = ioread8(ioaddr->lbal_addr);
 			if ((nsect == 1) && (lbal == 1))
 				break;
-			msleep(50);	/* give drive a breather */
+			ata_msleep(ap, 50);	/* give drive a breather */
 		}
 
 		rc = ata_sff_wait_ready(link, deadline);
@@ -2313,8 +2337,6 @@ void ata_sff_error_handler(struct ata_port *ap)
 	/* reset PIO HSM and stop DMA engine */
 	spin_lock_irqsave(ap->lock, flags);
 
-	ap->hsm_task_state = HSM_ST_IDLE;
-
 	if (ap->ioaddr.bmdma_addr &&
 	    qc && (qc->tf.protocol == ATA_PROT_DMA ||
 		   qc->tf.protocol == ATAPI_PROT_DMA)) {
@@ -2380,8 +2402,6 @@ void ata_sff_post_internal_cmd(struct ata_queued_cmd *qc)
 	unsigned long flags;
 
 	spin_lock_irqsave(ap->lock, flags);
-
-	ap->hsm_task_state = HSM_ST_IDLE;
 
 	if (ap->ioaddr.bmdma_addr)
 		ata_bmdma_stop(qc);
@@ -2575,100 +2595,6 @@ u8 ata_bmdma_status(struct ata_port *ap)
 	return ioread8(ap->ioaddr.bmdma_addr + ATA_DMA_STATUS);
 }
 EXPORT_SYMBOL_GPL(ata_bmdma_status);
-
-/**
- *	ata_bus_reset - reset host port and associated ATA channel
- *	@ap: port to reset
- *
- *	This is typically the first time we actually start issuing
- *	commands to the ATA channel.  We wait for BSY to clear, then
- *	issue EXECUTE DEVICE DIAGNOSTIC command, polling for its
- *	result.  Determine what devices, if any, are on the channel
- *	by looking at the device 0/1 error register.  Look at the signature
- *	stored in each device's taskfile registers, to determine if
- *	the device is ATA or ATAPI.
- *
- *	LOCKING:
- *	PCI/etc. bus probe sem.
- *	Obtains host lock.
- *
- *	SIDE EFFECTS:
- *	Sets ATA_FLAG_DISABLED if bus reset fails.
- *
- *	DEPRECATED:
- *	This function is only for drivers which still use old EH and
- *	will be removed soon.
- */
-void ata_bus_reset(struct ata_port *ap)
-{
-	struct ata_device *device = ap->link.device;
-	struct ata_ioports *ioaddr = &ap->ioaddr;
-	unsigned int slave_possible = ap->flags & ATA_FLAG_SLAVE_POSS;
-	u8 err;
-	unsigned int dev0, dev1 = 0, devmask = 0;
-	int rc;
-
-	DPRINTK("ENTER, host %u, port %u\n", ap->print_id, ap->port_no);
-
-	/* determine if device 0/1 are present */
-	if (ap->flags & ATA_FLAG_SATA_RESET)
-		dev0 = 1;
-	else {
-		dev0 = ata_devchk(ap, 0);
-		if (slave_possible)
-			dev1 = ata_devchk(ap, 1);
-	}
-
-	if (dev0)
-		devmask |= (1 << 0);
-	if (dev1)
-		devmask |= (1 << 1);
-
-	/* select device 0 again */
-	ap->ops->sff_dev_select(ap, 0);
-
-	/* issue bus reset */
-	if (ap->flags & ATA_FLAG_SRST) {
-		rc = ata_bus_softreset(ap, devmask,
-				       ata_deadline(jiffies, 40000));
-		if (rc && rc != -ENODEV)
-			goto err_out;
-	}
-
-	/*
-	 * determine by signature whether we have ATA or ATAPI devices
-	 */
-	device[0].class = ata_sff_dev_classify(&device[0], dev0, &err);
-	if ((slave_possible) && (err != 0x81))
-		device[1].class = ata_sff_dev_classify(&device[1], dev1, &err);
-
-	/* is double-select really necessary? */
-	if (device[1].class != ATA_DEV_NONE)
-		ap->ops->sff_dev_select(ap, 1);
-	if (device[0].class != ATA_DEV_NONE)
-		ap->ops->sff_dev_select(ap, 0);
-
-	/* if no devices were detected, disable this port */
-	if ((device[0].class == ATA_DEV_NONE) &&
-	    (device[1].class == ATA_DEV_NONE))
-		goto err_out;
-
-	if (ap->flags & (ATA_FLAG_SATA_RESET | ATA_FLAG_SRST)) {
-		/* set up device control for ATA_FLAG_SATA_RESET */
-		iowrite8(ap->ctl, ioaddr->ctl_addr);
-		ap->last_ctl = ap->ctl;
-	}
-
-	DPRINTK("EXIT\n");
-	return;
-
-err_out:
-	ata_port_printk(ap, KERN_ERR, "disabling port\n");
-	ata_port_disable(ap);
-
-	DPRINTK("EXIT\n");
-}
-EXPORT_SYMBOL_GPL(ata_bus_reset);
 
 #ifdef CONFIG_PCI
 
@@ -3078,3 +3004,39 @@ out:
 EXPORT_SYMBOL_GPL(ata_pci_sff_init_one);
 
 #endif /* CONFIG_PCI */
+
+/**
+ *	ata_sff_port_init - Initialize SFF/BMDMA ATA port
+ *	@ap: Port to initialize
+ *
+ *	Called on port allocation to initialize SFF/BMDMA specific
+ *	fields.
+ *
+ *	LOCKING:
+ *	None.
+ */
+void ata_sff_port_init(struct ata_port *ap)
+{
+	INIT_DELAYED_WORK(&ap->sff_pio_task, ata_sff_pio_task);
+}
+
+int __init ata_sff_init(void)
+{
+	/*
+	 * FIXME: In UP case, there is only one workqueue thread and if you
+	 * have more than one PIO device, latency is bloody awful, with
+	 * occasional multi-second "hiccups" as one PIO device waits for
+	 * another.  It's an ugly wart that users DO occasionally complain
+	 * about; luckily most users have at most one PIO polled device.
+	 */
+	ata_sff_wq = create_workqueue("ata_sff");
+	if (!ata_sff_wq)
+		return -ENOMEM;
+
+	return 0;
+}
+
+void __exit ata_sff_exit(void)
+{
+	destroy_workqueue(ata_sff_wq);
+}

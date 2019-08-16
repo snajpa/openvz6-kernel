@@ -174,13 +174,23 @@ next_hook:
 			     outdev, &elem, okfn, hook_thresh);
 	if (verdict == NF_ACCEPT || verdict == NF_STOP) {
 		ret = 1;
-	} else if (verdict == NF_DROP) {
+	} else if ((verdict & NF_VERDICT_MASK) == NF_DROP) {
 		kfree_skb(skb);
-		ret = -EPERM;
+		ret = NF_DROP_GETERR(verdict);
+		if (ret == 0)
+			ret = -EPERM;
 	} else if ((verdict & NF_VERDICT_MASK) == NF_QUEUE) {
-		if (!nf_queue(skb, elem, pf, hook, indev, outdev, okfn,
-			      verdict >> NF_VERDICT_BITS))
-			goto next_hook;
+		ret = nf_queue(skb, elem, pf, hook, indev, outdev, okfn,
+			       verdict >> NF_VERDICT_QBITS);
+		if (ret < 0) {
+			if (ret == -ECANCELED)
+				goto next_hook;
+			if (ret == -ESRCH &&
+			   (verdict & NF_VERDICT_FLAG_QUEUE_BYPASS))
+				goto next_hook;
+			kfree_skb(skb);
+		}
+		ret = 0;
 	}
 	rcu_read_unlock();
 	return ret;

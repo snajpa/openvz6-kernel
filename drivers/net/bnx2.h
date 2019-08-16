@@ -1,6 +1,7 @@
-/* bnx2.h: Broadcom NX2 network driver.
+/* bnx2.h: QLogic bnx2 network driver.
  *
- * Copyright (c) 2004-2009 Broadcom Corporation
+ * Copyright (c) 2004-2014 Broadcom Corporation
+ * Copyright (c) 2014-2015 QLogic Corporation
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -20,7 +21,7 @@
 /*
  *  tx_bd definition
  */
-struct tx_bd {
+struct bnx2_tx_bd {
 	u32 tx_bd_haddr_hi;
 	u32 tx_bd_haddr_lo;
 	u32 tx_bd_mss_nbytes;
@@ -48,7 +49,7 @@ struct tx_bd {
 /*
  *  rx_bd definition
  */
-struct rx_bd {
+struct bnx2_rx_bd {
 	u32 rx_bd_haddr_hi;
 	u32 rx_bd_haddr_lo;
 	u32 rx_bd_len;
@@ -295,6 +296,9 @@ struct l2_fhdr {
 		#define L2_FHDR_ERRORS_TCP_XSUM		(1<<28)
 		#define L2_FHDR_ERRORS_UDP_XSUM		(1<<31)
 
+		#define L2_FHDR_STATUS_USE_RXHASH	\
+			(L2_FHDR_STATUS_TCP_SEGMENT | L2_FHDR_STATUS_RSS_HASH)
+
 	u32 l2_fhdr_hash;
 #if defined(__BIG_ENDIAN)
 	u16 l2_fhdr_pkt_len;
@@ -349,12 +353,7 @@ struct l2_fhdr {
 #define BNX2_L2CTX_BD_PRE_READ				0x00000000
 #define BNX2_L2CTX_CTX_SIZE				0x00000000
 #define BNX2_L2CTX_CTX_TYPE				0x00000000
-#define BNX2_L2CTX_LO_WATER_MARK_DEFAULT		 32
-#define BNX2_L2CTX_LO_WATER_MARK_SCALE			 4
-#define BNX2_L2CTX_LO_WATER_MARK_DIS			 0
-#define BNX2_L2CTX_HI_WATER_MARK_SHIFT			 4
-#define BNX2_L2CTX_HI_WATER_MARK_SCALE			 16
-#define BNX2_L2CTX_WATER_MARKS_MSK			 0x000000ff
+#define BNX2_L2CTX_FLOW_CTRL_ENABLE			 0x000000ff
 #define BNX2_L2CTX_CTX_TYPE_SIZE_L2			 ((0x20/20)<<16)
 #define BNX2_L2CTX_CTX_TYPE_CTX_BD_CHN_TYPE		 (0xf<<28)
 #define BNX2_L2CTX_CTX_TYPE_CTX_BD_CHN_TYPE_UNDEFINED	 (0<<28)
@@ -463,6 +462,8 @@ struct l2_fhdr {
 #define BNX2_PCICFG_MAILBOX_QUEUE_ADDR			0x00000090
 #define BNX2_PCICFG_MAILBOX_QUEUE_DATA			0x00000094
 
+#define BNX2_PCICFG_DEVICE_CONTROL			0x000000b4
+#define BNX2_PCICFG_DEVICE_STATUS_NO_PEND		 ((1L<<5)<<16)
 
 /*
  *  pci_reg definition
@@ -4182,6 +4183,15 @@ struct l2_fhdr {
 #define BNX2_RLUP_RSS_CONFIG_IPV6_RSS_TYPE_IP_ONLY_XI	 (2L<<2)
 #define BNX2_RLUP_RSS_CONFIG_IPV6_RSS_TYPE_RES_XI	 (3L<<2)
 
+#define BNX2_RLUP_RSS_COMMAND				0x00002048
+#define BNX2_RLUP_RSS_COMMAND_RSS_IND_TABLE_ADDR	 (0xfUL<<0)
+#define BNX2_RLUP_RSS_COMMAND_RSS_WRITE_MASK		 (0xffUL<<4)
+#define BNX2_RLUP_RSS_COMMAND_WRITE			 (1UL<<12)
+#define BNX2_RLUP_RSS_COMMAND_READ			 (1UL<<13)
+#define BNX2_RLUP_RSS_COMMAND_HASH_MASK			 (0x7UL<<14)
+
+#define BNX2_RLUP_RSS_DATA				0x0000204c
+
 
 /*
  *  rbuf_reg definition
@@ -4632,6 +4642,47 @@ struct l2_fhdr {
 #define BNX2_TBDR_FTQ_CTL_MAX_DEPTH			 (0x3ffL<<12)
 #define BNX2_TBDR_FTQ_CTL_CUR_DEPTH			 (0x3ffL<<22)
 
+
+/*
+ *  tbdc definition
+ *  offset: 0x5400
+ */
+#define BNX2_TBDC_COMMAND                               0x5400
+#define BNX2_TBDC_COMMAND_CMD_ENABLED                    (1UL<<0)
+#define BNX2_TBDC_COMMAND_CMD_FLUSH                      (1UL<<1)
+#define BNX2_TBDC_COMMAND_CMD_SOFT_RST                   (1UL<<2)
+#define BNX2_TBDC_COMMAND_CMD_REG_ARB                    (1UL<<3)
+#define BNX2_TBDC_COMMAND_WRCHK_RANGE_ERROR              (1UL<<4)
+#define BNX2_TBDC_COMMAND_WRCHK_ALL_ONES_ERROR           (1UL<<5)
+#define BNX2_TBDC_COMMAND_WRCHK_ALL_ZEROS_ERROR          (1UL<<6)
+#define BNX2_TBDC_COMMAND_WRCHK_ANY_ONES_ERROR           (1UL<<7)
+#define BNX2_TBDC_COMMAND_WRCHK_ANY_ZEROS_ERROR          (1UL<<8)
+
+#define BNX2_TBDC_STATUS				0x5404
+#define BNX2_TBDC_STATUS_FREE_CNT                        (0x3fUL<<0)
+
+#define BNX2_TBDC_BD_ADDR                               0x5424
+
+#define BNX2_TBDC_BIDX                                  0x542c
+#define BNX2_TBDC_BDIDX_BDIDX                            (0xffffUL<<0)
+#define BNX2_TBDC_BDIDX_CMD                              (0xffUL<<24)
+
+#define BNX2_TBDC_CID                                   0x5430
+
+#define BNX2_TBDC_CAM_OPCODE                            0x5434
+#define BNX2_TBDC_CAM_OPCODE_OPCODE                      (0x7UL<<0)
+#define BNX2_TBDC_CAM_OPCODE_OPCODE_SEARCH               (0UL<<0)
+#define BNX2_TBDC_CAM_OPCODE_OPCODE_CACHE_WRITE          (1UL<<0)
+#define BNX2_TBDC_CAM_OPCODE_OPCODE_INVALIDATE           (2UL<<0)
+#define BNX2_TBDC_CAM_OPCODE_OPCODE_CAM_WRITE            (4UL<<0)
+#define BNX2_TBDC_CAM_OPCODE_OPCODE_CAM_READ             (5UL<<0)
+#define BNX2_TBDC_CAM_OPCODE_OPCODE_RAM_WRITE            (6UL<<0)
+#define BNX2_TBDC_CAM_OPCODE_OPCODE_RAM_READ             (7UL<<0)
+#define BNX2_TBDC_CAM_OPCODE_SMASK_BDIDX                 (1UL<<4)
+#define BNX2_TBDC_CAM_OPCODE_SMASK_CID                   (1UL<<5)
+#define BNX2_TBDC_CAM_OPCODE_SMASK_CMD                   (1UL<<6)
+#define BNX2_TBDC_CAM_OPCODE_WMT_FAILED                  (1UL<<7)
+#define BNX2_TBDC_CAM_OPCODE_CAM_VALIDS                  (0xffUL<<8)
 
 
 /*
@@ -6074,6 +6125,7 @@ struct l2_fhdr {
 
 #define BNX2_COM_SCRATCH				0x00120000
 
+#define BNX2_FW_RX_LOW_LATENCY				 0x00120058
 #define BNX2_FW_RX_DROP_COUNT				 0x00120084
 
 
@@ -6196,6 +6248,8 @@ struct l2_fhdr {
 #define BNX2_CP_CPQ_FTQ_CTL_CUR_DEPTH			 (0x3ffL<<22)
 
 #define BNX2_CP_SCRATCH					0x001a0000
+
+#define BNX2_FW_MAX_ISCSI_CONN				 0x001a0080
 
 
 /*
@@ -6345,6 +6399,10 @@ struct l2_fhdr {
 
 #define BNX2_MCP_ROM					0x00150000
 #define BNX2_MCP_SCRATCH				0x00160000
+#define BNX2_MCP_STATE_P1				 0x0016f9c8
+#define BNX2_MCP_STATE_P0				 0x0016fdc8
+#define BNX2_MCP_STATE_P1_5708				 0x001699c8
+#define BNX2_MCP_STATE_P0_5708				 0x00169dc8
 
 #define BNX2_SHM_HDR_SIGNATURE				BNX2_MCP_SCRATCH
 #define BNX2_SHM_HDR_SIGNATURE_SIG_MASK			 0xffff0000
@@ -6414,6 +6472,15 @@ struct l2_fhdr {
 
 #define BCM5708S_TX_ACTL3			0x17
 
+#define MII_BNX2_EXT_STATUS			0x11
+#define EXT_STATUS_MDIX				 (1 << 13)
+
+#define MII_BNX2_AUX_CTL			0x18
+#define AUX_CTL_MISC_CTL			 0x7007
+#define AUX_CTL_MISC_CTL_WIRESPEED		  (1 << 4)
+#define AUX_CTL_MISC_CTL_AUTOMDIX		  (1 << 9)
+#define AUX_CTL_MISC_CTL_WR			  (1 << 15)
+
 #define MII_BNX2_DSP_RW_PORT			0x15
 #define MII_BNX2_DSP_ADDRESS			0x17
 #define MII_BNX2_DSP_EXPAND_REG			 0x0f00
@@ -6481,37 +6548,38 @@ struct l2_fhdr {
 
 /* Use CPU native page size up to 16K for the ring sizes.  */
 #if (PAGE_SHIFT > 14)
-#define BCM_PAGE_BITS	14
+#define BNX2_PAGE_BITS	14
 #else
-#define BCM_PAGE_BITS	PAGE_SHIFT
+#define BNX2_PAGE_BITS	PAGE_SHIFT
 #endif
-#define BCM_PAGE_SIZE	(1 << BCM_PAGE_BITS)
+#define BNX2_PAGE_SIZE	(1 << BNX2_PAGE_BITS)
 
-#define TX_DESC_CNT  (BCM_PAGE_SIZE / sizeof(struct tx_bd))
-#define MAX_TX_DESC_CNT (TX_DESC_CNT - 1)
+#define BNX2_TX_DESC_CNT  (BNX2_PAGE_SIZE / sizeof(struct bnx2_tx_bd))
+#define BNX2_MAX_TX_DESC_CNT (BNX2_TX_DESC_CNT - 1)
 
-#define MAX_RX_RINGS	4
-#define MAX_RX_PG_RINGS	16
-#define RX_DESC_CNT  (BCM_PAGE_SIZE / sizeof(struct rx_bd))
-#define MAX_RX_DESC_CNT (RX_DESC_CNT - 1)
-#define MAX_TOTAL_RX_DESC_CNT (MAX_RX_DESC_CNT * MAX_RX_RINGS)
-#define MAX_TOTAL_RX_PG_DESC_CNT (MAX_RX_DESC_CNT * MAX_RX_PG_RINGS)
+#define BNX2_MAX_RX_RINGS	8
+#define BNX2_MAX_RX_PG_RINGS	32
+#define BNX2_RX_DESC_CNT  (BNX2_PAGE_SIZE / sizeof(struct bnx2_rx_bd))
+#define BNX2_MAX_RX_DESC_CNT (BNX2_RX_DESC_CNT - 1)
+#define BNX2_MAX_TOTAL_RX_DESC_CNT (BNX2_MAX_RX_DESC_CNT * BNX2_MAX_RX_RINGS)
+#define BNX2_MAX_TOTAL_RX_PG_DESC_CNT	\
+	(BNX2_MAX_RX_DESC_CNT * BNX2_MAX_RX_PG_RINGS)
 
-#define NEXT_TX_BD(x) (((x) & (MAX_TX_DESC_CNT - 1)) ==			\
-		(MAX_TX_DESC_CNT - 1)) ?				\
+#define BNX2_NEXT_TX_BD(x) (((x) & (BNX2_MAX_TX_DESC_CNT - 1)) ==	\
+		(BNX2_MAX_TX_DESC_CNT - 1)) ?				\
 	(x) + 2 : (x) + 1
 
-#define TX_RING_IDX(x) ((x) & MAX_TX_DESC_CNT)
+#define BNX2_TX_RING_IDX(x) ((x) & BNX2_MAX_TX_DESC_CNT)
 
-#define NEXT_RX_BD(x) (((x) & (MAX_RX_DESC_CNT - 1)) ==			\
-		(MAX_RX_DESC_CNT - 1)) ?				\
+#define BNX2_NEXT_RX_BD(x) (((x) & (BNX2_MAX_RX_DESC_CNT - 1)) ==	\
+		(BNX2_MAX_RX_DESC_CNT - 1)) ?				\
 	(x) + 2 : (x) + 1
 
-#define RX_RING_IDX(x) ((x) & bp->rx_max_ring_idx)
-#define RX_PG_RING_IDX(x) ((x) & bp->rx_max_pg_ring_idx)
+#define BNX2_RX_RING_IDX(x) ((x) & bp->rx_max_ring_idx)
+#define BNX2_RX_PG_RING_IDX(x) ((x) & bp->rx_max_pg_ring_idx)
 
-#define RX_RING(x) (((x) & ~MAX_RX_DESC_CNT) >> (BCM_PAGE_BITS - 4))
-#define RX_IDX(x) ((x) & MAX_RX_DESC_CNT)
+#define BNX2_RX_RING(x) (((x) & ~BNX2_MAX_RX_DESC_CNT) >> (BNX2_PAGE_BITS - 4))
+#define BNX2_RX_IDX(x) ((x) & BNX2_MAX_RX_DESC_CNT)
 
 /* Context size. */
 #define CTX_SHIFT                   7
@@ -6547,27 +6615,42 @@ struct l2_fhdr {
 #define MB_TX_CID_ADDR	MB_GET_CID_ADDR(TX_CID)
 #define MB_RX_CID_ADDR	MB_GET_CID_ADDR(RX_CID)
 
-struct sw_bd {
-	struct sk_buff		*skb;
-	DECLARE_PCI_UNMAP_ADDR(mapping)
+/*
+ * This driver uses new build_skb() API :
+ * RX ring buffer contains pointer to kmalloc() data only,
+ * skb are built only after Hardware filled the frame.
+ */
+struct bnx2_sw_bd {
+	u8			*data;
+	DEFINE_DMA_UNMAP_ADDR(mapping);
 };
 
-struct sw_pg {
+/* Its faster to compute this from data than storing it in sw_bd
+ * (less cache misses)
+ */
+static inline struct l2_fhdr *get_l2_fhdr(u8 *data)
+{
+	return (struct l2_fhdr *)(PTR_ALIGN(data, BNX2_RX_ALIGN) + NET_SKB_PAD);
+}
+
+
+struct bnx2_sw_pg {
 	struct page		*page;
-	DECLARE_PCI_UNMAP_ADDR(mapping)
+	DEFINE_DMA_UNMAP_ADDR(mapping);
 };
 
-struct sw_tx_bd {
+struct bnx2_sw_tx_bd {
 	struct sk_buff		*skb;
+	DEFINE_DMA_UNMAP_ADDR(mapping);
 	unsigned short		is_gso;
 	unsigned short		nr_frags;
 };
 
-#define SW_RXBD_RING_SIZE (sizeof(struct sw_bd) * RX_DESC_CNT)
-#define SW_RXPG_RING_SIZE (sizeof(struct sw_pg) * RX_DESC_CNT)
-#define RXBD_RING_SIZE (sizeof(struct rx_bd) * RX_DESC_CNT)
-#define SW_TXBD_RING_SIZE (sizeof(struct sw_tx_bd) * TX_DESC_CNT)
-#define TXBD_RING_SIZE (sizeof(struct tx_bd) * TX_DESC_CNT)
+#define SW_RXBD_RING_SIZE (sizeof(struct bnx2_sw_bd) * BNX2_RX_DESC_CNT)
+#define SW_RXPG_RING_SIZE (sizeof(struct bnx2_sw_pg) * BNX2_RX_DESC_CNT)
+#define RXBD_RING_SIZE (sizeof(struct bnx2_rx_bd) * BNX2_RX_DESC_CNT)
+#define SW_TXBD_RING_SIZE (sizeof(struct bnx2_sw_tx_bd) * BNX2_TX_DESC_CNT)
+#define TXBD_RING_SIZE (sizeof(struct bnx2_tx_bd) * BNX2_TX_DESC_CNT)
 
 /* Buffered flash (Atmel: AT45DB011B) specific information */
 #define SEEPROM_PAGE_BITS			2
@@ -6628,9 +6711,12 @@ struct flash_spec {
 
 #define BNX2_MAX_MSIX_HW_VEC	9
 #define BNX2_MAX_MSIX_VEC	9
-#define BNX2_BASE_VEC		0
-#define BNX2_TX_VEC		1
-#define BNX2_TX_INT_NUM	(BNX2_TX_VEC << BNX2_PCICFG_INT_ACK_CMD_INT_NUM_SHIFT)
+#ifdef BCM_CNIC
+#define BNX2_MIN_MSIX_VEC	2
+#else
+#define BNX2_MIN_MSIX_VEC	1
+#endif
+
 
 struct bnx2_irq {
 	irq_handler_t	handler;
@@ -6645,8 +6731,8 @@ struct bnx2_tx_ring_info {
 	u32			tx_bidx_addr;
 	u32			tx_bseq_addr;
 
-	struct tx_bd		*tx_desc_ring;
-	struct sw_tx_bd		*tx_buf_ring;
+	struct bnx2_tx_bd	*tx_desc_ring;
+	struct bnx2_sw_tx_bd	*tx_buf_ring;
 
 	u16			tx_cons;
 	u16			hw_tx_cons;
@@ -6666,13 +6752,13 @@ struct bnx2_rx_ring_info {
 	u16			rx_pg_prod;
 	u16			rx_pg_cons;
 
-	struct sw_bd		*rx_buf_ring;
-	struct rx_bd		*rx_desc_ring[MAX_RX_RINGS];
-	struct sw_pg		*rx_pg_ring;
-	struct rx_bd		*rx_pg_desc_ring[MAX_RX_PG_RINGS];
+	struct bnx2_sw_bd	*rx_buf_ring;
+	struct bnx2_rx_bd	*rx_desc_ring[BNX2_MAX_RX_RINGS];
+	struct bnx2_sw_pg	*rx_pg_ring;
+	struct bnx2_rx_bd	*rx_pg_desc_ring[BNX2_MAX_RX_PG_RINGS];
 
-	dma_addr_t		rx_desc_mapping[MAX_RX_RINGS];
-	dma_addr_t		rx_pg_desc_mapping[MAX_RX_PG_RINGS];
+	dma_addr_t		rx_desc_mapping[BNX2_MAX_RX_RINGS];
+	dma_addr_t		rx_pg_desc_mapping[BNX2_MAX_RX_PG_RINGS];
 };
 
 struct bnx2_napi {
@@ -6722,12 +6808,9 @@ struct bnx2 {
 #define BNX2_FLAG_JUMBO_BROKEN		0x00000800
 #define BNX2_FLAG_CAN_KEEP_VLAN		0x00001000
 #define BNX2_FLAG_BROKEN_STATS		0x00002000
+#define BNX2_FLAG_AER_ENABLED		0x00004000
 
 	struct bnx2_napi	bnx2_napi[BNX2_MAX_MSIX_VEC];
-
-#ifdef BCM_VLAN
-	struct			vlan_group *vlgrp;
-#endif
 
 	u32			rx_buf_use_size;	/* useable size */
 	u32			rx_buf_size;		/* with alignment */
@@ -6736,14 +6819,12 @@ struct bnx2 {
 	u32			rx_max_ring_idx;
 	u32			rx_max_pg_ring_idx;
 
-	u32			rx_csum;
-
 	/* TX constants */
 	int		tx_ring_size;
 	u32		tx_wake_thresh;
 
 #ifdef BCM_CNIC
-	struct cnic_ops		*cnic_ops;
+	struct cnic_ops __rcu	*cnic_ops;
 	void			*cnic_data;
 #endif
 
@@ -6773,6 +6854,7 @@ struct bnx2 {
 #define BNX2_PHY_FLAG_REMOTE_PHY_CAP		0x00000800
 #define BNX2_PHY_FLAG_FORCED_DOWN		0x00001000
 #define BNX2_PHY_FLAG_NO_PARALLEL		0x00002000
+#define BNX2_PHY_FLAG_MDIX			0x00004000
 
 	u32			mii_bmcr;
 	u32			mii_bmsr;
@@ -6783,33 +6865,31 @@ struct bnx2 {
 
 	u32			chip_id;
 	/* chip num:16-31, rev:12-15, metal:4-11, bond_id:0-3 */
-#define CHIP_NUM(bp)			(((bp)->chip_id) & 0xffff0000)
-#define CHIP_NUM_5706			0x57060000
-#define CHIP_NUM_5708			0x57080000
-#define CHIP_NUM_5709			0x57090000
+#define BNX2_CHIP(bp)			(((bp)->chip_id) & 0xffff0000)
+#define BNX2_CHIP_5706			0x57060000
+#define BNX2_CHIP_5708			0x57080000
+#define BNX2_CHIP_5709			0x57090000
 
-#define CHIP_REV(bp)			(((bp)->chip_id) & 0x0000f000)
-#define CHIP_REV_Ax			0x00000000
-#define CHIP_REV_Bx			0x00001000
-#define CHIP_REV_Cx			0x00002000
+#define BNX2_CHIP_REV(bp)		(((bp)->chip_id) & 0x0000f000)
+#define BNX2_CHIP_REV_Ax		0x00000000
+#define BNX2_CHIP_REV_Bx		0x00001000
+#define BNX2_CHIP_REV_Cx		0x00002000
 
-#define CHIP_METAL(bp)			(((bp)->chip_id) & 0x00000ff0)
-#define CHIP_BONDING(bp)		(((bp)->chip_id) & 0x0000000f)
+#define BNX2_CHIP_METAL(bp)		(((bp)->chip_id) & 0x00000ff0)
+#define BNX2_CHIP_BOND(bp)		(((bp)->chip_id) & 0x0000000f)
 
-#define CHIP_ID(bp)			(((bp)->chip_id) & 0xfffffff0)
-#define CHIP_ID_5706_A0			0x57060000
-#define CHIP_ID_5706_A1			0x57060010
-#define CHIP_ID_5706_A2			0x57060020
-#define CHIP_ID_5708_A0			0x57080000
-#define CHIP_ID_5708_B0			0x57081000
-#define CHIP_ID_5708_B1			0x57081010
-#define CHIP_ID_5709_A0			0x57090000
-#define CHIP_ID_5709_A1			0x57090010
-
-#define CHIP_BOND_ID(bp)		(((bp)->chip_id) & 0xf)
+#define BNX2_CHIP_ID(bp)		(((bp)->chip_id) & 0xfffffff0)
+#define BNX2_CHIP_ID_5706_A0		0x57060000
+#define BNX2_CHIP_ID_5706_A1			0x57060010
+#define BNX2_CHIP_ID_5706_A2			0x57060020
+#define BNX2_CHIP_ID_5708_A0			0x57080000
+#define BNX2_CHIP_ID_5708_B0			0x57081000
+#define BNX2_CHIP_ID_5708_B1			0x57081010
+#define BNX2_CHIP_ID_5709_A0			0x57090000
+#define BNX2_CHIP_ID_5709_A1			0x57090010
 
 /* A serdes chip will have the first bit of the bond id set. */
-#define CHIP_BOND_ID_SERDES_BIT		0x01
+#define BNX2_CHIP_BOND_SERDES_BIT		0x01
 
 	u32			phy_addr;
 	u32			phy_id;
@@ -6821,6 +6901,7 @@ struct bnx2 {
 
 	u16			fw_wr_seq;
 	u16			fw_drv_pulse_wr_seq;
+	u32			fw_last_msg;
 
 	int			rx_max_ring;
 	int			rx_ring_size;
@@ -6847,7 +6928,9 @@ struct bnx2 {
 
 	dma_addr_t		status_blk_mapping;
 
+	void *status_blk;
 	struct statistics_block	*stats_blk;
+	struct statistics_block	*temp_stats_blk;
 	dma_addr_t		stats_blk_mapping;
 
 	int			ctx_pages;
@@ -6900,27 +6983,34 @@ struct bnx2 {
 	struct bnx2_irq		irq_tbl[BNX2_MAX_MSIX_VEC];
 	int			irq_nvecs;
 
+	u8			func;
+
 	u8			num_tx_rings;
 	u8			num_rx_rings;
 
+	int			num_req_tx_rings;
+	int			num_req_rx_rings;
+
+	u32 			leds_save;
 	u32			idle_chk_status_idx;
 
 #ifdef BCM_CNIC
 	struct mutex		cnic_lock;
 	struct cnic_eth_dev	cnic_eth_dev;
+	struct cnic_eth_dev	*(*cnic_probe)(struct net_device *);
 #endif
 
 	const struct firmware	*mips_firmware;
 	const struct firmware	*rv2p_firmware;
 };
 
-#define REG_RD(bp, offset)					\
+#define BNX2_RD(bp, offset)					\
 	readl(bp->regview + offset)
 
-#define REG_WR(bp, offset, val)					\
+#define BNX2_WR(bp, offset, val)					\
 	writel(val, bp->regview + offset)
 
-#define REG_WR16(bp, offset, val)				\
+#define BNX2_WR16(bp, offset, val)				\
 	writew(val, bp->regview + offset)
 
 struct cpu_reg {
@@ -6975,7 +7065,7 @@ struct bnx2_rv2p_fw_file {
 
 #define RV2P_P1_FIXUP_PAGE_SIZE_IDX		0
 #define RV2P_BD_PAGE_SIZE_MSK			0xffff
-#define RV2P_BD_PAGE_SIZE			((BCM_PAGE_SIZE / 16) - 1)
+#define RV2P_BD_PAGE_SIZE			((BNX2_PAGE_SIZE / 16) - 1)
 
 #define RV2P_PROC1                              0
 #define RV2P_PROC2                              1
@@ -7280,6 +7370,8 @@ struct bnx2_rv2p_fw_file {
 #define BNX2_BC_STATE_RESET_TYPE_VALUE(msg) (BNX2_BC_STATE_RESET_TYPE_SIG | \
 					     (msg))
 
+#define BNX2_BC_RESET_TYPE			0x000001c0
+
 #define BNX2_BC_STATE				0x000001c4
 #define BNX2_BC_STATE_ERR_MASK			 0x0000ff00
 #define BNX2_BC_STATE_SIGN			 0x42530000
@@ -7317,6 +7409,10 @@ struct bnx2_rv2p_fw_file {
 #define BNX2_CONDITION_MFW_RUN_NCSI		 0x00006000
 #define BNX2_CONDITION_MFW_RUN_NONE		 0x0000e000
 #define BNX2_CONDITION_MFW_RUN_MASK		 0x0000e000
+#define BNX2_CONDITION_PM_STATE_MASK		 0x00030000
+#define BNX2_CONDITION_PM_STATE_FULL		 0x00030000
+#define BNX2_CONDITION_PM_STATE_PREP		 0x00020000
+#define BNX2_CONDITION_PM_STATE_UNPREP		 0x00010000
 
 #define BNX2_BC_STATE_DEBUG_CMD			0x1dc
 #define BNX2_BC_STATE_BC_DBG_CMD_SIGNATURE	 0x42440000
@@ -7350,6 +7446,21 @@ struct bnx2_rv2p_fw_file {
 #define BNX2_RPHY_SERDES_LINK			0x374
 #define BNX2_RPHY_COPPER_LINK			0x378
 
+#define BNX2_ISCSI_INITIATOR			0x3dc
+#define BNX2_ISCSI_INITIATOR_EN			 0x00080000
+
+#define BNX2_ISCSI_MAX_CONN			0x3e4
+#define BNX2_ISCSI_MAX_CONN_MASK		 0xffff0000
+#define BNX2_ISCSI_MAX_CONN_SHIFT		 16
+
 #define HOST_VIEW_SHMEM_BASE			0x167c00
+
+#define DP_SHMEM_LINE(bp, offset)					\
+	netdev_err(bp->dev, "DEBUG: %08x: %08x %08x %08x %08x\n",	\
+		   offset,						\
+		   bnx2_shmem_rd(bp, offset),				\
+		   bnx2_shmem_rd(bp, offset + 4),			\
+		   bnx2_shmem_rd(bp, offset + 8),			\
+		   bnx2_shmem_rd(bp, offset + 12))
 
 #endif

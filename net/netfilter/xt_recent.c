@@ -52,7 +52,7 @@ module_param(ip_list_perms, uint, 0400);
 module_param(ip_list_uid, uint, 0400);
 module_param(ip_list_gid, uint, 0400);
 MODULE_PARM_DESC(ip_list_tot, "number of IPs to remember per list");
-MODULE_PARM_DESC(ip_pkt_list_tot, "number of packets per IP to remember (max. 255)");
+MODULE_PARM_DESC(ip_pkt_list_tot, "number of packets per IP address to remember (max. 255)");
 MODULE_PARM_DESC(ip_list_hash_size, "size of hash table used to look up IPs");
 MODULE_PARM_DESC(ip_list_perms, "permissions on /proc/net/xt_recent/* files");
 MODULE_PARM_DESC(ip_list_uid,"owner of /proc/net/xt_recent/* files");
@@ -173,10 +173,10 @@ recent_entry_init(struct recent_table *t, const union nf_inet_addr *addr,
 
 static void recent_entry_update(struct recent_table *t, struct recent_entry *e)
 {
+	e->index %= ip_pkt_list_tot;
 	e->stamps[e->index++] = jiffies;
 	if (e->index > e->nstamps)
 		e->nstamps = e->index;
-	e->index %= ip_pkt_list_tot;
 	list_move_tail(&e->lru_list, &t->lru_list);
 }
 
@@ -260,7 +260,7 @@ recent_mt(const struct sk_buff *skb, const struct xt_match_param *par)
 		for (i = 0; i < e->nstamps; i++) {
 			if (info->seconds && time_after(time, e->stamps[i]))
 				continue;
-			if (++hits >= info->hit_count) {
+			if (!info->hit_count || ++hits >= info->hit_count) {
 				ret = !ret;
 				break;
 			}
@@ -294,8 +294,12 @@ static bool recent_mt_check(const struct xt_mtchk_param *par)
 	if ((info->check_set & (XT_RECENT_SET | XT_RECENT_REMOVE)) &&
 	    (info->seconds || info->hit_count))
 		return false;
-	if (info->hit_count > ip_pkt_list_tot)
+	if (info->hit_count > ip_pkt_list_tot) {
+		pr_info(KBUILD_MODNAME ": hitcount (%u) is larger than "
+			"packets to be remembered (%u)\n",
+			info->hit_count, ip_pkt_list_tot);
 		return false;
+	}
 	if (info->name[0] == '\0' ||
 	    strnlen(info->name, XT_RECENT_NAME_LEN) == XT_RECENT_NAME_LEN)
 		return false;
@@ -482,8 +486,7 @@ static ssize_t recent_old_proc_write(struct file *file,
 	if (copy_from_user(buf, input, size))
 		return -EFAULT;
 
-	while (isspace(*c))
-		c++;
+	c = skip_spaces(c);
 
 	if (size - (c - buf) < 5)
 		return c - buf;
