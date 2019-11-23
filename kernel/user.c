@@ -18,6 +18,8 @@
 #include <linux/user_namespace.h>
 #include "cred-internals.h"
 
+#include <bc/kmem.h>
+
 struct user_namespace init_user_ns = {
 	.kref = {
 		.refcount	= ATOMIC_INIT(2),
@@ -56,6 +58,7 @@ struct user_struct root_user = {
 	.sigpending	= ATOMIC_INIT(0),
 	.locked_shm     = 0,
 	.user_ns	= &init_user_ns,
+	.user_ub	= &ub0,
 #ifdef CONFIG_USER_SCHED
 	.tg		= &init_task_group,
 #endif
@@ -112,8 +115,11 @@ static struct user_struct *uid_hash_find(uid_t uid, struct hlist_head *hashent)
 	hlist_for_each_entry(user, h, hashent, uidhash_node) {
 		if (user->uid == uid) {
 			/* possibly resurrect an "almost deleted" object */
-			if (atomic_inc_return(&user->__count) == 1)
+			if (atomic_inc_return(&user->__count) == 1) {
+				user->user_ub = get_beancounter(get_exec_ub_top());
+				ub_kmem_charge(user->user_ub, uid_cachep->objuse, __GFP_NOFAIL);
 				cancel_delayed_work(&user->work);
+			}
 			return user;
 		}
 	}
@@ -330,6 +336,8 @@ done:
  */
 static void free_user(struct user_struct *up, unsigned long flags)
 {
+	ub_kmem_uncharge(user->user_ub, uid_cachep->objuse);
+	put_beancounter(up->user_ub);
 	INIT_DELAYED_WORK(&up->work, cleanup_user_struct);
 	schedule_delayed_work(&up->work, msecs_to_jiffies(1000));
 	spin_unlock_irqrestore(&uidhash_lock, flags);
@@ -363,12 +371,15 @@ static inline void uids_mutex_unlock(void) { }
  */
 static void free_user(struct user_struct *up, unsigned long flags)
 {
+	struct user_beancounter *ub = up->user_ub;
+
 	uid_hash_remove(up);
 	spin_unlock_irqrestore(&uidhash_lock, flags);
 	sched_destroy_user(up);
 	key_put(up->uid_keyring);
 	key_put(up->session_keyring);
-	kmem_cache_free(uid_cachep, up);
+	ub_kmem_free(ub, uid_cachep, up);
+	put_beancounter(ub);
 }
 
 #endif
@@ -408,6 +419,7 @@ struct user_struct *find_user(uid_t uid)
 	spin_unlock_irqrestore(&uidhash_lock, flags);
 	return ret;
 }
+EXPORT_SYMBOL(find_user);
 
 void free_uid(struct user_struct *up)
 {
@@ -422,6 +434,7 @@ void free_uid(struct user_struct *up)
 	else
 		local_irq_restore(flags);
 }
+EXPORT_SYMBOL(free_uid);
 
 struct user_struct *alloc_uid(struct user_namespace *ns, uid_t uid)
 {
@@ -438,9 +451,12 @@ struct user_struct *alloc_uid(struct user_namespace *ns, uid_t uid)
 	spin_unlock_irq(&uidhash_lock);
 
 	if (!up) {
-		new = kmem_cache_zalloc(uid_cachep, GFP_KERNEL);
+		struct user_beancounter *ub = get_exec_ub_top();
+
+		new = ub_kmem_alloc(ub, uid_cachep, GFP_KERNEL | __GFP_ZERO);
 		if (!new)
 			goto out_unlock;
+		new->user_ub = ub;
 
 		new->uid = uid;
 		atomic_set(&new->__count, 1);
@@ -467,8 +483,9 @@ struct user_struct *alloc_uid(struct user_namespace *ns, uid_t uid)
 			 */
 			key_put(new->uid_keyring);
 			key_put(new->session_keyring);
-			kmem_cache_free(uid_cachep, new);
+			ub_kmem_free(new->user_ub, uid_cachep, new);
 		} else {
+			get_beancounter(new->user_ub);
 			uid_hash_insert(new, hashent);
 			up = new;
 		}
@@ -483,11 +500,12 @@ out_destoy_sched:
 	sched_destroy_user(new);
 	put_user_ns(new->user_ns);
 out_free_user:
-	kmem_cache_free(uid_cachep, new);
+	ub_kmem_free(new->user_ub, uid_cachep, new);
 out_unlock:
 	uids_mutex_unlock();
 	return NULL;
 }
+EXPORT_SYMBOL(alloc_uid);
 
 static int __init uid_cache_init(void)
 {

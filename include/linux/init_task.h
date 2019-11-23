@@ -10,6 +10,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/user_namespace.h>
 #include <linux/securebits.h>
+#include <linux/seqlock.h>
 #include <net/net_namespace.h>
 
 extern struct files_struct init_files;
@@ -36,13 +37,29 @@ extern struct fs_struct init_fs;
 		.running = 0,						\
 		.lock = __SPIN_LOCK_UNLOCKED(sig.cputimer.lock),	\
 	},								\
+	.oom_score_adj  = OOM_SCORE_ADJ_UNSET,				\
 	INIT_GROUP_RWSEM(sig)					\
 }
+
+#ifdef CONFIG_VE
+/* one for ve0, one for init_task */
+#define INIT_NSPROXY_COUNT	ATOMIC_INIT(2)
+#define INIT_VE_TASK_INFO						\
+	.ve_task_info.exec_env	= &ve0,					\
+	.ve_task_info.owner_env	= &ve0,					\
+	.ve_task_info.sleep_time	= 0,				\
+	.ve_task_info.wakeup_stamp	= 0,				\
+	.ve_task_info.sched_time	= 0,				\
+	.ve_task_info.wakeup_lock	= SEQCNT_ZERO,
+#else
+#define INIT_NSPROXY_COUNT	ATOMIC_INIT(1)
+#define INIT_VE_TASK_INFO
+#endif
 
 extern struct nsproxy init_nsproxy;
 #define INIT_NSPROXY(nsproxy) {						\
 	.pid_ns		= &init_pid_ns,					\
-	.count		= ATOMIC_INIT(1),				\
+	.count		= INIT_NSPROXY_COUNT,				\
 	.uts_ns		= &init_uts_ns,					\
 	.mnt_ns		= NULL,						\
 	INIT_NET_NS(net_ns)                                             \
@@ -192,6 +209,7 @@ extern struct cred init_cred;
 	INIT_FTRACE_GRAPH						\
 	INIT_TRACE_RECURSION						\
 	INIT_TASK_RCU_PREEMPT(tsk)					\
+	INIT_VE_TASK_INFO						\
 }
 
 

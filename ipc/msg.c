@@ -193,6 +193,7 @@ static int newque(struct ipc_namespace *ns, struct ipc_params *params)
 	int id, retval;
 	key_t key = params->key;
 	int msgflg = params->flg;
+	int msqid = params->id;
 
 	msq = ipc_rcu_alloc(sizeof(*msq));
 	if (!msq)
@@ -220,7 +221,7 @@ static int newque(struct ipc_namespace *ns, struct ipc_params *params)
 	/*
 	 * ipc_addid() locks msq
 	 */
-	id = ipc_addid(&msg_ids(ns), &msq->q_perm, ns->msg_ctlmni);
+	id = ipc_addid(&msg_ids(ns), &msq->q_perm, ns->msg_ctlmni, msqid);
 	if (id < 0) {
 		ipc_rcu_putref(msq, msg_rcu_free);
 		return id;
@@ -331,6 +332,7 @@ SYSCALL_DEFINE2(msgget, key_t, key, int, msgflg)
 
 	msg_params.key = key;
 	msg_params.flg = msgflg;
+	msg_params.id = -1;
 
 	return ipcget(ns, &msg_ids(ns), &msg_ops, &msg_params);
 }
@@ -701,7 +703,8 @@ long do_msgsnd(int msqid, long mtype, void __user *mtext,
 
 		ipc_lock_by_ptr(&msq->q_perm);
 		ipc_rcu_putref(msq, ipc_rcu_free);
-		if (msq->q_perm.deleted) {
+		/* raced with RMID? */
+		if (!ipc_valid_object(&msq->q_perm)) {
 			err = -EIDRM;
 			goto out_unlock_free;
 		}
@@ -889,6 +892,12 @@ long do_msgrcv(int msqid, long *pmtype, void __user *mtext,
 		ipc_lock_by_ptr(&msq->q_perm);
 		rcu_read_unlock();
 
+		/* raced with RMID? */
+		if (!ipc_valid_object(&msq->q_perm)) {
+			msg = ERR_PTR(-EIDRM);
+			goto out_unlock;
+		}
+
 		/* Lockless receive, part 4:
 		 * Repeat test after acquiring the spinlock.
 		 */
@@ -954,4 +963,56 @@ static int sysvipc_msg_proc_show(struct seq_file *s, void *it)
 			msq->q_rtime,
 			msq->q_ctime);
 }
+#endif
+
+#ifdef CONFIG_VE
+#include <linux/module.h>
+
+int sysvipc_setup_msg(key_t key, int msqid, int msgflg)
+{
+	struct ipc_namespace *ns;
+	struct ipc_ops msg_ops;
+	struct ipc_params msg_params;
+
+	ns = current->nsproxy->ipc_ns;
+
+	msg_ops.getnew = newque;
+	msg_ops.associate = msg_security;
+	msg_ops.more_checks = NULL;
+
+	msg_params.key = key;
+	msg_params.flg = msgflg | IPC_CREAT;
+	msg_params.id = msqid;
+
+	return ipcget(ns, &msg_ids(ns), &msg_ops, &msg_params);
+}
+EXPORT_SYMBOL_GPL(sysvipc_setup_msg);
+
+int sysvipc_walk_msg(int (*func)(int i, struct msg_queue*, void *), void *arg)
+{
+	int err = 0;
+	struct msg_queue * msq;
+	struct ipc_namespace *ns;
+	int next_id;
+	int total, in_use;
+
+	ns = current->nsproxy->ipc_ns;
+
+	down_write(&msg_ids(ns).rw_mutex);
+	in_use = msg_ids(ns).in_use;
+	for (total = 0, next_id = 0; total < in_use; next_id++) {
+		msq = idr_find(&msg_ids(ns).ipcs_idr, next_id);
+		if (msq == NULL)
+			continue;
+		ipc_lock_by_ptr(&msq->q_perm);
+		err = func(ipc_buildid(next_id, msq->q_perm.seq), msq, arg);
+		msg_unlock(msq);
+		if (err)
+			break;
+		total++;
+	}
+	up_write(&msg_ids(ns).rw_mutex);
+	return err;
+}
+EXPORT_SYMBOL_GPL(sysvipc_walk_msg);
 #endif

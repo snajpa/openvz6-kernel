@@ -15,13 +15,14 @@
 #include <linux/sunrpc/clnt.h>
 #include <linux/vfs.h>
 #include <linux/sunrpc/gss_api.h>
+#include <linux/module.h>
 #include "internal.h"
 
 #define NFSDBG_FACILITY		NFSDBG_VFS
 
 static void nfs_expire_automounts(struct work_struct *work);
 
-static LIST_HEAD(nfs_automount_list);
+LIST_HEAD(nfs_automount_list);
 static DECLARE_DELAYED_WORK(nfs_automount_task, nfs_expire_automounts);
 int nfs_mountpoint_expiry_timeout = 500 * HZ;
 

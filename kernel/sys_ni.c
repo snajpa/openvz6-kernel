@@ -185,5 +185,27 @@ cond_syscall(compat_sys_timerfd_gettime);
 cond_syscall(sys_eventfd);
 cond_syscall(sys_eventfd2);
 
+/* open by handle */
+cond_syscall(sys_name_to_handle_at);
+cond_syscall(sys_open_by_handle_at);
+cond_syscall(compat_sys_open_by_handle_at);
+
 /* performance counters: */
 cond_syscall(sys_perf_event_open);
+cond_syscall(sys_getluid);
+cond_syscall(sys_setluid);
+cond_syscall(sys_setublimit);
+cond_syscall(compat_sys_setublimit);
+cond_syscall(sys_ubstat);
+
+/* fairsched compat */
+cond_syscall(sys_fairsched_mknod);
+cond_syscall(sys_fairsched_rmnod);
+cond_syscall(sys_fairsched_mvpr);
+cond_syscall(sys_fairsched_vcpus);
+cond_syscall(sys_fairsched_chwt);
+cond_syscall(sys_fairsched_rate);
+cond_syscall(sys_fairsched_cpumask);
+cond_syscall(sys_fairsched_nodemask);
+
+cond_syscall(compat_sys_lutime);

@@ -15,6 +15,7 @@
 #include <linux/ptrace.h>
 #include <linux/mman.h>
 #include <linux/mm.h>
+#include <linux/pram.h>
 #include <linux/swap.h>
 #include <linux/smp.h>
 #include <linux/init.h>
@@ -740,6 +741,10 @@ void __init mem_init(void)
 	absent_pages = absent_pages_in_range(0, max_pfn);
 	reservedpages = max_pfn - totalram_pages - absent_pages;
 	after_bootmem = 1;
+
+	totalram_pages += pram_reserved_pages;
+	reservedpages -= pram_reserved_pages;
+	pram_show_banned();
 
 	codesize =  (unsigned long) &_etext - (unsigned long) &_text;
 	datasize =  (unsigned long) &_edata - (unsigned long) &_etext;

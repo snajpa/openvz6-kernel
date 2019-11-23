@@ -12,6 +12,8 @@
 #include <linux/device.h>
 #include <trace/events/writeback.h>
 
+static atomic_long_t bdi_seq = ATOMIC_LONG_INIT(0);
+
 void default_unplug_io_fn(struct backing_dev_info *bdi, struct page *page)
 {
 }
@@ -25,6 +27,12 @@ struct backing_dev_info default_backing_dev_info = {
 	.unplug_io_fn	= default_unplug_io_fn,
 };
 EXPORT_SYMBOL_GPL(default_backing_dev_info);
+
+struct backing_dev_info noop_backing_dev_info = {
+	.name		= "noop",
+	.capabilities	= BDI_CAP_NO_ACCT_AND_WRITEBACK,
+};
+EXPORT_SYMBOL_GPL(noop_backing_dev_info);
 
 static struct class *bdi_class;
 
@@ -61,10 +69,10 @@ static int bdi_debug_stats_show(struct seq_file *m, void *v)
 	unsigned long background_thresh;
 	unsigned long dirty_thresh;
 	unsigned long bdi_thresh;
-	unsigned long nr_dirty, nr_io, nr_more_io, nr_wb;
+	unsigned long nr_dirty, nr_io, nr_more_io, nr_wb, nr_dirty_time;
 	struct inode *inode;
 
-	nr_wb = nr_dirty = nr_io = nr_more_io = 0;
+	nr_wb = nr_dirty = nr_io = nr_more_io = nr_dirty_time = 0;
 	spin_lock(&inode_lock);
 	list_for_each_entry(inode, &wb->b_dirty, i_list)
 		nr_dirty++;
@@ -72,6 +80,9 @@ static int bdi_debug_stats_show(struct seq_file *m, void *v)
 		nr_io++;
 	list_for_each_entry(inode, &wb->b_more_io, i_list)
 		nr_more_io++;
+	list_for_each_entry(inode, &wb->b_dirty_time, i_list)
+		if (inode->i_state & I_DIRTY_TIME)
+			nr_dirty_time++;
 	spin_unlock(&inode_lock);
 
 	get_dirty_limits(&background_thresh, &dirty_thresh, &bdi_thresh, bdi);
@@ -86,12 +97,14 @@ static int bdi_debug_stats_show(struct seq_file *m, void *v)
 		   "b_dirty:          %8lu\n"
 		   "b_io:             %8lu\n"
 		   "b_more_io:        %8lu\n"
+		   "b_dirty_time:     %8lu\n"
 		   "bdi_list:         %8u\n"
 		   "state:            %8lx\n",
 		   (unsigned long) K(bdi_stat(bdi, BDI_WRITEBACK)),
 		   (unsigned long) K(bdi_stat(bdi, BDI_RECLAIMABLE)),
 		   K(bdi_thresh), K(dirty_thresh),
 		   K(background_thresh), nr_dirty, nr_io, nr_more_io,
+		   nr_dirty_time,
 		   !list_empty(&bdi->bdi_list), bdi->state);
 #undef K
 
@@ -165,41 +178,51 @@ static ssize_t name##_show(struct device *dev,				\
 
 BDI_SHOW(read_ahead_kb, K(bdi->ra_pages))
 
-static ssize_t min_ratio_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
+static inline ssize_t generic_uint_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count,
+		int (*set_func) (struct backing_dev_info *, unsigned int))
 {
 	struct backing_dev_info *bdi = dev_get_drvdata(dev);
 	char *end;
-	unsigned int ratio;
+	unsigned int val;
 	ssize_t ret = -EINVAL;
 
-	ratio = simple_strtoul(buf, &end, 10);
+	val = simple_strtoul(buf, &end, 10);
 	if (*buf && (end[0] == '\0' || (end[0] == '\n' && end[1] == '\0'))) {
-		ret = bdi_set_min_ratio(bdi, ratio);
+		ret = set_func(bdi, val);
 		if (!ret)
 			ret = count;
 	}
 	return ret;
+}
+
+static ssize_t min_ratio_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	return generic_uint_store(dev, attr, buf, count, bdi_set_min_ratio);
 }
 BDI_SHOW(min_ratio, bdi->min_ratio)
 
 static ssize_t max_ratio_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
-	struct backing_dev_info *bdi = dev_get_drvdata(dev);
-	char *end;
-	unsigned int ratio;
-	ssize_t ret = -EINVAL;
-
-	ratio = simple_strtoul(buf, &end, 10);
-	if (*buf && (end[0] == '\0' || (end[0] == '\n' && end[1] == '\0'))) {
-		ret = bdi_set_max_ratio(bdi, ratio);
-		if (!ret)
-			ret = count;
-	}
-	return ret;
+	return generic_uint_store(dev, attr, buf, count, bdi_set_max_ratio);
 }
 BDI_SHOW(max_ratio, bdi->max_ratio)
+
+static ssize_t min_dirty_pages_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	return generic_uint_store(dev, attr, buf, count, bdi_set_min_dirty);
+}
+BDI_SHOW(min_dirty_pages, bdi->min_dirty_pages)
+
+static ssize_t max_dirty_pages_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	return generic_uint_store(dev, attr, buf, count, bdi_set_max_dirty);
+}
+BDI_SHOW(max_dirty_pages, bdi->max_dirty_pages)
 
 static ssize_t stable_pages_required_show(struct device *dev,
 					  struct device_attribute *attr,
@@ -215,6 +238,8 @@ static struct device_attribute bdi_dev_attrs[] = {
 	__ATTR_RW(read_ahead_kb),
 	__ATTR_RW(min_ratio),
 	__ATTR_RW(max_ratio),
+	__ATTR_RW(min_dirty_pages),
+	__ATTR_RW(max_dirty_pages),
 	__ATTR_RO(stable_pages_required),
 	__ATTR_NULL,
 };
@@ -241,6 +266,7 @@ static int __init default_bdi_init(void)
 	err = bdi_init(&default_backing_dev_info);
 	if (!err)
 		bdi_register(&default_backing_dev_info, NULL, "default");
+	err = bdi_init(&noop_backing_dev_info);
 
 	return err;
 }
@@ -513,13 +539,16 @@ int bdi_register(struct backing_dev_info *bdi, struct device *parent,
 {
 	va_list args;
 	struct device *dev;
+	struct ve_struct *ve;
 
 	if (bdi->dev)	/* The driver needs to use separate queues per device */
 		return 0;
 
+	ve = set_exec_env(&ve0);
 	va_start(args, fmt);
 	dev = device_create_vargs(bdi_class, parent, MKDEV(0, 0), bdi, fmt, args);
 	va_end(args);
+	set_exec_env(ve);
 	if (IS_ERR(dev))
 		return PTR_ERR(dev);
 
@@ -605,7 +634,7 @@ static void bdi_prune_sb(struct backing_dev_info *bdi)
 	spin_lock(&sb_lock);
 	list_for_each_entry(sb, &super_blocks, s_list) {
 		if (sb->s_bdi == bdi)
-			sb->s_bdi = NULL;
+			sb->s_bdi = &default_backing_dev_info;
 	}
 	spin_unlock(&sb_lock);
 }
@@ -613,6 +642,7 @@ static void bdi_prune_sb(struct backing_dev_info *bdi)
 void bdi_unregister(struct backing_dev_info *bdi)
 {
 	struct device *dev = bdi->dev;
+	struct ve_struct *ve;
 
 	if (dev) {
 		trace_writeback_bdi_unregister(bdi);
@@ -627,7 +657,9 @@ void bdi_unregister(struct backing_dev_info *bdi)
 		bdi->dev = NULL;
 		spin_unlock_bh(&bdi->wb_lock);
 
+		ve = set_exec_env(&ve0);
 		device_unregister(dev);
+		set_exec_env(ve);
 	}
 }
 EXPORT_SYMBOL(bdi_unregister);
@@ -641,6 +673,7 @@ static void bdi_wb_init(struct bdi_writeback *wb, struct backing_dev_info *bdi)
 	INIT_LIST_HEAD(&wb->b_dirty);
 	INIT_LIST_HEAD(&wb->b_io);
 	INIT_LIST_HEAD(&wb->b_more_io);
+	INIT_LIST_HEAD(&wb->b_dirty_time);
 }
 
 int bdi_init(struct backing_dev_info *bdi)
@@ -652,9 +685,12 @@ int bdi_init(struct backing_dev_info *bdi)
 	bdi->min_ratio = 0;
 	bdi->max_ratio = 100;
 	bdi->max_prop_frac = PROP_FRAC_BASE;
+	bdi->min_dirty_pages = 0;
+	bdi->max_dirty_pages = 0;
 	spin_lock_init(&bdi->wb_lock);
 	INIT_LIST_HEAD(&bdi->bdi_list);
 	INIT_LIST_HEAD(&bdi->work_list);
+	init_waitqueue_head(&bdi->cong_waitq);
 
 	bdi_wb_init(&bdi->wb, bdi);
 	bdi->wb.aux = kmalloc(sizeof(struct bdi_wb_aux), GFP_KERNEL);
@@ -717,6 +753,33 @@ void bdi_destroy(struct backing_dev_info *bdi)
 	kfree(bdi->wb.aux);
 }
 EXPORT_SYMBOL(bdi_destroy);
+
+/*
+ * For use from filesystems to quickly init and register a bdi associated
+ * with dirty writeback
+ */
+int bdi_setup_and_register(struct backing_dev_info *bdi, char *name,
+			   unsigned int cap)
+{
+	char tmp[32];
+	int err;
+
+	bdi->name = name;
+	bdi->capabilities = cap;
+	err = bdi_init(bdi);
+	if (err)
+		return err;
+
+	sprintf(tmp, "%.28s%s", name, "-%d");
+	err = bdi_register(bdi, NULL, tmp, atomic_long_inc_return(&bdi_seq));
+	if (err) {
+		bdi_destroy(bdi);
+		return err;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL(bdi_setup_and_register);
 
 static wait_queue_head_t congestion_wqh[2] = {
 		__WAIT_QUEUE_HEAD_INITIALIZER(congestion_wqh[0]),

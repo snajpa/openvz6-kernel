@@ -96,6 +96,9 @@ struct vlan_group {
 	struct hlist_node	hlist;	/* linked list */
 	struct net_device **vlan_devices_arrays[VLAN_GROUP_ARRAY_SPLIT_PARTS];
 	struct rcu_head		rcu;
+#ifdef CONFIG_VE
+	struct ve_struct	*owner;
+#endif
 };
 
 static inline struct net_device *vlan_group_get_device(struct vlan_group *vg,

@@ -152,7 +152,7 @@ static struct srcu_struct pmus_srcu;
 
 /*
  * perf event paranoia level:
- *  -1 - not paranoid at all
+ *  -1 - not paranoid at all, including containers
  *   0 - disallow raw tracepoint access for unpriv
  *   1 - disallow cpu events for unpriv
  *   2 - disallow kernel profiling for unpriv
@@ -7179,6 +7179,9 @@ SYSCALL_DEFINE5(perf_event_open,
 		if (perf_paranoid_kernel() && !capable(CAP_SYS_ADMIN))
 			return -EACCES;
 	}
+
+	if (perf_paranoid_container() && !ve_is_super(get_exec_env()))
+		return -EACCES;
 
 	if (attr.freq) {
 		if (attr.sample_freq > sysctl_perf_event_sample_rate)

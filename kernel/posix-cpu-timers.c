@@ -9,6 +9,7 @@
 #include <asm/uaccess.h>
 #include <linux/kernel_stat.h>
 #include <trace/events/timer.h>
+#include <linux/module.h>
 
 /*
  * Called after updating RLIMIT_CPU to set timer expiration if necessary.
@@ -366,7 +367,7 @@ static int posix_cpu_clock_get(const clockid_t which_clock, struct timespec *tp)
 				}
 			} else {
 				read_lock(&tasklist_lock);
-				if (thread_group_leader(p) && p->signal) {
+				if (thread_group_leader(p) && p->sighand) {
 					error =
 					    cpu_clock_sample_group(which_clock,
 							           p, &rtn);
@@ -443,7 +444,7 @@ static int posix_cpu_timer_del(struct k_itimer *timer)
 
 	if (likely(p != NULL)) {
 		read_lock(&tasklist_lock);
-		if (unlikely(p->signal == NULL)) {
+		if (unlikely(p->sighand == NULL)) {
 			/*
 			 * We raced with the reaping of the task.
 			 * The deletion should have cleared us off the list.
@@ -739,10 +740,10 @@ static int posix_cpu_timer_set(struct k_itimer *timer, int flags,
 	read_lock(&tasklist_lock);
 	/*
 	 * We need the tasklist_lock to protect against reaping that
-	 * clears p->signal.  If p has just been reaped, we can no
+	 * clears p->sighand.  If p has just been reaped, we can no
 	 * longer get any information about it at all.
 	 */
-	if (unlikely(p->signal == NULL)) {
+	if (unlikely(p->sighand == NULL)) {
 		read_unlock(&tasklist_lock);
 		put_task_struct(p);
 		timer->it.cpu.task = NULL;
@@ -911,7 +912,7 @@ static void posix_cpu_timer_get(struct k_itimer *timer, struct itimerspec *itp)
 		clear_dead = p->exit_state;
 	} else {
 		read_lock(&tasklist_lock);
-		if (unlikely(p->signal == NULL)) {
+		if (unlikely(p->sighand == NULL)) {
 			/*
 			 * The process has been reaped.
 			 * We can't even collect a sample any more.
@@ -1267,7 +1268,7 @@ void posix_cpu_timer_schedule(struct k_itimer *timer)
 		read_lock(&tasklist_lock); /* arm_timer needs it.  */
 	} else {
 		read_lock(&tasklist_lock);
-		if (unlikely(p->signal == NULL)) {
+		if (unlikely(p->sighand == NULL)) {
 			/*
 			 * The process has been reaped.
 			 * We can't even collect a sample any more.
@@ -1387,6 +1388,7 @@ static inline int fastpath_timer_check(struct task_struct *tsk)
 
 	return sig->rlim[RLIMIT_CPU].rlim_cur != RLIM_INFINITY;
 }
+EXPORT_SYMBOL(set_process_cpu_timer);
 
 /*
  * This is called from the timer interrupt handler.  The irq handler has
@@ -1539,8 +1541,10 @@ static int do_cpu_nanosleep(const clockid_t which_clock, int flags,
 		while (!signal_pending(current)) {
 			if (timer.it.cpu.expires.sched == 0) {
 				/*
-				 * Our timer fired and was reset.
+				 * Our timer fired and was reset, below
+				 * deletion can not fail.
 				 */
+				posix_cpu_timer_del(&timer);
 				spin_unlock_irq(&timer.it_lock);
 				return 0;
 			}
@@ -1558,8 +1562,25 @@ static int do_cpu_nanosleep(const clockid_t which_clock, int flags,
 		 * We were interrupted by a signal.
 		 */
 		sample_to_timespec(which_clock, timer.it.cpu.expires, rqtp);
-		posix_cpu_timer_set(&timer, 0, &zero_it, it);
+		error = posix_cpu_timer_set(&timer, 0, &zero_it, it);
+		if (!error) {
+			/*
+			 * Timer is now unarmed, deletion can not fail.
+			 */
+			posix_cpu_timer_del(&timer);
+		}
 		spin_unlock_irq(&timer.it_lock);
+
+		while (error == TIMER_RETRY) {
+			/*
+			 * We need to handle case when timer was or is in the
+			 * middle of firing. In other cases we already freed
+			 * resources.
+			 */
+			spin_lock_irq(&timer.it_lock);
+			error = posix_cpu_timer_del(&timer);
+			spin_unlock_irq(&timer.it_lock);
+		}
 
 		if ((it->it_value.tv_sec | it->it_value.tv_nsec) == 0) {
 			/*
@@ -1574,7 +1595,7 @@ static int do_cpu_nanosleep(const clockid_t which_clock, int flags,
 	return error;
 }
 
-static long posix_cpu_nsleep_restart(struct restart_block *restart_block);
+long posix_cpu_nsleep_restart(struct restart_block *restart_block);
 
 static int posix_cpu_nsleep(const clockid_t which_clock, int flags,
 			    struct timespec *rqtp, struct timespec __user *rmtp)
@@ -1612,7 +1633,7 @@ static int posix_cpu_nsleep(const clockid_t which_clock, int flags,
 	return error;
 }
 
-static long posix_cpu_nsleep_restart(struct restart_block *restart_block)
+long posix_cpu_nsleep_restart(struct restart_block *restart_block)
 {
 	clockid_t which_clock = restart_block->nanosleep.index;
 	struct timespec t;
@@ -1636,6 +1657,7 @@ static long posix_cpu_nsleep_restart(struct restart_block *restart_block)
 	return error;
 
 }
+EXPORT_SYMBOL_GPL(posix_cpu_nsleep_restart);
 
 #define PROCESS_CLOCK	MAKE_PROCESS_CPUCLOCK(0, CPUCLOCK_SCHED)
 #define THREAD_CLOCK	MAKE_THREAD_CPUCLOCK(0, CPUCLOCK_SCHED)

@@ -39,6 +39,7 @@ extern void cgroup_exit(struct task_struct *p, int run_callbacks);
 extern int cgroupstats_build(struct cgroupstats *stats,
 				struct dentry *dentry);
 
+extern struct file_system_type cgroup_fs_type;
 extern const struct file_operations proc_cgroup_operations;
 
 /* Define the enumeration of all cgroup subsystems */
@@ -147,6 +148,7 @@ enum {
 	 * A thread in rmdir() is wating for this cgroup.
 	 */
 	CGRP_WAIT_ON_RMDIR,
+	CGRP_SELF_DESTRUCTION,
 };
 
 /* which pidlist file are we talking about? */
@@ -205,6 +207,10 @@ struct cgroup {
 
 	struct cgroupfs_root *root;
 	struct cgroup *top_cgroup;
+
+	/* The path to use for release notifications. */
+	char *release_agent;
+	struct workqueue_struct *khelper_wq;
 
 	/*
 	 * List of cg_cgroup_links pointing at css_sets with
@@ -604,6 +610,39 @@ bool css_is_ancestor(struct cgroup_subsys_state *cg,
 unsigned short css_id(struct cgroup_subsys_state *css);
 unsigned short css_depth(struct cgroup_subsys_state *css);
 struct cgroup_subsys_state *cgroup_css_from_dir(struct file *f, int id);
+
+struct cgroup_sb_opts {
+	unsigned long subsys_bits;
+	unsigned long flags;
+	char *release_agent;
+	char *name;
+	/* User explicitly requested empty subsystem */
+	bool none;
+
+	struct cgroupfs_root *new_root;
+
+};
+
+enum cgroup_open_flags {
+	CGRP_CREAT	= 0x0001,	/* create if not found */
+	CGRP_EXCL	= 0x0002,	/* fail if already exist */
+	CGRP_WEAK	= 0x0004,	/* arm cgroup self-destruction */
+};
+
+struct vfsmount *cgroup_kernel_mount(struct cgroup_sb_opts *opts);
+struct cgroup *cgroup_get_root(struct vfsmount *mnt);
+struct cgroup *cgroup_kernel_open(struct cgroup *parent,
+		enum cgroup_open_flags flags, char *name);
+int cgroup_kernel_remove(struct cgroup *parent, char *name);
+int cgroup_kernel_attach(struct cgroup *cgrp, struct task_struct *tsk);
+void cgroup_kernel_close(struct cgroup *cgrp);
+int cpt_collect_cgroups(struct vfsmount *mnt,
+			int (*cb)(struct cgroup *cgrp, void *arg), void *arg);
+
+static inline void __cgroup_kernel_open(struct cgroup *cgrp)
+{
+	atomic_inc(&cgrp->count);
+}
 
 #else /* !CONFIG_CGROUPS */
 

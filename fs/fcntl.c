@@ -129,6 +129,7 @@ SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd)
 	}
 	return sys_dup3(oldfd, newfd, 0);
 }
+EXPORT_SYMBOL(sys_dup2);
 
 SYSCALL_DEFINE1(dup, unsigned int, fildes)
 {
@@ -146,11 +147,49 @@ SYSCALL_DEFINE1(dup, unsigned int, fildes)
 }
 
 #define SETFL_MASK (O_APPEND | O_NONBLOCK | O_NDELAY | O_DIRECT | O_NOATIME)
+void generic_set_file_flags_unlocked(struct file *filp, unsigned int arg)
+{
+	filp->f_flags = (arg & SETFL_MASK) |
+		(filp->f_flags & ~SETFL_MASK);
+
+}
+EXPORT_SYMBOL(generic_set_file_flags_unlocked);
+int generic_set_file_flags(struct file *filp, unsigned int arg)
+{
+	spin_lock(&filp->f_lock);
+	generic_set_file_flags_unlocked(filp, arg);
+	spin_unlock(&filp->f_lock);
+	return 0;
+
+}
+EXPORT_SYMBOL(generic_set_file_flags);
+
+int may_use_odirect(void)
+{
+	int may;
+
+	if (ve_is_super(get_exec_env()))
+		return 1;
+
+	may = capable(CAP_SYS_RAWIO);
+	if (!may) {
+		may = get_exec_env()->odirect_enable;
+		if (may == 2)
+			may = get_ve0()->odirect_enable;
+	}
+
+	return may;
+}
 
 static int setfl(int fd, struct file * filp, unsigned long arg)
 {
 	struct inode * inode = filp->f_path.dentry->d_inode;
 	int error = 0;
+
+	if (!may_use_odirect())
+		arg &= ~O_DIRECT;
+	if (ve_fsync_behavior() == FSYNC_NEVER)
+		arg &= ~O_SYNC;
 
 	/*
 	 * O_APPEND cannot be cleared if the file is marked as append-only
@@ -175,10 +214,6 @@ static int setfl(int fd, struct file * filp, unsigned long arg)
 				return -EINVAL;
 	}
 
-	if (filp->f_op && filp->f_op->check_flags)
-		error = filp->f_op->check_flags(arg);
-	if (error)
-		return error;
 
 	/*
 	 * ->fasync() is responsible for setting the FASYNC bit.
@@ -191,10 +226,11 @@ static int setfl(int fd, struct file * filp, unsigned long arg)
 		if (error > 0)
 			error = 0;
 	}
-	spin_lock(&filp->f_lock);
-	filp->f_flags = (arg & SETFL_MASK) | (filp->f_flags & ~SETFL_MASK);
-	spin_unlock(&filp->f_lock);
 
+	if (filp->f_op && filp->f_op->set_flags)
+		error = filp->f_op->set_flags(filp, arg);
+	else
+		error = generic_set_file_flags(filp, arg);
  out:
 	return error;
 }
@@ -745,7 +781,7 @@ EXPORT_SYMBOL(kill_fasync);
 static int __init fasync_init(void)
 {
 	fasync_cache = kmem_cache_create("fasync_cache",
-		sizeof(struct fasync_struct), 0, SLAB_PANIC, NULL);
+		sizeof(struct fasync_struct), 0, SLAB_PANIC|SLAB_UBC, NULL);
 	return 0;
 }
 

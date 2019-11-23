@@ -1253,7 +1253,7 @@ int __init ip_vs_conn_init(void)
 	/* Allocate ip_vs_conn slab cache */
 	ip_vs_conn_cachep = kmem_cache_create("ip_vs_conn",
 					      sizeof(struct ip_vs_conn), 0,
-					      SLAB_HWCACHE_ALIGN, NULL);
+					      SLAB_HWCACHE_ALIGN|SLAB_UBC, NULL);
 	if (!ip_vs_conn_cachep) {
 		vfree(ip_vs_conn_tab);
 		return -ENOMEM;

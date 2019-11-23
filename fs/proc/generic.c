@@ -249,11 +249,25 @@ static const struct file_operations proc_file_operations = {
 	.write		= proc_file_write,
 };
 
+static int proc_dir_is_ve_owner(struct proc_dir_entry *de,
+				struct proc_dir_entry *lde)
+{
+	return (lde && (lde == de));
+}
+
 static int proc_notify_change(struct dentry *dentry, struct iattr *iattr)
 {
 	struct inode *inode = dentry->d_inode;
 	struct proc_dir_entry *de = PDE(inode);
 	int error;
+
+	if (iattr->ia_valid & (ATTR_MODE|ATTR_UID|ATTR_GID)) {
+
+		/* Reject VE context change of perms of node's proc files */
+		if (!ve_is_super(get_exec_env()) &&
+			!proc_dir_is_ve_owner(de, LPDE(inode)))
+			return -EPERM;
+	}
 
 	error = inode_change_ok(inode, iattr);
 	if (error)
@@ -263,9 +277,12 @@ static int proc_notify_change(struct dentry *dentry, struct iattr *iattr)
 	if (error)
 		goto out;
 	
-	de->uid = inode->i_uid;
-	de->gid = inode->i_gid;
-	de->mode = inode->i_mode;
+	if (iattr->ia_valid & ATTR_UID)
+		de->uid = inode->i_uid;
+	if (iattr->ia_valid & ATTR_GID)
+		de->gid = inode->i_gid;
+	if (iattr->ia_valid & ATTR_MODE)
+		de->mode = inode->i_mode;
 out:
 	return error;
 }
@@ -274,11 +291,22 @@ static int proc_getattr(struct vfsmount *mnt, struct dentry *dentry,
 			struct kstat *stat)
 {
 	struct inode *inode = dentry->d_inode;
-	struct proc_dir_entry *de = PROC_I(inode)->pde;
-	if (de && de->nlink)
-		inode->i_nlink = de->nlink;
+	struct proc_dir_entry *de = PDE(inode);
+	struct proc_dir_entry *lde = LPDE(inode);
 
 	generic_fillattr(inode, stat);
+
+	if (de && de->nlink)
+		stat->nlink = de->nlink;
+	/* if dentry is found in both trees and it is a directory
+	 * then inode's nlink count must be altered, because local
+	 * and global subtrees may differ.
+	 * on the other hand, they may intersect, so actual nlink
+	 * value is difficult to calculate - upper estimate is used
+	 * instead of it.
+	 */
+	if (lde && lde != de && lde->nlink > 1)
+		stat->nlink += lde->nlink - 2;
 	return 0;
 }
 
@@ -421,28 +449,64 @@ static const struct dentry_operations proc_dentry_operations =
 	.d_delete	= proc_delete_dentry,
 };
 
+struct proc_dir_entry *__proc_lookup(struct proc_dir_entry *dir,
+		const char *name, int namelen)
+{
+	struct proc_dir_entry *de;
+
+	if (PROC_IS_HARDLINK(dir))
+		dir = (struct proc_dir_entry *) dir->data;
+
+	for (de = dir->subdir; de ; de = de->next) {
+		if (de->namelen != namelen)
+			continue;
+		if (memcmp(de->name, name, namelen))
+			continue;
+		break;
+	}
+	return de;
+}
+EXPORT_SYMBOL(__proc_lookup);
+
 /*
  * Don't create negative dentries here, return -ENOENT by hand
  * instead.
  */
-struct dentry *proc_lookup_de(struct proc_dir_entry *de, struct inode *dir,
-		struct dentry *dentry)
+struct dentry *proc_lookup_de(struct proc_dir_entry *de,
+		struct proc_dir_entry *lde,
+		struct inode *dir, struct dentry *dentry)
 {
 	struct inode *inode = NULL;
 	int error = -ENOENT;
 
 	spin_lock(&proc_subdir_lock);
-	for (de = de->subdir; de ; de = de->next) {
-		if (de->namelen != dentry->d_name.len)
-			continue;
-		if (!memcmp(dentry->d_name.name, de->name, de->namelen)) {
+	de = __proc_lookup(de, dentry->d_name.name, dentry->d_name.len);
+	if (lde != NULL)
+		lde = __proc_lookup(lde, dentry->d_name.name,
+				dentry->d_name.len);
+
+	if (de == NULL)
+		de = lde;
+
+	if (de != NULL) {
+		/*
+		 * de     lde    meaning   inode(g,l)
+		 * ------------------------------------
+		 * NULL   NULL   -ENOENT   *
+		 * X      NULL   global    X NULL
+		 * NULL   X      local     X X
+		 * X      Y      both      X Y
+		 */
+		{
 			unsigned int ino;
 
 			ino = de->low_ino;
 			de_get(de);
+			if (lde != NULL)
+				de_get(lde);
 			spin_unlock(&proc_subdir_lock);
 			error = -EINVAL;
-			inode = proc_get_inode(dir->i_sb, ino, de);
+			inode = proc_get_inode(dir->i_sb, ino, de, lde);
 			goto out_unlock;
 		}
 	}
@@ -456,13 +520,15 @@ out_unlock:
 	}
 	if (de)
 		de_put(de);
+	if (lde)
+		de_put(lde);
 	return ERR_PTR(error);
 }
 
 struct dentry *proc_lookup(struct inode *dir, struct dentry *dentry,
 		struct nameidata *nd)
 {
-	return proc_lookup_de(PDE(dir), dir, dentry);
+	return proc_lookup_de(PDE(dir), LPDE(dir), dir, dentry);
 }
 
 /*
@@ -474,13 +540,14 @@ struct dentry *proc_lookup(struct inode *dir, struct dentry *dentry,
  * value of the readdir() call, as long as it's non-negative
  * for success..
  */
-int proc_readdir_de(struct proc_dir_entry *de, struct file *filp, void *dirent,
-		filldir_t filldir)
+int proc_readdir_de(struct proc_dir_entry *de, struct proc_dir_entry *lde,
+		struct file *filp, void *dirent, filldir_t filldir)
 {
 	unsigned int ino;
 	int i;
 	struct inode *inode = filp->f_path.dentry->d_inode;
 	int ret = 0;
+	struct proc_dir_entry *ode = de, *fde = NULL;
 
 	ino = inode->i_ino;
 	i = filp->f_pos;
@@ -501,25 +568,21 @@ int proc_readdir_de(struct proc_dir_entry *de, struct file *filp, void *dirent,
 			/* fall through */
 		default:
 			spin_lock(&proc_subdir_lock);
-			de = de->subdir;
 			i -= 2;
-			for (;;) {
-				if (!de) {
-					ret = 1;
-					spin_unlock(&proc_subdir_lock);
-					goto out;
-				}
-				if (!i)
-					break;
-				de = de->next;
-				i--;
-			}
-
-			do {
+repeat:
+			if (PROC_IS_HARDLINK(de))
+				de = (struct proc_dir_entry *) de->data;
+			de = de->subdir;
+			while (de != NULL) {
 				struct proc_dir_entry *next;
 
-				/* filldir passes info to user space */
 				de_get(de);
+				if (i-- > 0 || (fde != NULL &&
+							__proc_lookup(fde,
+							de->name, de->namelen)))
+					goto skip;
+
+				/* filldir passes info to user space */
 				spin_unlock(&proc_subdir_lock);
 				if (filldir(dirent, de->name, de->namelen, filp->f_pos,
 					    de->low_ino, de->mode >> 12) < 0) {
@@ -528,10 +591,17 @@ int proc_readdir_de(struct proc_dir_entry *de, struct file *filp, void *dirent,
 				}
 				spin_lock(&proc_subdir_lock);
 				filp->f_pos++;
+skip:
 				next = de->next;
 				de_put(de);
 				de = next;
-			} while (de);
+			}
+
+			if (fde == NULL && lde != NULL && lde != ode) {
+				de = lde;
+				fde = ode;
+				goto repeat;
+			}
 			spin_unlock(&proc_subdir_lock);
 	}
 	ret = 1;
@@ -543,7 +613,7 @@ int proc_readdir(struct file *filp, void *dirent, filldir_t filldir)
 {
 	struct inode *inode = filp->f_path.dentry->d_inode;
 
-	return proc_readdir_de(PDE(inode), filp, dirent, filldir);
+	return proc_readdir_de(PDE(inode), LPDE(inode), filp, dirent, filldir);
 }
 
 /*
@@ -869,6 +939,8 @@ void remove_proc_entry(const char *name, struct proc_dir_entry *parent)
 	WARN(de->subdir, KERN_WARNING "%s: removing non-empty directory "
 			"'%s/%s', leaking at least '%s'\n", __func__,
 			de->parent->name, de->name, de->subdir->name);
+	if (PROC_IS_HARDLINK(de))
+		de_put((struct proc_dir_entry *) de->data);
 	if (atomic_dec_and_test(&de->count))
 		free_proc_entry(de);
 }
@@ -926,3 +998,41 @@ int remove_proc_subtree(const char *name, struct proc_dir_entry *parent)
 	return 0;
 }
 EXPORT_SYMBOL(remove_proc_subtree);
+
+const struct inode_operations proc_hard_inode_operations;
+
+struct proc_dir_entry *create_proc_hardlink(const char *name, mode_t mode,
+						struct proc_dir_entry *parent,
+						struct proc_dir_entry *link)
+{
+	struct proc_dir_entry *ent;
+	mode &= (~S_IFMT);
+	mode |= link->mode & S_IFMT;
+	ent = __proc_create(&parent, name, mode, 1);
+	if (!ent)
+		return ent;
+	ent->data = link;
+	ent->proc_iops = &proc_hard_inode_operations;
+	if (proc_register(parent, ent) < 0) {
+		kfree(ent);
+		ent = NULL;
+	}
+	de_get(link);
+	return ent;
+}
+EXPORT_SYMBOL(create_proc_hardlink);
+
+struct proc_dir_entry *proc_lookup_entry(const char *name, \
+					struct proc_dir_entry *parent)
+{
+	const char *fn = name;
+	int len;
+
+	if (xlate_proc_name(name, &parent, &fn) != 0)
+		return NULL;
+
+	len = strlen(fn);
+
+	return __proc_lookup(parent, fn, len);
+}
+EXPORT_SYMBOL(proc_lookup_entry);

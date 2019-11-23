@@ -15,6 +15,7 @@
 #include <linux/vmalloc.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/nsproxy.h>
 #include <linux/list.h>
 #include <linux/skbuff.h>
 #include <linux/mm.h>
@@ -41,8 +42,13 @@ MODULE_ALIAS("ipt_hashlimit");
 MODULE_ALIAS("ip6t_hashlimit");
 
 /* need to declare this at the top */
+#ifdef CONFIG_VE_IPTABLES
+#define hashlimit_procdir4 (get_exec_env()->_xt_hashlimit->hashlimit_procdir4)
+#define hashlimit_procdir6 (get_exec_env()->_xt_hashlimit->hashlimit_procdir6)
+#else
 static struct proc_dir_entry *hashlimit_procdir4;
 static struct proc_dir_entry *hashlimit_procdir6;
+#endif
 static const struct file_operations dl_file_ops;
 
 /* hash table crap */
@@ -99,8 +105,15 @@ struct xt_hashlimit_htable {
 
 static DEFINE_SPINLOCK(hashlimit_lock);	/* protects htables list */
 static DEFINE_MUTEX(hlimit_mutex);	/* additional checkentry protection */
+#ifdef CONFIG_VE_IPTABLES
+#define hashlimit_htables (get_exec_env()->_xt_hashlimit->hashlimit_htables)
+#else
 static HLIST_HEAD(hashlimit_htables);
+#endif
 static struct kmem_cache *hashlimit_cachep __read_mostly;
+
+static int init_xt_hashlimit(void);
+static void fini_xt_hashlimit(void);
 
 static inline bool dst_cmp(const struct dsthash_ent *ent,
 			   const struct dsthash_dst *b)
@@ -687,6 +700,9 @@ static bool hashlimit_mt_check_v0(const struct xt_mtchk_param *par)
 	if (r->name[sizeof(r->name) - 1] != '\0')
 		return false;
 
+	if (init_xt_hashlimit())
+		return 0;
+
 	/* This is the best we've got: We cannot release and re-grab lock,
 	 * since checkentry() is called before x_tables.c grabs xt_mutex.
 	 * We also cannot grab the hashtable spinlock, since htable_create will
@@ -728,6 +744,9 @@ static bool hashlimit_mt_check(const struct xt_mtchk_param *par)
 			return false;
 	}
 
+	if (init_xt_hashlimit())
+		return 0;
+
 	/* This is the best we've got: We cannot release and re-grab lock,
 	 * since checkentry() is called before x_tables.c grabs xt_mutex.
 	 * We also cannot grab the hashtable spinlock, since htable_create will
@@ -750,6 +769,8 @@ hashlimit_mt_destroy_v0(const struct xt_mtdtor_param *par)
 	const struct xt_hashlimit_info *r = par->matchinfo;
 
 	htable_put(r->hinfo);
+	if (!ve_is_super(get_exec_env()) && hlist_empty(&hashlimit_htables))
+		fini_xt_hashlimit();
 }
 
 static void hashlimit_mt_destroy(const struct xt_mtdtor_param *par)
@@ -757,6 +778,8 @@ static void hashlimit_mt_destroy(const struct xt_mtdtor_param *par)
 	const struct xt_hashlimit_mtinfo1 *info = par->matchinfo;
 
 	htable_put(info->hinfo);
+	if (!ve_is_super(get_exec_env()) && hlist_empty(&hashlimit_htables))
+		fini_xt_hashlimit();
 }
 
 #ifdef CONFIG_COMPAT
@@ -958,6 +981,78 @@ static const struct file_operations dl_file_ops = {
 	.release = seq_release
 };
 
+static inline struct proc_dir_entry *proc_from_netns(void)
+{
+#if defined(CONFIG_VE)
+	return get_exec_env()->ve_netns->proc_net;
+#else
+	return init_net.proc_net;
+#endif
+}
+
+static int init_xt_hashlimit(void)
+{
+	struct proc_dir_entry *proc_net = proc_from_netns();
+
+#if defined(CONFIG_VE_IPTABLES)
+	struct ve_struct *ve = get_exec_env();
+
+	if (ve->_xt_hashlimit)
+		return 0;
+
+	ve->_xt_hashlimit = kzalloc(sizeof(struct ve_xt_hashlimit), GFP_KERNEL);
+	if (!ve->_xt_hashlimit)
+		goto err1;
+#endif
+	INIT_HLIST_HEAD(&hashlimit_htables);
+
+	hashlimit_procdir4 = proc_mkdir("ipt_hashlimit", proc_net);
+	if (!hashlimit_procdir4) {
+		printk(KERN_ERR "xt_hashlimit: unable to create proc dir "
+				"entry\n");
+		goto err2;
+	}
+#if defined(CONFIG_IP6_NF_IPTABLES) || defined(CONFIG_IP6_NF_IPTABLES_MODULE)
+	hashlimit_procdir6 = proc_mkdir("ip6t_hashlimit", proc_net);
+	if (!hashlimit_procdir6) {
+		printk(KERN_ERR "xt_hashlimit: unable to create proc dir "
+				"entry\n");
+		goto err3;
+	}
+#endif
+
+	return 0;
+
+#if defined(CONFIG_IP6_NF_IPTABLES) || defined(CONFIG_IP6_NF_IPTABLES_MODULE)
+err3:
+	remove_proc_entry("ipt_hashlimit", proc_net);
+#endif
+err2:
+#if defined(CONFIG_VE_IPTABLES)
+	kfree(ve->_xt_hashlimit);
+	ve->_xt_hashlimit = NULL;
+err1:
+#endif
+	return -ENOMEM;
+}
+
+static void fini_xt_hashlimit(void)
+{
+	struct proc_dir_entry *proc_net = proc_from_netns();
+#ifdef CONFIG_VE_IPTABLES
+	struct ve_struct *ve = get_exec_env();
+#endif
+#if defined(CONFIG_IP6_NF_IPTABLES) || defined(CONFIG_IP6_NF_IPTABLES_MODULE)
+	remove_proc_entry("ip6t_hashlimit", proc_net);
+#endif
+	remove_proc_entry("ipt_hashlimit", proc_net);
+
+#if defined(CONFIG_VE_IPTABLES)
+	kfree(ve->_xt_hashlimit);
+	ve->_xt_hashlimit = NULL;
+#endif
+}
+
 static int __init hashlimit_mt_init(void)
 {
 	int err;
@@ -975,24 +1070,11 @@ static int __init hashlimit_mt_init(void)
 		printk(KERN_ERR "xt_hashlimit: unable to create slab cache\n");
 		goto err2;
 	}
-	hashlimit_procdir4 = proc_mkdir("ipt_hashlimit", init_net.proc_net);
-	if (!hashlimit_procdir4) {
-		printk(KERN_ERR "xt_hashlimit: unable to create proc dir "
-				"entry\n");
+	err = init_xt_hashlimit();
+	if (err)
 		goto err3;
-	}
-	err = 0;
-#if defined(CONFIG_IP6_NF_IPTABLES) || defined(CONFIG_IP6_NF_IPTABLES_MODULE)
-	hashlimit_procdir6 = proc_mkdir("ip6t_hashlimit", init_net.proc_net);
-	if (!hashlimit_procdir6) {
-		printk(KERN_ERR "xt_hashlimit: unable to create proc dir "
-				"entry\n");
-		err = -ENOMEM;
-	}
-#endif
 	if (!err)
 		return 0;
-	remove_proc_entry("ipt_hashlimit", init_net.proc_net);
 err3:
 	kmem_cache_destroy(hashlimit_cachep);
 err2:
@@ -1004,10 +1086,7 @@ err1:
 
 static void __exit hashlimit_mt_exit(void)
 {
-	remove_proc_entry("ipt_hashlimit", init_net.proc_net);
-#if defined(CONFIG_IP6_NF_IPTABLES) || defined(CONFIG_IP6_NF_IPTABLES_MODULE)
-	remove_proc_entry("ip6t_hashlimit", init_net.proc_net);
-#endif
+	fini_xt_hashlimit();
 	kmem_cache_destroy(hashlimit_cachep);
 	xt_unregister_matches(hashlimit_mt_reg, ARRAY_SIZE(hashlimit_mt_reg));
 }

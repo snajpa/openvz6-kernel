@@ -34,7 +34,12 @@
 extern char uevent_helper[];
 
 /* counter to tag the uevent, read only except for the kobject core */
+#ifdef CONFIG_VE
+#define ve_uevent_seqnum	(get_exec_env()->_uevent_seqnum)
+#else
+#define ve_uevent_seqnum uevent_seqnum
 extern u64 uevent_seqnum;
+#endif
 
 /*
  * The actions here must match the index to the string array
@@ -51,6 +56,8 @@ enum kobject_action {
 	KOBJ_REMOVE,
 	KOBJ_CHANGE,
 	KOBJ_MOVE,
+	KOBJ_START,
+	KOBJ_STOP,
 	KOBJ_ONLINE,
 	KOBJ_OFFLINE,
 	KOBJ_MAX
@@ -69,6 +76,7 @@ struct kobject {
 	unsigned int state_add_uevent_sent:1;
 	unsigned int state_remove_uevent_sent:1;
 	unsigned int uevent_suppress:1;
+	struct list_head	env_head;
 };
 
 extern int kobject_set_name(struct kobject *kobj, const char *name, ...)
@@ -200,9 +208,16 @@ extern struct kobject *power_kobj;
 /* The global /sys/firmware/ kobject for people to chain off of */
 extern struct kobject *firmware_kobj;
 
+/* Initialize kernel sysfs part for VE */
+extern int ksysfs_init_ve(struct ve_struct *ve, struct kobject **kernel_kobj);
+/* Remove group attributes and put kernel sysfs directory */
+extern void ksysfs_fini_ve(struct ve_struct *ve, struct kobject **kernel_kobj);
+
 #if defined(CONFIG_HOTPLUG)
 int kobject_uevent(struct kobject *kobj, enum kobject_action action);
 int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
+			char *envp[]);
+int kobject_uevent_env_one(struct kobject *kobj, enum kobject_action action,
 			char *envp[]);
 
 int add_uevent_var(struct kobj_uevent_env *env, const char *format, ...)

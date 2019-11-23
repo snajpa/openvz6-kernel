@@ -112,8 +112,10 @@ EXPORT_SYMBOL(sk_stream_wait_close);
  * sk_stream_wait_memory - Wait for more memory for a socket
  * @sk: socket to wait for memory
  * @timeo_p: for how long
+ * @amount - amount of memory to wait for (in UB space!)
  */
-int sk_stream_wait_memory(struct sock *sk, long *timeo_p)
+int __sk_stream_wait_memory(struct sock *sk, long *timeo_p,
+		unsigned long amount)
 {
 	int err = 0;
 	long vm_wait = 0;
@@ -135,7 +137,10 @@ int sk_stream_wait_memory(struct sock *sk, long *timeo_p)
 		if (signal_pending(current))
 			goto do_interrupted;
 		clear_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
-		if (sk_stream_memory_free(sk) && !vm_wait)
+		if (amount == 0) {
+			if (sk_stream_memory_free(sk) && !vm_wait)
+				break;
+		} else if (!ub_sock_sndqueueadd_tcp(sk, amount))
 			break;
 
 		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
@@ -145,6 +150,8 @@ int sk_stream_wait_memory(struct sock *sk, long *timeo_p)
 						  sk_stream_memory_free(sk) &&
 						  vm_wait);
 		sk->sk_write_pending--;
+		if (amount > 0)
+			ub_sock_sndqueuedel(sk);
 
 		if (vm_wait) {
 			vm_wait -= current_timeo;
@@ -171,6 +178,10 @@ do_interrupted:
 	goto out;
 }
 
+int sk_stream_wait_memory(struct sock *sk, long *timeo_p)
+{
+	return __sk_stream_wait_memory(sk, timeo_p, 0);
+}
 EXPORT_SYMBOL(sk_stream_wait_memory);
 
 int sk_stream_error(struct sock *sk, int flags, int err)

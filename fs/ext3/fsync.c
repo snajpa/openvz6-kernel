@@ -56,9 +56,13 @@ int ext3_sync_file(struct file * file, struct dentry *dentry, int datasync)
 
 	trace_ext3_sync_file_enter(file, datasync);
 
-	if (inode->i_sb->s_flags & MS_RDONLY)
+	if (inode->i_sb->s_flags & MS_RDONLY) {
+		/* Make shure that we read updated state */
+		smp_rmb();
+		if (EXT3_SB(inode->i_sb)->s_mount_state & EXT3_ERROR_FS)
+			return -EROFS;
 		return 0;
-
+	}
 
 	/*
 	 * data=writeback,ordered:

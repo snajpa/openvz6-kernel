@@ -10,6 +10,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/completion.h>
+#include <linux/quotaops.h>
 #include <linux/buffer_head.h>
 #include <linux/xattr.h>
 #include <linux/gfs2_ondisk.h>
@@ -288,7 +289,7 @@ static int ea_dealloc_unstuffed(struct gfs2_inode *ip, struct buffer_head *bh,
 		}
 
 		*dataptrs = 0;
-		gfs2_add_inode_blocks(&ip->i_inode, -1);
+		vfs_dq_free_block(&ip->i_inode, 1);
 	}
 	if (bstart)
 		gfs2_free_meta(ip, bstart, blen);
@@ -612,7 +613,7 @@ static int ea_alloc_blk(struct gfs2_inode *ip, struct buffer_head **bhp)
 	u64 block;
 	int error;
 
-	error = gfs2_alloc_blocks(ip, &block, &n, 0, NULL);
+	error = gfs2_alloc_blocks(ip, &block, &n, 0, NULL, 1);
 	if (error)
 		return error;
 	gfs2_trans_add_unrevoke(sdp, block, 1);
@@ -627,7 +628,7 @@ static int ea_alloc_blk(struct gfs2_inode *ip, struct buffer_head **bhp)
 	ea->ea_flags = GFS2_EAFLAG_LAST;
 	ea->ea_num_ptrs = 0;
 
-	gfs2_add_inode_blocks(&ip->i_inode, 1);
+	vfs_dq_claim_block(&ip->i_inode, 1);
 
 	return 0;
 }
@@ -649,6 +650,12 @@ static int ea_write(struct gfs2_inode *ip, struct gfs2_ea_header *ea,
 {
 	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
 	int error;
+
+	if (GFS2_EAREQ_SIZE_STUFFED(er) > sdp->sd_jbsize &&
+	    vfs_dq_reserve_block(&ip->i_inode,
+				 DIV_ROUND_UP(er->er_data_len,
+					      sdp->sd_jbsize)))
+		return -EDQUOT;
 
 	ea->ea_data_len = cpu_to_be32(er->er_data_len);
 	ea->ea_name_len = er->er_name_len;
@@ -674,15 +681,18 @@ static int ea_write(struct gfs2_inode *ip, struct gfs2_ea_header *ea,
 			int mh_size = sizeof(struct gfs2_meta_header);
 			unsigned int n = 1;
 
-			error = gfs2_alloc_blocks(ip, &block, &n, 0, NULL);
-			if (error)
+			error = gfs2_alloc_blocks(ip, &block, &n, 0, NULL, 0);
+			if (error) {
+				vfs_dq_release_reservation_block(&ip->i_inode,
+							ea->ea_num_ptrs - x);
 				return error;
+			}
 			gfs2_trans_add_unrevoke(sdp, block, 1);
 			bh = gfs2_meta_new(ip->i_gl, block);
 			gfs2_trans_add_meta(ip->i_gl, bh);
 			gfs2_metatype_set(bh, GFS2_METATYPE_ED, GFS2_FORMAT_ED);
 
-			gfs2_add_inode_blocks(&ip->i_inode, 1);
+			vfs_dq_claim_block(&ip->i_inode, 1);
 
 			copy = data_len > sdp->sd_jbsize ? sdp->sd_jbsize :
 							   data_len;
@@ -714,6 +724,7 @@ static int ea_alloc_skeleton(struct gfs2_inode *ip, struct gfs2_ea_request *er,
 	struct gfs2_alloc_parms ap = { .target = blks };
 	struct buffer_head *dibh;
 	int error;
+	int error2 = 0;
 
 	error = gfs2_rindex_update(GFS2_SB(&ip->i_inode));
 	if (error)
@@ -733,8 +744,13 @@ static int ea_alloc_skeleton(struct gfs2_inode *ip, struct gfs2_ea_request *er,
 	if (error)
 		goto out_ipres;
 
-	error = skeleton_call(ip, er, private);
-	if (error)
+	/*
+	 * skeleton_call below might allocate a few disk blocks,
+	 * then fail with -EDQUOT. It wouldn't be nice to bail out
+	 * without flushing metadata info to disk in such a case.
+	 */
+	error2 = error = skeleton_call(ip, er, private);
+	if (error && (error != -EDQUOT))
 		goto out_end_trans;
 
 	error = gfs2_meta_inode_buffer(ip, &dibh);
@@ -751,6 +767,8 @@ out_ipres:
 	gfs2_inplace_release(ip);
 out_gunlock_q:
 	gfs2_quota_unlock(ip);
+	if (error2)
+		return error2;
 	return error;
 }
 
@@ -990,7 +1008,7 @@ static int ea_set_block(struct gfs2_inode *ip, struct gfs2_ea_request *er,
 	} else {
 		u64 blk;
 		unsigned int n = 1;
-		error = gfs2_alloc_blocks(ip, &blk, &n, 0, NULL);
+		error = gfs2_alloc_blocks(ip, &blk, &n, 0, NULL, 1);
 		if (error)
 			return error;
 		gfs2_trans_add_unrevoke(sdp, blk, 1);
@@ -1003,7 +1021,7 @@ static int ea_set_block(struct gfs2_inode *ip, struct gfs2_ea_request *er,
 		*eablk = cpu_to_be64(ip->i_eattr);
 		ip->i_eattr = blk;
 		ip->i_diskflags |= GFS2_DIF_EA_INDIRECT;
-		gfs2_add_inode_blocks(&ip->i_inode, 1);
+		vfs_dq_claim_block(&ip->i_inode, 1);
 
 		eablk++;
 	}
@@ -1404,7 +1422,7 @@ static int ea_dealloc_indirect(struct gfs2_inode *ip)
 		}
 
 		*eablk = 0;
-		gfs2_add_inode_blocks(&ip->i_inode, -1);
+		vfs_dq_free_block(&ip->i_inode, 1);
 	}
 	if (bstart)
 		gfs2_free_meta(ip, bstart, blen);
@@ -1459,7 +1477,7 @@ static int ea_dealloc_block(struct gfs2_inode *ip)
 	gfs2_free_meta(ip, ip->i_eattr, 1);
 
 	ip->i_eattr = 0;
-	gfs2_add_inode_blocks(&ip->i_inode, -1);
+	vfs_dq_free_block(&ip->i_inode, 1);
 
 	error = gfs2_meta_inode_buffer(ip, &dibh);
 	if (!error) {

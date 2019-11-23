@@ -10,7 +10,9 @@ struct nf_conntrack_ecache;
 
 struct netns_ct {
 	atomic_t		count;
+	unsigned int		max;
 	unsigned int		expect_count;
+	unsigned int		expect_max;
 	unsigned int		htable_size;
 	struct kmem_cache	*nf_conntrack_cachep;
 	struct hlist_nulls_head	*hash;
@@ -18,6 +20,8 @@ struct netns_ct {
 	struct hlist_nulls_head	unconfirmed;
 	struct hlist_nulls_head	dying;
 	struct ip_conntrack_stat *stat;
+	struct nf_ct_event_notifier *nf_conntrack_event_cb;
+	struct nf_exp_event_notifier *nf_expect_event_cb;
 	int			sysctl_events;
 	unsigned int		sysctl_events_retry_timeout;
 	int			sysctl_acct;

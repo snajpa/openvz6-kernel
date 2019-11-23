@@ -36,6 +36,18 @@ struct mnt_namespace;
 #define MNT_UNBINDABLE	0x2000	/* if the vfsmount is a unbindable mount */
 #define MNT_PNODE_MASK	0x3000	/* propagation flag mask */
 
+#define MNT_CPT		0x1000000
+
+#define MNT_BEHAVIOR_FLAGS	(MNT_NOSUID | MNT_NODEV | MNT_NOEXEC |		\
+				MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME |	\
+				MNT_READONLY | MNT_STRICTATIME | MNT_SHRINKABLE)
+
+/*
+ * Remounts, which change any flags except for following ones,
+ * are forbidden inside containers.
+ */
+#define MNT_VE_RMT_MASK	MNT_READONLY
+
 struct vfsmount {
 	struct list_head mnt_hash;
 	struct vfsmount *mnt_parent;	/* fs we are mounted on */
@@ -71,6 +83,7 @@ struct vfsmount {
 #else
 	int mnt_writers;
 #endif
+	unsigned owner;
 };
 
 static inline int *get_mnt_writers_ptr(struct vfsmount *mnt)
@@ -91,6 +104,7 @@ static inline struct vfsmount *mntget(struct vfsmount *mnt)
 
 struct file; /* forward dec */
 
+extern struct vfsmount *next_mnt(struct vfsmount *p, struct vfsmount *root);
 extern int mnt_want_write(struct vfsmount *mnt);
 extern int mnt_want_write_file(struct file *file);
 extern int mnt_clone_write(struct vfsmount *mnt);
@@ -116,6 +130,8 @@ struct file_system_type;
 extern struct vfsmount *vfs_kern_mount(struct file_system_type *type,
 				      int flags, const char *name,
 				      void *data);
+extern struct vfsmount *vfs_bind_mount_private(struct vfsmount *, struct dentry *);
+extern struct vfsmount *vfs_bind_mount(struct vfsmount *, struct dentry *);
 
 struct nameidata;
 
@@ -125,6 +141,7 @@ extern int do_add_mount(struct vfsmount *newmnt, struct path *path,
 
 extern void mnt_set_expiry(struct vfsmount *mnt, struct list_head *expiry_list);
 extern void mark_mounts_for_expiry(struct list_head *mounts);
+extern void replace_mount(struct vfsmount *src_mnt, struct vfsmount *dst_mnt);
 
 extern spinlock_t vfsmount_lock;
 extern dev_t name_to_dev_t(char *name);

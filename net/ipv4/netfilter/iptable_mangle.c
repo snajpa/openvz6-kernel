@@ -198,17 +198,27 @@ static struct nf_hook_ops ipt_ops[] __read_mostly = {
 
 static int __net_init iptable_mangle_net_init(struct net *net)
 {
+	if (!net_ipt_permitted(net, VE_IP_MANGLE))
+		return 0;
+
 	/* Register table */
 	net->ipv4.iptable_mangle =
 		ipt_register_table(net, &packet_mangler, &initial_table.repl);
 	if (IS_ERR(net->ipv4.iptable_mangle))
 		return PTR_ERR(net->ipv4.iptable_mangle);
+
+	net_ipt_module_set(net, VE_IP_MANGLE);
 	return 0;
 }
 
 static void __net_exit iptable_mangle_net_exit(struct net *net)
 {
+	if (!net_is_ipt_module_set(net, VE_IP_MANGLE))
+		return;
+
 	ipt_unregister_table(net->ipv4.iptable_mangle);
+
+	net_ipt_module_clear(net, VE_IP_MANGLE);
 }
 
 static struct pernet_operations iptable_mangle_net_ops = {

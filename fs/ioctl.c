@@ -613,9 +613,11 @@ int do_vfs_ioctl(struct file *filp, unsigned int fd, unsigned int cmd,
 
 	case FIGETBSZ:
 	{
-		struct inode *inode = filp->f_path.dentry->d_inode;
+		struct super_block *sb = filp->f_path.dentry->d_inode->i_sb;
 		int __user *p = (int __user *)arg;
-		return put_user(inode->i_sb->s_blocksize, p);
+		if (sb->s_blocksize == 1ul << sb->s_blocksize_bits)
+			return put_user(sb->s_blocksize, p);
+		/* fail through */
 	}
 
 	default:

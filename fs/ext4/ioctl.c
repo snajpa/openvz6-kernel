@@ -18,6 +18,61 @@
 #include "ext4_jbd2.h"
 #include "ext4.h"
 
+#define MAX_32_NUM ((((unsigned long long) 1) << 32) - 1)
+
+static int ext4_open_balloon(struct super_block *sb, struct vfsmount *mnt)
+{
+	struct inode *balloon_ino;
+	int err, fd;
+	struct file *filp;
+	struct dentry *de;
+	struct path path;
+	fmode_t mode;
+
+	balloon_ino = EXT4_SB(sb)->s_balloon_ino;
+	err = -ENOENT;
+	if (balloon_ino == NULL)
+		goto err;
+
+	err = fd = get_unused_fd();
+	if (err < 0)
+		goto err_fd;
+
+	__iget(balloon_ino);
+	de = d_obtain_alias(balloon_ino);
+	err = PTR_ERR(de);
+	if (IS_ERR(de))
+		goto err_de;
+
+	path.dentry = de;
+	path.mnt = mntget(mnt);
+	err = mnt_want_write(path.mnt);
+	if (err)
+		mode = FMODE_READ;
+	else
+		mode = FMODE_READ | FMODE_WRITE;
+	filp = alloc_file(&path, mode,
+			&ext4_file_operations);
+	if (mode & FMODE_WRITE)
+		mnt_drop_write(path.mnt);
+	err = -ENOMEM;
+	if (filp == NULL)
+		goto err_filp;
+
+	filp->f_flags |= O_LARGEFILE;
+	fd_install(fd, filp);
+	return fd;
+
+err_filp:
+	path_put(&path);
+err_de:
+	put_unused_fd(fd);
+err_fd:
+	/* nothing */
+err:
+	return err;
+}
+
 long ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct inode *inode = filp->f_dentry->d_inode;
@@ -77,7 +132,7 @@ long ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		 * the relevant capability.
 		 */
 		if ((jflag ^ oldflags) & (EXT4_JOURNAL_DATA_FL)) {
-			if (!capable(CAP_SYS_RESOURCE))
+			if (!capable(CAP_SYS_ADMIN))
 				goto flags_out;
 		}
 		if (oldflags & EXT4_EXTENTS_FL) {
@@ -202,15 +257,18 @@ setversion_out:
 		struct super_block *sb = inode->i_sb;
 		int err, err2=0;
 
-		if (!capable(CAP_SYS_RESOURCE))
-			return -EPERM;
+		err = ext4_resize_begin(sb);
+		if (err)
+			return err;
 
-		if (get_user(n_blocks_count, (__u32 __user *)arg))
-			return -EFAULT;
+		if (get_user(n_blocks_count, (__u32 __user *)arg)) {
+			err = -EFAULT;
+			goto group_extend_out;
+		}
 
 		err = mnt_want_write(filp->f_path.mnt);
 		if (err)
-			return err;
+			goto group_extend_out;
 
 		err = ext4_group_extend(sb, EXT4_SB(sb)->s_es, n_blocks_count);
 		if (EXT4_SB(sb)->s_journal) {
@@ -221,6 +279,8 @@ setversion_out:
 		if (err == 0)
 			err = err2;
 		mnt_drop_write(filp->f_path.mnt);
+group_extend_out:
+		ext4_resize_end(sb);
 
 		return err;
 	}
@@ -271,8 +331,9 @@ mext_out:
 		struct super_block *sb = inode->i_sb;
 		int err, err2=0;
 
-		if (!capable(CAP_SYS_RESOURCE))
-			return -EPERM;
+		err = ext4_resize_begin(sb);
+		if (err)
+			return err;
 
 		if (copy_from_user(&input, (struct ext4_new_group_input __user *)arg,
 				sizeof(input)))
@@ -291,6 +352,7 @@ mext_out:
 		if (err == 0)
 			err = err2;
 		mnt_drop_write(filp->f_path.mnt);
+		ext4_resize_end(sb);
 
 		return err;
 	}
@@ -331,6 +393,113 @@ mext_out:
 		return err;
 	}
 
+	case EXT4_IOC_RESIZE_FS: {
+		ext4_fsblk_t n_blocks_count;
+		struct super_block *sb = inode->i_sb;
+		int err = 0, err2 = 0;
+
+		if (EXT4_HAS_INCOMPAT_FEATURE(sb,
+			       EXT4_FEATURE_INCOMPAT_META_BG)) {
+			ext4_msg(sb, KERN_ERR,
+				 "Online resizing not (yet) supported with meta_bg");
+			return -EOPNOTSUPP;
+		}
+
+		if (copy_from_user(&n_blocks_count, (__u64 __user *)arg,
+				   sizeof(__u64))) {
+			return -EFAULT;
+		}
+
+		if (n_blocks_count > MAX_32_NUM &&
+		    !EXT4_HAS_INCOMPAT_FEATURE(sb,
+					       EXT4_FEATURE_INCOMPAT_64BIT)) {
+			ext4_msg(sb, KERN_ERR,
+				 "File system only supports 32-bit block numbers");
+			return -EOPNOTSUPP;
+		}
+
+		err = ext4_resize_begin(sb);
+		if (err)
+			return err;
+
+		err = mnt_want_write(filp->f_path.mnt);
+		if (err)
+			goto resizefs_out;
+
+		err = ext4_resize_fs(sb, n_blocks_count);
+		if (EXT4_SB(sb)->s_journal) {
+			jbd2_journal_lock_updates(EXT4_SB(sb)->s_journal);
+			err2 = jbd2_journal_flush(EXT4_SB(sb)->s_journal);
+			jbd2_journal_unlock_updates(EXT4_SB(sb)->s_journal);
+		}
+		if (err == 0)
+			err = err2;
+		mnt_drop_write(filp->f_path.mnt);
+resizefs_out:
+		ext4_resize_end(sb);
+		return err;
+	}
+	case EXT4_IOC_SET_RSV_BLOCKS: {
+		ext4_fsblk_t n_blocks_count;
+		struct super_block *sb = inode->i_sb;
+		handle_t *handle;
+		int err = 0, err2 = 0;
+
+		if (copy_from_user(&n_blocks_count, (__u64 __user *)arg,
+				   sizeof(__u64))) {
+			return -EFAULT;
+		}
+
+		if (n_blocks_count > MAX_32_NUM &&
+		    !EXT4_HAS_INCOMPAT_FEATURE(sb,
+					       EXT4_FEATURE_INCOMPAT_64BIT)) {
+			ext4_msg(sb, KERN_ERR,
+				 "File system only supports 32-bit block numbers");
+			return -EOPNOTSUPP;
+		}
+
+		if (n_blocks_count > ext4_blocks_count(EXT4_SB(sb)->s_es))
+			return -EINVAL;
+
+		err = ext4_resize_begin(sb);
+		if (err)
+			return err;
+
+		err = mnt_want_write(filp->f_path.mnt);
+		if (err)
+			goto resize_out;
+
+		handle = ext4_journal_start_sb(sb, 1);
+		if (IS_ERR(handle)) {
+			err = PTR_ERR(handle);
+			goto mnt_out;
+		}
+		err = ext4_journal_get_write_access(handle, EXT4_SB(sb)->s_sbh);
+		if (err) {
+			goto journal_out;
+		}
+		ext4_r_blocks_count_set(EXT4_SB(sb)->s_es, n_blocks_count);
+		ext4_handle_dirty_metadata(handle, NULL, EXT4_SB(sb)->s_sbh);
+journal_out:
+		err2 = ext4_journal_stop(handle);
+		if (err == 0)
+			err = err2;
+
+		if (!err && EXT4_SB(sb)->s_journal) {
+			jbd2_journal_lock_updates(EXT4_SB(sb)->s_journal);
+			err2 = jbd2_journal_flush(EXT4_SB(sb)->s_journal);
+			jbd2_journal_unlock_updates(EXT4_SB(sb)->s_journal);
+		}
+		if (err == 0)
+			err = err2;
+mnt_out:
+		mnt_drop_write(filp->f_path.mnt);
+resize_out:
+		ext4_resize_end(sb);
+		return err;
+	}
+
+
 	case FITRIM:
 	{
 		struct super_block *sb = inode->i_sb;
@@ -361,6 +530,98 @@ mext_out:
 		return 0;
 	}
 
+	case EXT4_IOC_OPEN_BALLOON:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EACCES;
+
+		return ext4_open_balloon(inode->i_sb, filp->f_vfsmnt);
+
+	case FS_IOC_PFCACHE_OPEN:
+	{
+		int err;
+
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+
+		mutex_lock(&inode->i_mutex);
+		err = ext4_open_pfcache(inode);
+		mutex_unlock(&inode->i_mutex);
+
+		return err;
+	}
+	case FS_IOC_PFCACHE_CLOSE:
+	{
+		int err;
+
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+
+		mutex_lock(&inode->i_mutex);
+		err = ext4_close_pfcache(inode);
+		mutex_unlock(&inode->i_mutex);
+
+		return err;
+	}
+	case FS_IOC_PFCACHE_DUMP:
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+
+		return ext4_dump_pfcache(inode->i_sb,
+				(struct pfcache_dump_request __user *) arg);
+	case EXT4_IOC_MFSYNC:
+	{
+		struct ext4_ioc_mfsync_info mfsync;
+		struct file **filpp;
+		unsigned int *flags;
+		int i, err;
+		__u32 __user *usr_fd;
+
+		if (copy_from_user(&mfsync, (struct ext4_ioc_mfsync_info *)arg,
+				   sizeof(mfsync)))
+			return -EFAULT;
+
+		usr_fd = (__u32 __user*) (arg + sizeof(__u32));
+		if (mfsync.size == 0)
+			return 0;
+		filpp = kzalloc(mfsync.size * sizeof(*filp), GFP_KERNEL);
+		if (!filpp)
+			return -ENOMEM;
+		flags = kzalloc(mfsync.size * sizeof(*flags), GFP_KERNEL);
+		if (!flags) {
+			kfree(filpp);
+			return -ENOMEM;
+		}
+		for (i = 0; i < mfsync.size; i++) {
+			int fd;
+			int ret;
+
+			err = -EFAULT;
+			ret = get_user(fd, usr_fd + i);
+			if (ret)
+				goto mfsync_fput;
+
+			/* negative fd means fdata_sync */
+			flags[i] = (fd & (1<< 31)) != 0;
+			fd &= ~(1<< 31);
+
+			err = -EBADF;
+			filpp[i] = fget(fd);
+			if (!filpp[i])
+				goto mfsync_fput;
+			if (filpp[i]->f_mapping->host->i_sb != filp->f_mapping->host->i_sb) {
+				err = -EXDEV;
+				goto mfsync_fput;
+			}
+		}
+		err = ext4_sync_files(filpp, flags, mfsync.size);
+mfsync_fput:
+		for (i = 0; i < mfsync.size; i++)
+			if (filpp[i])
+				fput(filpp[i]);
+		kfree(filpp);
+		kfree(flags);
+		return err;
+	}
 	default:
 		return -ENOTTY;
 	}
@@ -426,6 +687,10 @@ long ext4_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		set_fs(old_fs);
 		return err;
 	}
+	case FS_IOC_PFCACHE_OPEN:
+	case FS_IOC_PFCACHE_CLOSE:
+	case FS_IOC_PFCACHE_DUMP:
+		break;
 	case FITRIM:
 		break;
 	default:

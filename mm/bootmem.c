@@ -13,6 +13,7 @@
 #include <linux/bootmem.h>
 #include <linux/module.h>
 #include <linux/kmemleak.h>
+#include <linux/pram.h>
 
 #include <asm/bug.h>
 #include <asm/io.h>
@@ -288,6 +289,8 @@ static int __init __reserve(bootmem_data_t *bdata, unsigned long sidx,
 			bdebug("silent double reserve of PFN %lx\n",
 				idx + bdata->node_min_pfn);
 		}
+	pram_ban_region(sidx + bdata->node_min_pfn,
+			eidx + bdata->node_min_pfn - 1);
 	return 0;
 }
 

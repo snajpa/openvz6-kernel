@@ -3277,7 +3277,9 @@ int ext3_setattr(struct dentry *dentry, struct iattr *attr)
 
 	rc = inode_setattr(inode, attr);
 
-	if (!rc && (ia_valid & ATTR_MODE))
+	/* Openvz want to change permission for symlink, but not interested
+	 * in acl support -dmon */ 
+	if (!rc && (ia_valid & ATTR_MODE) && !S_ISLNK(inode->i_mode))
 		rc = ext3_acl_chmod(inode);
 
 err_out:
@@ -3426,7 +3428,7 @@ int ext3_mark_inode_dirty(handle_t *handle, struct inode *inode)
  * so would cause a commit on atime updates, which we don't bother doing.
  * We handle synchronous inodes at the highest possible level.
  */
-void ext3_dirty_inode(struct inode *inode)
+void ext3_dirty_inode(struct inode *inode, int flags)
 {
 	handle_t *current_handle = ext3_journal_current_handle();
 	handle_t *handle;

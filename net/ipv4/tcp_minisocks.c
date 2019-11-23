@@ -26,6 +26,9 @@
 #include <net/inet_common.h>
 #include <net/xfrm.h>
 
+#include <bc/net.h>
+#include <bc/sock_orphan.h>
+
 #ifdef CONFIG_SYSCTL
 #define SYNC_INIT 0 /* let the user enable it */
 #else
@@ -36,6 +39,11 @@ int sysctl_tcp_syncookies __read_mostly = SYNC_INIT;
 EXPORT_SYMBOL(sysctl_tcp_syncookies);
 
 int sysctl_tcp_abort_on_overflow __read_mostly;
+int sysctl_tcp_max_tw_kmem_fraction __read_mostly = 384;
+int sysctl_tcp_max_tw_buckets_ub __read_mostly = 16536;
+
+EXPORT_SYMBOL(sysctl_tcp_max_tw_kmem_fraction);
+EXPORT_SYMBOL(sysctl_tcp_max_tw_buckets_ub);
 
 struct inet_timewait_death_row tcp_death_row = {
 	.sysctl_max_tw_buckets = NR_FILE * 2,
@@ -51,6 +59,7 @@ struct inet_timewait_death_row tcp_death_row = {
 	.twcal_hand	= -1,
 	.twcal_timer	= TIMER_INITIALIZER(inet_twdr_twcal_tick, 0,
 					    (unsigned long)&tcp_death_row),
+	.ub_managed	= 1,
 };
 
 EXPORT_SYMBOL_GPL(tcp_death_row);
@@ -294,7 +303,8 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
 	if (tcp_death_row.sysctl_tw_recycle && tp->rx_opt.ts_recent_stamp)
 		recycle_ok = icsk->icsk_af_ops->remember_stamp(sk);
 
-	if (tcp_death_row.tw_count < tcp_death_row.sysctl_max_tw_buckets)
+	if (tcp_death_row.tw_count < tcp_death_row.sysctl_max_tw_buckets &&
+			ub_timewait_check(sk, &tcp_death_row))
 		tw = inet_twsk_alloc(sk, state);
 
 	if (tw != NULL) {
@@ -308,6 +318,8 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
 		tcptw->tw_ts_recent	= tp->rx_opt.ts_recent;
 		tcptw->tw_ts_recent_stamp = tp->rx_opt.ts_recent_stamp;
 		tcptw->tw_last_oow_ack_time = 0;
+		if (sk->sk_user_data != NULL)
+			tw->tw_rcv_wscale |= TW_WSCALE_SPEC;
 
 #if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
 		if (tw->tw_family == PF_INET6) {
@@ -342,6 +354,7 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
 			}
 		} while (0);
 #endif
+		tw->tw_owner_env = VEID(sk->owner_env);
 
 		/* Get the TIME_WAIT timeout firing. */
 		if (timeo < rto)
@@ -362,11 +375,16 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
 				   TCP_TIMEWAIT_LEN);
 		inet_twsk_put(tw);
 	} else {
+		int ubid = 0;
 		/* Sorry, if we're out of memory, just CLOSE this
 		 * socket up.  We've got bigger problems than
 		 * non-graceful socket closings.
 		 */
-		LIMIT_NETDEBUG(KERN_INFO "TCP: time wait bucket table overflow\n");
+#ifdef CONFIG_BEANCOUNTERS
+		if (sock_has_ubc(sk))
+			ubid = sock_bc(sk)->ub->ub_uid;
+#endif
+		LIMIT_NETDEBUG(KERN_INFO "TCP: time wait bucket table overflow (CT%d)\n", ubid);
 	}
 
 	tcp_update_metrics(sk);
@@ -407,6 +425,8 @@ struct sock *tcp_create_openreq_child(struct sock *sk, struct request_sock *req,
 		struct tcp_sock *newtp;
 
 		/* Now setup tcp_sock */
+		newsk->owner_env = sk->owner_env;
+
 		newtp = tcp_sk(newsk);
 		newtp->pred_flags = 0;
 		newtp->rcv_wup = newtp->copied_seq = newtp->rcv_nxt = treq->rcv_isn + 1;

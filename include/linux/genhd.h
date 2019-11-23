@@ -22,6 +22,7 @@
 #define part_to_dev(part)	(&((part)->__dev))
 
 extern struct device_type part_type;
+extern struct device_type disk_type;
 extern struct kobject *block_depr;
 extern struct class block_class;
 
@@ -89,7 +90,13 @@ struct disk_stats {
 	
 struct hd_struct {
 	sector_t start_sect;
+	/*
+	 * nr_sects is protected by sequence counter. One might extend a
+	 * partition while IO is happening to it and update of nr_sects
+	 * can be non-atomic on 32bit machines with 64bit sector_t.
+	 */
 	sector_t nr_sects;
+	seqcount_t seq;
 	sector_t alignment_offset;
 	unsigned int discard_alignment;
 	struct device __dev;
@@ -562,6 +569,8 @@ extern struct hd_struct * __must_check add_partition(struct gendisk *disk,
 extern void __delete_partition(struct hd_struct *);
 extern void delete_partition(struct gendisk *, int);
 extern void printk_all_partitions(void);
+extern sector_t part_nr_sects_read(struct hd_struct *part);
+extern void part_nr_sects_write(struct hd_struct *part, sector_t val);
 
 extern struct gendisk *alloc_disk_node(int minors, int node_id);
 extern struct gendisk *alloc_disk(int minors);

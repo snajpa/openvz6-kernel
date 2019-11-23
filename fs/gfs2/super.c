@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/completion.h>
+#include <linux/quotaops.h>
 #include <linux/buffer_head.h>
 #include <linux/statfs.h>
 #include <linux/seq_file.h>
@@ -773,7 +774,7 @@ static int gfs2_write_inode(struct inode *inode, struct writeback_control *wbc)
  * been carried out.
  */
 
-static void gfs2_dirty_inode(struct inode *inode)
+static void gfs2_dirty_inode(struct inode *inode, int flags)
 {
 	struct gfs2_inode *ip = GFS2_I(inode);
 	struct gfs2_sbd *sdp = GFS2_SB(inode);
@@ -1572,7 +1573,7 @@ static void gfs2_delete_inode(struct inode *inode)
 		goto out_truncate;
 
 	if (test_bit(GIF_INVALID, &ip->i_flags)) {
-		error = gfs2_inode_refresh(ip);
+		error = gfs2_inode_refresh(ip, 0);
 		if (error)
 			goto out_truncate;
 	}
@@ -1661,6 +1662,12 @@ out_truncate:
 		goto out_unlock;
 	/* Needs to be done before glock release & also in a transaction */
 	truncate_inode_pages(&inode->i_data, 0);
+
+	vfs_dq_init(inode);
+	vfs_dq_free_block(inode, 1);
+	vfs_dq_free_inode(inode);
+	vfs_dq_drop(inode);
+
 	gfs2_trans_end(sdp);
 
 out_unlock:

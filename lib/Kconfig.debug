@@ -135,6 +135,15 @@ config DEBUG_SECTION_MISMATCH
 	  - Enable verbose reporting from modpost to help solving
 	    the section mismatches reported.
 
+config SYSRQ_DEBUG
+	bool "Debugging via sysrq keys"
+	depends on MAGIC_SYSRQ
+	default y
+	help
+	  Say Y if you want to extend functionality of magic key. It will
+	  provide you with some debugging facilities such as dumping and
+	  writing memory, resolving symbols and some other.
+
 config DEBUG_KERNEL
 	bool "Kernel debugging"
 	help
@@ -322,7 +331,7 @@ config SCHEDSTATS
 config DEBUG_NMI_TIMEOUT
 	int "Number of seconds before NMI timeout"
 	depends on X86
-	default 5
+	default 30
 	help
 	  This value is the number of seconds the NMI watchdog will tick
 	  before it decides the machine has hung.
@@ -628,6 +637,7 @@ config TRACE_IRQFLAGS
 
 config DEBUG_SPINLOCK_SLEEP
 	bool "Spinlock debugging: sleep-inside-spinlock checking"
+	select PREEMPT_COUNT
 	depends on DEBUG_KERNEL
 	help
 	  If you say Y here, various routines which may sleep will become very

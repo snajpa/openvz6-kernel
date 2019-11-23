@@ -28,6 +28,7 @@
 #include <linux/rmap.h>
 #include <linux/mmu_notifier.h>
 #include <linux/perf_event.h>
+#include <linux/virtinfo.h>
 #include <linux/random.h>
 #include <linux/khugepaged.h>
 
@@ -41,6 +42,9 @@
 #ifndef arch_mmap_check
 #define arch_mmap_check(addr, len, flags)	(0)
 #endif
+
+#include <bc/vmpages.h>
+#include <bc/kmem.h>
 
 #ifndef arch_rebalance_pgtables
 #define arch_rebalance_pgtables(addr, len)		(addr)
@@ -58,6 +62,7 @@
 #endif
 
 
+static unsigned long __do_brk(unsigned long addr, unsigned long len, int soft);
 static void unmap_region(struct mm_struct *mm,
 		struct vm_area_struct *vma, struct vm_area_struct *prev,
 		unsigned long start, unsigned long end);
@@ -138,6 +143,12 @@ int __vm_enough_memory(struct mm_struct *mm, long pages, int cap_sys_admin)
 	long free, allowed;
 
 	vm_acct_memory(pages);
+
+#ifdef CONFIG_BEANCOUNTERS
+	if (mm && mm_ub_top(mm)->ub_parms[UB_PRIVVMPAGES].held <=
+			mm_ub_top(mm)->ub_parms[UB_VMGUARPAGES].barrier)
+		return 0;
+#endif
 
 	/*
 	 * Sometimes we want to use more memory than we have
@@ -249,6 +260,7 @@ void unlink_file_vma(struct vm_area_struct *vma)
 		spin_unlock(&mapping->i_mmap_lock);
 	}
 }
+EXPORT_SYMBOL_GPL(unlink_file_vma);
 
 /*
  * Close a vm structure and free it, returning the next.
@@ -258,6 +270,9 @@ static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 	struct vm_area_struct *next = vma->vm_next;
 
 	might_sleep();
+
+	ub_memory_uncharge(vma->vm_mm, vma->vm_end - vma->vm_start,
+			vma->vm_flags, vma->vm_file);
 	if (vma->vm_ops && vma->vm_ops->close)
 		vma->vm_ops->close(vma);
 	if (vma->vm_file) {
@@ -266,7 +281,7 @@ static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 			removed_exe_file_vma(vma->vm_mm);
 	}
 	mpol_put(vma_policy(vma));
-	kmem_cache_free(vm_area_cachep, vma);
+	free_vma(vma->vm_mm, vma);
 	return next;
 }
 
@@ -325,7 +340,7 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 		goto out;
 
 	/* Ok, looks good - let it rip. */
-	if (do_brk(oldbrk, newbrk-oldbrk) != oldbrk)
+	if (__do_brk(oldbrk, newbrk-oldbrk, UB_HARD) != oldbrk)
 		goto out;
 set_brk:
 	mm->brk = brk;
@@ -455,7 +470,7 @@ void __vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
 	rb_insert_color(&vma->vm_rb, &mm->mm_rb);
 }
 
-static void __vma_link_file(struct vm_area_struct *vma)
+void __vma_link_file(struct vm_area_struct *vma)
 {
 	struct file *file;
 
@@ -476,6 +491,7 @@ static void __vma_link_file(struct vm_area_struct *vma)
 		flush_dcache_mmap_unlock(mapping);
 	}
 }
+EXPORT_SYMBOL_GPL(__vma_link_file);
 
 static void
 __vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
@@ -701,7 +717,7 @@ again:			remove_next = 1 + (end > next->vm_end);
 			anon_vma_merge(vma, next);
 		mm->map_count--;
 		mpol_put(vma_policy(next));
-		kmem_cache_free(vm_area_cachep, next);
+		free_vma(mm, next);
 		/*
 		 * In mprotect's case 6 (see comments on vma_merge),
 		 * we must remove another next too. It would clutter
@@ -1029,7 +1045,7 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 {
 	struct mm_struct * mm = current->mm;
 	struct inode *inode;
-	unsigned int vm_flags;
+	vm_flags_t vm_flags;
 	int error;
 	unsigned long reqprot = prot;
 
@@ -1121,7 +1137,8 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 		case MAP_PRIVATE:
 			if (!(file->f_mode & FMODE_READ))
 				return -EACCES;
-			if (file->f_path.mnt->mnt_flags & MNT_NOEXEC) {
+			if ((file->f_path.mnt->mnt_flags & MNT_NOEXEC) &&
+					!(flags & MAP_CPT)) {
 				if (vm_flags & VM_EXEC)
 					return -EPERM;
 				vm_flags &= ~VM_MAYEXEC;
@@ -1170,7 +1187,7 @@ EXPORT_SYMBOL(do_mmap_pgoff);
  */
 int vma_wants_writenotify(struct vm_area_struct *vma)
 {
-	unsigned int vm_flags = vma->vm_flags;
+	vm_flags_t vm_flags = vma->vm_flags;
 
 	/* If it was private or non-writable, the write bit is already clear */
 	if ((vm_flags & (VM_WRITE|VM_SHARED)) != ((VM_WRITE|VM_SHARED)))
@@ -1191,14 +1208,15 @@ int vma_wants_writenotify(struct vm_area_struct *vma)
 
 	/* Can the mapping track the dirty pages? */
 	return vma->vm_file && vma->vm_file->f_mapping &&
-		mapping_cap_account_dirty(vma->vm_file->f_mapping);
+		(mapping_cap_account_dirty(vma->vm_file->f_mapping) ||
+		 test_bit(AS_CHECKPOINT, &vma->vm_file->f_mapping->flags));
 }
 
 /*
  * We account for memory if it's a private writeable mapping,
  * not hugepages and VM_NORESERVE wasn't set.
  */
-static inline int accountable_mapping(struct file *file, unsigned int vm_flags)
+static inline int accountable_mapping(struct file *file, vm_flags_t vm_flags)
 {
 	/*
 	 * hugetlb has its own accounting separate from the core VM
@@ -1212,7 +1230,7 @@ static inline int accountable_mapping(struct file *file, unsigned int vm_flags)
 
 unsigned long mmap_region(struct file *file, unsigned long addr,
 			  unsigned long len, unsigned long flags,
-			  unsigned int vm_flags, unsigned long pgoff)
+			  vm_flags_t vm_flags, unsigned long pgoff)
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma, *prev;
@@ -1221,6 +1239,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	struct rb_node **rb_link, *rb_parent;
 	unsigned long charged = 0;
 	struct inode *inode =  file ? file->f_path.dentry->d_inode : NULL;
+	unsigned long ub_charged = 0;
 
 	/* Clear old maps */
 	error = -ENOMEM;
@@ -1260,6 +1279,11 @@ munmap_back:
 		vm_flags |= VM_ACCOUNT;
 	}
 
+	if (ub_memory_charge(mm, len, vm_flags, file,
+				(flags & MAP_EXECPRIO ? UB_SOFT : UB_HARD)))
+		goto charge_error;
+	ub_charged = 1;
+
 	/*
 	 * Can we just expand an old mapping?
 	 */
@@ -1272,7 +1296,8 @@ munmap_back:
 	 * specific mapper. the address has already been validated, but
 	 * not unmapped, but the maps are removed from the list.
 	 */
-	vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
+	vma = allocate_vma(mm, GFP_KERNEL | __GFP_ZERO |
+			(flags & MAP_EXECPRIO ? __GFP_SOFT_UBC : 0));
 	if (!vma) {
 		error = -ENOMEM;
 		goto unacct_error;
@@ -1303,6 +1328,19 @@ munmap_back:
 			goto unmap_and_free_vma;
 		if (vm_flags & VM_EXECUTABLE)
 			added_exe_file_vma(mm);
+		if (vm_flags != vma->vm_flags) {
+		/* 
+		 * ->vm_flags has been changed in f_op->mmap method.
+		 * We have to recharge ub memory.
+		 */
+			ub_memory_uncharge(mm, len, vm_flags, file);
+			if (ub_memory_charge(mm, len, vma->vm_flags, file,
+				(flags & MAP_EXECPRIO ? UB_SOFT : UB_HARD))) {
+				ub_charged = 0;
+				error = -ENOMEM;
+				goto unmap_and_free_vma;
+			}
+		}
 
 		/* Can addr have changed??
 		 *
@@ -1351,6 +1389,8 @@ out:
 		long nr_pages = mlock_vma_pages_range(vma, addr, addr + len);
 		if (nr_pages < 0)
 			return nr_pages;	/* vma gone! */
+		if (nr_pages)
+			ub_locked_uncharge(mm, nr_pages << PAGE_SHIFT);
 		mm->locked_vm += (len >> PAGE_SHIFT) - nr_pages;
 	} else if ((flags & MAP_POPULATE) && !(flags & MAP_NONBLOCK))
 		make_pages_present(addr, addr + len);
@@ -1366,8 +1406,11 @@ unmap_and_free_vma:
 	unmap_region(mm, vma, prev, vma->vm_start, vma->vm_end);
 	charged = 0;
 free_vma:
-	kmem_cache_free(vm_area_cachep, vma);
+	free_vma(mm, vma);
 unacct_error:
+	if (ub_charged)
+		ub_memory_uncharge(mm, len, vm_flags, file);
+charge_error:
 	if (charged)
 		vm_unacct_memory(charged);
 	return error;
@@ -1870,12 +1913,16 @@ static int acct_stack_growth(struct vm_area_struct *vma, unsigned long size, uns
 	if (is_hugepage_only_range(vma->vm_mm, new_start, size))
 		return -EFAULT;
 
+	if (ub_memory_charge(mm, grow << PAGE_SHIFT, vma->vm_flags,
+				vma->vm_file, UB_SOFT))
+		goto fail_charge;
+
 	/*
 	 * Overcommit..  This must be the final test, as it will
 	 * update security statistics.
 	 */
 	if (security_vm_enough_memory_mm(mm, grow))
-		return -ENOMEM;
+		goto fail_sec;
 
 	/* Ok, everything looks good - let it rip */
 	mm->total_vm += grow;
@@ -1883,6 +1930,11 @@ static int acct_stack_growth(struct vm_area_struct *vma, unsigned long size, uns
 		mm->locked_vm += grow;
 	vm_stat_account(mm, vma->vm_flags, vma->vm_file, grow);
 	return 0;
+
+fail_sec:
+	ub_memory_uncharge(mm, grow << PAGE_SHIFT, vma->vm_flags, vma->vm_file);
+fail_charge:
+	return -ENOMEM;
 }
 
 #if defined(CONFIG_STACK_GROWSUP) || defined(CONFIG_IA64)
@@ -2189,7 +2241,7 @@ static int __split_vma(struct mm_struct * mm, struct vm_area_struct * vma,
 					~(huge_page_mask(hstate_vma(vma)))))
 		return -EINVAL;
 
-	new = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
+	new = allocate_vma(mm, GFP_KERNEL);
 	if (!new)
 		goto out_err;
 
@@ -2251,7 +2303,7 @@ static int __split_vma(struct mm_struct * mm, struct vm_area_struct * vma,
  out_free_mpol:
 	mpol_put(pol);
  out_free_vma:
-	kmem_cache_free(vm_area_cachep, new);
+	free_vma(mm, new);
  out_err:
 	return err;
 }
@@ -2268,6 +2320,7 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 
 	return __split_vma(mm, vma, addr, new_below);
 }
+EXPORT_SYMBOL(split_vma);
 
 /* Munmap is split into 2 main parts -- this part which finds
  * what needs doing, and the areas themselves, which do the
@@ -2385,7 +2438,7 @@ static inline void verify_mm_writelocked(struct mm_struct *mm)
  *  anonymous maps.  eventually we may be able to do some
  *  brk-specific accounting here.
  */
-unsigned long do_brk(unsigned long addr, unsigned long len)
+static unsigned long __do_brk(unsigned long addr, unsigned long len, int soft)
 {
 	struct mm_struct * mm = current->mm;
 	struct vm_area_struct * vma, * prev;
@@ -2445,8 +2498,11 @@ unsigned long do_brk(unsigned long addr, unsigned long len)
 	if (mm->map_count > sysctl_max_map_count)
 		return -ENOMEM;
 
+	if (ub_memory_charge(mm, len, flags, NULL, soft))
+		goto fail_charge;
+
 	if (security_vm_enough_memory(len >> PAGE_SHIFT))
-		return -ENOMEM;
+		goto fail_sec;
 
 	/* Can we just expand an old private anonymous mapping? */
 	vma = vma_merge(mm, prev, addr, addr + len, flags,
@@ -2457,11 +2513,10 @@ unsigned long do_brk(unsigned long addr, unsigned long len)
 	/*
 	 * create a vma struct for an anonymous mapping
 	 */
-	vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
-	if (!vma) {
-		vm_unacct_memory(len >> PAGE_SHIFT);
-		return -ENOMEM;
-	}
+	vma = allocate_vma(mm, GFP_KERNEL | __GFP_ZERO |
+			(soft == UB_SOFT ? __GFP_SOFT_UBC : 0));
+	if (!vma)
+		goto fail_alloc;
 
 	INIT_LIST_HEAD(&vma->anon_vma_chain);
 	vma->vm_mm = mm;
@@ -2479,8 +2534,19 @@ out:
 			mm->locked_vm += (len >> PAGE_SHIFT);
 	}
 	return addr;
+
+fail_alloc:
+	vm_unacct_memory(len >> PAGE_SHIFT);
+fail_sec:
+	ub_memory_uncharge(mm, len, flags, NULL);
+fail_charge:
+	return -ENOMEM;
 }
 
+unsigned long do_brk(unsigned long addr, unsigned long len)
+{
+	return __do_brk(addr, len, UB_SOFT);
+}
 EXPORT_SYMBOL(do_brk);
 
 /* Release all mmaps. */
@@ -2490,6 +2556,7 @@ void exit_mmap(struct mm_struct *mm)
 	struct vm_area_struct *vma;
 	unsigned long nr_accounted = 0;
 	unsigned long end;
+	unsigned int ptes_before;
 
 	/* mm's last user has gone, and its about to be pulled down */
 	mmu_notifier_release(mm);
@@ -2516,6 +2583,8 @@ void exit_mmap(struct mm_struct *mm)
 	end = unmap_vmas(&tlb, vma, 0, -1, &nr_accounted, NULL, 1);
 	vm_unacct_memory(nr_accounted);
 
+	ptes_before = mm->nr_ptes;
+	tlb->ptes_freed = 0;
 	free_pgtables(tlb, vma, FIRST_USER_ADDRESS, 0);
 	tlb_finish_mmu(tlb, 0, end);
 	arch_flush_exec_range(mm);
@@ -2527,7 +2596,11 @@ void exit_mmap(struct mm_struct *mm)
 	while (vma)
 		vma = remove_vma(vma);
 
-	WARN_ON(mm->nr_ptes > (FIRST_USER_ADDRESS+PMD_SIZE-1)>>PMD_SHIFT);
+	if (mm->nr_ptes > (FIRST_USER_ADDRESS+PMD_SIZE-1)>>PMD_SHIFT) {
+		printk(KERN_ERR "PTE pages leak: had %u freed %u has %u\n",
+				ptes_before, tlb->ptes_freed, (unsigned int)mm->nr_ptes);
+		dump_stack();
+	}
 }
 
 /* Insert vm structure into process list sorted by address
@@ -2615,7 +2688,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 		} else
 			anon_vma_moveto_tail(new_vma);
 	} else {
-		new_vma = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
+		new_vma = allocate_vma(mm, GFP_KERNEL);
 		if (new_vma) {
 			*new_vma = *vma;
 			pol = mpol_dup(vma_policy(vma));
@@ -2643,7 +2716,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
  out_free_mempol:
 	mpol_put(pol);
  out_free_vma:
-	kmem_cache_free(vm_area_cachep, new_vma);
+	free_vma(mm, new_vma);
 	return NULL;
 }
 
@@ -2698,10 +2771,11 @@ static void special_mapping_close(struct vm_area_struct *vma)
 {
 }
 
-static const struct vm_operations_struct special_mapping_vmops = {
+const struct vm_operations_struct special_mapping_vmops = {
 	.close = special_mapping_close,
 	.fault = special_mapping_fault,
 };
+EXPORT_SYMBOL(special_mapping_vmops);
 
 /*
  * Called with mm->mmap_sem held for writing.
@@ -2719,7 +2793,7 @@ int install_special_mapping(struct mm_struct *mm,
 	int ret;
 	struct vm_area_struct *vma;
 
-	vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
+	vma = allocate_vma(mm, GFP_KERNEL | __GFP_ZERO);
 	if (unlikely(vma == NULL))
 		return -ENOMEM;
 
@@ -2749,7 +2823,7 @@ int install_special_mapping(struct mm_struct *mm,
 	return 0;
 
 out:
-	kmem_cache_free(vm_area_cachep, vma);
+	free_vma(mm, vma);
 	return ret;
 }
 

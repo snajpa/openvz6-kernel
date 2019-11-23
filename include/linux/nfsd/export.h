@@ -145,12 +145,9 @@ int			exp_rootfh(struct auth_domain *,
 __be32			exp_pseudoroot(struct svc_rqst *, struct svc_fh *);
 __be32			nfserrno(int errno);
 
-extern struct cache_detail svc_export_cache;
+dev_t exp_get_dev(struct svc_export *ex);
 
-static inline void exp_put(struct svc_export *exp)
-{
-	cache_put(&exp->h, &svc_export_cache);
-}
+extern void exp_put(struct svc_export *exp);
 
 static inline void exp_get(struct svc_export *exp)
 {

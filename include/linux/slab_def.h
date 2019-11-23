@@ -28,27 +28,45 @@
 #endif
 
 /*
+ * DEBUG	- 1 for kmem_cache_create() to honour; SLAB_RED_ZONE & SLAB_POISON.
+ *		  0 for faster, smaller code (especially in the critical paths).
+ *
+ * STATS	- 1 to collect stats for /proc/slabinfo.
+ *		  0 for faster, smaller code (especially in the critical paths).
+ *
+ * FORCED_DEBUG	- 1 enables SLAB_RED_ZONE and SLAB_POISON (if possible)
+ */
+
+#ifdef CONFIG_DEBUG_SLAB
+#define	SLAB_DEBUG		1
+#define	SLAB_STATS		1
+#define SLAB_FORCED_DEBUG	1
+#else
+#define	SLAB_DEBUG		0
+#define	SLAB_STATS		0
+#define SLAB_FORCED_DEBUG	0
+#endif
+
+/*
  * struct kmem_cache
  *
  * manages a cache.
  */
 
 struct kmem_cache {
-/* 1) per-cpu data, touched during every alloc/free */
-	struct array_cache *array[NR_CPUS];
-/* 2) Cache tunables. Protected by cache_chain_mutex */
+/* 1) Cache tunables. Protected by cache_chain_mutex */
 	unsigned int batchcount;
 	unsigned int limit;
 	unsigned int shared;
 
 	unsigned int buffer_size;
 	u32 reciprocal_buffer_size;
-/* 3) touched by every alloc & free from the backend */
+/* 2) touched by every alloc & free from the backend */
 
 	unsigned int flags;		/* constant flags */
 	unsigned int num;		/* # of objs per slab */
 
-/* 4) cache_grow/shrink */
+/* 3) cache_grow/shrink */
 	/* order of pgs per slab (2^n) */
 	unsigned int gfporder;
 
@@ -64,17 +82,18 @@ struct kmem_cache {
 	/* constructor func */
 	void (*ctor)(void *obj);
 
-/* 5) cache creation/removal */
+/* 4) cache creation/removal */
 	const char *name;
 	struct list_head next;
 
-/* 6) statistics */
+/* 5) statistics */
 #ifdef CONFIG_DEBUG_SLAB
 	unsigned long num_active;
 	unsigned long num_allocations;
 	unsigned long high_mark;
 	unsigned long grown;
 	unsigned long reaped;
+	unsigned long shrunk;
 	unsigned long errors;
 	unsigned long max_freeable;
 	unsigned long node_allocs;
@@ -94,17 +113,22 @@ struct kmem_cache {
 	int obj_offset;
 	int obj_size;
 #endif /* CONFIG_DEBUG_SLAB */
+#ifdef CONFIG_BEANCOUNTERS
+	int objuse;
+#endif
 
+/* 6) per-cpu/per-node data, touched during every alloc/free */
 	/*
-	 * We put nodelists[] at the end of kmem_cache, because we want to size
-	 * this array to nr_node_ids slots instead of MAX_NUMNODES
+	 * We put array[] at the end of kmem_cache, because we want to size
+	 * this array to nr_cpu_ids slots instead of NR_CPUS
 	 * (see kmem_cache_init())
-	 * We still use [MAX_NUMNODES] and not [1] or [0] because cache_cache
-	 * is statically defined, so we reserve the max number of nodes.
+	 * We still use [NR_CPUS] and not [1] or [0] because cache_cache
+	 * is statically defined, so we reserve the max number of cpus.
 	 */
-	struct kmem_list3 *nodelists[MAX_NUMNODES];
+	struct kmem_list3 **nodelists;
+	struct array_cache *array[NR_CPUS];
 	/*
-	 * Do not add fields after nodelists[]
+	 * Do not add fields after array[]
 	 */
 };
 
@@ -117,6 +141,7 @@ struct cache_sizes {
 #endif
 };
 extern struct cache_sizes malloc_sizes[];
+extern int malloc_cache_num;
 
 void *kmem_cache_alloc(struct kmem_cache *, gfp_t);
 void *__kmalloc(size_t size, gfp_t flags);
@@ -162,6 +187,8 @@ static __always_inline void *kmalloc(size_t size, gfp_t flags)
 #undef CACHE
 		return NULL;
 found:
+		if (flags & __GFP_UBC)
+			i += malloc_cache_num;
 #ifdef CONFIG_ZONE_DMA
 		if (flags & GFP_DMA)
 			cachep = malloc_sizes[i].cs_dmacachep;

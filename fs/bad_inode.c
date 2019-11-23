@@ -80,6 +80,11 @@ static int bad_file_mmap(struct file *file, struct vm_area_struct *vma)
 
 static int bad_file_open(struct inode *inode, struct file *filp)
 {
+#if IS_ENABLED(CONFIG_VZ_CHECKPOINT)
+	/* Nobody but CPT uses bad_file_ops on anon_inode */
+	if (inode == anon_inode_inode)
+		return 0;
+#endif
 	return -EIO;
 }
 
@@ -127,7 +132,7 @@ static unsigned long bad_file_get_unmapped_area(struct file *file,
 	return -EIO;
 }
 
-static int bad_file_check_flags(int flags)
+static int bad_file_set_flags(struct file *file, int flags)
 {
 	return -EIO;
 }
@@ -151,7 +156,7 @@ static ssize_t bad_file_splice_read(struct file *in, loff_t *ppos,
 	return -EIO;
 }
 
-static const struct file_operations bad_file_ops =
+const struct file_operations bad_file_ops =
 {
 	.llseek		= bad_file_llseek,
 	.read		= bad_file_read,
@@ -173,11 +178,15 @@ static const struct file_operations bad_file_ops =
 	.lock		= bad_file_lock,
 	.sendpage	= bad_file_sendpage,
 	.get_unmapped_area = bad_file_get_unmapped_area,
-	.check_flags	= bad_file_check_flags,
+	.set_flags	= bad_file_set_flags,
 	.flock		= bad_file_flock,
 	.splice_write	= bad_file_splice_write,
 	.splice_read	= bad_file_splice_read,
 };
+
+#if IS_ENABLED(CONFIG_VZ_CHECKPOINT)
+EXPORT_SYMBOL(bad_file_ops);
+#endif
 
 static int bad_inode_create (struct inode *dir, struct dentry *dentry,
 		int mode, struct nameidata *nd)

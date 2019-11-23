@@ -128,17 +128,27 @@ module_param(forward, bool, 0000);
 
 static int __net_init iptable_filter_net_init(struct net *net)
 {
+	if (!net_ipt_permitted(net, VE_IP_FILTER))
+		return 0;
+
 	/* Register table */
 	net->ipv4.iptable_filter =
 		ipt_register_table(net, &packet_filter, &initial_table.repl);
 	if (IS_ERR(net->ipv4.iptable_filter))
 		return PTR_ERR(net->ipv4.iptable_filter);
+
+	net_ipt_module_set(net, VE_IP_FILTER);
 	return 0;
 }
 
 static void __net_exit iptable_filter_net_exit(struct net *net)
 {
+	if (!net_is_ipt_module_set(net, VE_IP_FILTER))
+		return;
+
 	ipt_unregister_table(net->ipv4.iptable_filter);
+
+	net_ipt_module_clear(net, VE_IP_FILTER);
 }
 
 static struct pernet_operations iptable_filter_net_ops = {

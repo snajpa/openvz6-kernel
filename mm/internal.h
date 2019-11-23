@@ -12,6 +12,7 @@
 #define __MM_INTERNAL_H
 
 #include <linux/mm.h>
+#include <linux/rcupdate.h>
 
 void free_pgtables(struct mmu_gather *tlb, struct vm_area_struct *start_vma,
 		unsigned long floor, unsigned long ceiling);
@@ -122,8 +123,13 @@ static inline void unevictable_migrate_page(struct page *new, struct page *old)
 #ifdef CONFIG_MMU
 extern long mlock_vma_pages_range(struct vm_area_struct *vma,
 			unsigned long start, unsigned long end);
-extern void munlock_vma_pages_range(struct vm_area_struct *vma,
-			unsigned long start, unsigned long end);
+extern void __munlock_vma_pages_range(struct vm_area_struct *vma,
+			unsigned long start, unsigned long end, int acct);
+static inline void munlock_vma_pages_range(struct vm_area_struct *vma,
+			unsigned long start, unsigned long end)
+{
+	__munlock_vma_pages_range(vma, start, end, 1);
+}
 static inline void munlock_vma_pages_all(struct vm_area_struct *vma)
 {
 	munlock_vma_pages_range(vma, vma->vm_start, vma->vm_end);
@@ -147,12 +153,6 @@ static inline int is_mlocked_vma(struct vm_area_struct *vma, struct page *page)
 	}
 	return 1;
 }
-
-/*
- * must be called with vma's mmap_sem held for read or write, and page locked.
- */
-extern void mlock_vma_page(struct page *page);
-extern void munlock_vma_page(struct page *page);
 
 /*
  * Clear the page's PageMlocked().  This can be useful in a situation where
@@ -193,7 +193,7 @@ static inline int is_mlocked_vma(struct vm_area_struct *v, struct page *p)
 	return 0;
 }
 static inline void clear_page_mlock(struct page *page) { }
-static inline void mlock_vma_page(struct page *page) { }
+static inline void mlock_vma_page(struct vm_area_struct *vma, struct page *page) { }
 static inline void mlock_migrate_page(struct page *new, struct page *old) { }
 
 #endif /* !CONFIG_MMU */
@@ -298,7 +298,6 @@ static inline void mminit_validate_memmodel_limits(unsigned long *start_pfn,
 #define ZONE_RECLAIM_FULL	-1
 #define ZONE_RECLAIM_SOME	0
 #define ZONE_RECLAIM_SUCCESS	1
-#endif
 
 extern int hwpoison_filter(struct page *p);
 
@@ -308,3 +307,5 @@ extern u64 hwpoison_filter_flags_mask;
 extern u64 hwpoison_filter_flags_value;
 extern u64 hwpoison_filter_memcg;
 extern u32 hwpoison_filter_enable;
+
+#endif /* __MM_INTERNAL_H */

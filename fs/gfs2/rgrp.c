@@ -10,6 +10,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/completion.h>
+#include <linux/quotaops.h>
 #include <linux/buffer_head.h>
 #include <linux/fs.h>
 #include <linux/gfs2_ondisk.h>
@@ -1951,12 +1952,13 @@ out:
  * @nblocks: requested number of blocks/extent length (value/result)
  * @dinode: 1 if we're allocating a dinode block, else 0
  * @generation: the generation number of the inode
+ * @do_reserve: reserve linux disk quota blocks
  *
  * Returns: 0 or error
  */
 
 int gfs2_alloc_blocks(struct gfs2_inode *ip, u64 *bn, unsigned int *nblocks,
-		      bool dinode, u64 *generation)
+		      bool dinode, u64 *generation, int do_reserve)
 {
 	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
 	struct buffer_head *dibh;
@@ -1965,6 +1967,12 @@ int gfs2_alloc_blocks(struct gfs2_inode *ip, u64 *bn, unsigned int *nblocks,
 	u64 goal;
 	u64 block; /* block, within the file system scope */
 	int error;
+	int quota_initial_reserve = *nblocks;
+
+	if (do_reserve) {
+		if (vfs_dq_reserve_block(&ip->i_inode, *nblocks))
+			return -EDQUOT;
+	}
 
 	if (gfs2_rs_active(&ip->i_res))
 		goal = gfs2_rbm_to_block(&ip->i_res.rs_rbm);
@@ -1981,6 +1989,10 @@ int gfs2_alloc_blocks(struct gfs2_inode *ip, u64 *bn, unsigned int *nblocks,
 		error = gfs2_rbm_find(&rbm, GFS2_BLKST_FREE, NULL, NULL, false,
 				      NULL);
 	}
+
+	if (do_reserve && *nblocks != quota_initial_reserve)
+		vfs_dq_release_reservation_block(&ip->i_inode,
+					quota_initial_reserve - *nblocks);
 
 	/* Since all blocks are reserved in advance, this shouldn't happen */
 	if (error) {
@@ -2042,6 +2054,8 @@ int gfs2_alloc_blocks(struct gfs2_inode *ip, u64 *bn, unsigned int *nblocks,
 	return 0;
 
 rgrp_error:
+	if (do_reserve)
+		vfs_dq_release_reservation_block(&ip->i_inode, *nblocks);
 	gfs2_rgrp_error(rbm.rgd);
 	return -EIO;
 }

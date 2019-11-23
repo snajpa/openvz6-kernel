@@ -234,6 +234,11 @@ static int tg3_debug = -1;	/* -1 == use TG3_DEF_MSG_ENABLE as value */
 module_param(tg3_debug, int, 0);
 MODULE_PARM_DESC(tg3_debug, "Tigon3 bitmapped debugging message enable value");
 
+static int tg3_pcie_mrrs_boost = 0;
+module_param(tg3_pcie_mrrs_boost, int, S_IRUGO);
+MODULE_PARM_DESC(tg3_pcie_mrrs_boost, "Increase Tigon3 PCI MRRS "
+				      "(can result in a performance boost)");
+
 #define TG3_DRV_DATA_FLAG_10_100_ONLY	0x0001
 #define TG3_DRV_DATA_FLAG_5705_10_100	0x0002
 
@@ -8928,6 +8933,10 @@ static void tg3_restore_pci_state(struct tg3 *tp)
 
 	pci_write_config_word(tp->pdev, PCI_COMMAND, tp->pci_cmd);
 
+	if (tg3_pcie_mrrs_boost && tg3_flag(tp, PCI_EXPRESS) &&
+	    tg3_asic_rev(tp) != ASIC_REV_5785)
+		pcie_set_readrq(tp->pdev, tp->pcie_readrq);
+
 	if (!tg3_flag(tp, PCI_EXPRESS)) {
 		pci_write_config_byte(tp->pdev, PCI_CACHE_LINE_SIZE,
 				      tp->pci_cacheline_sz);
@@ -9169,6 +9178,9 @@ static int tg3_chip_reset(struct tg3 *tp)
 		if (!tg3_flag(tp, CPMU_PRESENT))
 			val16 |= PCI_EXP_DEVCTL_PAYLOAD;
 		pcie_capability_clear_word(tp->pdev, PCI_EXP_DEVCTL, val16);
+
+		if (tg3_pcie_mrrs_boost)
+			pcie_set_readrq(tp->pdev, tp->pcie_readrq);
 
 		/* Clear error status */
 		pcie_capability_write_word(tp->pdev, PCI_EXP_DEVSTA,
@@ -16380,6 +16392,14 @@ static int tg3_get_invariants(struct tg3 *tp,
 		u16 lnkctl;
 
 		tg3_flag_set(tp, PCI_EXPRESS);
+
+		if (tg3_pcie_mrrs_boost) {
+			tp->pcie_readrq = 4096;
+			if (tg3_asic_rev(tp) == ASIC_REV_5719 ||
+			    tg3_asic_rev(tp) == ASIC_REV_5720)
+				tp->pcie_readrq = 2048;
+			pcie_set_readrq(tp->pdev, tp->pcie_readrq);
+		}
 
 		pcie_capability_read_word(tp->pdev, PCI_EXP_LNKCTL, &lnkctl);
 		if (lnkctl & PCI_EXP_LNKCTL_CLKREQ_EN) {

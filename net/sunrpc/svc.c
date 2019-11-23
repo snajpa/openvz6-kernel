@@ -398,7 +398,7 @@ static int svc_uses_rpcbind(struct svc_serv *serv)
  */
 static struct svc_serv *
 __svc_create(struct svc_program *prog, unsigned int bufsize, int npools,
-	     void (*shutdown)(struct svc_serv *serv))
+	     void (*shutdown)(struct svc_serv *serv), struct svc_stat *stats)
 {
 	struct svc_serv	*serv;
 	unsigned int vers;
@@ -410,7 +410,7 @@ __svc_create(struct svc_program *prog, unsigned int bufsize, int npools,
 	serv->sv_name      = prog->pg_name;
 	serv->sv_program   = prog;
 	serv->sv_nrthreads = 1;
-	serv->sv_stats     = prog->pg_stats;
+	serv->sv_stats     = stats;
 	if (bufsize > RPCSVC_MAXPAYLOAD)
 		bufsize = RPCSVC_MAXPAYLOAD;
 	serv->sv_max_payload = bufsize? bufsize : 4096;
@@ -458,7 +458,7 @@ __svc_create(struct svc_program *prog, unsigned int bufsize, int npools,
 	}
 
 	if (svc_uses_rpcbind(serv)) {
-	       	if (svc_rpcb_setup(serv) < 0) {
+	       	if (svc_rpcb_setup(serv)) {
 			kfree(serv->sv_pools);
 			kfree(serv);
 			return NULL;
@@ -474,19 +474,21 @@ struct svc_serv *
 svc_create(struct svc_program *prog, unsigned int bufsize,
 	   void (*shutdown)(struct svc_serv *serv))
 {
-	return __svc_create(prog, bufsize, /*npools*/1, shutdown);
+	return __svc_create(prog, bufsize, /*npools*/1, shutdown,
+			prog->pg_stats);
 }
 EXPORT_SYMBOL_GPL(svc_create);
 
 struct svc_serv *
 svc_create_pooled(struct svc_program *prog, unsigned int bufsize,
 		  void (*shutdown)(struct svc_serv *serv),
-		  svc_thread_fn func, struct module *mod)
+		  svc_thread_fn func, struct module *mod,
+		  struct svc_stat *stat)
 {
 	struct svc_serv *serv;
 	unsigned int npools = svc_pool_map_get();
 
-	serv = __svc_create(prog, bufsize, npools, shutdown);
+	serv = __svc_create(prog, bufsize, npools, shutdown, stat);
 
 	if (serv != NULL) {
 		serv->sv_function = func;
@@ -707,7 +709,7 @@ svc_set_num_threads(struct svc_serv *serv, struct svc_pool *pool, int nrservs)
 		}
 
 		__module_get(serv->sv_module);
-		task = kthread_create(serv->sv_function, rqstp, serv->sv_name);
+		task = kthread_create_ve(get_exec_env(), serv->sv_function, rqstp, serv->sv_name);
 		if (IS_ERR(task)) {
 			error = PTR_ERR(task);
 			module_put(serv->sv_module);
@@ -882,7 +884,7 @@ static int __svc_register(const char *progname,
 	}
 
 	if (error < 0)
-		printk(KERN_WARNING "svc: failed to register %sv%u RPC "
+		ve_printk(VE_LOG, KERN_WARNING "svc: failed to register %sv%u RPC "
 			"service (errno %d).\n", progname, version, -error);
 	return error;
 }

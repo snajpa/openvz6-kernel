@@ -334,6 +334,9 @@ nlmsvc_is_client(void *data, struct nlm_host *dummy)
 {
 	struct nlm_host *host = data;
 
+	if (!ve_accessible_strict(host->owner_env, get_exec_env()))
+		return 0;
+
 	if (host->h_server) {
 		/* we are destroying locks even though the client
 		 * hasn't asked us too, so don't unmonitor the

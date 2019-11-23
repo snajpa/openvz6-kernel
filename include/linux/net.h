@@ -220,6 +220,7 @@ enum {
 extern int	     sock_wake_async(struct socket *sk, int how, int band);
 extern int	     sock_register(const struct net_proto_family *fam);
 extern void	     sock_unregister(int family);
+extern int	     is_sock_registered(int family);
 extern int	     __sock_create(struct net *net, int family, int type, int proto,
 				 struct socket **res, int kern);
 extern int	     sock_create(int family, int type, int proto,

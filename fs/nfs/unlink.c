@@ -20,15 +20,6 @@
 #include "iostat.h"
 #include "delegation.h"
 
-struct nfs_unlinkdata {
-	struct hlist_node list;
-	struct nfs_removeargs args;
-	struct nfs_removeres res;
-	struct inode *dir;
-	struct rpc_cred	*cred;
-	struct nfs_fattr dir_attr;
-};
-
 /**
  * nfs_free_unlinkdata - release data from a sillydelete operation.
  * @data: pointer to unlink structure.
@@ -139,7 +130,7 @@ static int nfs_do_call_unlink(struct dentry *parent, struct inode *dir, struct n
 		.rpc_message = &msg,
 		.callback_ops = &nfs_unlink_ops,
 		.callback_data = data,
-		.workqueue = nfsiod_workqueue,
+		.workqueue = inode_nfsiod_wq(dir),
 		.flags = RPC_TASK_ASYNC,
 	};
 	struct rpc_task *task;
@@ -424,7 +415,7 @@ nfs_async_rename(struct inode *old_dir, struct inode *new_dir,
 	struct rpc_task_setup task_setup_data = {
 		.rpc_message = &msg,
 		.callback_ops = &nfs_rename_ops,
-		.workqueue = nfsiod_workqueue,
+		.workqueue = inode_nfsiod_wq(old_dir),
 		.rpc_client = NFS_CLIENT(old_dir),
 		.flags = RPC_TASK_ASYNC,
 	};

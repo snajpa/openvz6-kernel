@@ -183,17 +183,23 @@ static inline int qdisc_restart(struct Qdisc *q)
 	struct net_device *dev;
 	spinlock_t *root_lock;
 	struct sk_buff *skb;
+	int ret;
+	struct ve_struct *old_ve;
 
 	/* Dequeue packet */
 	skb = dequeue_skb(q);
 	if (unlikely(!skb))
 		return 0;
 
+	old_ve = set_exec_env(skb->owner_env);
 	root_lock = qdisc_lock(q);
 	dev = qdisc_dev(q);
 	txq = netdev_get_tx_queue(dev, skb_get_queue_mapping(skb));
 
-	return sch_direct_xmit(skb, q, dev, txq, root_lock);
+	ret = sch_direct_xmit(skb, q, dev, txq, root_lock);
+	(void)set_exec_env(old_ve);
+
+	return ret;
 }
 
 void __qdisc_run(struct Qdisc *q)
@@ -810,15 +816,18 @@ static bool some_qdisc_is_busy(struct net_device *dev)
 
 void dev_deactivate_many(struct list_head *head)
 {
+	struct ve_struct *old_env;
 	struct net_device *dev;
 	struct net_device_extended *nde;
 
 	list_for_each_entry(nde, head, unreg_list) {
 		dev = nde->dev;
+		old_env = set_exec_env(dev->owner_env);
 		netdev_for_each_tx_queue(dev, dev_deactivate_queue,
 					 &noop_qdisc);
 		dev_deactivate_queue(dev, &dev->rx_queue, &noop_qdisc);
 		dev_watchdog_down(dev);
+		set_exec_env(old_env);
 	}
 
 	/* Wait for outstanding qdisc-less dev_queue_xmit calls. */

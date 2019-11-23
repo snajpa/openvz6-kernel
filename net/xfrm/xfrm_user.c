@@ -1409,6 +1409,9 @@ static int xfrm_dump_policy_done(struct netlink_callback *cb)
 {
 	struct xfrm_policy_walk *walk = (struct xfrm_policy_walk *) &cb->args[1];
 
+	if (!cb->args[0])
+		xfrm_policy_walk_init(walk, XFRM_POLICY_TYPE_ANY);
+
 	xfrm_policy_walk_done(walk);
 	return 0;
 }
@@ -2189,7 +2192,8 @@ static int xfrm_user_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 	link = &xfrm_dispatch[type];
 
 	/* All operations require privileges, even GET */
-	if (!netlink_capable(skb, CAP_NET_ADMIN))
+	if (!netlink_capable(skb, CAP_NET_ADMIN) &&
+	    !netlink_capable(skb, CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	if ((type == (XFRM_MSG_GETSA - XFRM_MSG_BASE) ||
@@ -2824,22 +2828,24 @@ static int __net_init xfrm_user_net_init(struct net *net)
 				     xfrm_netlink_rcv, NULL, THIS_MODULE);
 	if (nlsk == NULL)
 		return -ENOMEM;
+	net->xfrm.nlsk_stash = nlsk; /* Don't set to NULL */
 	rcu_assign_pointer(net->xfrm.nlsk, nlsk);
 	return 0;
 }
 
-static void __net_exit xfrm_user_net_exit(struct net *net)
+static void __net_exit xfrm_user_net_exit(struct list_head *net_exit_list)
 {
-	struct sock *nlsk = net->xfrm.nlsk;
-
-	rcu_assign_pointer(net->xfrm.nlsk, NULL);
-	synchronize_rcu();
-	netlink_kernel_release(nlsk);
+	struct net *net;
+	list_for_each_entry(net, net_exit_list, exit_list)
+		rcu_assign_pointer(net->xfrm.nlsk, NULL);
+	synchronize_net();
+	list_for_each_entry(net, net_exit_list, exit_list)
+		netlink_kernel_release(net->xfrm.nlsk_stash);
 }
 
 static struct pernet_operations xfrm_user_net_ops = {
-	.init = xfrm_user_net_init,
-	.exit = xfrm_user_net_exit,
+	.init	    = xfrm_user_net_init,
+	.exit_batch = xfrm_user_net_exit,
 };
 
 static int __init xfrm_user_init(void)

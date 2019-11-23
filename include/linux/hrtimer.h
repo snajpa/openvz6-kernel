@@ -149,7 +149,21 @@ struct hrtimer_clock_base {
 	ktime_t			offset;
 };
 
-#define HRTIMER_MAX_CLOCK_BASES 2
+/*
+ * This enum is not in the same order
+ * as vanilla kernel has, but just to
+ * make CLOCK_BOOTTIME backport easier.
+ * Thus once reworked hrtimers will be
+ * merged this hunk should be dropped
+ * off.
+ * 	-- gorcunov@
+ */
+enum  hrtimer_base_type {
+	HRTIMER_BASE_REALTIME,
+	HRTIMER_BASE_MONOTONIC,
+	HRTIMER_BASE_BOOTTIME,
+	HRTIMER_MAX_CLOCK_BASES,
+};
 
 /*
  * struct hrtimer_cpu_base - the per cpu clock bases
@@ -322,7 +336,8 @@ extern ktime_t ktime_get_real(void);
 extern ktime_t ktime_get_boottime(void);
 extern ktime_t ktime_get_monotonic_offset(void);
 extern ktime_t ktime_get_update_offsets(unsigned int *cwsseq,
-					ktime_t *offs_real);
+					ktime_t *offs_real,
+					ktime_t *offs_boot);
 
 DECLARE_PER_CPU(struct tick_device, tick_cpu_device);
 
@@ -426,6 +441,9 @@ extern long hrtimer_nanosleep(struct timespec *rqtp,
 			      const enum hrtimer_mode mode,
 			      const clockid_t clockid);
 extern long hrtimer_nanosleep_restart(struct restart_block *restart_block);
+#ifdef CONFIG_COMPAT
+extern long compat_nanosleep_restart(struct restart_block *restart);
+#endif
 
 extern void hrtimer_init_sleeper(struct hrtimer_sleeper *sl,
 				 struct task_struct *tsk);

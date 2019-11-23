@@ -1677,6 +1677,7 @@ static void vxlan_setup(struct net_device *dev)
 
 	dev->vlan_features = dev->features;
 	dev->features |= NETIF_F_HW_VLAN_TX | NETIF_F_HW_VLAN_RX;
+	dev->vz_features |= NETIF_F_VIRTUAL;
 	dev->priv_flags	&= ~IFF_XMIT_DST_RELEASE;
 	netdev_extended(dev)->ext_priv_flags |= IFF_LIVE_ADDR_CHANGE;
 	netdev_extended(dev)->ndo_fdb_add = vxlan_fdb_add;
@@ -1989,7 +1990,7 @@ static int vxlan_newlink(struct net_device *dev,
 	return 0;
 }
 
-static void vxlan_dellink(struct net_device *dev)
+static void vxlan_dellink(struct net_device *dev, struct list_head *head)
 {
 	struct vxlan_net *vn = net_generic(dev_net(dev), vxlan_net_id);
 	struct vxlan_dev *vxlan = netdev_priv(dev);
@@ -2000,7 +2001,7 @@ static void vxlan_dellink(struct net_device *dev)
 	spin_unlock(&vn->sock_lock);
 
 	list_del(&vxlan->next);
-	unregister_netdevice(dev);
+	unregister_netdevice_queue(dev, head);
 }
 
 static size_t vxlan_get_size(const struct net_device *dev)
@@ -2085,19 +2086,8 @@ static struct rtnl_link_ops vxlan_link_ops __read_mostly = {
 
 static __net_init int vxlan_init_net(struct net *net)
 {
-	struct vxlan_net *vn;
-	int rc;
+	struct vxlan_net *vn = net_generic(net, vxlan_net_id);
 	unsigned int h;
-
-	vn = kzalloc(sizeof(struct vxlan_net), GFP_KERNEL);
-	if (vn == NULL)
-		return -ENOMEM;
-
-	rc = net_assign_generic(net, vxlan_net_id, vn);
-	if (rc < 0) {
-		kfree(vn);
-		return rc;
-	}
 
 	INIT_LIST_HEAD(&vn->vxlan_list);
 	spin_lock_init(&vn->sock_lock);
@@ -2119,12 +2109,13 @@ static __net_exit void vxlan_exit_net(struct net *net)
 		unregister_netdevice_queue(vxlan->dev, &list);
 	unregister_netdevice_many(&list);
 	rtnl_unlock();
-	kfree(vn);
 }
 
 static struct pernet_operations vxlan_net_ops = {
 	.init = vxlan_init_net,
 	.exit = vxlan_exit_net,
+	.id   = &vxlan_net_id,
+	.size = sizeof(struct vxlan_net),
 };
 
 static int __init vxlan_init_module(void)
@@ -2137,7 +2128,7 @@ static int __init vxlan_init_module(void)
 
 	get_random_bytes(&vxlan_salt, sizeof(vxlan_salt));
 
-	rc = register_pernet_gen_device(&vxlan_net_id, &vxlan_net_ops);
+	rc = register_pernet_device(&vxlan_net_ops);
 	if (rc)
 		goto out1;
 
@@ -2148,7 +2139,7 @@ static int __init vxlan_init_module(void)
 	return 0;
 
 out2:
-	unregister_pernet_gen_device(vxlan_net_id, &vxlan_net_ops);
+	unregister_pernet_device(&vxlan_net_ops);
 out1:
 	destroy_workqueue(vxlan_wq);
 	return rc;
@@ -2159,7 +2150,7 @@ static void __exit vxlan_cleanup_module(void)
 {
 	rtnl_link_unregister(&vxlan_link_ops);
 	destroy_workqueue(vxlan_wq);
-	unregister_pernet_gen_device(vxlan_net_id, &vxlan_net_ops);
+	unregister_pernet_device(&vxlan_net_ops);
 	rcu_barrier();
 }
 module_exit(vxlan_cleanup_module);

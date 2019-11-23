@@ -88,6 +88,15 @@ static int __init sign_setup(char *str)
 }
 __setup("enforcemodulesig", sign_setup);
 
+static int badsigok = 0;
+
+static int __init setup_badsigok(char *str)
+{
+	badsigok = 1;
+	return 0;
+}
+__setup("badsigok", setup_badsigok);
+
 static const char modsign_note_name[] = ELFNOTE_NAME(MODSIGN_NOTE_NAME);
 static const char modsign_note_section[] = ELFNOTE_SECTION(MODSIGN_NOTE_NAME);
 
@@ -283,6 +292,11 @@ int module_verify_signature(struct module_verify_data *mvdata,
 		break;
 	default:		/* other error (probably ENOMEM) */
 		break;
+	}
+
+	if (ret && badsigok) {
+		printk(KERN_ERR "Bad signature ignored by cmdline\n");
+		ret = 0;
 	}
 
 	return ret;

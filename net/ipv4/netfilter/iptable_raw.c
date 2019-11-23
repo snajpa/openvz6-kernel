@@ -90,17 +90,28 @@ static struct nf_hook_ops ipt_ops[] __read_mostly = {
 
 static int __net_init iptable_raw_net_init(struct net *net)
 {
+	if (!net_ipt_permitted(net, VE_IP_IPTABLES))
+		return 0;
+
 	/* Register table */
 	net->ipv4.iptable_raw =
 		ipt_register_table(net, &packet_raw, &initial_table.repl);
 	if (IS_ERR(net->ipv4.iptable_raw))
 		return PTR_ERR(net->ipv4.iptable_raw);
+
+	net_ipt_module_set(net, VE_IP_IPTABLES);
+
 	return 0;
 }
 
 static void __net_exit iptable_raw_net_exit(struct net *net)
 {
+	if (!net_is_ipt_module_set(net, VE_IP_IPTABLES))
+		return;
+
 	ipt_unregister_table(net->ipv4.iptable_raw);
+
+	net_ipt_module_clear(net, VE_IP_IPTABLES);
 }
 
 static struct pernet_operations iptable_raw_net_ops = {

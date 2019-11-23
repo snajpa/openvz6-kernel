@@ -1807,6 +1807,11 @@ static int fn_trie_flush(struct fib_table *tb)
 	return found;
 }
 
+void fib_free_table(struct fib_table *tb)
+{
+	kfree(tb);
+}
+
 static void fn_trie_select_default(struct fib_table *tb,
 				   const struct flowi *flp,
 				   struct fib_result *res)

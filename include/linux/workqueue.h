@@ -173,14 +173,14 @@ struct execute_work {
 extern struct workqueue_struct *
 __create_workqueue_key(const char *name, int singlethread,
 		       int freezeable, int rt, struct lock_class_key *key,
-		       const char *lock_name);
+		       const char *lock_name, void *ve);
 
 extern struct workqueue_struct *system_wq;
 extern struct workqueue_struct *system_long_wq;
 extern struct workqueue_struct *system_power_efficient_wq;
 
 #ifdef CONFIG_LOCKDEP
-#define __create_workqueue(name, singlethread, freezeable, rt)	\
+#define __create_workqueue(name, singlethread, freezeable, rt, ve)	\
 ({								\
 	static struct lock_class_key __key;			\
 	const char *__lock_name;				\
@@ -192,21 +192,26 @@ extern struct workqueue_struct *system_power_efficient_wq;
 								\
 	__create_workqueue_key((name), (singlethread),		\
 			       (freezeable), (rt), &__key,	\
-			       __lock_name);			\
+			       __lock_name, (ve));		\
 })
 #else
-#define __create_workqueue(name, singlethread, freezeable, rt)	\
+#define __create_workqueue(name, singlethread, freezeable, rt, ve)	\
 	__create_workqueue_key((name), (singlethread), (freezeable), (rt), \
-			       NULL, NULL)
+			       NULL, NULL, ve)
 #endif
 
-#define create_workqueue(name) __create_workqueue((name), 0, 0, 0)
-#define create_rt_workqueue(name) __create_workqueue((name), 0, 0, 1)
-#define create_freezeable_workqueue(name) __create_workqueue((name), 1, 1, 0)
+#define create_workqueue(name) __create_workqueue((name), 0, 0, 0, NULL)
+#define create_rt_workqueue(name) __create_workqueue((name), 0, 0, 1, NULL)
+#define create_freezeable_workqueue(name)	\
+				__create_workqueue((name), 1, 1, 0, NULL)
 #define create_freezable_workqueue(name) create_freezeable_workqueue(name)
-#define create_singlethread_workqueue(name) __create_workqueue((name), 1, 0, 0)
+#define create_singlethread_workqueue(name)	\
+				__create_workqueue((name), 1, 0, 0, NULL)
 
 #define alloc_ordered_workqueue(name, flags) create_singlethread_workqueue(name)
+
+#define create_workqueue_ve(name, ve) __create_workqueue((name), 0, 0, 0, ve)
+#define create_singlethread_workqueue_ve(name, ve) __create_workqueue((name), 1, 0, 0, ve)
 
 extern void destroy_workqueue(struct workqueue_struct *wq);
 

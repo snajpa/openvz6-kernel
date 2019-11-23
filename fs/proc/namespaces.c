@@ -138,6 +138,8 @@ static void *proc_ns_follow_link(struct dentry *dentry, struct nameidata *nd)
 out_put_task:
 	put_task_struct(task);
 out:
+	if (error)
+		path_put(&nd->path);
 	return error;
 }
 

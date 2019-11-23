@@ -260,7 +260,8 @@ struct nf_afinfo {
 					    unsigned int dataoff,
 					    unsigned int len,
 					    u_int8_t protocol);
-	int		(*route)(struct dst_entry **dst, struct flowi *fl);
+	int		(*route)(struct net *net, struct dst_entry **dst,
+				 struct flowi *fl);
 	void		(*saveroute)(const struct sk_buff *skb,
 				     struct nf_queue_entry *entry);
 	int		(*reroute)(struct sk_buff *skb,
@@ -365,6 +366,34 @@ extern void (*nf_ct_destroy)(struct nf_conntrack *);
 #else
 static inline void nf_ct_attach(struct sk_buff *new, struct sk_buff *skb) {}
 #endif
+
+#ifdef CONFIG_VE_IPTABLES
+#include <linux/vziptable_defs.h>
+
+#define net_ipt_permitted(netns, ipt)					\
+	(mask_ipt_allow((netns)->owner_ve->ipt_mask, ipt))
+
+#define net_ipt_module_set(netns, ipt)					\
+	({								\
+		(netns)->_iptables_modules |= ipt##_MOD;		\
+	})
+
+#define net_ipt_module_clear(netns, ipt)				\
+	({								\
+		(netns)->_iptables_modules &= ~ipt##_MOD;		\
+	})
+
+#define net_is_ipt_module_set(netns, ipt)				\
+	((netns)->_iptables_modules & (ipt##_MOD))
+
+#else /* CONFIG_VE_IPTABLES */
+
+#define net_ipt_permitted(netns, ipt)		(1)
+#define net_is_ipt_module_set(netns, ipt)	(1)
+#define net_ipt_module_set(netns, ipt)
+#define net_ipt_module_clear(netns, ipt)
+
+#endif /* CONFIG_VE_IPTABLES */
 
 #endif /*__KERNEL__*/
 #endif /*__LINUX_NETFILTER_H*/

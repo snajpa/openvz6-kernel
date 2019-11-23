@@ -444,5 +444,6 @@ static inline int elf_coredump_extra_notes_write(struct file *file,
 extern int elf_coredump_extra_notes_size(void);
 extern int elf_coredump_extra_notes_write(struct file *file, loff_t *foffset);
 #endif
+
 #endif /* __KERNEL__ */
 #endif /* _LINUX_ELF_H */

@@ -206,6 +206,22 @@ __wait_on_bit(wait_queue_head_t *wq, struct wait_bit_queue *q,
 }
 EXPORT_SYMBOL(__wait_on_bit);
 
+int __sched
+__wait_on_bit_2(wait_queue_head_t *wq, struct wait_bit_queue *q,
+	      wait_bit_action_f *action, unsigned mode)
+{
+	int ret = 0;
+
+	do {
+		prepare_to_wait(wq, &q->wait, mode);
+		if (test_bit(q->key.bit_nr, q->key.flags))
+			ret = (*action)(&q->key, mode);
+	} while (test_bit(q->key.bit_nr, q->key.flags) && !ret);
+	finish_wait(wq, &q->wait);
+	return ret;
+}
+EXPORT_SYMBOL(__wait_on_bit_2);
+
 int __sched out_of_line_wait_on_bit(void *word, int bit,
 					int (*action)(void *), unsigned mode)
 {
@@ -375,3 +391,15 @@ void wake_up_atomic_t(atomic_t *p)
 	__wake_up_bit(atomic_t_waitqueue(p), p, WAIT_ATOMIC_T_BIT_NR);
 }
 EXPORT_SYMBOL(wake_up_atomic_t);
+
+__sched int bit_wait_io_timeout(struct wait_bit_key *word, int mode)
+{
+	unsigned long now = ACCESS_ONCE(jiffies);
+	if (time_after_eq(now, word->timeout))
+		return -EAGAIN;
+	io_schedule_timeout(word->timeout - now);
+	if (signal_pending_state(mode, current))
+		return -EINTR;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bit_wait_io_timeout);

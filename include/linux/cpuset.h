@@ -16,6 +16,8 @@
 
 #ifdef CONFIG_CPUSETS
 
+extern int sysctl_strict_mem_cpuset;
+
 extern int number_of_cpusets;	/* How many cpusets are defined in system? */
 
 extern int cpuset_init(void);
@@ -127,6 +129,11 @@ static inline void set_mems_allowed(nodemask_t nodemask)
 	current->mems_allowed = nodemask;
 	task_unlock(current);
 }
+
+extern int cgroup_set_cpumask(struct cgroup *cgrp,
+			      const struct cpumask *cpus_allowed);
+extern int cgroup_set_nodemask(struct cgroup *cgrp,
+			       const nodemask_t *nodes_allowed);
 
 #else /* !CONFIG_CPUSETS */
 

@@ -351,6 +351,9 @@ ip6t_do_table(struct sk_buff *skb,
 	struct xt_match_param mtpar;
 	struct xt_target_param tgpar;
 
+	if (ve_xt_table_forbidden(table))
+		return NF_ACCEPT;
+
 	/* Initialization */
 	indev = in ? in->name : nulldevname;
 	outdev = out ? out->name : nulldevname;
@@ -473,6 +476,17 @@ ip6t_do_table(struct sk_buff *skb,
 #undef tb_comefrom
 }
 
+static bool next_offset_ok(const struct xt_table_info *t, unsigned int newpos)
+{
+	if (newpos > t->size - sizeof(struct ip6t_entry))
+		return false;
+
+	if (newpos % __alignof__(struct ip6t_entry) != 0)
+		return false;
+
+	return true;
+}
+
 /* Figures out from what hook each rule can be called: returns 0 if
    there are loops.  Puts hook bitmask in comefrom. */
 static int
@@ -549,6 +563,8 @@ mark_source_chains(struct xt_table_info *newinfo,
 
 				/* Move along one */
 				size = e->next_offset;
+				if (!next_offset_ok(newinfo, pos + size))
+					return 0;
 				e = (struct ip6t_entry *)
 					(entry0 + pos + size);
 				e->counters.pcnt = pos;
@@ -559,13 +575,6 @@ mark_source_chains(struct xt_table_info *newinfo,
 				if (strcmp(t->target.u.user.name,
 					   IP6T_STANDARD_TARGET) == 0
 				    && newpos >= 0) {
-					if (newpos > newinfo->size -
-						sizeof(struct ip6t_entry)) {
-						duprintf("mark_source_chains: "
-							"bad verdict (%i)\n",
-								newpos);
-						return 0;
-					}
 					/* This a jump; chase it. */
 					duprintf("Jump rule %u -> %u\n",
 						 pos, newpos);
@@ -573,6 +582,10 @@ mark_source_chains(struct xt_table_info *newinfo,
 					/* ... this is a fallthru */
 					newpos = pos + e->next_offset;
 				}
+
+				if (!next_offset_ok(newinfo, newpos))
+					return 0;
+
 				e = (struct ip6t_entry *)
 					(entry0 + newpos);
 				e->counters.pcnt = pos;
@@ -648,9 +661,10 @@ find_check_match(struct ip6t_entry_match *m, struct xt_mtchk_param *par,
 	struct xt_match *match;
 	int ret;
 
-	match = try_then_request_module(xt_find_match(AF_INET6, m->u.user.name,
-						      m->u.user.revision),
-					"ip6t_%s", m->u.user.name);
+	match = ve0_try_then_request_module(xt_find_match(AF_INET6,
+							  m->u.user.name,
+							  m->u.user.revision),
+					    "ip6t_%s", m->u.user.name);
 	if (IS_ERR(match) || !match) {
 		duprintf("find_check_match: `%s' not found\n", m->u.user.name);
 		return match ? PTR_ERR(match) : -ENOENT;
@@ -711,10 +725,10 @@ find_check_entry(struct ip6t_entry *e, const char *name, unsigned int size,
 		goto cleanup_matches;
 
 	t = ip6t_get_target(e);
-	target = try_then_request_module(xt_find_target(AF_INET6,
-							t->u.user.name,
-							t->u.user.revision),
-					 "ip6t_%s", t->u.user.name);
+	target = ve0_try_then_request_module(xt_find_target(AF_INET6,
+							    t->u.user.name,
+							    t->u.user.revision),
+					     "ip6t_%s", t->u.user.name);
 	if (IS_ERR(target) || !target) {
 		duprintf("find_check_entry: `%s' not found\n", t->u.user.name);
 		ret = target ? PTR_ERR(target) : -ENOENT;
@@ -1163,8 +1177,8 @@ static int get_info(struct net *net, void __user *user, int *len, int compat)
 	if (compat)
 		xt_compat_lock(AF_INET6);
 #endif
-	t = try_then_request_module(xt_find_table_lock(net, AF_INET6, name),
-				    "ip6table_%s", name);
+	t = ve0_try_then_request_module(xt_find_table_lock(net, AF_INET6, name),
+					"ip6table_%s", name);
 	if (t && !IS_ERR(t)) {
 		struct ip6t_getinfo info;
 		const struct xt_table_info *private = t->private;
@@ -1260,8 +1274,8 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
 		goto out;
 	}
 
-	t = try_then_request_module(xt_find_table_lock(net, AF_INET6, name),
-				    "ip6table_%s", name);
+	t = ve0_try_then_request_module(xt_find_table_lock(net, AF_INET6, name),
+					"ip6table_%s", name);
 	if (!t || IS_ERR(t)) {
 		ret = t ? PTR_ERR(t) : -ENOENT;
 		goto free_newinfo_counters_untrans;
@@ -1531,9 +1545,10 @@ compat_find_calc_match(struct ip6t_entry_match *m,
 {
 	struct xt_match *match;
 
-	match = try_then_request_module(xt_find_match(AF_INET6, m->u.user.name,
-						      m->u.user.revision),
-					"ip6t_%s", m->u.user.name);
+	match = ve0_try_then_request_module(xt_find_match(AF_INET6,
+							  m->u.user.name,
+							  m->u.user.revision),
+					    "ip6t_%s", m->u.user.name);
 	if (IS_ERR(match) || !match) {
 		duprintf("compat_check_calc_match: `%s' not found\n",
 			 m->u.user.name);
@@ -1620,10 +1635,10 @@ check_compat_entry_size_and_hooks(struct compat_ip6t_entry *e,
 		goto release_matches;
 
 	t = compat_ip6t_get_target(e);
-	target = try_then_request_module(xt_find_target(AF_INET6,
-							t->u.user.name,
-							t->u.user.revision),
-					 "ip6t_%s", t->u.user.name);
+	target = ve0_try_then_request_module(xt_find_target(AF_INET6,
+							    t->u.user.name,
+							    t->u.user.revision),
+					     "ip6t_%s", t->u.user.name);
 	if (IS_ERR(target) || !target) {
 		duprintf("check_compat_entry_size_and_hooks: `%s' not found\n",
 			 t->u.user.name);
@@ -1656,7 +1671,7 @@ check_compat_entry_size_and_hooks(struct compat_ip6t_entry *e,
 out:
 	module_put(t->u.kernel.target->me);
 release_matches:
-	IP6T_MATCH_ITERATE(e, compat_release_match, &j);
+	COMPAT_IP6T_MATCH_ITERATE(e, compat_release_match, &j);
 	return ret;
 }
 
@@ -1906,7 +1921,7 @@ compat_do_ip6t_set_ctl(struct sock *sk, int cmd, void __user *user,
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -2017,7 +2032,7 @@ compat_do_ip6t_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -2039,7 +2054,7 @@ do_ip6t_set_ctl(struct sock *sk, int cmd, void __user *user, unsigned int len)
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -2064,7 +2079,7 @@ do_ip6t_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -2096,10 +2111,11 @@ do_ip6t_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 		else
 			target = 0;
 
-		try_then_request_module(xt_find_revision(AF_INET6, rev.name,
-							 rev.revision,
-							 target, &ret),
-					"ip6t_%s", rev.name);
+		ve0_try_then_request_module(xt_find_revision(AF_INET6,
+							     rev.name,
+							     rev.revision,
+							     target, &ret),
+					    "ip6t_%s", rev.name);
 		break;
 	}
 
@@ -2118,7 +2134,7 @@ struct xt_table *ip6t_register_table(struct net *net,
 	int ret;
 	struct xt_table_info *newinfo;
 	struct xt_table_info bootstrap
-		= { 0, 0, 0, { 0 }, { 0 }, { } };
+		= { 0, 0, 0, 0, { 0 }, { 0 }, { } };
 	void *loc_cpu_entry;
 	struct xt_table *new_table;
 
@@ -2263,12 +2279,25 @@ static struct xt_match icmp6_matchstruct __read_mostly = {
 
 static int __net_init ip6_tables_net_init(struct net *net)
 {
-	return xt_proto_init(net, NFPROTO_IPV6);
+	int res;
+
+	if (!net_ipt_permitted(net, VE_IP_IPTABLES6))
+		return 0;
+
+	res = xt_proto_init(net, NFPROTO_IPV6);
+	if (!res)
+		net_ipt_module_set(net, VE_IP_IPTABLES6);
+	return res;
 }
 
 static void __net_exit ip6_tables_net_exit(struct net *net)
 {
+	if (!net_is_ipt_module_set(net, VE_IP_IPTABLES6))
+		return;
+
 	xt_proto_fini(net, NFPROTO_IPV6);
+
+	net_ipt_module_clear(net, VE_IP_IPTABLES6);
 }
 
 static struct pernet_operations ip6_tables_net_ops = {

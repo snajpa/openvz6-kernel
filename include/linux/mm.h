@@ -68,7 +68,9 @@ extern int overcommit_kbytes_handler(struct ctl_table *, int, void __user *,
  * mmap() functions).
  */
 
-extern struct kmem_cache *vm_area_cachep;
+extern struct kmem_cache *__vm_area_cachep;
+#define allocate_vma(mm, gfp_flags)	ub_kmem_alloc(mm_ub_top(mm), __vm_area_cachep, gfp_flags)
+#define free_vma(mm, vma)		ub_kmem_free(mm_ub_top(mm), __vm_area_cachep, vma)
 
 #ifndef CONFIG_MMU
 extern struct rb_root nommu_region_tree;
@@ -186,12 +188,12 @@ extern pgprot_t protection_map[16];
  */
 static inline int is_linear_pfn_mapping(struct vm_area_struct *vma)
 {
-	return (vma->vm_flags & VM_PFN_AT_MMAP);
+	return !!(vma->vm_flags & VM_PFN_AT_MMAP);
 }
 
 static inline int is_pfn_mapping(struct vm_area_struct *vma)
 {
-	return (vma->vm_flags & VM_PFNMAP);
+	return !!(vma->vm_flags & VM_PFNMAP);
 }
 
 /*
@@ -650,6 +652,37 @@ static inline struct zone *page_zone(struct page *page)
 	return &NODE_DATA(page_to_nid(page))->node_zones[page_zonenum(page)];
 }
 
+#ifndef CONFIG_MEMORY_GANGS
+
+static inline struct gang *zone_init_gang(struct zone *zone)
+{
+       return &zone->init_gang;
+}
+
+static inline struct zone *gang_zone(struct gang *gang)
+{
+	return container_of(gang, struct zone, init_gang);
+}
+
+#else /* CONFIG_MEMORY_GANGS */
+
+static inline struct gang *zone_init_gang(struct zone *zone)
+{
+	return &zone->zone_pgdat->init_gangs[zone_idx(zone)];
+}
+
+static inline struct gang *zone_junk_gang(struct zone *zone)
+{
+	return &zone->zone_pgdat->junk_gangs[zone_idx(zone)];
+}
+
+static inline struct zone *gang_zone(struct gang *gang)
+{
+	return gang->lruvec.zone;
+}
+
+#endif /* CONFIG_MEMORY_GANGS */
+
 #if defined(CONFIG_SPARSEMEM) && !defined(CONFIG_SPARSEMEM_VMEMMAP)
 static inline unsigned long page_to_section(struct page *page)
 {
@@ -855,6 +888,7 @@ extern void show_free_areas(void);
 extern void __show_free_areas(unsigned int flags);
 
 int shmem_lock(struct file *file, int lock, struct user_struct *user);
+#define shmem_nopage filemap_nopage
 struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags);
 int shmem_zero_setup(struct vm_area_struct *);
 
@@ -867,6 +901,8 @@ extern unsigned long shmem_get_unmapped_area(struct file *file,
 #endif
 
 extern int can_do_mlock(void);
+extern int __mlock(unsigned long, size_t, bool);
+extern int __munlock(unsigned long, size_t, bool);
 extern int user_shm_lock(size_t, struct user_struct *);
 extern void user_shm_unlock(size_t, struct user_struct *);
 
@@ -881,6 +917,9 @@ struct zap_details {
 	spinlock_t *i_mmap_lock;		/* For unmap_mapping_range: */
 	unsigned long truncate_count;		/* Compare vm_truncate_count */
 };
+
+void print_bad_pte(struct vm_area_struct *vma, unsigned long addr,
+		pte_t pte, struct page *page);
 
 struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
 		pte_t pte);
@@ -925,9 +964,14 @@ int walk_page_range(unsigned long addr, unsigned long end,
 void free_pgd_range(struct mmu_gather *tlb, unsigned long addr,
 		unsigned long end, unsigned long floor, unsigned long ceiling);
 int copy_page_range(struct mm_struct *dst, struct mm_struct *src,
-			struct vm_area_struct *vma);
+		struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma);
+int __copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *vma,
+		      unsigned long addr, size_t size);
 void unmap_mapping_range(struct address_space *mapping,
 		loff_t const holebegin, loff_t const holelen, int even_cows);
+void zap_mapping_range(struct address_space *mapping,
+		struct zap_details *details);
+void synchronize_mapping_faults(struct address_space *mapping);
 int follow_pfn(struct vm_area_struct *vma, unsigned long address,
 	unsigned long *pfn);
 int follow_phys(struct vm_area_struct *vma, unsigned long address,
@@ -966,10 +1010,14 @@ static inline int handle_mm_fault(struct mm_struct *mm,
 }
 #endif
 
+extern int install_anon_page(struct mm_struct *mm, struct vm_area_struct *vma,
+			     unsigned long addr, struct page *page);
+
+extern unsigned long vma_address(struct page *page, struct vm_area_struct *vma);
 extern int make_pages_present(unsigned long addr, unsigned long end);
 extern int access_process_vm(struct task_struct *tsk, unsigned long addr, void *buf, int len, int write);
 extern int access_remote_vm(struct mm_struct *mm, unsigned long addr,
-		void *buf, int len, int write);
+		void *buf, int len, unsigned int gup_flags);
 
 int __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 		     unsigned long start, int len, unsigned int foll_flags,
@@ -990,6 +1038,7 @@ int redirty_page_for_writepage(struct writeback_control *wbc,
 				struct page *page);
 void account_page_dirtied(struct page *page, struct address_space *mapping);
 int set_page_dirty(struct page *page);
+int set_page_dirty_mm(struct page *page, struct mm_struct *mm);
 int set_page_dirty_lock(struct page *page);
 int clear_page_dirty_for_io(struct page *page);
 
@@ -1036,7 +1085,7 @@ struct shrinker {
 
 	/* These are for internal use */
 	struct list_head list;
-	long nr;	/* objs pending delete */
+	atomic_long_t nr_in_batch; /* objs pending delete */
 };
 #define DEFAULT_SEEKS 2 /* A good number if you don't know better. */
 extern void register_shrinker(struct shrinker *);
@@ -1221,7 +1270,6 @@ extern void set_dma_reserve(unsigned long new_dma_reserve);
 extern void memmap_init_zone(unsigned long, int, unsigned long,
 				unsigned long, enum memmap_context);
 extern void setup_per_zone_wmarks(void);
-extern void calculate_zone_inactive_ratio(struct zone *zone);
 extern void mem_init(void);
 extern void __init mmap_init(void);
 extern void show_mem(unsigned int flags);
@@ -1273,6 +1321,7 @@ extern int insert_vm_struct(struct mm_struct *, struct vm_area_struct *);
 extern void __vma_link_rb(struct mm_struct *, struct vm_area_struct *,
 	struct rb_node **, struct rb_node *);
 extern void unlink_file_vma(struct vm_area_struct *);
+extern void __vma_link_file(struct vm_area_struct *vma);
 extern struct vm_area_struct *copy_vma(struct vm_area_struct **,
 	unsigned long addr, unsigned long len, pgoff_t pgoff);
 extern void exit_mmap(struct mm_struct *);
@@ -1310,7 +1359,7 @@ extern unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 	unsigned long flag, unsigned long pgoff);
 extern unsigned long mmap_region(struct file *file, unsigned long addr,
 	unsigned long len, unsigned long flags,
-	unsigned int vm_flags, unsigned long pgoff);
+	vm_flags_t vm_flags, unsigned long pgoff);
 
 static inline unsigned long do_mmap(struct file *file, unsigned long addr,
 	unsigned long len, unsigned long prot,
@@ -1337,6 +1386,8 @@ extern void truncate_inode_pages_range(struct address_space *,
 /* generic vm_area_ops exported for stackable file systems */
 extern int filemap_fault(struct vm_area_struct *, struct vm_fault *);
 extern int filemap_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf);
+struct page *pick_peer_page(struct inode *inode, struct file_ra_state *ra,
+			    pgoff_t index, unsigned ra_size);
 
 /* mm/page-writeback.c */
 int write_one_page(struct page *page, int wait);
@@ -1424,6 +1475,7 @@ static inline unsigned long vma_pages(struct vm_area_struct *vma)
 	return (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
 }
 
+extern const struct vm_operations_struct special_mapping_vmops;
 pgprot_t vm_get_page_prot(unsigned long vm_flags);
 struct vm_area_struct *find_extend_vma(struct mm_struct *, unsigned long addr);
 int remap_pfn_range(struct vm_area_struct *, unsigned long addr,
@@ -1448,6 +1500,7 @@ struct page *follow_page(struct vm_area_struct *, unsigned long address,
 #define FOLL_NUMA	0x200	/* force NUMA hinting page fault */
 #define FOLL_MIGRATION	0x400	/* wait for page to replace migration entry */
 #define FOLL_COW	0x4000	/* internal GUP flag */
+#define FOLL_ANON	0x8000	/* don't do file mappings */
 
 typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
 			void *data);
@@ -1503,7 +1556,12 @@ unsigned long shrink_slab(unsigned long scanned, gfp_t gfp_mask,
 #ifndef CONFIG_MMU
 #define randomize_va_space 0
 #else
-extern int randomize_va_space;
+extern int _randomize_va_space;
+#ifndef CONFIG_VE
+#define randomize_va_space _randomize_va_space
+#else
+#define randomize_va_space (get_exec_env()->_randomize_va_space)
+#endif
 #endif
 
 const char * arch_vma_name(struct vm_area_struct *vma);

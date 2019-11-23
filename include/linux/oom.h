@@ -15,12 +15,15 @@
  */
 #define OOM_SCORE_ADJ_MIN	(-1000)
 #define OOM_SCORE_ADJ_MAX	1000
+#define OOM_SCORE_ADJ_UNSET	1001
 
 #ifdef __KERNEL__
 
 #include <linux/sched.h>
 #include <linux/types.h>
 #include <linux/nodemask.h>
+#include <linux/spinlock_types.h>
+#include <linux/wait.h>
 
 struct zonelist;
 struct notifier_block;
@@ -39,8 +42,17 @@ enum oom_constraint {
 
 extern int test_set_oom_score_adj(int new_val);
 
-extern unsigned int oom_badness(struct task_struct *p, struct mem_cgroup *mem,
-			const nodemask_t *nodemask, unsigned long totalpages);
+struct task_struct *select_bad_process(int *ppoints,
+		unsigned long totalpages, struct user_beancounter *ub,
+		struct mem_cgroup *mem, const nodemask_t *nodemask);
+int oom_kill_process(struct task_struct *p, gfp_t gfp_mask, int order,
+			    int points, unsigned long totalpages,
+			    struct user_beancounter *ub, struct mem_cgroup *mem,
+			    nodemask_t *nodemask, const char *message);
+/* linux/mm/oom_group.c */
+extern int get_task_oom_score_adj(struct task_struct *t);
+
+extern int oom_badness(struct task_struct *p, unsigned long totalpages, long *overdraft);
 extern int try_set_zonelist_oom(struct zonelist *zonelist, gfp_t gfp_flags);
 extern void clear_zonelist_oom(struct zonelist *zonelist, gfp_t gfp_flags);
 
@@ -66,6 +78,19 @@ extern unsigned long badness(struct task_struct *p, struct mem_cgroup *mem,
 		      const nodemask_t *nodemask, unsigned long uptime);
 
 extern struct task_struct *find_lock_task_mm(struct task_struct *p);
+
+struct oom_control {
+	int			generation;
+	int			kill_counter;
+	unsigned long		last_kill;
+	int			oom_rage;
+	spinlock_t		lock;
+	wait_queue_head_t 	wq;
+};
+
+extern struct oom_control global_oom_ctrl;
+
+extern void init_oom_control(struct oom_control *oom_ctrl);
 
 #endif /* __KERNEL__*/
 #endif /* _INCLUDE_LINUX_OOM_H */

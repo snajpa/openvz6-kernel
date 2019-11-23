@@ -15,6 +15,7 @@
 #endif
 
 	.text
+	.org __kernel_vsyscall+0x100,0x90
 	.globl __kernel_sigreturn
 	.type __kernel_sigreturn,@function
 	ALIGN
@@ -27,6 +28,7 @@ __kernel_sigreturn:
 	nop
 	.size __kernel_sigreturn,.-.LSTART_sigreturn
 
+	.org __kernel_vsyscall+0x200,0x90
 	.globl __kernel_rt_sigreturn
 	.type __kernel_rt_sigreturn,@function
 	ALIGN

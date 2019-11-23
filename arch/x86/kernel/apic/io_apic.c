@@ -3369,6 +3369,12 @@ void destroy_irq(unsigned int irq)
 	spin_unlock_irqrestore(&vector_lock, flags);
 }
 
+int __irq_to_vector(int irq)
+{
+	return irq_cfg(irq)->vector;
+}
+EXPORT_SYMBOL(__irq_to_vector);
+
 /*
  * MSI message composition
  */

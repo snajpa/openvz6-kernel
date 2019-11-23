@@ -99,6 +99,98 @@ static inline void *swp_to_radix_entry(swp_entry_t entry)
 	return (void *)(value | RADIX_TREE_EXCEPTIONAL_ENTRY);
 }
 
+#include <linux/rmap.h>
+
+#ifdef CONFIG_MEMORY_VSWAP
+
+static inline swp_entry_t make_vswap_entry(struct page *page, int write)
+{
+	VM_BUG_ON(!PageLocked(page));
+	return swp_entry(write ? SWP_VSWAP_WRITE : SWP_VSWAP_READ,
+			page_to_pfn(page));
+}
+
+static inline int is_vswap_entry(swp_entry_t entry)
+{
+	return swp_type(entry) == SWP_VSWAP_READ ||
+	       swp_type(entry) == SWP_VSWAP_WRITE;
+}
+
+static inline int is_write_vswap_entry(swp_entry_t entry)
+{
+	return swp_type(entry) == SWP_VSWAP_WRITE;
+}
+
+static inline swp_entry_t wprotect_vswap_entry(swp_entry_t entry)
+{
+	return swp_entry(SWP_VSWAP_READ, swp_offset(entry));
+}
+
+static inline struct page *vswap_entry_to_page(swp_entry_t entry)
+{
+	return pfn_to_page(swp_offset(entry));
+}
+
+extern int add_to_vswap(struct page *page);
+extern void __remove_from_vswap(struct page *page);
+extern int remove_from_vswap(struct page *page);
+
+static inline void get_vswap_page(struct page *page)
+{
+	VM_BUG_ON(!PageVSwap(page));
+	VM_BUG_ON(!atomic_read(&page->vswap_count));
+	atomic_inc(&page->vswap_count);
+}
+
+static inline void put_vswap_page(struct page *page)
+{
+	VM_BUG_ON(!PageVSwap(page));
+	if (atomic_dec_and_test(&page->vswap_count))
+		__remove_from_vswap(page);
+}
+
+static inline int page_vswapcount(struct page *page)
+{
+	return atomic_read(&page->vswap_count);
+}
+
+#else /* CONFIG_MEMORY_VSWAP */
+
+static inline swp_entry_t make_vswap_entry(struct page *page, int write)
+{
+	return swp_entry(0, 0);
+}
+static inline int is_vswap_entry(swp_entry_t entry) {
+	return 0;
+}
+static inline int is_write_vswap_entry(swp_entry_t entry)
+{
+	return 0;
+}
+static inline swp_entry_t wprotect_vswap_entry(swp_entry_t entry)
+{
+	return swp_entry(0, 0);
+}
+static inline struct page *vswap_entry_to_page(swp_entry_t entry)
+{
+	BUG();
+	return NULL;
+}
+static inline int add_to_vswap(struct page *page)
+{
+	return SWAP_FAIL;
+}
+static inline int remove_from_vswap(struct page *page)
+{
+	BUG();
+	return 0;
+}
+static inline void get_vswap_page(struct page *page) { }
+static inline void put_vswap_page(struct page *page) { }
+static inline int page_vswapcount(struct page *page) { return 0; }
+
+#endif /* CONFIG_MEMORY_VSWAP */
+
 #ifdef CONFIG_MIGRATION
 static inline swp_entry_t make_migration_entry(struct page *page, int write)
 {

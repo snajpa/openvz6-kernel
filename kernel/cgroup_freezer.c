@@ -21,12 +21,6 @@
 #include <linux/freezer.h>
 #include <linux/seq_file.h>
 
-enum freezer_state {
-	CGROUP_THAWED = 0,
-	CGROUP_FREEZING,
-	CGROUP_FROZEN,
-};
-
 struct freezer {
 	struct cgroup_subsys_state css;
 	enum freezer_state state;
@@ -311,7 +305,7 @@ static void unfreeze_cgroup(struct cgroup *cgroup, struct freezer *freezer)
 	freezer->state = CGROUP_THAWED;
 }
 
-static int freezer_change_state(struct cgroup *cgroup,
+int freezer_change_state(struct cgroup *cgroup,
 				enum freezer_state goal_state)
 {
 	struct freezer *freezer;

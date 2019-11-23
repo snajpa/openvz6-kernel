@@ -28,6 +28,7 @@
 #include <linux/anon_inodes.h>
 #include <linux/signalfd.h>
 #include <linux/syscalls.h>
+#include <linux/module.h>
 
 void signalfd_cleanup(struct sighand_struct *sighand)
 {
@@ -43,10 +44,6 @@ void signalfd_cleanup(struct sighand_struct *sighand)
 	/* wait_queue_t->func(POLLFREE) should do remove_wait_queue() */
 	wake_up_poll(wqh, POLLHUP | POLLFREE);
 }
-
-struct signalfd_ctx {
-	sigset_t sigmask;
-};
 
 static int signalfd_release(struct inode *inode, struct file *file)
 {
@@ -224,17 +221,17 @@ static ssize_t signalfd_read(struct file *file, char __user *buf, size_t count,
 	return total ? total: ret;
 }
 
-static const struct file_operations signalfd_fops = {
+const struct file_operations signalfd_fops = {
 	.release	= signalfd_release,
 	.poll		= signalfd_poll,
 	.read		= signalfd_read,
 };
+EXPORT_SYMBOL(signalfd_fops);
 
 SYSCALL_DEFINE4(signalfd4, int, ufd, sigset_t __user *, user_mask,
 		size_t, sizemask, int, flags)
 {
 	sigset_t sigmask;
-	struct signalfd_ctx *ctx;
 
 	/* Check the SFD_* constants for consistency.  */
 	BUILD_BUG_ON(SFD_CLOEXEC != O_CLOEXEC);
@@ -249,12 +246,19 @@ SYSCALL_DEFINE4(signalfd4, int, ufd, sigset_t __user *, user_mask,
 	sigdelsetmask(&sigmask, sigmask(SIGKILL) | sigmask(SIGSTOP));
 	signotset(&sigmask);
 
+	return do_signalfd(ufd, &sigmask, flags);
+}
+
+long do_signalfd(int ufd, sigset_t *sigmask, int flags)
+{
+	struct signalfd_ctx *ctx;
+
 	if (ufd == -1) {
 		ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
 		if (!ctx)
 			return -ENOMEM;
 
-		ctx->sigmask = sigmask;
+		ctx->sigmask = *sigmask;
 
 		/*
 		 * When we call this, the initialization must be complete, since
@@ -274,7 +278,7 @@ SYSCALL_DEFINE4(signalfd4, int, ufd, sigset_t __user *, user_mask,
 			return -EINVAL;
 		}
 		spin_lock_irq(&current->sighand->siglock);
-		ctx->sigmask = sigmask;
+		ctx->sigmask = *sigmask;
 		spin_unlock_irq(&current->sighand->siglock);
 
 		wake_up(&current->sighand->signalfd_wqh);
@@ -283,6 +287,7 @@ SYSCALL_DEFINE4(signalfd4, int, ufd, sigset_t __user *, user_mask,
 
 	return ufd;
 }
+EXPORT_SYMBOL_GPL(do_signalfd);
 
 SYSCALL_DEFINE3(signalfd, int, ufd, sigset_t __user *, user_mask,
 		size_t, sizemask)

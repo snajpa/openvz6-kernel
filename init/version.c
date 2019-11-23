@@ -38,6 +38,12 @@ struct uts_namespace init_uts_ns = {
 };
 EXPORT_SYMBOL_GPL(init_uts_ns);
 
+struct new_utsname virt_utsname = {
+	/* we need only this field */
+	.release        = UTS_RELEASE,
+};
+EXPORT_SYMBOL(virt_utsname);
+
 /* FIXED STRINGS! Don't touch! */
 const char linux_banner[] =
 	"Linux version " UTS_RELEASE " (" LINUX_COMPILE_BY "@"

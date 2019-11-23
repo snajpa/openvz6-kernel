@@ -55,6 +55,16 @@ void nfs_fscache_release_client_cookie(struct nfs_client *clp)
 	clp->fscache = NULL;
 }
 
+void nfs_fscache_dup_uniq_id(char *dst, struct super_block *sb)
+{
+	struct nfs_server *nfss = NFS_SB(sb);
+	struct nfs_fscache_key *key = nfss->fscache_key;
+
+	if ((nfss->options & NFS_OPTION_FSCACHE) && key)
+		strcpy(dst, key->key.uniquifier);
+}
+EXPORT_SYMBOL(nfs_fscache_dup_uniq_id);
+
 /*
  * Get the cache cookie for an NFS superblock.  We have to handle
  * uniquification here because the cache doesn't do it for us.

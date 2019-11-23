@@ -85,6 +85,7 @@ struct fsnotify_ops {
 	void (*free_group_priv)(struct fsnotify_group *group);
 	void (*freeing_mark)(struct fsnotify_mark_entry *entry, struct fsnotify_group *group);
 	void (*free_event_priv)(struct fsnotify_event_private_data *priv);
+	void (*detach_mnt)(struct fsnotify_mark_entry *e);
 };
 
 /*
@@ -351,6 +352,7 @@ extern void fsnotify_clear_marks_by_group(struct fsnotify_group *group);
 extern void fsnotify_get_mark(struct fsnotify_mark_entry *entry);
 extern void fsnotify_put_mark(struct fsnotify_mark_entry *entry);
 extern void fsnotify_unmount_inodes(struct super_block *sb);
+extern void fsnotify_unmount_mnt(struct vfsmount *mnt);
 
 /* put here because inotify does some weird stuff when destroying watches */
 extern struct fsnotify_event *fsnotify_create_event(struct inode *to_tell, __u32 mask,
@@ -383,6 +385,7 @@ static inline u32 fsnotify_get_cookie(void)
 static inline void fsnotify_unmount_inodes(struct super_block *sb)
 {}
 
+static inline void fsnotify_unmount_mnt(struct vfsmount *mnt) { }
 #endif	/* CONFIG_FSNOTIFY */
 
 #endif	/* __KERNEL __ */

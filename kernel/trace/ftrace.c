@@ -3882,7 +3882,7 @@ static int alloc_retstack_tasklist(struct ftrace_ret_stack **ret_stack_list)
 	}
 
 	read_lock_irqsave(&tasklist_lock, flags);
-	do_each_thread(g, t) {
+	do_each_thread_all(g, t) {
 		if (start == end) {
 			ret = -EAGAIN;
 			goto unlock;
@@ -3896,7 +3896,7 @@ static int alloc_retstack_tasklist(struct ftrace_ret_stack **ret_stack_list)
 			smp_wmb();
 			t->ret_stack = ret_stack_list[start++];
 		}
-	} while_each_thread(g, t);
+	} while_each_thread_all(g, t);
 
 unlock:
 	read_unlock_irqrestore(&tasklist_lock, flags);

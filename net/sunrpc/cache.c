@@ -35,6 +35,8 @@
 #include <linux/sunrpc/rpc_pipe_fs.h>
 #include <net/net_namespace.h>
 
+#include "ve.h"
+
 #define	 RPCDBG_FACILITY RPCDBG_CACHE
 
 static bool cache_defer_req(struct cache_req *req, struct cache_head *item);
@@ -345,6 +347,34 @@ static int current_index;
 
 static void do_cache_clean(struct work_struct *work);
 static struct delayed_work cache_cleaner;
+
+struct cache_detail *cache_alloc(struct cache_detail *orig, int hsize)
+{
+	struct cache_detail *n;
+	struct cache_head **table;
+
+	n = kmemdup(orig, sizeof(struct cache_detail), GFP_KERNEL);
+	if (n == NULL)
+		return NULL;
+
+	table = kzalloc(hsize * sizeof(struct cache_head *), GFP_KERNEL);
+	if (table == NULL) {
+		kfree(n);
+		return NULL;
+	}
+
+	n->hash_table = table;
+	return n;
+}
+EXPORT_SYMBOL(cache_alloc);
+
+void cache_free(struct cache_detail *cd)
+{
+	cache_unregister(cd);
+	kfree(cd->hash_table);
+	kfree(cd);
+}
+EXPORT_SYMBOL(cache_free);
 
 static void sunrpc_init_cache_detail(struct cache_detail *cd)
 {

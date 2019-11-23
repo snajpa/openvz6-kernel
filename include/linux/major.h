@@ -174,4 +174,7 @@
 #define BLOCK_EXT_MAJOR		259
 #define SCSI_OSD_MAJOR		260	/* open-osd's OSD scsi device */
 
+#define UNNAMED_EXTRA_MAJOR		130
+#define UNNAMED_EXTRA_MAJOR_COUNT	120
+
 #endif

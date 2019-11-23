@@ -1572,6 +1572,11 @@ static inline bool perf_paranoid_kernel(void)
 	return sysctl_perf_event_paranoid > 1;
 }
 
+static inline bool perf_paranoid_container(void)
+{
+	return sysctl_perf_event_paranoid > -1;
+}
+
 extern void perf_event_init(void);
 extern void perf_tp_event(int event_id, u64 addr, u64 count,
 		void *record, int entry_size);

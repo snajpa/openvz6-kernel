@@ -5,6 +5,7 @@
  */
 
 #include <linux/namei.h>
+#include <linux/sched.h>
 
 #include "cache.h"
 #include "xdr.h"

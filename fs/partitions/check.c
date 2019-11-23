@@ -21,6 +21,7 @@
 #include <linux/genhd.h>
 #include <linux/blktrace_api.h>
 #include <linux/nospec.h>
+#include <linux/sysfs.h>
 
 #include "check.h"
 
@@ -133,6 +134,7 @@ char *disk_name(struct gendisk *hd, int partno, char *buf)
 
 	return buf;
 }
+EXPORT_SYMBOL(disk_name);
 
 const char *bdevname(struct block_device *bdev, char *buf)
 {
@@ -217,7 +219,7 @@ ssize_t part_size_show(struct device *dev,
 		       struct device_attribute *attr, char *buf)
 {
 	struct hd_struct *p = dev_to_part(dev);
-	return sprintf(buf, "%llu\n",(unsigned long long)p->nr_sects);
+	return sprintf(buf, "%llu\n",(unsigned long long)part_nr_sects_read(p));
 }
 
 ssize_t part_alignment_offset_show(struct device *dev,
@@ -382,6 +384,44 @@ void delete_partition(struct gendisk *disk, int partno)
 	hd_struct_put(part);
 }
 
+#if BITS_PER_LONG == 32 && defined(CONFIG_LBDAF)
+void part_nr_sects_write(struct hd_struct *part, sector_t val)
+{
+	write_seqcount_begin(&part->seq);
+	part->nr_sects = val;
+	write_seqcount_end(&part->seq);
+}
+
+/*
+ * Any access of part->nr_sects which is not protected by partition
+ * bd_mutex or gendisk bdev bd_mutex, hould be done using this accessor
+ * function.
+ */
+sector_t part_nr_sects_read(struct hd_struct *part)
+{
+	sector_t nr_sects;
+	unsigned seq;
+
+	do {
+		seq = read_seqcount_begin(&part->seq);
+		nr_sects = part->nr_sects;
+	} while (read_seqcount_retry(&part->seq, seq));
+
+	return nr_sects;
+}
+#else
+void part_nr_sects_write(struct hd_struct *part, sector_t val)
+{
+	part->nr_sects = val;
+}
+
+sector_t part_nr_sects_read(struct hd_struct *part)
+{
+	return part->nr_sects;
+}
+#endif
+EXPORT_SYMBOL(part_nr_sects_read);
+
 static ssize_t whole_disk_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
@@ -425,6 +465,7 @@ struct hd_struct *add_partition(struct gendisk *disk, int partno,
 		queue_limit_alignment_offset(&disk->queue->limits, start);
 	p->discard_alignment =
 		queue_limit_discard_alignment(&disk->queue->limits, start);
+	seqcount_init(&p->seq);
 	p->nr_sects = len;
 	p->partno = partno;
 	p->policy = get_disk_ro(disk);
@@ -506,14 +547,16 @@ void register_disk(struct gendisk *disk)
 
 	if (device_add(ddev))
 		return;
-#ifndef CONFIG_SYSFS_DEPRECATED
-	err = sysfs_create_link(block_depr, &ddev->kobj,
-				kobject_name(&ddev->kobj));
-	if (err) {
-		device_del(ddev);
-		return;
+
+	if (!sysfs_deprecated) {
+		err = sysfs_create_link(block_depr, &ddev->kobj,
+					kobject_name(&ddev->kobj));
+		if (err) {
+			device_del(ddev);
+			return;
+		}
 	}
-#endif
+
 	disk->part0.holder_dir = kobject_create_and_add("holders", &ddev->kobj);
 	disk->slave_dir = kobject_create_and_add("slaves", &ddev->kobj);
 
@@ -694,8 +737,7 @@ void del_gendisk(struct gendisk *disk)
 	kobject_put(disk->part0.holder_dir);
 	kobject_put(disk->slave_dir);
 	disk->driverfs_dev = NULL;
-#ifndef CONFIG_SYSFS_DEPRECATED
-	sysfs_remove_link(block_depr, dev_name(disk_to_dev(disk)));
-#endif
+	if (!sysfs_deprecated)
+		sysfs_remove_link(block_depr, dev_name(disk_to_dev(disk)));
 	device_del(disk_to_dev(disk));
 }

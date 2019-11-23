@@ -53,16 +53,22 @@ int ext4_sync_file(struct file *file, struct dentry *dentry, int datasync)
 	struct inode *inode = dentry->d_inode;
 	struct ext4_inode_info *ei = EXT4_I(inode);
 	journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
-	int ret;
+	int ret, err = 0;
 	tid_t commit_tid;
 	bool needs_barrier = false;
 
 	J_ASSERT(ext4_journal_current_handle() == NULL);
 
 	trace_ext4_sync_file(file, dentry, datasync);
+	percpu_counter_inc(&EXT4_SB(inode->i_sb)->s_fsync_counter);
 
-	if (inode->i_sb->s_flags & MS_RDONLY)
+	if (inode->i_sb->s_flags & MS_RDONLY) {
+		/* Make shure that we read updated s_mount_flags value */
+		smp_rmb();
+		if (EXT4_SB(inode->i_sb)->s_mount_flags & EXT4_MF_FS_ABORTED)
+			return -EROFS;
 		return 0;
+	}
 
 	ret = ext4_flush_unwritten_io(inode);
 	if (ret < 0)
@@ -93,7 +99,145 @@ int ext4_sync_file(struct file *file, struct dentry *dentry, int datasync)
 	    !jbd2_trans_will_send_data_barrier(journal, commit_tid))
 		needs_barrier = true;
 	ret = jbd2_complete_transaction(journal, commit_tid);
+
+	/* Even if we had to wait for commit completion, it does not mean a flush has been
+	 * issued after data demanded by this fsync were written back. Commit could be in state
+	 * after it is already done, but not yet in state where we should not wait.
+	 */
 	if (needs_barrier)
-		blkdev_issue_flush(inode->i_sb->s_bdev, NULL);
+		err = blkdev_issue_flush(inode->i_sb->s_bdev, NULL);
+	if (!ret)
+		ret = err;
 	return ret;
+}
+
+int ext4_sync_files(struct file **files, unsigned int *flags, unsigned int nr_files)
+{
+	struct super_block *sb;
+	journal_t *journal;
+	int err = 0, err2 = 0, i = 0, j = 0;
+	int force_commit = 0, datawriteback = 0;
+	tid_t commit_tid = 0;
+	int fdsync_cnt = 0, fsync_cnt = 0;
+	int need_barrier = 0;
+	struct user_beancounter *ub;
+
+	J_ASSERT(ext4_journal_current_handle() == NULL);
+	if (!nr_files)
+		return 0;
+
+	sb = files[0]->f_mapping->host->i_sb;
+	journal = EXT4_SB(sb)->s_journal;
+	ub = get_exec_ub_top();
+	if (sb->s_flags & MS_RDONLY) {
+		/* Make shure that we read updated s_mount_flags value */
+		smp_rmb();
+		if (EXT4_SB(sb)->s_mount_flags & EXT4_MF_FS_ABORTED)
+			return -EROFS;
+		return 0;
+	}
+	for (i = 0; i < nr_files; i++) {
+		struct address_space * mapping = files[i]->f_mapping;
+		struct inode *inode = mapping->host;
+		unsigned int datasync = flags[i];
+
+		BUG_ON(sb != inode->i_sb);
+		trace_ext4_sync_file(files[i], files[i]->f_path.dentry, flags[i]);
+
+		if (datasync) {
+			ub_percpu_inc(ub, fdsync);
+			fdsync_cnt++;
+		} else {
+			ub_percpu_inc(ub, fsync);
+			fsync_cnt++;
+		}
+
+		if (!mapping->nrpages)
+			continue;
+
+		err = filemap_fdatawrite(mapping);
+		if (err)
+			break;
+	}
+	/*
+	 * Even if the above returned error, the pages may be
+	 * written partially (e.g. -ENOSPC), so we wait for it.
+	 * But the -EIO is special case, it may indicate the worst
+	 * thing (e.g. bug) happened, so we avoid waiting for it.
+	 */
+	if (err == -EIO)
+		goto out;
+
+	for (j = 0; j < i; j++) {
+		struct address_space * mapping = files[j]->f_mapping;
+		struct inode *inode = mapping->host;
+		struct ext4_inode_info *ei = EXT4_I(inode);
+		unsigned int datasync = flags[j];
+		tid_t tid;
+
+		if (mapping->nrpages) {
+			err2 = filemap_fdatawait(mapping);
+			if (!err || err2 == -EIO)
+				err = err2;
+		}
+
+		mutex_lock(&inode->i_mutex);
+		err2 = ext4_flush_unwritten_io(inode);
+		if (!err || err2 == -EIO)
+			err = err2;
+		force_commit  |= ext4_should_journal_data(inode);
+		datawriteback |= ext4_should_writeback_data(inode);
+		tid = datasync ? ei->i_datasync_tid : ei->i_sync_tid;
+		mutex_unlock(&inode->i_mutex);
+		trace_ext4_sync_files_iterate(files[j]->f_path.dentry, tid, datasync);
+		if (j == 0 || !tid_geq(commit_tid, tid))
+			commit_tid = tid;
+	}
+
+	/* Ext4 specific stuff starts here */
+	if (!journal) {
+		for (j = 0; j < i; j++) {
+			err2 = simple_fsync(files[j], files[j]->f_path.dentry, flags[j]);
+			if (!err)
+				err = err2;
+		}
+	} else if (force_commit) {
+		/* data=journal:
+		 *  filemap_fdatawrite won't do anything (the buffers are clean).
+		 *  ext4_force_commit will write the file data into the journal and
+		 *  will wait on that.
+		 *  filemap_fdatawait() will encounter a ton of newly-dirtied pages
+		 *  (they were dirtied by commit).  But that's OK - the blocks are
+		 *  safe in-journal, which is all fsync() needs to ensure.
+		 */
+		err2 = ext4_force_commit(sb);
+	} else {
+		/*
+		 * data=writeback,ordered:
+		 * The caller's filemap_fdatawrite()/wait will sync the data.
+		 * Metadata is in the journal, we wait for proper transaction to
+		 * commit here.
+		 */
+		if (journal->j_flags & JBD2_BARRIER &&
+		    !jbd2_trans_will_send_data_barrier(journal, commit_tid))
+			need_barrier = true;
+
+		err2 = jbd2_complete_transaction(journal, commit_tid);
+		/* Even if we had to wait for commit completion, it does not
+		 * mean a flush has been issued after data demanded by this
+		 * fsync were written back. Commit could be in state after
+		 * it is already done, but not yet in state where we should
+		 * not wait.
+		 */
+		if (need_barrier)
+			err2 = blkdev_issue_flush(sb->s_bdev, NULL);
+	}
+out:
+	trace_ext4_sync_files_exit(files[0]->f_path.dentry, commit_tid, need_barrier);
+	ub_percpu_add(ub, fdsync_done, fdsync_cnt);
+	ub_percpu_add(ub, fsync_done, fsync_cnt);
+	percpu_counter_add(&EXT4_SB(sb)->s_fsync_counter, i);
+	if (!err || err2 == -EIO)
+		err = err2;
+	return err;
 }

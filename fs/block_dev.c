@@ -194,6 +194,7 @@ static struct super_block *freeze_bdev_old(struct block_device *bdev,
 	down_write(&sb->s_umount);
 	if (sb->s_flags & MS_RDONLY) {
 		sb->s_frozen = SB_FREEZE_TRANS;
+		smp_wmb();
 		up_write(&sb->s_umount);
 		mutex_unlock(&bdev->bd_fsfreeze_mutex);
 		return sb;
@@ -340,6 +341,12 @@ static int thaw_bdev_old(struct block_device *bdev, struct super_block *sb)
 
 	BUG_ON(sb->s_bdev != bdev);
 	down_write(&sb->s_umount);
+	if (sb->s_frozen == SB_UNFROZEN) {
+		up_write(&sb->s_umount);
+		error = -EINVAL;
+		goto out_unlock;
+	}
+
 	if (sb->s_flags & MS_RDONLY)
 		goto out_unfrozen;
 
@@ -350,6 +357,7 @@ static int thaw_bdev_old(struct block_device *bdev, struct super_block *sb)
 				"VFS:Filesystem thaw failed\n");
 			sb->s_frozen = SB_FREEZE_TRANS;
 			bdev->bd_fsfreeze_count++;
+			up_write(&sb->s_umount);
 			mutex_unlock(&bdev->bd_fsfreeze_mutex);
 			return error;
 		}
@@ -396,6 +404,7 @@ int thaw_bdev(struct block_device *bdev, struct super_block *sb)
 			printk(KERN_ERR
 				"VFS:Filesystem thaw failed\n");
 			bdev->bd_fsfreeze_count++;
+			up_write(&sb->s_umount);
 			mutex_unlock(&bdev->bd_fsfreeze_mutex);
 			return error;
 		}
@@ -1233,11 +1242,18 @@ int check_disk_change(struct block_device *bdev)
 
 EXPORT_SYMBOL(check_disk_change);
 
+void bd_write_size(struct block_device *bdev, loff_t size)
+{
+	i_size_write(bdev->bd_inode, size);
+	blk_cbt_update_size(bdev);
+}
+EXPORT_SYMBOL(bd_write_size);
+
 void bd_set_size(struct block_device *bdev, loff_t size)
 {
 	unsigned bsize = bdev_logical_block_size(bdev);
 
-	bdev->bd_inode->i_size = size;
+	bd_write_size(bdev, size);
 	while (bsize < PAGE_CACHE_SIZE) {
 		if (size & bsize)
 			break;
@@ -1269,6 +1285,8 @@ static int __blkdev_get(struct block_device *bdev, fmode_t mode, int for_part)
 		perm |= MAY_READ;
 	if (mode & FMODE_WRITE)
 		perm |= MAY_WRITE;
+	if (mode & FMODE_EXCLUSIVE)
+		perm |= MAY_MOUNT;
 	/*
 	 * hooks: /n/, see "layering violations".
 	 */
@@ -1671,7 +1689,7 @@ struct block_device *open_bdev_exclusive(const char *path, fmode_t mode, void *h
 	if (IS_ERR(bdev))
 		return bdev;
 
-	error = blkdev_get(bdev, mode);
+	error = blkdev_get(bdev, mode | FMODE_EXCLUSIVE);
 	if (error)
 		return ERR_PTR(error);
 	error = -EACCES;
@@ -1719,7 +1737,7 @@ int __invalidate_device(struct block_device *bdev, bool kill_dirty)
 		 * hold).
 		 */
 		shrink_dcache_sb(sb);
-		res = invalidate_inodes(sb, kill_dirty);
+		res = invalidate_inodes_check(sb, kill_dirty, 1);
 		drop_super(sb);
 	}
 	invalidate_bdev(bdev);

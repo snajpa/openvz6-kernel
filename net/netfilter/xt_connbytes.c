@@ -95,6 +95,7 @@ connbytes_mt(const struct sk_buff *skb, const struct xt_match_param *par)
 static bool connbytes_mt_check(const struct xt_mtchk_param *par)
 {
 	const struct xt_connbytes_info *sinfo = par->matchinfo;
+	struct net *net;
 
 	if (sinfo->what != XT_CONNBYTES_PKTS &&
 	    sinfo->what != XT_CONNBYTES_BYTES &&
@@ -116,9 +117,10 @@ static bool connbytes_mt_check(const struct xt_mtchk_param *par)
 	 * This filter cannot function correctly unless connection tracking
 	 * accounting is enabled, so complain in the hope that someone notices.
 	 */
-	if (!nf_ct_acct_enabled(&init_net)) {
+	net = get_exec_env()->ve_netns;
+	if (!nf_ct_acct_enabled(net)) {
 		pr_warning("Forcing CT accounting to be enabled\n");
-		nf_ct_set_acct(&init_net, true);
+		nf_ct_set_acct(net, true);
 	}
 
 	return true;

@@ -340,7 +340,7 @@ static int sysfs_open_file(struct inode *inode, struct file *file)
 	char *p;
 
 	p = d_path(&file->f_path, last_sysfs_file, sizeof(last_sysfs_file));
-	if (p)
+	if (!IS_ERR(p))
 		memmove(last_sysfs_file, p, strlen(p) + 1);
 
 	/* need attr_sd for attr and ops, its parent for kobj */
@@ -508,6 +508,8 @@ int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
 	sd = sysfs_new_dirent(attr->name, mode, type);
 	if (!sd)
 		return -ENOMEM;
+
+	sd->owner_env = dir_sd->owner_env;
 	sd->s_attr.attr = (void *)attr;
 
 	sysfs_addrm_start(&acxt, dir_sd);
@@ -536,6 +538,8 @@ int sysfs_add_file(struct sysfs_dirent *dir_sd, const struct attribute *attr,
 
 int sysfs_create_file(struct kobject * kobj, const struct attribute * attr)
 {
+	if (!ve_sysfs_alowed())
+		return 0;
 	BUG_ON(!kobj || !attr);
 
 	/* RHEL specific
@@ -656,6 +660,8 @@ EXPORT_SYMBOL_GPL(sysfs_chmod_file);
 
 void sysfs_remove_file(struct kobject * kobj, const struct attribute * attr)
 {
+	if (!ve_sysfs_alowed())
+		return;
 	sysfs_hash_and_remove(kobj->sd, attr->name);
 }
 

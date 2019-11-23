@@ -38,6 +38,7 @@
 #include <linux/slab.h>
 #include <linux/inetdevice.h>
 #include <linux/net.h>
+#include <linux/nsproxy.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/skbuff.h>
@@ -1312,7 +1313,8 @@ static int set_mcast_if(struct sock *sk, char *ifname)
 	struct net_device *dev;
 	struct inet_sock *inet = inet_sk(sk);
 
-	if ((dev = __dev_get_by_name(&init_net, ifname)) == NULL)
+	dev = __dev_get_by_name(get_exec_env()->ve_netns, ifname);
+	if (!dev)
 		return -ENODEV;
 
 	if (sk->sk_bound_dev_if && dev->ifindex != sk->sk_bound_dev_if)
@@ -1333,11 +1335,12 @@ static int set_mcast_if(struct sock *sk, char *ifname)
  */
 static int set_sync_mesg_maxlen(int sync_state)
 {
+	struct net *net = get_exec_env()->ve_netns;
 	struct net_device *dev;
 	int num;
 
 	if (sync_state == IP_VS_STATE_MASTER) {
-		if ((dev = __dev_get_by_name(&init_net, ip_vs_master_mcast_ifn)) == NULL)
+		if ((dev = __dev_get_by_name(net, ip_vs_master_mcast_ifn)) == NULL)
 			return -ENODEV;
 
 		num = (dev->mtu - sizeof(struct iphdr) -
@@ -1348,7 +1351,7 @@ static int set_sync_mesg_maxlen(int sync_state)
 		IP_VS_DBG(7, "setting the maximum length of sync sending "
 			  "message %d.\n", sync_send_mesg_maxlen);
 	} else if (sync_state == IP_VS_STATE_BACKUP) {
-		if ((dev = __dev_get_by_name(&init_net, ip_vs_backup_mcast_ifn)) == NULL)
+		if ((dev = __dev_get_by_name(net, ip_vs_backup_mcast_ifn)) == NULL)
 			return -ENODEV;
 
 		sync_recv_mesg_maxlen = dev->mtu -
@@ -1376,7 +1379,8 @@ join_mcast_group(struct sock *sk, struct in_addr *addr, char *ifname)
 	memset(&mreq, 0, sizeof(mreq));
 	memcpy(&mreq.imr_multiaddr, addr, sizeof(struct in_addr));
 
-	if ((dev = __dev_get_by_name(&init_net, ifname)) == NULL)
+	dev = __dev_get_by_name(get_exec_env()->ve_netns, ifname);
+	if (!dev)
 		return -ENODEV;
 	if (sk->sk_bound_dev_if && dev->ifindex != sk->sk_bound_dev_if)
 		return -EINVAL;
@@ -1397,7 +1401,8 @@ static int bind_mcastif_addr(struct socket *sock, char *ifname)
 	__be32 addr;
 	struct sockaddr_in sin;
 
-	if ((dev = __dev_get_by_name(&init_net, ifname)) == NULL)
+	dev = __dev_get_by_name(get_exec_env()->ve_netns, ifname);
+	if (!dev)
 		return -ENODEV;
 
 	addr = inet_select_addr(dev, 0, RT_SCOPE_UNIVERSE);

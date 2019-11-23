@@ -443,8 +443,7 @@ int __log_start_commit(journal_t *journal, tid_t target)
 	 * currently running transaction (if it exists).  Otherwise,
 	 * the target tid must be an old one.
 	 */
-	if (journal->j_commit_request != target &&
-	    journal->j_running_transaction &&
+	if (journal->j_running_transaction &&
 	    journal->j_running_transaction->t_tid == target) {
 		/*
 		 * We want a new commit: OK, mark the request and wakeup the
@@ -581,12 +580,11 @@ int log_wait_commit(journal_t *journal, tid_t tid)
 		spin_lock(&journal->j_state_lock);
 	}
 out_unlock:
-	spin_unlock(&journal->j_state_lock);
-
 	if (unlikely(is_journal_aborted(journal))) {
 		printk(KERN_EMERG "journal commit I/O error\n");
 		err = -EIO;
 	}
+	spin_unlock(&journal->j_state_lock);
 	return err;
 }
 

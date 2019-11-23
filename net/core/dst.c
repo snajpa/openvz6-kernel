@@ -317,6 +317,7 @@ again:
 #if RT_CACHE_DEBUG >= 2
 	atomic_dec(&dst_total);
 #endif
+	dst->flags |= DST_FREE;
 	kmem_cache_free(dst->ops->kmem_cachep, dst);
 
 	dst = child;
@@ -388,6 +389,7 @@ static int dst_dev_event(struct notifier_block *this, unsigned long event, void 
 	switch (event) {
 	case NETDEV_UNREGISTER:
 	case NETDEV_DOWN:
+		dst_gc_task(NULL);
 		mutex_lock(&dst_gc_mutex);
 		for (dst = dst_busy_list; dst; dst = dst->next) {
 			last = dst;
@@ -425,3 +427,18 @@ EXPORT_SYMBOL(__dst_free);
 EXPORT_SYMBOL(__dst_alloc);
 EXPORT_SYMBOL(dst_alloc);
 EXPORT_SYMBOL(dst_destroy);
+
+void dst_dump_one(struct dst_entry *d)
+{
+	printk("\tdev %p err %d obs %d flags %x i/o %p/%p ref %d use %d\n",
+			d->dev, (int)d->error, (int)d->obsolete, d->flags,
+			d->input, d->output, atomic_read(&d->__refcnt), d->__use);
+}
+EXPORT_SYMBOL(dst_dump_one);
+
+void dst_cache_dump(void)
+{
+	ip_rt_dump_dsts();
+	if (ip6_rt_dump_dsts)
+		ip6_rt_dump_dsts();
+}

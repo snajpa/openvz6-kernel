@@ -22,6 +22,7 @@ static int notifier_chain_register(struct notifier_block **nl,
 		struct notifier_block *n)
 {
 	while ((*nl) != NULL) {
+		WARN_ON((*nl) == n);
 		if (n->priority > (*nl)->priority)
 			break;
 		nl = &((*nl)->next);

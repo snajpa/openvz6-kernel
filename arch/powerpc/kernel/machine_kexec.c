@@ -112,7 +112,7 @@ void __init reserve_crashkernel(void)
 
 	/* use common parsing */
 	ret = parse_crashkernel(boot_command_line, lmb_phys_mem_size(),
-			&crash_size, &crash_base);
+			&crash_size, &crash_base, NULL);
 	if (ret == 0 && crash_size > 0) {
 		crashk_res.start = crash_base;
 		crashk_res.end = crash_base + crash_size - 1;

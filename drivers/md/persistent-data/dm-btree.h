@@ -159,4 +159,8 @@ int dm_btree_walk(struct dm_btree_info *info, dm_block_t root,
 		  int (*fn)(void *context, uint64_t *keys, void *leaf),
 		  void *context);
 
+int dm_btree_iterate(struct dm_btree_info *info, dm_block_t root, uint64_t key,
+		     uint64_t start_block, uint64_t end_block,
+		     dm_block_t *blks, int max_blks, int *n);
+
 #endif	/* _LINUX_DM_BTREE_H */

@@ -622,6 +622,10 @@ struct nfs4_deviceid {
 	char data[NFS4_DEVICEID4_SIZE];
 };
 
+struct file_lock;
+extern int nfs4_set_lockowner(struct file *filp, struct file_lock *fl,
+			      u32 counter, u64 ls_id);
+
 #endif
 #endif
 

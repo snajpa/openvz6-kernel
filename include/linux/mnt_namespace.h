@@ -23,7 +23,16 @@ struct proc_mounts {
 	struct mnt_namespace *ns;
 	struct path root;
 	int event;
+	struct list_head *iter;
+	loff_t iter_pos;
+	int iter_advanced;
+	struct list_head reader;
 };
+
+extern unsigned int sysctl_ve_mount_nr;
+
+extern void register_mounts_reader(struct proc_mounts *p);
+extern void unregister_mounts_reader(struct proc_mounts *p);
 
 struct fs_struct;
 
@@ -39,6 +48,20 @@ static inline void get_mnt_ns(struct mnt_namespace *ns)
 extern const struct seq_operations mounts_op;
 extern const struct seq_operations mountinfo_op;
 extern const struct seq_operations mountstats_op;
+
+#ifdef CONFIG_VE
+extern void get_mnt_poll(struct mnt_namespace *ns,
+		wait_queue_head_t **ppoll, int **pevent);
+#else
+static inline void get_mnt_poll(struct mnt_namespace *ns,
+		wait_queue_head_t **ppoll, int **pevent)
+{
+	*ppoll = &ns->poll;
+	*pevent = &ns->event;
+}
+#endif
+
+extern struct rw_semaphore namespace_sem;
 
 #endif
 #endif

@@ -13,6 +13,7 @@
 #include "nfsd.h"
 #include "vfs.h"
 #include "auth.h"
+#include "ve.h"
 
 #define NFSDDBG_FACILITY		NFSDDBG_FH
 
@@ -145,6 +146,7 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 	int fileid_type;
 	int data_left = fh->fh_size/4;
 	__be32 error;
+	int err_line = 0;
 
 	error = nfserr_stale;
 	if (rqstp->rq_vers > 2)
@@ -155,13 +157,16 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 	if (fh->fh_version == 1) {
 		int len;
 
-		if (--data_left < 0)
-			return error;
-		if (fh->fh_auth_type != 0)
-			return error;
+		if (--data_left < 0) {
+			err_line = __LINE__; goto out_err;
+		}
+		if (fh->fh_auth_type != 0) {
+			err_line = __LINE__; goto out_err;
+		}
 		len = key_len(fh->fh_fsid_type) / 4;
-		if (len == 0)
-			return error;
+		if (len == 0) {
+			err_line = __LINE__; goto out_err;
+		}
 		if  (fh->fh_fsid_type == FSID_MAJOR_MINOR) {
 			/* deprecated, convert to type 3 */
 			len = key_len(FSID_ENCODE_DEV)/4;
@@ -170,8 +175,9 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 			fh->fh_fsid[1] = fh->fh_fsid[2];
 		}
 		data_left -= len;
-		if (data_left < 0)
-			return error;
+		if (data_left < 0) {
+			err_line = __LINE__; goto out_err;
+		}
 		exp = rqst_exp_find(rqstp, fh->fh_fsid_type, fh->fh_auth);
 		fid = (struct fid *)(fh->fh_auth + len);
 	} else {
@@ -179,8 +185,9 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 		dev_t xdev;
 		ino_t xino;
 
-		if (fh->fh_size != NFS_FHSIZE)
-			return error;
+		if (fh->fh_size != NFS_FHSIZE) {
+			err_line = __LINE__; goto out_err;
+		}
 		/* assume old filehandle format */
 		xdev = old_decode_dev(fh->ofh_xdev);
 		xino = u32_to_ino_t(fh->ofh_xino);
@@ -189,8 +196,9 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 	}
 
 	error = nfserr_stale;
-	if (PTR_ERR(exp) == -ENOENT)
-		return error;
+	if (PTR_ERR(exp) == -ENOENT) {
+		err_line = __LINE__; goto out_err;
+	}
 
 	if (IS_ERR(exp))
 		return nfserrno(PTR_ERR(exp));
@@ -215,8 +223,10 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 		put_cred(new);
 	} else {
 		error = nfsd_setuser_and_check_port(rqstp, exp);
-		if (error)
+		if (error) {
+			err_line = __LINE__;
 			goto out;
+		}
 	}
 
 	/*
@@ -245,12 +255,20 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 		dentry = exportfs_decode_fh(exp->ex_path.mnt, fid,
 				data_left, fileid_type,
 				nfsd_acceptable, exp);
+		if (dentry == NULL)
+			printk(KERN_ERR "%s: exportfs_decode_fh failed\n", __func__);
 	}
-	if (dentry == NULL)
+	if (dentry == NULL) {
+		err_line = __LINE__;
 		goto out;
+	}
 	if (IS_ERR(dentry)) {
 		if (PTR_ERR(dentry) != -EINVAL)
 			error = nfserrno(PTR_ERR(dentry));
+		if (PTR_ERR(dentry) != -ESTALE)
+			printk(KERN_ERR "%s: encoded dentry is err: %ld\n",
+					__func__, PTR_ERR(dentry));
+		err_line = __LINE__;
 		goto out;
 	}
 
@@ -265,6 +283,9 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct svc_fh *fhp)
 	return 0;
 out:
 	exp_put(exp);
+out_err:
+	if (error == nfserr_badhandle)
+		printk(KERN_ERR "%s: return BAD_HANDLE, line: %d\n", __func__, err_line);
 	return error;
 }
 
@@ -371,8 +392,16 @@ skip_pseudoflavor_check:
 			access, ntohl(error));
 	}
 out:
-	if (error == nfserr_stale)
+	if (error == nfserr_stale) {
+		extern int report_stale;
+
+		if (report_stale) {
+			printk("%s: return STALE in %d\n", __func__, get_exec_env()->veid);
+			dump_stack();
+		}
+
 		nfsdstats.fh_stale++;
+	}
 	return error;
 }
 
@@ -429,7 +458,7 @@ static bool fsid_type_ok_for_exp(u8 fsid_type, struct svc_export *exp)
 {
 	switch (fsid_type) {
 	case FSID_DEV:
-		if (!old_valid_dev(exp_sb(exp)->s_dev))
+		if (!old_valid_dev(exp_get_dev(exp)))
 			return 0;
 		/* FALL THROUGH */
 	case FSID_MAJOR_MINOR:
@@ -494,7 +523,7 @@ retry:
 			else
 				fsid_type = FSID_UUID4_INUM;
 		}
-	} else if (!old_valid_dev(exp_sb(exp)->s_dev))
+	} else if (!old_valid_dev(exp_get_dev(exp)))
 		/* for newer device numbers, we must use a newer fsid format */
 		fsid_type = FSID_ENCODE_DEV;
 	else
@@ -519,7 +548,9 @@ fh_compose(struct svc_fh *fhp, struct svc_export *exp, struct dentry *dentry,
 	struct inode * inode = dentry->d_inode;
 	struct dentry *parent = dentry->d_parent;
 	__u32 *datap;
-	dev_t ex_dev = exp_sb(exp)->s_dev;
+	dev_t ex_dev;
+
+	ex_dev = exp_get_dev(exp);
 
 	dprintk("nfsd: fh_compose(exp %02x:%02x/%ld %s/%s, ino=%ld)\n",
 		MAJOR(ex_dev), MINOR(ex_dev),
@@ -640,7 +671,7 @@ fh_put(struct svc_fh *fhp)
 	}
 	fh_drop_write(fhp);
 	if (exp) {
-		cache_put(&exp->h, &svc_export_cache);
+		exp_put(exp);
 		fhp->fh_export = NULL;
 	}
 	return;

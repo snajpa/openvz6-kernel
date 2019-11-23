@@ -29,6 +29,7 @@
 #include <linux/slab.h> /* kmem_* */
 #include <linux/types.h>
 #include <linux/sched.h>
+#include <linux/mount.h>
 
 #include "inotify.h"
 
@@ -165,10 +166,25 @@ void inotify_free_event_priv(struct fsnotify_event_private_data *fsn_event_priv)
 	kmem_cache_free(event_priv_cachep, event_priv);
 }
 
+static void inotify_detach_mnt(struct fsnotify_mark_entry *fe)
+{
+	struct inotify_inode_mark_entry *e;
+
+	e = container_of(fe, struct inotify_inode_mark_entry, fsn_entry);
+	if (e->cpt_wd_path) {
+		kfree(e->cpt_wd_path);
+		e->cpt_wd_path = NULL;
+		mnt_unpin(e->cpt_wd_mnt);
+		mntput(e->cpt_wd_mnt);
+		e->cpt_wd_mnt = NULL;
+	}
+}
+
 const struct fsnotify_ops inotify_fsnotify_ops = {
 	.handle_event = inotify_handle_event,
 	.should_send_event = inotify_should_send_event,
 	.free_group_priv = inotify_free_group_priv,
 	.free_event_priv = inotify_free_event_priv,
 	.freeing_mark = inotify_freeing_mark,
+	.detach_mnt = inotify_detach_mnt,
 };

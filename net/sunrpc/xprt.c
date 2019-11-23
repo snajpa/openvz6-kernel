@@ -44,6 +44,7 @@
 #include <linux/workqueue.h>
 #include <linux/net.h>
 #include <linux/ktime.h>
+#include <linux/sched.h>
 
 #include <linux/sunrpc/clnt.h>
 #include <linux/sunrpc/metrics.h>
@@ -222,6 +223,7 @@ EXPORT_SYMBOL_GPL(xprt_reserve_xprt);
 
 static void xprt_clear_locked(struct rpc_xprt *xprt)
 {
+	BUG_ON(xprt->owner_env != get_exec_env());
 	xprt->snd_task = NULL;
 	if (!test_bit(XPRT_CLOSE_WAIT, &xprt->state)) {
 		smp_mb__before_clear_bit();
@@ -650,6 +652,7 @@ EXPORT_SYMBOL_GPL(xprt_disconnect_done);
  */
 void xprt_force_disconnect(struct rpc_xprt *xprt)
 {
+	BUG_ON(xprt->owner_env != get_exec_env());
 	/* Don't race with the test_bit() in xprt_clear_locked() */
 	spin_lock_bh(&xprt->transport_lock);
 	set_bit(XPRT_CLOSE_WAIT, &xprt->state);
@@ -673,6 +676,7 @@ void xprt_force_disconnect(struct rpc_xprt *xprt)
  */
 void xprt_conditional_disconnect(struct rpc_xprt *xprt, unsigned int cookie)
 {
+	BUG_ON(xprt->owner_env != get_exec_env());
 	/* Don't race with the test_bit() in xprt_clear_locked() */
 	spin_lock_bh(&xprt->transport_lock);
 	if (cookie != xprt->connect_cookie)
@@ -692,7 +696,13 @@ static void
 xprt_init_autodisconnect(unsigned long data)
 {
 	struct rpc_xprt *xprt = (struct rpc_xprt *)data;
+	struct ve_struct *ve;
 
+	/*
+	 * Here we have to change execution environment since this function is
+	 * called from timer handling code, which is executed in ve0.
+	 */
+	ve = set_exec_env(xprt->owner_env);
 	spin_lock(&xprt->transport_lock);
 	if (!list_empty(&xprt->recv))
 		goto out_abort;
@@ -700,9 +710,11 @@ xprt_init_autodisconnect(unsigned long data)
 		goto out_abort;
 	spin_unlock(&xprt->transport_lock);
 	queue_work(rpciod_workqueue, &xprt->task_cleanup);
+	(void)set_exec_env(ve);
 	return;
 out_abort:
 	spin_unlock(&xprt->transport_lock);
+	(void)set_exec_env(ve);
 }
 
 bool xprt_lock_connect(struct rpc_xprt *xprt,
@@ -1158,6 +1170,7 @@ EXPORT_SYMBOL_GPL(xprt_alloc);
 
 void xprt_free(struct rpc_xprt *xprt)
 {
+	ve_rpc_data_put(xprt->owner_env);
 	put_net(xprt->xprt_net);
 	xprt_free_all_slots(xprt);
 	kfree(xprt);
@@ -1318,6 +1331,8 @@ static void xprt_init(struct rpc_xprt *xprt, struct net *net)
 	xprt_init_xid(xprt);
 
 	xprt->xprt_net = get_net(net);
+	xprt->owner_env = get_exec_env();
+	ve_rpc_data_get();
 }
 
 /**

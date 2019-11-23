@@ -25,6 +25,7 @@
 #include <linux/smp.h>
 #include <linux/slab.h>
 #include <linux/user.h>
+#include <linux/sysctl.h>
 #include <linux/interrupt.h>
 #include <linux/delay.h>
 #include <linux/module.h>
@@ -52,7 +53,10 @@
 #include <asm/syscalls.h>
 #include <asm/spec_ctrl.h>
 
-asmlinkage extern void ret_from_fork(void);
+
+asmlinkage void kernel_execve(const char *filename, char *const argv[], 
+				char *const envp[]) __asm__ ("kernel_execve");
+EXPORT_SYMBOL(kernel_execve);
 
 DEFINE_PER_CPU(unsigned long, old_rsp);
 static DEFINE_PER_CPU(unsigned char, is_idle);
@@ -166,7 +170,8 @@ void __show_regs(struct pt_regs *regs, int all)
 
 	show_regs_common();
 	printk(KERN_DEFAULT "RIP: %04lx:[<%016lx>] ", regs->cs & 0xffff, regs->ip);
-	printk_address(regs->ip, 1);
+	if (decode_call_traces)
+		printk_address(regs->ip, 1);
 	printk(KERN_DEFAULT "RSP: %04lx:%016lx  EFLAGS: %08lx\n", regs->ss,
 			regs->sp, regs->flags);
 	printk(KERN_DEFAULT "RAX: %016lx RBX: %016lx RCX: %016lx\n",
@@ -218,7 +223,9 @@ void __show_regs(struct pt_regs *regs, int all)
 void show_regs(struct pt_regs *regs)
 {
 	show_registers(regs);
-	show_trace(NULL, regs, (void *)(regs + 1));
+	show_trace(NULL, regs, &regs->sp);
+	if (!decode_call_traces)
+		printk(" EIP: [<%08lx>]\n", regs->ip);
 }
 
 void release_thread(struct task_struct *dead_task)
@@ -698,4 +705,21 @@ unsigned long KSTK_ESP(struct task_struct *task)
 {
 	return (test_tsk_thread_flag(task, TIF_IA32)) ?
 			(task_pt_regs(task)->sp) : ((task)->thread.usersp);
+}
+
+long do_fork_kthread(unsigned long clone_flags,
+	      unsigned long stack_start,
+	      struct pt_regs *regs,
+	      unsigned long stack_size,
+	      int __user *parent_tidptr,
+	      int __user *child_tidptr)
+{
+	if (ve_allow_kthreads || ve_is_super(get_exec_env()))
+		return do_fork(clone_flags, stack_start, regs, stack_size,
+				parent_tidptr, child_tidptr);
+
+	/* Don't allow kernel_thread() inside VE */
+	printk("kernel_thread call inside container\n");
+	dump_stack();
+	return -EPERM;
 }

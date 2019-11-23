@@ -34,4 +34,5 @@ VDSO64_PRELINK = VDSO_PRELINK;
  */
 #define VEXTERN(x)	VDSO64_ ## x = vdso_ ## x;
 #include "vextern.h"
+VEXTERN(linux_version_code)
 #undef	VEXTERN

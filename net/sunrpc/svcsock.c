@@ -1579,6 +1579,8 @@ static void svc_sock_detach(struct svc_xprt *xprt)
 
 	dprintk("svc: svc_sock_detach(%p)\n", svsk);
 
+	/* XXX: serialization? */
+	sk->sk_user_data = NULL;
 	/* put back the old socket callbacks */
 	sk->sk_state_change = svsk->sk_ostate;
 	sk->sk_data_ready = svsk->sk_odata;

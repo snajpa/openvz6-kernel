@@ -333,9 +333,14 @@ struct linux_binprm;
 
 #define ARCH_HAS_SETUP_ADDITIONAL_PAGES 1
 extern int arch_setup_additional_pages(struct linux_binprm *bprm,
-				       int uses_interp);
+				       int uses_interp,
+				       unsigned long map_address);
+extern int arch_setup_additional_pages_rhel5(struct linux_binprm *bprm,
+				       int uses_interp,
+				       unsigned long map_address);
 
-extern int syscall32_setup_pages(struct linux_binprm *, int exstack);
+extern int syscall32_setup_pages(struct linux_binprm *, int exstack,
+				 unsigned long map_address);
 #define compat_arch_setup_additional_pages	syscall32_setup_pages
 
 /*

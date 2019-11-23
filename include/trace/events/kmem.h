@@ -683,25 +683,102 @@ TRACE_EVENT(mm_directreclaim_reclaimzone,
 	TP_printk("node = %d reclaimed=%ld, priority=%ld",
 			__entry->node, __entry->reclaimed, __entry->priority)
 	);
+
 TRACE_EVENT(mm_pagereclaim_shrinkzone,
 
-	TP_PROTO(unsigned long reclaimed, unsigned long priority),
+	TP_PROTO(int nid, int zid, int priority, unsigned long reclaimed),
 
-	TP_ARGS(reclaimed, priority),
+	TP_ARGS(nid, zid, priority, reclaimed),
 
 	TP_STRUCT__entry(
+		__field(int, nid)
+		__field(int, zid)
+		__field(int, priority)
 		__field(unsigned long, reclaimed)
-		__field(unsigned long, priority)
 	),
 
 	TP_fast_assign(
-		__entry->reclaimed = reclaimed;
+		__entry->nid = nid;
+		__entry->zid = zid;
 		__entry->priority = priority;
+		__entry->reclaimed = reclaimed;
 	),
 
-	TP_printk("reclaimed=%ld priority=%ld",
-			__entry->reclaimed, __entry->priority)
+	TP_printk("nid=%d zid=%d priority=%d reclaimed=%ld",
+			__entry->nid, __entry->zid,
+			__entry->priority, __entry->reclaimed)
 	);
+
+TRACE_EVENT(mm_pagereclaim_shrinkgang,
+
+	TP_PROTO(int nid, int zid, int gid, int type,
+		 int priority, unsigned long reclaimed),
+
+	TP_ARGS(nid, zid, gid, type, priority, reclaimed),
+
+	TP_STRUCT__entry(
+		__field(int, nid)
+		__field(int, zid)
+		__field(int, gid)
+		__field(int, type)
+		__field(int, priority)
+		__field(unsigned long, reclaimed)
+	),
+
+	TP_fast_assign(
+		__entry->nid = nid;
+		__entry->zid = zid;
+		__entry->gid = gid;
+		__entry->type = type;
+		__entry->priority = priority;
+		__entry->reclaimed = reclaimed;
+	),
+
+	TP_printk("nid=%d zid=%d gid=%u type=%d priority=%d reclaimed=%ld",
+			__entry->nid, __entry->zid, __entry->gid, __entry->type,
+			__entry->priority, __entry->reclaimed)
+	);
+
+TRACE_EVENT(mm_pagereclaim_reschedule,
+
+       TP_PROTO(int nid, int zid, int gid, int type,
+		unsigned long usage, unsigned long shadow,
+		unsigned long limit, unsigned long age,
+		unsigned long max_age, int priority),
+
+       TP_ARGS(nid, zid, gid, type, usage, shadow, limit, age, max_age, priority),
+
+       TP_STRUCT__entry(
+	       __field(int, nid)
+	       __field(int, zid)
+	       __field(int, gid)
+	       __field(int, type)
+	       __field(unsigned long, usage)
+	       __field(unsigned long, shadow)
+	       __field(unsigned long, limit)
+	       __field(unsigned long, age)
+	       __field(unsigned long, max_age)
+	       __field(int, priority)
+       ),
+
+       TP_fast_assign(
+	       __entry->nid = nid;
+	       __entry->zid = zid;
+	       __entry->gid = gid;
+	       __entry->type = type;
+	       __entry->usage = usage;
+	       __entry->shadow = shadow;
+	       __entry->limit = limit;
+	       __entry->age = age;
+	       __entry->max_age = max_age;
+	       __entry->priority = priority;
+       ),
+       TP_printk("nid=%d zid=%d gid=%u type=%d usage=%ld "
+		 "shadow=%ld limit=%ld age=%ld max_age=%ld priority=%d",
+		 __entry->nid, __entry->zid, __entry->gid, __entry->type,
+		 __entry->usage ,__entry->shadow, __entry->limit,
+		 __entry->age, __entry->max_age, __entry->priority)
+       );
 
 TRACE_EVENT(mm_pagereclaim_shrinkactive,
 

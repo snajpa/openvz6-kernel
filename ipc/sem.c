@@ -91,13 +91,7 @@
 #include <asm/uaccess.h>
 #include "util.h"
 
-/* One semaphore structure for each semaphore in the system. */
-struct sem {
-	int	semval;		/* current value */
-	int	sempid;		/* pid of last operation */
-	spinlock_t	lock;	/* spinlock for fine-grained semtimedop */
-	struct list_head sem_pending; /* pending single-sop operations */
-};
+#include <bc/kmem.h>
 
 /* One queue for each sleeping process in the system. */
 struct sem_queue {
@@ -109,31 +103,6 @@ struct sem_queue {
 	struct sembuf		*sops;	 /* array of pending operations */
 	int			nsops;	 /* number of operations */
 	int			alter;	 /* does *sops alter the array? */
-};
-
-/* Each task has a list of undo requests. They are executed automatically
- * when the process exits.
- */
-struct sem_undo {
-	struct list_head	list_proc;	/* per-process list: *
-						 * all undos from one process
-						 * rcu protected */
-	struct rcu_head		rcu;		/* rcu struct for sem_undo */
-	struct sem_undo_list	*ulp;		/* back ptr to sem_undo_list */
-	struct list_head	list_id;	/* per semaphore array list:
-						 * all undos for one array */
-	int			semid;		/* semaphore set identifier */
-	short			*semadj;	/* array of adjustments */
-						/* one per semaphore */
-};
-
-/* sem_undo_list controls shared access to the list of sem_undo structures
- * that may be shared among all a CLONE_SYSVSEM task group.
- */
-struct sem_undo_list {
-	atomic_t		refcnt;
-	spinlock_t		lock;
-	struct list_head	list_proc;
 };
 
 
@@ -424,6 +393,7 @@ static int newary(struct ipc_namespace *ns, struct ipc_params *params)
 	key_t key = params->key;
 	int nsems = params->u.nsems;
 	int semflg = params->flg;
+	int semid = params->id;
 	int i;
 
 	if (!nsems)
@@ -461,7 +431,7 @@ static int newary(struct ipc_namespace *ns, struct ipc_params *params)
 	sma->sem_nsems = nsems;
 	sma->sem_ctime = get_seconds();
 
-	id = ipc_addid(&sem_ids(ns), &sma->sem_perm, ns->sc_semmni);
+	id = ipc_addid(&sem_ids(ns), &sma->sem_perm, ns->sc_semmni, semid);
 	if (id < 0) {
 		ipc_rcu_putref(sma, sem_rcu_free);
 		return id;
@@ -519,6 +489,7 @@ SYSCALL_DEFINE3(semget, key_t, key, int, nsems, int, semflg)
 	sem_params.key = key;
 	sem_params.flg = semflg;
 	sem_params.u.nsems = nsems;
+	sem_params.id = -1;
 
 	return ipcget(ns, &sem_ids(ns), &sem_ops, &sem_params);
 }
@@ -1435,7 +1406,7 @@ static inline int get_undo_list(struct sem_undo_list **undo_listp)
 
 	undo_list = current->sysvsem.undo_list;
 	if (!undo_list) {
-		undo_list = kzalloc(sizeof(*undo_list), GFP_KERNEL);
+		undo_list = kzalloc(sizeof(*undo_list), GFP_KERNEL_UBC);
 		if (undo_list == NULL)
 			return -ENOMEM;
 		spin_lock_init(&undo_list->lock);
@@ -1519,7 +1490,8 @@ static struct sem_undo *find_alloc_undo(struct ipc_namespace *ns, int semid)
 	rcu_read_unlock();
 
 	/* step 2: allocate new undo structure */
-	new = kzalloc(sizeof(struct sem_undo) + sizeof(short)*nsems, GFP_KERNEL);
+	new = kzalloc(sizeof(struct sem_undo) + sizeof(short)*nsems,
+			GFP_KERNEL_UBC);
 	if (!new) {
 		ipc_rcu_putref(sma, ipc_rcu_free);
 		return ERR_PTR(-ENOMEM);
@@ -1610,7 +1582,7 @@ SYSCALL_DEFINE4(semtimedop, int, semid, struct sembuf __user *, tsops,
 	if (nsops > ns->sc_semopm)
 		return -E2BIG;
 	if(nsops > SEMOPM_FAST) {
-		sops = kmalloc(sizeof(*sops)*nsops,GFP_KERNEL);
+		sops = kmalloc(sizeof(*sops)*nsops, GFP_KERNEL_UBC);
 		if(sops==NULL)
 			return -ENOMEM;
 	}
@@ -1973,4 +1945,59 @@ static int sysvipc_sem_proc_show(struct seq_file *s, void *it)
 			  sma->sem_otime,
 			  sma->sem_ctime);
 }
+#endif
+
+#ifdef CONFIG_VE
+#include <linux/module.h>
+
+int sysvipc_setup_sem(key_t key, int semid, size_t size, int semflg)
+{
+	struct ipc_namespace *ns;
+	struct ipc_ops sem_ops;
+	struct ipc_params sem_params;
+
+	ns = current->nsproxy->ipc_ns;
+
+	sem_ops.getnew = newary;
+	sem_ops.associate = sem_security;
+	sem_ops.more_checks = sem_more_checks;
+
+	sem_params.key = key;
+	sem_params.flg = semflg | IPC_CREAT;
+	sem_params.u.nsems = size;
+	sem_params.id = semid;
+
+	return ipcget(ns, &sem_ids(ns), &sem_ops, &sem_params);
+}
+EXPORT_SYMBOL_GPL(sysvipc_setup_sem);
+
+int sysvipc_walk_sem(int (*func)(int i, struct sem_array*, void *), void *arg)
+{
+	int err = 0;
+	struct sem_array *sma;
+	struct ipc_namespace *ns;
+	int next_id;
+	int total, in_use;
+
+	ns = current->nsproxy->ipc_ns;
+
+	down_write(&sem_ids(ns).rw_mutex);
+	in_use = sem_ids(ns).in_use;
+	for (total = 0, next_id = 0; total < in_use; next_id++) {
+		sma = idr_find(&sem_ids(ns).ipcs_idr, next_id);
+		if (sma == NULL)
+			continue;
+		ipc_lock_by_ptr(&sma->sem_perm);
+		err = func(ipc_buildid(next_id, sma->sem_perm.seq), sma, arg);
+		sem_unlock(sma, -1);
+		rcu_read_unlock();
+		if (err)
+			break;
+		total++;
+	}
+	up_write(&sem_ids(ns).rw_mutex);
+	return err;
+}
+EXPORT_SYMBOL_GPL(sysvipc_walk_sem);
+EXPORT_SYMBOL_GPL(exit_sem);
 #endif

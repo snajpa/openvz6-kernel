@@ -15,6 +15,7 @@
 
 #include <asm/uaccess.h>
 #include <linux/kmemtrace.h>
+#include <linux/mount.h>
 
 /**
  * kstrdup - allocate space for and copy an existing string
@@ -327,7 +328,14 @@ SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
 			return PTR_ERR(file);
 	}
 
-	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE | MAP_EXECPRIO | MAP_CPT);
+
+	/* Ugly fix for PSBM-23133 vdavydov@ */
+	if (file && file->f_op && file->f_op->mmap &&
+	    (flags & MAP_TYPE) == MAP_SHARED &&
+	    S_ISREG(file->f_path.dentry->d_inode->i_mode) &&
+	    (file->f_path.mnt->mnt_sb->s_type->fs_flags & FS_HAS_MMAP_PREP))
+		file->f_op->mmap(file, NULL);
 
 	down_write(&current->mm->mmap_sem);
 	retval = do_mmap_pgoff(file, addr, len, prot, flags, pgoff);

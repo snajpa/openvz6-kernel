@@ -48,6 +48,7 @@ struct page;
 struct buffer_head;
 struct address_space;
 typedef void (bh_end_io_t)(struct buffer_head *bh, int uptodate);
+typedef int (bh_submit_io_t)(int rw, struct buffer_head *bh, void *fsdata);
 
 /*
  * Historically, a buffer_head was used to map a single block
@@ -186,6 +187,7 @@ int sync_dirty_buffer(struct buffer_head *bh);
 int __sync_dirty_buffer(struct buffer_head *bh, int rw);
 void write_dirty_buffer(struct buffer_head *bh, int rw);
 int submit_bh(int, struct buffer_head *);
+int generic_submit_bh_handler(int rw, struct buffer_head * bh, void *fsdata);
 void write_boundary_block(struct block_device *bdev,
 			sector_t bblock, unsigned blocksize);
 int bh_uptodate_or_lock(struct buffer_head *bh);
@@ -202,9 +204,14 @@ int block_write_full_page(struct page *page, get_block_t *get_block,
 				struct writeback_control *wbc);
 int __block_write_full_page(struct inode *inode, struct page *page,
 			get_block_t *get_block, struct writeback_control *wbc,
+			    bh_submit_io_t *submit_handler,
 			    bh_end_io_t *handler);
 int block_write_full_page_endio(struct page *page, get_block_t *get_block,
 			struct writeback_control *wbc, bh_end_io_t *handler);
+int generic_block_write_full_page(struct page *page, get_block_t *get_block,
+			struct writeback_control *wbc,
+			bh_submit_io_t *submit,	bh_end_io_t *handler);
+
 int block_read_full_page(struct page*, get_block_t*);
 int block_is_partially_uptodate(struct page *page, read_descriptor_t *desc,
 				unsigned long from);

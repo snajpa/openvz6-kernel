@@ -159,7 +159,7 @@ static void throtl_free_tg(struct rcu_head *head)
 	struct throtl_grp *tg;
 
 	tg = container_of(head, struct throtl_grp, rcu_head);
-	free_percpu(tg->blkg.stats_cpu);
+	blkio_free_blkg_stats(&tg->blkg);
 	kfree(tg);
 }
 
@@ -336,7 +336,8 @@ static struct throtl_grp * throtl_get_tg(struct throtl_data *td)
 
 	/* Make sure @q is still alive */
 	if (unlikely(blk_queue_dying(q))) {
-		kfree(tg);
+		if (tg)
+			throtl_free_tg(&tg->rcu_head);
 		return NULL;
 	}
 
@@ -353,7 +354,8 @@ static struct throtl_grp * throtl_get_tg(struct throtl_data *td)
 	__tg = throtl_find_tg(td, blkcg);
 
 	if (__tg) {
-		kfree(tg);
+		if (tg)
+			throtl_free_tg(&tg->rcu_head);
 		rcu_read_unlock();
 		return __tg;
 	}

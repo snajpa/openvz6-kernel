@@ -282,6 +282,22 @@ out:
 	rcu_read_unlock();
 }
 
+void nf_nat_hash_conntrack(struct net *net, struct nf_conn *ct)
+{
+	unsigned int srchash;
+	struct nf_conn_nat *nat;
+
+	srchash = hash_by_src(net, &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple);
+	spin_lock_bh(&nf_nat_lock);
+	/* nf_conntrack_alter_reply might re-allocate exntension aera */
+	nat = nfct_nat(ct);
+	nat->ct = ct;
+	hlist_add_head_rcu(&nat->bysource,
+			   &net->ipv4.nat_bysource[srchash]);
+	spin_unlock_bh(&nf_nat_lock);
+}
+EXPORT_SYMBOL_GPL(nf_nat_hash_conntrack);
+
 unsigned int
 nf_nat_setup_info(struct nf_conn *ct,
 		  const struct nf_nat_range *range,
@@ -329,18 +345,8 @@ nf_nat_setup_info(struct nf_conn *ct,
 			ct->status |= IPS_DST_NAT;
 	}
 
-	if (maniptype == IP_NAT_MANIP_SRC) {
-		unsigned int srchash;
-
-		srchash = hash_by_src(net, &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple);
-		spin_lock_bh(&nf_nat_lock);
-		/* nf_conntrack_alter_reply might re-allocate exntension aera */
-		nat = nfct_nat(ct);
-		nat->ct = ct;
-		hlist_add_head_rcu(&nat->bysource,
-				   &net->ipv4.nat_bysource[srchash]);
-		spin_unlock_bh(&nf_nat_lock);
-	}
+	if (maniptype == IP_NAT_MANIP_SRC)
+		nf_nat_hash_conntrack(net, ct);
 
 	/* It's done. */
 	if (maniptype == IP_NAT_MANIP_DST)
@@ -579,7 +585,7 @@ static void nf_nat_cleanup_conntrack(struct nf_conn *ct)
 	if (nat == NULL || nat->ct == NULL)
 		return;
 
-	NF_CT_ASSERT(nat->ct->status & IPS_SRC_NAT_DONE);
+	NF_CT_ASSERT(nat->ct->status & IPS_NAT_DONE_MASK);
 
 	spin_lock_bh(&nf_nat_lock);
 	hlist_del_rcu(&nat->bysource);
@@ -706,6 +712,9 @@ nfnetlink_parse_nat_setup(struct nf_conn *ct,
 
 static int __net_init nf_nat_net_init(struct net *net)
 {
+	if (net_ipt_permitted(net, VE_IP_NAT))
+		net_ipt_module_set(net, VE_IP_NAT);
+
 	/* Leave them the same for the moment. */
 	net->ipv4.nat_htable_size = net->ct.htable_size;
 	net->ipv4.nat_bysource = nf_ct_alloc_hashtable(&net->ipv4.nat_htable_size,
@@ -733,6 +742,8 @@ static void __net_exit nf_nat_net_exit(struct net *net)
 	synchronize_rcu();
 	nf_ct_free_hashtable(net->ipv4.nat_bysource, net->ipv4.nat_vmalloced,
 			     net->ipv4.nat_htable_size);
+
+	net_ipt_module_clear(net, VE_IP_NAT);
 }
 
 static struct pernet_operations nf_nat_net_ops = {

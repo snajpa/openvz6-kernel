@@ -126,7 +126,7 @@ static struct dentry *proc_tgid_net_lookup(struct inode *dir,
 	de = ERR_PTR(-ENOENT);
 	net = get_proc_task_net(dir);
 	if (net != NULL) {
-		de = proc_lookup_de(net->proc_net, dir, dentry);
+		de = proc_lookup_de(net->proc_net, NULL, dir, dentry);
 		put_net(net);
 	}
 	return de;
@@ -164,7 +164,8 @@ static int proc_tgid_net_readdir(struct file *filp, void *dirent,
 	ret = -EINVAL;
 	net = get_proc_task_net(filp->f_path.dentry->d_inode);
 	if (net != NULL) {
-		ret = proc_readdir_de(net->proc_net, filp, dirent, filldir);
+		ret = proc_readdir_de(net->proc_net, NULL,
+				filp, dirent, filldir);
 		put_net(net);
 	}
 	return ret;
@@ -234,7 +235,7 @@ static struct pernet_operations __net_initdata proc_net_ns_ops = {
 
 int __init proc_net_init(void)
 {
-	proc_symlink("net", NULL, "self/net");
+	proc_symlink("net", &glob_proc_root, "self/net");
 
 	return register_pernet_subsys(&proc_net_ns_ops);
 }

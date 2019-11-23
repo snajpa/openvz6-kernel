@@ -31,6 +31,11 @@ typedef __kernel_timer_t	timer_t;
 typedef __kernel_clockid_t	clockid_t;
 typedef __kernel_mqd_t		mqd_t;
 
+#ifndef __ENVID_T_DEFINED__
+typedef unsigned envid_t;
+#define __ENVID_T_DEFINED__
+#endif
+
 typedef _Bool			bool;
 
 typedef __kernel_uid32_t	uid_t;
@@ -140,6 +145,7 @@ typedef		__s64		int64_t;
  * blkcnt_t is the type of the inode's block count.
  */
 #ifdef CONFIG_LBDAF
+
 typedef u64 sector_t;
 typedef u64 blkcnt_t;
 #else

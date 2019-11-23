@@ -23,9 +23,13 @@
 #include <linux/sunrpc/metrics.h>
 #include <net/net_namespace.h>
 
+#include "ve.h"
+
 #define RPCDBG_FACILITY	RPCDBG_MISC
 
-struct proc_dir_entry	*proc_net_rpc = NULL;
+#ifndef CONFIG_VE
+struct proc_dir_entry	*_proc_net_rpc = NULL;
+#endif
 
 /*
  * Get RPC client stats
@@ -215,7 +219,9 @@ EXPORT_SYMBOL_GPL(rpc_print_iostats);
 static inline struct proc_dir_entry *
 do_register(const char *name, void *data, const struct file_operations *fops)
 {
-	rpc_proc_init();
+	if (rpc_proc_init() == NULL)
+		return NULL;
+
 	dprintk("RPC:       registering /proc/net/rpc/%s\n", name);
 
 	return proc_create_data(name, 0, proc_net_rpc, fops, data);
@@ -249,12 +255,12 @@ svc_proc_unregister(const char *name)
 }
 EXPORT_SYMBOL_GPL(svc_proc_unregister);
 
-void
-rpc_proc_init(void)
+struct proc_dir_entry *rpc_proc_init(void)
 {
 	dprintk("RPC:       registering /proc/net/rpc\n");
-	if (!proc_net_rpc)
-		proc_net_rpc = proc_mkdir("rpc", init_net.proc_net);
+	if (!proc_net_rpc && get_exec_env()->ve_netns)
+		proc_net_rpc = proc_mkdir("rpc", get_exec_env()->ve_netns->proc_net);
+	return proc_net_rpc;
 }
 
 void
@@ -263,7 +269,7 @@ rpc_proc_exit(void)
 	dprintk("RPC:       unregistering /proc/net/rpc\n");
 	if (proc_net_rpc) {
 		proc_net_rpc = NULL;
-		remove_proc_entry("rpc", init_net.proc_net);
+		remove_proc_entry("rpc", get_exec_env()->ve_netns->proc_net);
 	}
 }
 

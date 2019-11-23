@@ -405,9 +405,6 @@ struct module
 	/* What modules depend on me? */
 	struct list_head modules_which_use_me;
 
-	/* Who is waiting for us to be unloaded */
-	struct task_struct *waiter;
-
 	/* Destruction function. */
 	void (*exit)(void);
 

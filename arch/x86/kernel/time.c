@@ -77,7 +77,23 @@ static irqreturn_t timer_interrupt(int irq, void *dev_id)
 		spin_unlock(&i8259A_lock);
 	}
 
-	global_clock_event->event_handler(global_clock_event);
+	/*
+	 * If hpet is enabled by hpet_late_init(), event_handler can be left
+	 * uninitialized by clockevents_register_device() because of
+	 * hpet_clockevent low rating (by the time hpet_late_init() is called,
+	 * high prio apic timers have already been setup). The event_handler is
+	 * then initialized a bit later by the clocksource_done_booting()
+	 * procedure.
+	 *
+	 * Normally, timer interrupts should not be delivered between these two
+	 * calls, but if e.g. the kernel is booted using kexec, there might be
+	 * some pending interrupts from the previous kernel's context, which
+	 * can lead to a NULL pointer dereference.
+	 *
+	 * So, take precautions against spurious timer interrupts.
+	 */
+	if (global_clock_event->event_handler)
+		global_clock_event->event_handler(global_clock_event);
 
 	/* MCA bus quirk: Acknowledge irq0 by setting bit 7 in port 0x61 */
 	if (MCA_bus)

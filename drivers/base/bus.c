@@ -15,6 +15,7 @@
 #include <linux/errno.h>
 #include <linux/init.h>
 #include <linux/string.h>
+#include <linux/sched.h>
 #include "base.h"
 #include "power/power.h"
 
@@ -299,7 +300,7 @@ int bus_for_each_dev(struct bus_type *bus, struct device *start,
 	klist_iter_exit(&i);
 	return error;
 }
-EXPORT_SYMBOL_GPL(bus_for_each_dev);
+EXPORT_SYMBOL(bus_for_each_dev);
 
 /**
  * bus_find_device - device iterator for locating a particular device.
@@ -439,21 +440,20 @@ static void device_remove_attrs(struct bus_type *bus, struct device *dev)
 	}
 }
 
-#ifdef CONFIG_SYSFS_DEPRECATED
 static int make_deprecated_bus_links(struct device *dev)
 {
-	return sysfs_create_link(&dev->kobj,
-				 &dev->bus->p->subsys.kobj, "bus");
+	if (sysfs_deprecated)
+		return sysfs_create_link(&dev->kobj,
+					 &dev->bus->p->subsys.kobj, "bus");
+	else
+		return 0;
 }
 
 static void remove_deprecated_bus_links(struct device *dev)
 {
-	sysfs_remove_link(&dev->kobj, "bus");
+	if (sysfs_deprecated)
+		sysfs_remove_link(&dev->kobj, "bus");
 }
-#else
-static inline int make_deprecated_bus_links(struct device *dev) { return 0; }
-static inline void remove_deprecated_bus_links(struct device *dev) { }
-#endif
 
 /**
  * bus_add_device - add device to bus

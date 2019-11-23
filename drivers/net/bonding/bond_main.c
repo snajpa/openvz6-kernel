@@ -4890,27 +4890,14 @@ out:
 
 static int __net_init bond_net_init(struct net *net)
 {
-	struct bond_net *bn;
-	int err;
-
-	err = -ENOMEM;
-	bn = kzalloc(sizeof(struct bond_net), GFP_KERNEL);
-	if (bn == NULL)
-		goto out;
+	struct bond_net *bn = net_generic(net, bond_net_id);
 
 	bn->net = net;
 	INIT_LIST_HEAD(&bn->dev_list);
 
-	err = net_assign_generic(net, bond_net_id, bn);
-	if (err)
-		goto out_free;
-
 	bond_create_proc_dir(bn);
-out:
-	return err;
-out_free:
-	kfree(bn);
-	goto out;
+
+	return 0;
 }
 
 static void __net_exit bond_net_exit(struct net *net)
@@ -4927,12 +4914,13 @@ static void __net_exit bond_net_exit(struct net *net)
 	rtnl_unlock();
 
 	bond_destroy_proc_dir(bn);
-	kfree(bn);
 }
 
 static struct pernet_operations bond_net_ops = {
 	.init = bond_net_init,
 	.exit = bond_net_exit,
+	.id   = &bond_net_id,
+	.size = sizeof(struct bond_net),
 };
 
 static int __init bonding_init(void)
@@ -4946,7 +4934,7 @@ static int __init bonding_init(void)
 	if (res)
 		goto out;
 
-	res = register_pernet_gen_subsys(&bond_net_id, &bond_net_ops);
+	res = register_pernet_subsys(&bond_net_ops);
 	if (res)
 		goto out;
 
@@ -4973,7 +4961,7 @@ err:
 	bond_destroy_debugfs();
 	bond_netlink_fini();
 err_link:
-	unregister_pernet_gen_subsys(bond_net_id, &bond_net_ops);
+	unregister_pernet_subsys(&bond_net_ops);
 	goto out;
 
 }
@@ -4986,7 +4974,7 @@ static void __exit bonding_exit(void)
 	bond_destroy_debugfs();
 
 	bond_netlink_fini();
-	unregister_pernet_gen_subsys(bond_net_id, &bond_net_ops);
+	unregister_pernet_subsys(&bond_net_ops);
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	/* Make sure we don't have an imbalance on our netpoll blocking */

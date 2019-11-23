@@ -41,7 +41,7 @@ static LIST_HEAD(input_handler_list);
  * be mutually exclusive which simplifies locking in drivers implementing
  * input handlers.
  */
-static DEFINE_MUTEX(input_mutex);
+DEFINE_MUTEX(input_mutex);
 
 static struct input_handler *input_table[8];
 

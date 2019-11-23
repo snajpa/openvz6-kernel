@@ -95,6 +95,16 @@ DEFINE_IRQ_VECTOR_EVENT(threshold_apic);
  */
 DEFINE_IRQ_VECTOR_EVENT(thermal_apic);
 
+/*
+ * monitor_ipi - called when ...
+ */
+DEFINE_IRQ_VECTOR_EVENT(monitor_ipi);
+
+/*
+ * monitor_posted_interrupt - called when ...
+ */
+DEFINE_IRQ_VECTOR_EVENT(monitor_posted_interrupt);
+
 #undef TRACE_INCLUDE_PATH
 #define TRACE_INCLUDE_PATH .
 #define TRACE_INCLUDE_FILE irq_vectors

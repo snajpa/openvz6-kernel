@@ -10,8 +10,11 @@
 #include <linux/slab.h>
 #include <linux/time.h>
 #include <linux/irqnr.h>
+#include <linux/fairsched.h>
 #include <asm/cputime.h>
 #include <linux/tick.h>
+#include <linux/mm.h>
+#include <linux/vmstat.h>
 
 #ifndef arch_irq_stat_cpu
 #define arch_irq_stat_cpu(cpu) 0
@@ -79,19 +82,32 @@ static unsigned int (*kstat_irqs_usr_fn)(unsigned int irq);
 static int show_stat(struct seq_file *p, void *v)
 {
 	int i, j;
-	unsigned long jif;
+	unsigned long jif, realjif;
 	cputime64_t user, nice, system, idle, iowait, irq, softirq, steal;
 	cputime64_t guest;
 	u64 sum = 0;
 	u64 sum_softirq = 0;
 	unsigned int per_softirq_sums[NR_SOFTIRQS] = {0};
 	struct timespec boottime;
+	struct ve_struct *ve;
+
+	getboottime(&boottime);
+	jif = boottime.tv_sec;
+
+	getrealboottime(&boottime);
+	realjif = boottime.tv_sec;
+
+	ve = get_exec_env();
+	if (!ve_is_super(ve)) {
+		int ret;
+		ret = fairsched_show_stat(p, ve->veid);
+		if (ret != -ENOSYS)
+			return ret;
+	}
 
 	user = nice = system = idle = iowait =
 		irq = softirq = steal = cputime64_zero;
 	guest = cputime64_zero;
-	getboottime(&boottime);
-	jif = boottime.tv_sec;
 
 	for_each_possible_cpu(i) {
 		user = cputime64_add(user, kstat_cpu(i).cpustat.user);
@@ -155,14 +171,22 @@ static int show_stat(struct seq_file *p, void *v)
 	for_each_irq_nr(j)
 		seq_printf(p, " %u", kstat_irqs_usr_fn(j));
 
+#ifdef CONFIG_VM_EVENT_COUNTERS
+	seq_printf(p, "\nswap %lu %lu", vm_events(PSWPIN), vm_events(PSWPOUT));
+#else
+	seq_printf(p, "\nswap 0 0");
+#endif
+
 	seq_printf(p,
 		"\nctxt %llu\n"
 		"btime %lu\n"
+		"realbtime %lu\n"
 		"processes %lu\n"
 		"procs_running %lu\n"
 		"procs_blocked %lu\n",
 		nr_context_switches(),
 		(unsigned long)jif,
+		(unsigned long)realjif,
 		total_forks,
 		nr_running(),
 		nr_iowait());
@@ -210,7 +234,7 @@ static int __init proc_stat_init(void)
 	if (!kstat_irqs_usr_fn)
 		kstat_irqs_usr_fn = kstat_irqs_usr_lock;
 
-	proc_create("stat", 0, NULL, &proc_stat_operations);
+	proc_create("stat", 0, &glob_proc_root, &proc_stat_operations);
 	return 0;
 }
 module_init(proc_stat_init);

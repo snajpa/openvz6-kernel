@@ -430,6 +430,12 @@ extern struct ratelimit_state printk_ratelimit_state;
 extern int printk_ratelimit(void);
 extern bool printk_timed_ratelimit(unsigned long *caller_jiffies,
 				   unsigned int interval_msec);
+asmlinkage int ve_vprintk(int dst, const char *fmt, va_list args)
+	__attribute__ ((format (printf, 2, 0)));
+asmlinkage int ve_printk(int, const char * fmt, ...)
+	__attribute__ ((format (printf, 2, 3)));
+void prepare_printk(void);
+
 
 extern int printk_delay_msec;
 extern int dmesg_restrict;
@@ -459,6 +465,15 @@ static inline int printk_ratelimit(void) { return 0; }
 static inline bool printk_timed_ratelimit(unsigned long *caller_jiffies, \
 					  unsigned int interval_msec)	\
 		{ return false; }
+static inline int ve_printk(int d, const char *s, ...)
+	__attribute__ ((format (printf, 2, 3)));
+static inline int ve_printk(int d, const char *s, ...)
+{
+	return 0;
+}
+static inline void prepare_printk(void)
+{
+}
 
 /* No effect, but we still get type checking even in the !PRINTK case: */
 #define printk_once(x...) printk(x)
@@ -484,10 +499,18 @@ extern void asmlinkage __attribute__((format(printf, 1, 2)))
 	early_printk(const char *fmt, ...);
 
 unsigned long int_sqrt(unsigned long);
+extern int console_silence_loglevel;
+
+#define VE0_LOG		1
+#define VE_LOG		2
+#define VE_LOG_BOTH	(VE0_LOG | VE_LOG)
 
 static inline void console_silent(void)
 {
-	console_loglevel = 0;
+	if (console_loglevel > console_silence_loglevel) {
+		printk(KERN_EMERG "console shuts up ...\n");
+		console_loglevel = 0;
+	}
 }
 
 static inline void console_verbose(void)
@@ -501,6 +524,7 @@ extern void wake_up_klogd(void);
 extern int oops_in_progress;		/* If set, an oops, panic(), BUG() or die() is in progress */
 extern int panic_timeout;
 extern int panic_on_oops;
+extern int decode_call_traces;
 extern int panic_on_unrecovered_nmi;
 extern int panic_on_io_nmi;
 extern int panic_on_warn;

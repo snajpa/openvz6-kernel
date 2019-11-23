@@ -14,6 +14,9 @@
 #include <linux/nfsd/debug.h>
 #include <linux/nfsd/export.h>
 #include <linux/nfsd/stats.h>
+
+#include <linux/sched.h>
+#include "ve.h"
 /*
  * nfsd version
  */
@@ -29,7 +32,6 @@ extern struct svc_version	nfsd_version2, nfsd_version3,
 				nfsd_version4;
 extern u32			nfsd_supported_minorversion;
 extern struct mutex		nfsd_mutex;
-extern struct svc_serv		*nfsd_serv;
 extern spinlock_t		nfsd_drc_lock;
 extern unsigned long		nfsd_drc_max_mem;
 extern unsigned long		nfsd_drc_mem_used;

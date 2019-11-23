@@ -362,7 +362,7 @@ static int autofs_root_unlink(struct inode *dir, struct dentry *dentry)
 
 	/* This allows root to remove symlinks */
 	lock_kernel();
-	if (!autofs_oz_mode(sbi) && !capable(CAP_SYS_ADMIN)) {
+	if (!autofs_oz_mode(sbi) && !capable(CAP_SYS_ADMIN) && !capable(CAP_VE_SYS_ADMIN)) {
 		unlock_kernel();
 		return -EACCES;
 	}
@@ -556,7 +556,7 @@ static int autofs_root_ioctl(struct inode *inode, struct file *filp,
 	     _IOC_NR(cmd) - _IOC_NR(AUTOFS_IOC_FIRST) >= AUTOFS_IOC_COUNT)
 		return -ENOTTY;
 	
-	if (!autofs_oz_mode(sbi) && !capable(CAP_SYS_ADMIN))
+	if (!autofs_oz_mode(sbi) && !capable(CAP_SYS_ADMIN) && !capable(CAP_VE_SYS_ADMIN))
 		return -EPERM;
 	
 	switch(cmd) {

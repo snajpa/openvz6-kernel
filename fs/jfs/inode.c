@@ -169,7 +169,7 @@ void jfs_delete_inode(struct inode *inode)
 	clear_inode(inode);
 }
 
-void jfs_dirty_inode(struct inode *inode)
+void jfs_dirty_inode(struct inode *inode, int flags)
 {
 	static int noisy = 5;
 

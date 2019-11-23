@@ -99,6 +99,7 @@ smb_close_socket(struct smb_sb_info *server)
 
 		VERBOSE("closing socket %p\n", sock);
 		sock->sk->sk_data_ready = server->data_ready;
+		sock->sk->sk_user_data = NULL;
 		server->sock_file = NULL;
 		fput(file);
 	}

@@ -132,7 +132,7 @@ void *__alloc_percpu(size_t size, size_t align)
 	kfree(pdata);
 	return NULL;
 }
-EXPORT_SYMBOL_GPL(__alloc_percpu);
+EXPORT_SYMBOL(__alloc_percpu);
 
 /**
  * free_percpu - final cleanup of per-cpu data
@@ -148,7 +148,7 @@ void free_percpu(void *__pdata)
 	__percpu_depopulate_mask(__pdata, cpu_possible_mask);
 	kfree(__percpu_disguise(__pdata));
 }
-EXPORT_SYMBOL_GPL(free_percpu);
+EXPORT_SYMBOL(free_percpu);
 
 /*
  * Generic percpu area setup.

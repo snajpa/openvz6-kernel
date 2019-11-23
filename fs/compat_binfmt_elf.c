@@ -131,3 +131,5 @@ static void cputime_to_compat_timeval(const cputime_t cputime,
  * We share all the actual code with the native (64-bit) version.
  */
 #include "binfmt_elf.c"
+
+EXPORT_SYMBOL(compat_elf_format);

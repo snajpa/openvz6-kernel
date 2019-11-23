@@ -10,6 +10,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/completion.h>
+#include <linux/quotaops.h>
 #include <linux/buffer_head.h>
 #include <linux/namei.h>
 #include <linux/mm.h>
@@ -338,6 +339,10 @@ static int gfs2_unlink(struct inode *dir, struct dentry *dentry)
 	struct gfs2_rgrpd *rgd;
 	int error;
 
+	vfs_dq_init(dentry->d_inode);
+
+	vfs_dq_init(dentry->d_inode);
+
 	error = gfs2_rindex_update(sdp);
 	if (error)
 		return error;
@@ -534,6 +539,7 @@ static int gfs2_rename(struct inode *odir, struct dentry *odentry,
 
 	gfs2_holder_mark_uninitialized(&r_gh);
 	if (ndentry->d_inode) {
+		vfs_dq_init(ndentry->d_inode);
 		nip = GFS2_I(ndentry->d_inode);
 		if (ip == nip)
 			return 0;

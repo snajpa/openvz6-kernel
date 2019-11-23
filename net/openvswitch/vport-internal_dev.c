@@ -107,6 +107,17 @@ static int internal_dev_change_mtu(struct net_device *netdev, int new_mtu)
 	return 0;
 }
 
+#if defined(CONFIG_OVS_BRCOMPAT) || defined(CONFIG_OVS_BRCOMPAT_MODULE)
+static int internal_dev_do_ioctl(struct net_device *dev,
+				 struct ifreq *ifr, int cmd)
+{
+	if (ovs_dp_ioctl_hook)
+		return ovs_dp_ioctl_hook(dev, ifr, cmd);
+
+	return -EOPNOTSUPP;
+}
+#endif
+
 static void internal_dev_destructor(struct net_device *dev)
 {
 	struct vport *vport = ovs_internal_dev_get_vport(dev);
@@ -122,6 +133,9 @@ static const struct net_device_ops internal_dev_netdev_ops = {
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_change_mtu = internal_dev_change_mtu,
 	.ndo_get_stats = internal_dev_get_stats,
+#if defined(CONFIG_OVS_BRCOMPAT) || defined(CONFIG_OVS_BRCOMPAT_MODULE)
+	.ndo_do_ioctl = internal_dev_do_ioctl,
+#endif
 };
 
 static void do_setup(struct net_device *netdev)

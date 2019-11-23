@@ -12,12 +12,13 @@ static int blkpg_ioctl(struct block_device *bdev, struct blkpg_ioctl_arg __user 
 {
 	struct block_device *bdevp;
 	struct gendisk *disk;
-	struct hd_struct *part;
+	struct hd_struct *part, *lpart;
 	struct blkpg_ioctl_arg a;
 	struct blkpg_partition p;
 	struct disk_part_iter piter;
 	long long start, length;
 	int partno;
+	int err;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EACCES;
@@ -90,6 +91,71 @@ static int blkpg_ioctl(struct block_device *bdev, struct blkpg_ioctl_arg __user 
 			mutex_unlock(&bdevp->bd_mutex);
 			bdput(bdevp);
 
+			return 0;
+		case BLKPG_RESIZE_PARTITION:
+			start = p.start >> 9;
+			length = p.length >> 9;
+			/* check for fit in a hd_struct */
+			if (sizeof(sector_t) == sizeof(long) &&
+			    sizeof(long long) > sizeof(long)) {
+				long pstart = start, plength = length;
+				if (pstart != start || plength != length
+				    || pstart < 0 || plength < 0)
+					return -EINVAL;
+			}
+
+			part = disk_get_part(disk, partno);
+			if (!part)
+				return -ENXIO;
+			bdevp = bdget(part_devt(part));
+			if (!bdevp) {
+				disk_put_part(part);
+				return -ENOMEM;
+			}
+
+			err = 0;
+			mutex_lock(&bdevp->bd_mutex);
+			mutex_lock_nested(&bdev->bd_mutex, 1);
+
+			if (start != part->start_sect) {
+				err = -EINVAL;
+				goto resize_done;
+			}
+			/* overlap? */
+			disk_part_iter_init(&piter, disk,
+					    DISK_PITER_INCL_EMPTY);
+			while ((lpart = disk_part_iter_next(&piter))) {
+				if (lpart->partno != partno &&
+				    !(start + length <= lpart->start_sect ||
+				      start >= lpart->start_sect + lpart->nr_sects)) {
+					disk_part_iter_exit(&piter);
+					err = -EBUSY;
+					goto resize_done;
+				}
+			}
+			disk_part_iter_exit(&piter);
+			part_nr_sects_write(part, length);
+			bd_write_size(bdevp, p.length);
+	resize_done:
+			mutex_unlock(&bdevp->bd_mutex);
+			mutex_unlock(&bdev->bd_mutex);
+			bdput(bdevp);
+			disk_put_part(part);
+			return err;
+		case BLKPG_GET_PARTITION:
+			mutex_lock(&bdev->bd_mutex);
+			part = disk_get_part(disk, partno);
+			if (!part)
+			{
+				mutex_unlock(&bdev->bd_mutex);
+				return -ENXIO;
+			}
+			p.start = part->start_sect << 9;
+			p.length = part->nr_sects << 9;
+			disk_put_part(part);
+			mutex_unlock(&bdev->bd_mutex);
+			if (copy_to_user(a.data, &p, sizeof(struct blkpg_partition)))
+				return -EFAULT;
 			return 0;
 		default:
 			return -EINVAL;
@@ -329,6 +395,15 @@ int blkdev_ioctl(struct block_device *bdev, fmode_t mode, unsigned cmd,
 	case BLKTRACETEARDOWN:
 		lock_kernel();
 		ret = blk_trace_ioctl(bdev, cmd, (char __user *) arg);
+		unlock_kernel();
+		break;
+	case BLKCBTSTART:
+	case BLKCBTSTOP:
+	case BLKCBTGET:
+	case BLKCBTSET:
+	case BLKCBTCLR:
+		lock_kernel();
+		ret = blk_cbt_ioctl(bdev, cmd, (char __user *)arg);
 		unlock_kernel();
 		break;
 	default:

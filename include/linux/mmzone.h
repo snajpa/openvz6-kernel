@@ -16,6 +16,8 @@
 #include <linux/nodemask.h>
 #include <linux/pageblock-flags.h>
 #include <linux/bounds.h>
+#include <linux/workqueue.h>
+#include <linux/mutex.h>
 #include <linux/nospec.h>
 #include <asm/atomic.h>
 #include <asm/page.h>
@@ -105,6 +107,9 @@ enum zone_stat_item {
 	NR_ISOLATED_ANON,	/* Temporary isolated pages from anon lru */
 	NR_ISOLATED_FILE,	/* Temporary isolated pages from file lru */
 	NR_SHMEM,		/* shmem pages (included tmpfs/GEM pages) */
+#ifdef CONFIG_MEMORY_VSWAP
+	NR_VSWAP,
+#endif
 #ifdef CONFIG_NUMA
 	NUMA_HIT,		/* allocated in intended node */
 	NUMA_MISS,		/* allocated in non intended node */
@@ -135,12 +140,14 @@ enum lru_list {
 	LRU_INACTIVE_FILE = LRU_BASE + LRU_FILE,
 	LRU_ACTIVE_FILE = LRU_BASE + LRU_FILE + LRU_ACTIVE,
 	LRU_UNEVICTABLE,
+	NR_EVICTABLE_LRU_LISTS = LRU_UNEVICTABLE,
 	NR_LRU_LISTS
 };
 
 #define for_each_lru(l) for (l = 0; l < NR_LRU_LISTS; l++)
 
-#define for_each_evictable_lru(l) for (l = 0; l <= LRU_ACTIVE_FILE; l++)
+#define for_each_evictable_lru(l) \
+	for (l = LRU_ACTIVE_FILE; (int)l >= LRU_INACTIVE_ANON; l--)
 
 static inline int is_file_lru(enum lru_list l)
 {
@@ -163,6 +170,8 @@ static inline int is_unevictable_lru(enum lru_list l)
 #define ISOLATE_ACTIVE		((__force isolate_mode_t)0x2)
 /* Isolate clean file */
 #define ISOLATE_CLEAN		((__force isolate_mode_t)0x4)
+/* Isolate unmapped file */
+#define ISOLATE_UNMAPPED	((__force isolate_mode_t)0x8)
 /* Isolate for asynchronous migration */
 #define ISOLATE_ASYNC_MIGRATE	((__force isolate_mode_t)0x10)
 
@@ -170,7 +179,35 @@ static inline int is_unevictable_lru(enum lru_list l)
 typedef unsigned __bitwise__ isolate_mode_t;
 
 struct lruvec {
-	struct list_head lists[NR_LRU_LISTS];
+	spinlock_t		lru_lock;
+
+	struct list_head	lru_list[NR_LRU_LISTS];
+	unsigned long		nr_pages[NR_LRU_LISTS];
+
+	/*
+	 * The pageout code in vmscan.c keeps track of how many of the
+	 * mem/swap backed and file backed pages are refeferenced.
+	 * The higher the rotated/scanned ratio, the more valuable
+	 * that cache is.
+	 *
+	 * The anon LRU stats live in [0], file LRU stats in [1]
+	 */
+	unsigned long		recent_rotated[2];
+	unsigned long		recent_scanned[2];
+
+	/*
+	 * accumulated for batching
+	 */
+	unsigned long		nr_saved_scan[NR_LRU_LISTS];
+
+	/*
+	 * Progress counter for local reclaimer
+	 */
+	atomic_long_t		pages_scanned;
+
+	unsigned int		priority;
+
+	struct zone		*zone;
 };
 
 enum zone_watermarks {
@@ -283,22 +320,88 @@ enum zone_type {
 #error ZONES_SHIFT -- too many zones configured adjust calculation
 #endif
 
-struct zone_reclaim_stat {
-	/*
-	 * The pageout code in vmscan.c keeps track of how many of the
-	 * mem/swap backed and file backed pages are refeferenced.
-	 * The higher the rotated/scanned ratio, the more valuable
-	 * that cache is.
-	 *
-	 * The anon LRU stats live in [0], file LRU stats in [1]
-	 */
-	unsigned long		recent_rotated[2];
-	unsigned long		recent_scanned[2];
+/*
+ * The "priority" of VM scanning is how much of the queues we will scan in one
+ * go. A value of 12 for DEF_PRIORITY implies that we will scan 1/4096th of the
+ * queues ("queue_length >> 12") during an aging round.
+ */
+#define DEF_PRIORITY		12
 
-	/*
-	 * accumulated for batching
-	 */
-	unsigned long		nr_saved_scan[NR_LRU_LISTS];
+/*
+ * Topmost priority for scanning LRU vector. At each priority kernel scans LRU
+ * vectors with this priority or higher. On one priority LRU verctors with
+ * higher priority got more pressure, see get_scan_count() for details.
+ */
+#define MAX_VMSCAN_PRIORITY	41
+
+#define NR_VMSCAN_PRIORITIES	(MAX_VMSCAN_PRIORITY + 1)
+
+struct gang;
+
+#ifdef CONFIG_MEMORY_GANGS_MIGRATION
+struct gangs_migration_work {
+	struct delayed_work dwork;
+	nodemask_t src_nodes;
+	nodemask_t dest_nodes;
+	int cur_node, preferred_node;
+	unsigned long batch;
+	struct mutex lock;
+};
+#endif
+
+struct gang_set {
+#ifdef CONFIG_MEMORY_GANGS
+	struct gang		**gangs;
+	unsigned long		memory_limit;
+	unsigned long		memory_portion;
+	unsigned long		memory_available;
+	unsigned long		memory_committed;
+	nodemask_t		nodemask;
+#endif
+#ifdef CONFIG_MEMORY_GANGS_MIGRATION
+	struct gangs_migration_work migration_work;
+#endif
+};
+
+/* bits in gang->flags */
+enum {
+	GANG_IN_SHADOW,
+	GANG_OF_JUNK,
+	GANG_UNHASHED,
+	GANG_NEED_RESCHED,
+};
+
+#define	MIN_MILESTONE_INTERVAL	HZ
+#define	MAX_MILESTONE_INTERVAL	(HZ * 60)
+
+#define NR_LRU_MILESTONES	51
+
+struct lru_milestone {
+	unsigned long		timestamp;
+	struct list_head	lru[NR_EVICTABLE_LRU_LISTS];
+};
+
+struct gang {
+	struct lruvec		lruvec;
+
+	struct gang_set		*set;
+#ifdef CONFIG_MEMORY_GANGS
+	struct list_head	list;
+#endif
+	unsigned long		flags;
+	struct list_head	vmscan_list;
+#ifdef CONFIG_MEMORY_GANGS
+	struct lru_milestone	milestones[NR_LRU_MILESTONES];
+	unsigned long		timestamp[NR_EVICTABLE_LRU_LISTS];
+	unsigned int		last_milestone;
+	unsigned long		committed;
+	unsigned long		present;
+	unsigned long		portion;
+	struct gang		*shadow;
+#endif
+#ifdef CONFIG_MEMORY_GANGS_MIGRATION
+	unsigned long nr_migratepages; /* number of pages to migrate */
+#endif
 };
 
 struct zone {
@@ -368,44 +471,27 @@ struct zone {
 	ZONE_PADDING(_pad1_)
 
 	/* Fields commonly accessed by the page reclaim scanner */
-	spinlock_t		lru_lock;
-#ifdef __GENKSYMS__
-	struct zone_lru {
-		struct list_head list;
-	} lru[NR_LRU_LISTS];
+#ifndef CONFIG_MEMORY_GANGS
+	struct gang		init_gang;
 #else
-	struct lruvec		lruvec;
-#endif
+	spinlock_t		gangs_lock;
+	int			nr_gangs;
+	struct list_head	gangs;
+	unsigned long		vmscan_mask[BITS_TO_LONGS(NR_VMSCAN_PRIORITIES)];
+	struct list_head	vmscan_prio[NR_VMSCAN_PRIORITIES];
+	struct list_head	*vmscan_iter[NR_VMSCAN_PRIORITIES];
+	atomic_t		vmscan_round[NR_VMSCAN_PRIORITIES];
+	unsigned long		eldest_timestamp;
+	unsigned long		committed;
+	unsigned int		nr_unlimited_gangs;
+	bool			force_scan;
+#endif /* CONFIG_MEMORY_GANGS */
 
-	struct zone_reclaim_stat reclaim_stat;
-
-	unsigned long		pages_scanned;	   /* since last reclaim */
+	atomic_long_t		pages_scanned;     /* since last reclaim */
 	unsigned long		flags;		   /* zone flags, see below */
 
 	/* Zone statistics */
 	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS];
-
-	/*
-	 * prev_priority holds the scanning priority for this zone.  It is
-	 * defined as the scanning priority at which we achieved our reclaim
-	 * target at the previous try_to_free_pages() or balance_pgdat()
-	 * invokation.
-	 *
-	 * We use prev_priority as a measure of how much stress page reclaim is
-	 * under - it drives the swappiness decision: whether to unmap mapped
-	 * pages.
-	 *
-	 * Access to both this field is quite racy even on uniprocessor.  But
-	 * it is expected to average out OK.
-	 */
-	int prev_priority;
-
-	/*
-	 * The target ratio of ACTIVE_ANON to INACTIVE_ANON pages on
-	 * this zone's LRU.  Maintained by the pageout code.
-	 */
-	unsigned int inactive_ratio;
-
 
 	ZONE_PADDING(_pad2_)
 	/* Rarely used or read-mostly fields */
@@ -517,13 +603,6 @@ static inline int zone_is_oom_locked(const struct zone *zone)
 {
 	return test_bit(ZONE_OOM_LOCKED, &zone->flags);
 }
-
-/*
- * The "priority" of VM scanning is how much of the queues we will scan in one
- * go. A value of 12 for DEF_PRIORITY implies that we will scan 1/4096th of the
- * queues ("queue_length >> 12") during an aging round.
- */
-#define DEF_PRIORITY 12
 
 /* Maximum number of zones on a zonelist */
 #define MAX_ZONES_PER_ZONELIST (MAX_NUMNODES * MAX_NR_ZONES)
@@ -671,6 +750,14 @@ struct bootmem_data;
 typedef struct pglist_data {
 	struct zone node_zones[MAX_NR_ZONES];
 	struct zonelist node_zonelists[MAX_ZONELISTS];
+#ifdef CONFIG_MEMORY_GANGS
+	struct gang init_gangs[MAX_NR_ZONES];
+	struct gang init_shadow_gangs[MAX_NR_ZONES];
+	struct gang junk_gangs[MAX_NR_ZONES];
+	int milestone_interval;
+	unsigned long next_milestone;
+	struct timer_list milestone_timer;
+#endif
 	int nr_zones;
 #ifdef CONFIG_FLAT_NODE_MEM_MAP	/* means !SPARSEMEM */
 	struct page *node_mem_map;

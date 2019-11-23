@@ -82,6 +82,14 @@ static unsigned int tcp_timeouts[TCP_CONNTRACK_MAX] __read_mostly = {
 	[TCP_CONNTRACK_SYN_SENT2]	= 2 MINS,
 };
 
+unsigned long get_tcp_timeout(u8 state)
+{
+	if (state >= TCP_CONNTRACK_MAX)
+		return 0;
+	return (unsigned long) tcp_timeouts[state];
+}
+EXPORT_SYMBOL(get_tcp_timeout);
+
 #define sNO TCP_CONNTRACK_NONE
 #define sSS TCP_CONNTRACK_SYN_SENT
 #define sSR TCP_CONNTRACK_SYN_RECV

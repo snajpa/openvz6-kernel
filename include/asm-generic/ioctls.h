@@ -86,6 +86,8 @@
 #define TIOCMIWAIT	0x545C	/* wait for a change on serial input line(s) */
 #define TIOCGICOUNT	0x545D	/* read serial port inline interrupt counts */
 
+#define TIOSAK		_IO('T', 0x66)	/* "Secure Attention Key" */
+
 /*
  * some architectures define FIOQSIZE as 0x545E, which is used for
  * TIOCGHAYESESP on others

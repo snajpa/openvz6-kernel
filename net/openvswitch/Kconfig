@@ -28,6 +28,15 @@ config OPENVSWITCH
 
 	  If unsure, say N.
 
+config OVS_BRCOMPAT
+	tristate "Open vSwitch bridge compatibility"
+	depends on OPENVSWITCH
+	---help---
+	  Enable this option if you want to control Open vSwitch with bridge
+	  control utilities like brctl.
+
+	  This option adds compatibility layer to implement ioctl transferring.
+
 config OPENVSWITCH_GRE
 	bool "Open vSwitch GRE tunneling support"
 	depends on INET

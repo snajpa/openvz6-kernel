@@ -11,6 +11,7 @@
  */
 
 #include <linux/mm.h>
+#include <linux/mmgang.h>
 #include <linux/kernel_stat.h>
 #include <linux/pagemap.h>
 #include <linux/swap.h>
@@ -19,12 +20,19 @@
 #include <linux/writeback.h>
 #include <asm/pgtable.h>
 
+static struct bio_set *swap_bio_set;
+
+static void swap_bio_destructor(struct bio *bio)
+{
+	bio_free(bio, swap_bio_set);
+}
+
 static struct bio *get_swap_bio(gfp_t gfp_flags,
 				struct page *page, bio_end_io_t end_io)
 {
 	struct bio *bio;
 
-	bio = bio_alloc(gfp_flags, 1);
+	bio = bio_alloc_bioset(gfp_flags, 1, swap_bio_set);
 	if (bio) {
 		swp_entry_t entry;
 		entry.val = page_private(page);
@@ -37,6 +45,7 @@ static struct bio *get_swap_bio(gfp_t gfp_flags,
 		bio->bi_idx = 0;
 		bio->bi_size = PAGE_SIZE;
 		bio->bi_end_io = end_io;
+		bio->bi_destructor = swap_bio_destructor;
 	}
 	return bio;
 }
@@ -109,12 +118,14 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 	if (wbc->sync_mode == WB_SYNC_ALL)
 		rw |= (1 << BIO_RW_SYNCIO) | (1 << BIO_RW_UNPLUG);
 	count_vm_event(PSWPOUT);
+	ub_percpu_inc(top_beancounter(get_gang_ub(page_gang(page))), swapout);
 	set_page_writeback(page);
 	unlock_page(page);
 	submit_bio(rw, bio);
 out:
 	return ret;
 }
+EXPORT_SYMBOL(swap_writepage);
 
 int swap_readpage(struct page *page)
 {
@@ -130,7 +141,17 @@ int swap_readpage(struct page *page)
 		goto out;
 	}
 	count_vm_event(PSWPIN);
+	ub_percpu_inc(top_beancounter(get_gang_ub(page_gang(page))), swapin);
 	submit_bio(READ, bio);
 out:
 	return ret;
 }
+
+static int __init swap_init(void)
+{
+	swap_bio_set = bioset_create(SWAP_CLUSTER_MAX, 0);
+	if (!swap_bio_set)
+		panic("can't allocate swap_bio_set\n");
+	return 0;
+}
+late_initcall(swap_init);

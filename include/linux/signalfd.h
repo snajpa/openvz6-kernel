@@ -63,6 +63,12 @@ static inline void signalfd_notify(struct task_struct *tsk, int sig)
 
 extern void signalfd_cleanup(struct sighand_struct *sighand);
 
+struct signalfd_ctx {
+	sigset_t sigmask;
+};
+
+extern long do_signalfd(int ufd, sigset_t *sigmask, int flags);
+
 #else /* CONFIG_SIGNALFD */
 
 static inline void signalfd_notify(struct task_struct *tsk, int sig) { }

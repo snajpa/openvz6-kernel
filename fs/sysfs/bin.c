@@ -398,6 +398,9 @@ static int open(struct inode * inode, struct file * file)
 	struct bin_buffer *bb = NULL;
 	int error;
 
+	if (!ve_sysfs_alowed())
+		return 0;
+
 	/* binary file operations requires both @sd and its parent */
 	if (!sysfs_get_active_two(attr_sd))
 		return -ENODEV;
@@ -485,6 +488,9 @@ void unmap_bin_file(struct sysfs_dirent *attr_sd)
 
 int sysfs_create_bin_file(struct kobject * kobj, struct bin_attribute * attr)
 {
+	if (!ve_sysfs_alowed())
+		return 0;
+
 	BUG_ON(!kobj || !attr);
 
 	/* RHEL specific
@@ -509,6 +515,8 @@ int sysfs_create_bin_file(struct kobject * kobj, struct bin_attribute * attr)
 
 void sysfs_remove_bin_file(struct kobject * kobj, struct bin_attribute * attr)
 {
+	if (!ve_sysfs_alowed())
+		return;
 	sysfs_hash_and_remove(kobj->sd, attr->attr.name);
 }
 

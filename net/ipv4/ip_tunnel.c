@@ -41,6 +41,7 @@
 #include <linux/if_vlan.h>
 #include <linux/rculist.h>
 #include <linux/hash.h>
+#include <linux/cpt_image.h>
 
 #include <net/sock.h>
 #include <net/ip.h>
@@ -370,6 +371,37 @@ static struct ip_tunnel *ip_tunnel_create(struct net *net,
 	return nt;
 }
 
+int ip_tunnel_rst(struct net *net, struct ip_tunnel_net *itn,
+		  const struct cpt_tunnel_image *v, const char *name)
+{
+	struct ip_tunnel_parm p;
+	struct ip_tunnel *nt;
+
+	strcpy(p.name, name);
+	p.link = 0;
+	if (cpt_object_has(v, cpt_link))
+		p.link = v->cpt_link;
+	p.i_flags = v->cpt_i_flags;
+	p.o_flags = v->cpt_o_flags;
+	p.i_key = v->cpt_i_key;
+	p.o_key = v->cpt_o_key;
+
+	BUILD_BUG_ON(sizeof(v->cpt_iphdr) != sizeof(p.iph));
+	memcpy(&p.iph, &v->cpt_iphdr, sizeof(p.iph));
+
+	if (v->cpt_tnl_flags & CPT_TUNNEL_FBDEV)
+		nt = netdev_priv(itn->fb_tunnel_dev);
+	else
+		nt = ip_tunnel_create(net, itn, &p);
+	if (!nt)
+		return -ENOMEM;
+
+	nt->i_seqno = v->cpt_i_seqno;
+	nt->o_seqno = v->cpt_o_seqno;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ip_tunnel_rst);
+
 static inline void ipgre_ecn_decapsulate(const struct iphdr *iph, struct sk_buff *skb)
 {
 	if (INET_ECN_is_ce(iph->tos)) {
@@ -685,7 +717,7 @@ int ip_tunnel_ioctl(struct net_device *dev, struct ip_tunnel_parm *p, int cmd)
 	case SIOCADDTUNNEL:
 	case SIOCCHGTUNNEL:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			goto done;
 		if (p->iph.ttl)
 			p->iph.frag_off |= htons(IP_DF);
@@ -736,7 +768,7 @@ int ip_tunnel_ioctl(struct net_device *dev, struct ip_tunnel_parm *p, int cmd)
 
 	case SIOCDELTUNNEL:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			goto done;
 
 		if (dev == itn->fb_tunnel_dev) {
@@ -783,7 +815,7 @@ static void ip_tunnel_dev_free(struct net_device *dev)
 	free_netdev(dev);
 }
 
-void ip_tunnel_dellink(struct net_device *dev)
+void ip_tunnel_dellink(struct net_device *dev, struct list_head *head)
 {
 	struct net *net = dev_net(dev);
 	struct ip_tunnel *tunnel = netdev_priv(dev);
@@ -793,7 +825,7 @@ void ip_tunnel_dellink(struct net_device *dev)
 
 	if (itn->fb_tunnel_dev != dev) {
 		ip_tunnel_del(netdev_priv(dev));
-		unregister_netdevice(dev);
+		unregister_netdevice_queue(dev, head);
 	}
 }
 EXPORT_SYMBOL_GPL(ip_tunnel_dellink);

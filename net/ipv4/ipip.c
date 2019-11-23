@@ -106,6 +106,7 @@
 #include <linux/init.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/if_ether.h>
+#include <linux/vzcalluser.h>
 
 #include <net/sock.h>
 #include <net/ip.h>
@@ -115,6 +116,9 @@
 #include <net/xfrm.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
+
+#include <linux/cpt_image.h>
+#include <linux/cpt_export.h>
 
 #define HASH_SIZE  16
 #define HASH(addr) (((__force u32)addr^((__force u32)addr>>4))&0xF)
@@ -143,6 +147,9 @@ static struct ip_tunnel * ipip_tunnel_lookup(struct net *net,
 	unsigned h1 = HASH(local);
 	struct ip_tunnel *t;
 	struct ipip_net *ipn = net_generic(net, ipip_net_id);
+
+	if (ipn == NULL)
+		return NULL;
 
 	for (t = ipn->tunnels_r_l[h0^h1]; t; t = t->next) {
 		if (local == t->parms.iph.saddr &&
@@ -609,7 +616,7 @@ ipip_tunnel_ioctl (struct net_device *dev, struct ifreq *ifr, int cmd)
 	case SIOCADDTUNNEL:
 	case SIOCCHGTUNNEL:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			goto done;
 
 		err = -EFAULT;
@@ -668,7 +675,7 @@ ipip_tunnel_ioctl (struct net_device *dev, struct ifreq *ifr, int cmd)
 
 	case SIOCDELTUNNEL:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			goto done;
 
 		if (dev == ipn->fb_tunnel_dev) {
@@ -703,11 +710,14 @@ static int ipip_tunnel_change_mtu(struct net_device *dev, int new_mtu)
 	return 0;
 }
 
+static void ipip_cpt(struct net_device *dev,
+		struct cpt_ops *ops, struct cpt_context *ctx);
 static const struct net_device_ops ipip_netdev_ops = {
 	.ndo_uninit	= ipip_tunnel_uninit,
 	.ndo_start_xmit	= ipip_tunnel_xmit,
 	.ndo_do_ioctl	= ipip_tunnel_ioctl,
 	.ndo_change_mtu	= ipip_tunnel_change_mtu,
+	.ndo_cpt	= ipip_cpt,
 
 };
 
@@ -723,6 +733,7 @@ static void ipip_tunnel_setup(struct net_device *dev)
 	dev->iflink		= 0;
 	dev->addr_len		= 4;
 	dev->features		|= NETIF_F_NETNS_LOCAL;
+	dev->vz_features	|= NETIF_F_VIRTUAL;
 	dev->priv_flags		&= ~IFF_XMIT_DST_RELEASE;
 }
 
@@ -765,24 +776,132 @@ static struct xfrm_tunnel ipip_handler = {
 static const char banner[] __initconst =
 	KERN_INFO "IPv4 over IPv4 tunneling driver\n";
 
-static void ipip_destroy_tunnels(struct ipip_net *ipn)
+static void ipip_destroy_tunnels(struct ipip_net *ipn, struct list_head *head)
 {
 	int prio;
 
 	for (prio = 1; prio < 4; prio++) {
 		int h;
 		for (h = 0; h < HASH_SIZE; h++) {
-			struct ip_tunnel *t;
-			while ((t = ipn->tunnels[prio][h]) != NULL)
-				unregister_netdevice(t->dev);
+			struct ip_tunnel *t = ipn->tunnels[prio][h];
+
+			while (t != NULL) {
+				unregister_netdevice_queue(t->dev, head);
+				t = t->next;
+			}
 		}
 	}
 }
+
+static void ipip_cpt(struct net_device *dev,
+		struct cpt_ops *ops, struct cpt_context *ctx)
+{
+	struct cpt_tunnel_image v;
+	struct ip_tunnel *t;
+	struct ipip_net *ipn;
+
+	t = netdev_priv(dev);
+	ipn = net_generic(get_exec_env()->ve_netns, ipip_net_id);
+	BUG_ON(ipn == NULL);
+
+	v.cpt_next = CPT_NULL;
+	v.cpt_object = CPT_OBJ_NET_IPIP_TUNNEL;
+	v.cpt_hdrlen = sizeof(v);
+	v.cpt_content = CPT_CONTENT_VOID;
+
+	/* mark fb dev */
+	v.cpt_tnl_flags = 0;
+	if (dev == ipn->fb_tunnel_dev)
+		v.cpt_tnl_flags |= CPT_TUNNEL_FBDEV;
+
+	v.cpt_i_flags = t->parms.i_flags;
+	v.cpt_o_flags = t->parms.o_flags;
+	v.cpt_i_key = t->parms.i_key;
+	v.cpt_o_key = t->parms.o_key;
+
+	BUILD_BUG_ON(sizeof(v.cpt_iphdr) != sizeof(t->parms.iph));
+	memcpy(&v.cpt_iphdr, &t->parms.iph, sizeof(t->parms.iph));
+
+	ops->write(&v, sizeof(v), ctx);
+}
+
+static int ipip_rst(loff_t start, struct cpt_netdev_image *di,
+		struct rst_ops *ops, struct cpt_context *ctx)
+{
+	int err = -ENODEV;
+	struct cpt_tunnel_image v;
+	struct net_device *dev;
+	struct ip_tunnel *t;
+	loff_t pos;
+	int fbdev;
+	struct ipip_net *ipn;
+
+	ipn = net_generic(get_exec_env()->ve_netns, ipip_net_id);
+	if (ipn == NULL)
+		return -EOPNOTSUPP;
+
+	pos = start + di->cpt_hdrlen;
+	err = ops->get_object(CPT_OBJ_NET_IPIP_TUNNEL,
+			pos, &v, sizeof(v), ctx);
+	if (err)
+		return err;
+
+	/* some sanity */
+	if (v.cpt_content != CPT_CONTENT_VOID)
+		return -EINVAL;
+
+	if (v.cpt_tnl_flags & (~CPT_TUNNEL_FBDEV))
+		return 1;
+
+	if (v.cpt_tnl_flags & CPT_TUNNEL_FBDEV) {
+		fbdev = 1;
+		err = 0;
+		dev = ipn->fb_tunnel_dev;
+	} else {
+		fbdev = 0;
+		err = -ENOMEM;
+		dev = alloc_netdev(sizeof(struct ip_tunnel), di->cpt_name,
+				ipip_tunnel_setup);
+		if (!dev)
+			goto out;
+	}
+
+	t = netdev_priv(dev);
+	t->parms.i_flags = v.cpt_i_flags;
+	t->parms.o_flags = v.cpt_o_flags;
+	t->parms.i_key = v.cpt_i_key;
+	t->parms.o_key = v.cpt_o_key;
+
+	BUILD_BUG_ON(sizeof(v.cpt_iphdr) != sizeof(t->parms.iph));
+	memcpy(&t->parms.iph, &v.cpt_iphdr, sizeof(t->parms.iph));
+
+	if (!fbdev) {
+		ipip_tunnel_init(dev);
+		err = register_netdevice(dev);
+		if (err) {
+			free_netdev(dev);
+			goto out;
+		}
+
+		dev_hold(dev);
+		ipip_tunnel_link(ipn, t);
+	}
+out:
+	return err;
+}
+
+static struct netdev_rst ipip_netdev_rst = {
+	.cpt_object = CPT_OBJ_NET_IPIP_TUNNEL,
+	.ndo_rst = ipip_rst,
+};
 
 static int ipip_init_net(struct net *net)
 {
 	int err;
 	struct ipip_net *ipn;
+
+	if (!(get_exec_env()->features & VE_FEATURE_IPIP))
+		return net_assign_generic(net, ipip_net_id, NULL);
 
 	err = -ENOMEM;
 	ipn = kzalloc(sizeof(struct ipip_net), GFP_KERNEL);
@@ -827,18 +946,25 @@ err_alloc:
 static void ipip_exit_net(struct net *net)
 {
 	struct ipip_net *ipn;
+	LIST_HEAD(list);
 
 	ipn = net_generic(net, ipip_net_id);
+	if (ipn == NULL) /* no VE_FEATURE_IPIP */
+		return;
+
 	rtnl_lock();
-	ipip_destroy_tunnels(ipn);
-	unregister_netdevice(ipn->fb_tunnel_dev);
+	ipip_destroy_tunnels(ipn, &list);
+	unregister_netdevice_queue(ipn->fb_tunnel_dev, &list);
+	unregister_netdevice_many(&list);
 	rtnl_unlock();
+	net_assign_generic(net, ipip_net_id, NULL);
 	kfree(ipn);
 }
 
 static struct pernet_operations ipip_net_ops = {
 	.init = ipip_init_net,
 	.exit = ipip_exit_net,
+	.id = &ipip_net_id,
 };
 
 static int __init ipip_init(void)
@@ -847,23 +973,26 @@ static int __init ipip_init(void)
 
 	printk(banner);
 
-	err = register_pernet_gen_device(&ipip_net_id, &ipip_net_ops);
+	err = register_pernet_device(&ipip_net_ops);
 	if (err < 0)
 		return err;
 	err = xfrm4_tunnel_register(&ipip_handler, AF_INET);
 	if (err < 0) {
-		unregister_pernet_gen_device(ipip_net_id, &ipip_net_ops);
+		unregister_pernet_device(&ipip_net_ops);
 		printk(KERN_INFO "ipip init: can't register tunnel\n");
-	}
+	} else
+		register_netdev_rst(&ipip_netdev_rst);
+
 	return err;
 }
 
 static void __exit ipip_fini(void)
 {
+	unregister_netdev_rst(&ipip_netdev_rst);
 	if (xfrm4_tunnel_deregister(&ipip_handler, AF_INET))
 		printk(KERN_INFO "ipip close: can't deregister tunnel\n");
 
-	unregister_pernet_gen_device(ipip_net_id, &ipip_net_ops);
+	unregister_pernet_device(&ipip_net_ops);
 }
 
 module_init(ipip_init);

@@ -350,6 +350,15 @@ struct utrace_engine *utrace_attach_pid(
 }
 EXPORT_SYMBOL_GPL(utrace_attach_pid);
 
+int task_utrace_attached(struct task_struct *task)
+{
+	struct utrace *utrace = task_utrace_struct(task);
+
+	return utrace && (!list_empty(&utrace->attached) ||
+			  !list_empty(&utrace->attaching));
+}
+EXPORT_SYMBOL_GPL(task_utrace_attached);
+
 /*
  * When an engine is detached, the target thread may still see it and
  * make callbacks until it quiesces.  We install a special ops vector

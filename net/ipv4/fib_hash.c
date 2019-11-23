@@ -679,6 +679,21 @@ static int fn_hash_flush(struct fib_table *tb)
 	return found;
 }
 
+void fib_free_table(struct fib_table *tb)
+{
+	struct fn_hash *table = (struct fn_hash *) tb->tb_data;
+	struct fn_zone *fz, *next;
+
+	next = table->fn_zone_list;
+	while (next != NULL) {
+		fz = next;
+		next = fz->fz_next;
+		fz_hash_free(fz->fz_hash, fz->fz_divisor);
+		kfree(fz);
+	}
+
+	kfree(tb);
+}
 
 static inline int
 fn_hash_dump_bucket(struct sk_buff *skb, struct netlink_callback *cb,
@@ -771,10 +786,10 @@ static int fn_hash_dump(struct fib_table *tb, struct sk_buff *skb, struct netlin
 void __init fib_hash_init(void)
 {
 	fn_hash_kmem = kmem_cache_create("ip_fib_hash", sizeof(struct fib_node),
-					 0, SLAB_PANIC, NULL);
+					 0, SLAB_PANIC | SLAB_UBC, NULL);
 
 	fn_alias_kmem = kmem_cache_create("ip_fib_alias", sizeof(struct fib_alias),
-					  0, SLAB_PANIC, NULL);
+					  0, SLAB_PANIC | SLAB_UBC, NULL);
 
 }
 

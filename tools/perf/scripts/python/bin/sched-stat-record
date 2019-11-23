@@ -1,0 +1,65 @@
+#!/bin/bash
+# perf script record -- sched:sched_stat_[smth] -- CMD
+# perf script record -- -e sched:sched_stat_[smth]
+#
+set -o monitor
+
+usage()
+{
+	echo "Usage:"
+	echo "	perf script record sched-stat -- sched:sched_stat_[smth] -- CMD"
+	echo "	perf script record sched-stat -- [PERF OPTS] -e sched:sched_stat_[smth]"
+	exit 1;
+}
+
+declare -a opt
+declare -a cmd
+f=0;
+for i in "${@:2}"; do
+	if [ "$i" == "--" ]; then
+		f=1
+		continue
+	fi
+	if [ $f -eq 1 ]; then
+		cmd[${#cmd[*]}]="$i"
+	else
+		opt[${#opt[*]}]="$i"
+	fi
+done
+
+if [[ "${opt[@]}" != *sched_stat_* ]]; then
+	usage;
+fi
+
+if [ ${#cmd[@]} -eq 0 ]; then
+	if [ ${#opt[@]} -eq 0 ]; then
+		usage;
+	fi
+	exec perf record -agP \
+		-e sched:sched_switch \
+		--filter "prev_state == 1 || prev_state == 2" \
+		"${opt[@]}"
+fi
+
+if [ ${#opt[@]} -ne 1 ]; then
+	usage;
+fi
+
+# Wait until a target process is stopped.
+bash -c 'kill -STOP $$; exec "$@"' -- "${cmd[@]}" &
+pid=$!
+wait %1
+[ $? -eq 147 ] || exit 1;
+
+perf record -agP \
+		-e sched:sched_switch \
+		--filter "prev_pid == $pid && prev_state == 1 || prev_state == 2" \
+		-e sched:sched_process_exit -e "${opt[@]}" --filter "pid == $pid" &
+pid_perf=$!
+kill -CONT %1
+while :; do
+	wait %1
+	[ $? -eq 127 ] && break;
+done
+kill -INT %2
+wait %2

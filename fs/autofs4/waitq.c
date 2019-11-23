@@ -156,6 +156,16 @@ static void autofs4_notify_daemon(struct autofs_sb_info *sbi,
 		struct autofs_v5_packet *packet = &pkt.v5_pkt.v5_packet;
 
 		pktsz = sizeof(*packet);
+#if defined CONFIG_X86_64 && defined CONFIG_IA32_EMULATION
+		/*
+		 * On x86_64 autofs_v5_packet struct padded with 4 bytes
+		 * it broke autofs daemon worked in ia32 emulation mode
+		 *
+		 * reduce size if work in 32-bit mode to satisfy userspace hope
+		 */
+		if (sbi->is32bit)
+			pktsz -= 4;
+#endif
 
 		packet->wait_queue_token = wq->wait_queue_token;
 		packet->len = wq->name.len;

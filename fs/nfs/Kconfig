@@ -121,3 +121,12 @@ config NFS_USE_KERNEL_DNS
 	depends on NFS_V4 && !NFS_USE_LEGACY_DNS
 	select DNS_RESOLVER
 	default y
+
+config NFS_QUOTA
+	bool "Virtuozzo NFS local quota support"
+	depends on NFS_FS
+	select CONFIG_VZ_QUOTA
+	help
+	  This option enables local NFS quota accounting
+
+	  If unsure, say Y.

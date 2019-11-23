@@ -218,4 +218,7 @@ void dm_pool_issue_prefetches(struct dm_pool_metadata *pmd);
 
 /*----------------------------------------------------------------*/
 
+int dm_thin_find_blocks(struct dm_thin_device *td, dm_block_t start_block, dm_block_t end_block,
+			dm_block_t *blks, int max_blks, int *n);
+
 #endif

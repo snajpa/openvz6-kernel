@@ -360,8 +360,6 @@ void acct_exit_ns(struct pid_namespace *ns)
 	if (acct != NULL) {
 		if (acct->file != NULL)
 			acct_file_reopen(acct, NULL, NULL);
-
-		kfree(acct);
 	}
 	spin_unlock(&acct_lock);
 }

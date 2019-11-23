@@ -418,6 +418,9 @@ extern unsigned int create_irq_nr(unsigned int irq_want, int node);
 extern int create_irq(void);
 extern void destroy_irq(unsigned int irq);
 
+extern int __irq_to_vector(int nr);
+#define irq_to_vector(nr)	__irq_to_vector(nr)
+
 /* Test to see if a driver has successfully requested an irq */
 static inline int irq_has_action(unsigned int irq)
 {

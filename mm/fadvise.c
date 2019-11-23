@@ -7,6 +7,7 @@
  *		Initial version.
  */
 
+#include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/file.h>
 #include <linux/fs.h>
@@ -21,34 +22,56 @@
 
 #include <asm/unistd.h>
 
+static void fadvise_deactivate(struct address_space *mapping,
+		pgoff_t start, pgoff_t end)
+{
+	struct pagevec pvec;
+	pgoff_t index = start;
+	int i;
+
+	if (start > end)
+		return;
+
+	/*
+	 * Note: this function may get called on a shmem/tmpfs mapping:
+	 * pagevec_lookup() might then return 0 prematurely (because it
+	 * got a gangful of swap entries); but it's hardly worth worrying
+	 * about - it can rarely have anything to free from such a mapping
+	 * (most pages are dirty), and already skips over any difficulties.
+	 */
+
+	pagevec_init(&pvec, 0);
+	while (index <= end && pagevec_lookup(&pvec, mapping, index,
+			min(end - index, (pgoff_t)PAGEVEC_SIZE - 1) + 1)) {
+		for (i = 0; i < pagevec_count(&pvec); i++) {
+			struct page *page = pvec.pages[i];
+
+			/* We rely upon deletion not changing page->index */
+			index = page->index;
+			if (index > end)
+				break;
+
+			deactivate_page(page);
+		}
+		pagevec_release(&pvec);
+		cond_resched();
+		index++;
+	}
+}
+
 /*
  * POSIX_FADV_WILLNEED could set PG_Referenced, and POSIX_FADV_NOREUSE could
  * deactivate the pages and clear PG_Referenced.
  */
-SYSCALL_DEFINE(fadvise64_64)(int fd, loff_t offset, loff_t len, int advice)
+int generic_fadvise(struct file* file, loff_t offset, loff_t len, int advice)
 {
-	struct file *file = fget(fd);
-	struct address_space *mapping;
+	struct address_space *mapping = file->f_mapping;
 	struct backing_dev_info *bdi;
 	loff_t endbyte;			/* inclusive */
 	pgoff_t start_index;
 	pgoff_t end_index;
 	unsigned long nrpages;
 	int ret = 0;
-
-	if (!file)
-		return -EBADF;
-
-	if (S_ISFIFO(file->f_path.dentry->d_inode->i_mode)) {
-		ret = -ESPIPE;
-		goto out;
-	}
-
-	mapping = file->f_mapping;
-	if (!mapping || len < 0) {
-		ret = -EINVAL;
-		goto out;
-	}
 
 	if (mapping->a_ops->get_xip_mem) {
 		switch (advice) {
@@ -58,6 +81,7 @@ SYSCALL_DEFINE(fadvise64_64)(int fd, loff_t offset, loff_t len, int advice)
 		case POSIX_FADV_WILLNEED:
 		case POSIX_FADV_NOREUSE:
 		case POSIX_FADV_DONTNEED:
+		case FADV_DEACTIVATE:
 			/* no bad return value, but ignore advice */
 			break;
 		default:
@@ -118,7 +142,8 @@ SYSCALL_DEFINE(fadvise64_64)(int fd, loff_t offset, loff_t len, int advice)
 		break;
 	case POSIX_FADV_DONTNEED:
 		if (!bdi_write_congested(mapping->backing_dev_info))
-			filemap_flush(mapping);
+			__filemap_fdatawrite_range(mapping, offset, endbyte,
+						   WB_SYNC_NONE);
 
 		/* First and last FULL page! */
 		start_index = (offset+(PAGE_CACHE_SIZE-1)) >> PAGE_CACHE_SHIFT;
@@ -141,9 +166,41 @@ SYSCALL_DEFINE(fadvise64_64)(int fd, loff_t offset, loff_t len, int advice)
 			}
 		}
 		break;
+	case FADV_DEACTIVATE:
+		start_index = (offset+(PAGE_CACHE_SIZE-1)) >> PAGE_CACHE_SHIFT;
+		end_index = (endbyte >> PAGE_CACHE_SHIFT);
+		fadvise_deactivate(mapping, start_index, end_index);
+		break;
 	default:
 		ret = -EINVAL;
 	}
+out:
+	return ret;
+}
+EXPORT_SYMBOL(generic_fadvise);
+
+SYSCALL_DEFINE(fadvise64_64)(int fd, loff_t offset, loff_t len, int advice)
+{
+	struct file *file = fget(fd);
+	int (*fadvise)(struct file *,loff_t, loff_t, int) = generic_fadvise;
+	int ret = 0;
+
+	if (!file)
+		return -EBADF;
+
+	if (S_ISFIFO(file->f_path.dentry->d_inode->i_mode)) {
+		ret = -ESPIPE;
+		goto out;
+	}
+
+	if (!file->f_mapping || len < 0) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (file->f_op && file->f_op->fadvise)
+		fadvise = file->f_op->fadvise;
+
+	ret = fadvise(file, offset, len, advice);
 out:
 	fput(file);
 	return ret;

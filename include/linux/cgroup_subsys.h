@@ -78,3 +78,9 @@ SUBSYS(net_prio)
 #endif
 
 /* */
+
+#ifdef CONFIG_BEANCOUNTERS
+SUBSYS(mem_cgroup)
+#endif
+
+/* */

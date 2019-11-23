@@ -708,7 +708,8 @@ static int expect_h245(struct sk_buff *skb, struct nf_conn *ct,
 
 /* If the calling party is on the same side of the forward-to party,
  * we don't need to track the second call */
-static int callforward_do_filter(const union nf_inet_addr *src,
+static int callforward_do_filter(struct net *net,
+				 const union nf_inet_addr *src,
 				 const union nf_inet_addr *dst,
 				 u_int8_t family)
 {
@@ -730,8 +731,9 @@ static int callforward_do_filter(const union nf_inet_addr *src,
 
 		fl1.fl4_dst = src->ip;
 		fl2.fl4_dst = dst->ip;
-		if (!afinfo->route((struct dst_entry **)&rt1, &fl1)) {
-			if (!afinfo->route((struct dst_entry **)&rt2, &fl2)) {
+		if (!afinfo->route(net, (struct dst_entry **)&rt1, &fl1)) {
+			if (!afinfo->route(net, (struct dst_entry **)&rt2,
+					   &fl2)) {
 				if (rt1->rt_gateway == rt2->rt_gateway &&
 				    rt1->u.dst.dev  == rt2->u.dst.dev)
 					ret = 1;
@@ -748,8 +750,9 @@ static int callforward_do_filter(const union nf_inet_addr *src,
 
 		memcpy(&fl1.fl6_dst, src, sizeof(fl1.fl6_dst));
 		memcpy(&fl2.fl6_dst, dst, sizeof(fl2.fl6_dst));
-		if (!afinfo->route((struct dst_entry **)&rt1, &fl1)) {
-			if (!afinfo->route((struct dst_entry **)&rt2, &fl2)) {
+		if (!afinfo->route(net, (struct dst_entry **)&rt1, &fl1)) {
+			if (!afinfo->route(net, (struct dst_entry **)&rt2,
+					   &fl2)) {
 				if (!memcmp(&rt1->rt6i_gateway, &rt2->rt6i_gateway,
 					    sizeof(rt1->rt6i_gateway)) &&
 				    rt1->u.dst.dev == rt2->u.dst.dev)
@@ -778,6 +781,7 @@ static int expect_callforwarding(struct sk_buff *skb,
 	__be16 port;
 	union nf_inet_addr addr;
 	struct nf_conntrack_expect *exp;
+	struct net *net = nf_ct_net(ct);
 	typeof(nat_callforwarding_hook) nat_callforwarding;
 
 	/* Read alternativeAddress */
@@ -787,7 +791,7 @@ static int expect_callforwarding(struct sk_buff *skb,
 	/* If the calling party is on the same side of the forward-to party,
 	 * we don't need to track the second call */
 	if (callforward_filter &&
-	    callforward_do_filter(&addr, &ct->tuplehash[!dir].tuple.src.u3,
+	    callforward_do_filter(net, &addr, &ct->tuplehash[!dir].tuple.src.u3,
 				  nf_ct_l3num(ct))) {
 		pr_debug("nf_ct_q931: Call Forwarding not tracked\n");
 		return 0;

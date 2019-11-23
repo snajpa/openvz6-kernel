@@ -1819,3 +1819,9 @@ void dm_pool_issue_prefetches(struct dm_pool_metadata *pmd)
 		dm_tm_issue_prefetches(pmd->tm);
 	up_read(&pmd->root_lock);
 }
+
+int dm_thin_find_blocks(struct dm_thin_device *td, dm_block_t start_block, dm_block_t end_block,
+			dm_block_t *blks, int max_blks, int *n)
+{
+	return dm_btree_iterate(&td->pmd->info, td->pmd->root, td->id, start_block, end_block, blks, max_blks, n);
+}

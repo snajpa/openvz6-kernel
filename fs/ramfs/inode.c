@@ -155,10 +155,6 @@ static const struct super_operations ramfs_ops = {
 	.show_options	= generic_show_options,
 };
 
-struct ramfs_mount_opts {
-	umode_t mode;
-};
-
 enum {
 	Opt_mode,
 	Opt_err
@@ -167,10 +163,6 @@ enum {
 static const match_table_t tokens = {
 	{Opt_mode, "mode=%o"},
 	{Opt_err, NULL}
-};
-
-struct ramfs_fs_info {
-	struct ramfs_mount_opts mount_opts;
 };
 
 static int ramfs_parse_options(char *data, struct ramfs_mount_opts *opts)
@@ -205,7 +197,7 @@ static int ramfs_parse_options(char *data, struct ramfs_mount_opts *opts)
 	return 0;
 }
 
-static int ramfs_fill_super(struct super_block * sb, void * data, int silent)
+int ramfs_fill_super(struct super_block * sb, void * data, int silent)
 {
 	struct ramfs_fs_info *fsi;
 	struct inode *inode = NULL;

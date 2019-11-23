@@ -28,6 +28,7 @@
 #include <linux/mutex.h>
 #include <linux/kthread.h>
 #include <linux/freezer.h>
+#include <linux/ve_proto.h>
 
 #include <linux/sunrpc/types.h>
 #include <linux/sunrpc/stats.h>
@@ -39,7 +40,8 @@
 #include <net/addrconf.h>
 #include <net/ipv6.h>
 #include <linux/lockd/lockd.h>
-#include <linux/nfs.h>
+
+#include "ve.h"
 
 #define NLMDBG_FACILITY		NLMDBG_SVC
 #define LOCKD_BUFSIZE		(1024 + NLMSVC_XDRSIZE)
@@ -51,18 +53,21 @@ struct nlmsvc_binding *		nlmsvc_ops;
 EXPORT_SYMBOL_GPL(nlmsvc_ops);
 
 static DEFINE_MUTEX(nlmsvc_mutex);
-static unsigned int		nlmsvc_users;
-static struct task_struct	*nlmsvc_task;
-static struct svc_rqst		*nlmsvc_rqst;
-unsigned long			nlmsvc_timeout;
 
 /*
  * These can be set at insmod time (useful for NFS as root filesystem),
  * and also changed through the sysctl interface.  -- Jamie Lokier, Aug 2003
  */
-static unsigned long		nlm_grace_period;
 static unsigned long		nlm_timeout = LOCKD_DFLT_TIMEO;
 static int			nlm_udpport, nlm_tcpport;
+
+#ifndef CONFIG_VE
+static unsigned int		_nlmsvc_users;
+static struct task_struct	*_nlmsvc_task;
+static struct svc_rqst		*_nlmsvc_rqst;
+static unsigned long		_nlmsvc_grace_period;
+unsigned long			_nlmsvc_timeout;
+#endif
 
 /* RLIM_NOFILE defaults to 1024. That seems like a reasonable default here. */
 static unsigned int		nlm_max_connections = 1024;
@@ -70,6 +75,7 @@ static unsigned int		nlm_max_connections = 1024;
 /*
  * Constants needed for the sysctl interface.
  */
+static unsigned long		nlm_grace_period;
 static const unsigned long	nlm_grace_period_min = 0;
 static const unsigned long	nlm_grace_period_max = 240;
 static const unsigned long	nlm_timeout_min = 3;
@@ -89,15 +95,16 @@ static unsigned long get_lockd_grace_period(void)
 		return nlm_timeout * 5 * HZ;
 }
 
-static struct lock_manager lockd_manager = {
-};
-
-static void grace_ender(struct work_struct *not_used)
+void grace_ender(struct work_struct *grace)
 {
-	locks_end_grace(&lockd_manager);
-}
+	struct delayed_work *dwork = container_of(grace, struct delayed_work,
+						  work);
+	struct ve_nlm_data *nlm = container_of(dwork, struct ve_nlm_data,
+					       _grace_period_end);
 
-static DECLARE_DELAYED_WORK(grace_period_end, grace_ender);
+	locks_end_grace(&nlm->_lockd_manager);
+}
+EXPORT_SYMBOL_GPL(grace_ender);
 
 static void set_grace_period(void)
 {
@@ -180,8 +187,9 @@ lockd(void *vrqstp)
 		}
 		if (err < 0) {
 			if (err != preverr) {
-				printk(KERN_WARNING "%s: unexpected error "
-					"from svc_recv (%d)\n", __func__, err);
+				printk(KERN_WARNING "%s: ct%d unexpected error "
+					"from svc_recv (%d)\n", __func__,
+					get_exec_env()->veid, err);
 				preverr = err;
 			}
 			schedule_timeout_interruptible(HZ);
@@ -211,8 +219,8 @@ static int create_lockd_listener(struct svc_serv *serv, const char *name,
 
 	xprt = svc_find_xprt(serv, name, family, 0);
 	if (xprt == NULL)
-		return svc_create_xprt(serv, name, &init_net, family, port,
-						SVC_SOCK_DEFAULTS);
+		return svc_create_xprt(serv, name, current->nsproxy->net_ns,
+					family, port, SVC_SOCK_DEFAULTS);
 	svc_xprt_put(xprt);
 	return 0;
 }
@@ -267,7 +275,9 @@ static int lockd_inetaddr_event(struct notifier_block *this,
 	struct in_ifaddr *ifa = (struct in_ifaddr *)ptr;
 	struct sockaddr_in sin;
 
-	if (event != NETDEV_DOWN)
+	if ((event != NETDEV_DOWN) ||
+	    !NLM_CTX_TEST ||
+	    !atomic_inc_not_zero(&nlm_ntf_refcnt))
 		goto out;
 
 	if (nlmsvc_rqst) {
@@ -278,6 +288,8 @@ static int lockd_inetaddr_event(struct notifier_block *this,
 		svc_age_temp_xprts_now(nlmsvc_rqst->rq_server,
 			(struct sockaddr *)&sin);
 	}
+	atomic_dec(&nlm_ntf_refcnt);
+	wake_up(&nlm_ntf_wq);
 out:
 	return NOTIFY_DONE;
 }
@@ -293,7 +305,9 @@ static int lockd_inet6addr_event(struct notifier_block *this,
 	struct inet6_ifaddr *ifa = (struct inet6_ifaddr *)ptr;
 	struct sockaddr_in6 sin6;
 
-	if (event != NETDEV_DOWN)
+	if ((event != NETDEV_DOWN) ||
+	    !NLM_CTX_TEST ||
+	    !atomic_inc_not_zero(&nlm_ntf_refcnt))
 		goto out;
 
 	if (nlmsvc_rqst) {
@@ -303,6 +317,8 @@ static int lockd_inet6addr_event(struct notifier_block *this,
 		svc_age_temp_xprts_now(nlmsvc_rqst->rq_server,
 			(struct sockaddr *)&sin6);
 	}
+	atomic_dec(&nlm_ntf_refcnt);
+	wake_up(&nlm_ntf_wq);
 out:
 	return NOTIFY_DONE;
 }
@@ -312,22 +328,45 @@ static struct notifier_block lockd_inet6addr_notifier = {
 };
 #endif
 
+static atomic_t lockd_notifier_refcount = ATOMIC_INIT(0);
+static void lockd_register_notifiers(void)
+{
+	/* check if the notifier is already set */
+	if (atomic_inc_return(&lockd_notifier_refcount) == 1) {
+#if IS_ENABLED(CONFIG_IPV6)
+		int (*fn)(struct notifier_block *);
+
+		fn = symbol_get(register_inet6addr_notifier);
+		if (fn) {
+			fn(&lockd_inet6addr_notifier);
+			symbol_put_addr(fn);
+		}
+#endif
+		register_inetaddr_notifier(&lockd_inetaddr_notifier);
+	}
+}
+
 static void lockd_unregister_notifiers(void)
 {
+	/* check if the notifier still has clients */
+	if (atomic_dec_return(&lockd_notifier_refcount) == 0) {
 #if IS_ENABLED(CONFIG_IPV6)
-	int (*fn)(struct notifier_block *);
+		int (*fn)(struct notifier_block *);
 
-	fn = symbol_get(unregister_inet6addr_notifier);
-	if (fn) {
-		fn(&lockd_inet6addr_notifier);
-		symbol_put_addr(fn);
-	}
+		fn = symbol_get(unregister_inet6addr_notifier);
+		if (fn) {
+			fn(&lockd_inet6addr_notifier);
+			symbol_put_addr(fn);
+		}
 #endif
-	unregister_inetaddr_notifier(&lockd_inetaddr_notifier);
+		unregister_inetaddr_notifier(&lockd_inetaddr_notifier);
+	}
+	wait_event(nlm_ntf_wq, atomic_read(&nlm_ntf_refcnt) == 0);
 }
 
 static void lockd_svc_exit_thread(void)
 {
+	atomic_dec(&nlm_ntf_refcnt);
 	lockd_unregister_notifiers();
 	svc_exit_thread(nlmsvc_rqst);
 }
@@ -339,9 +378,6 @@ int lockd_up(void)
 {
 	struct svc_serv *serv;
 	int		error = 0;
-#if IS_ENABLED(CONFIG_IPV6)
-	int (*fn)(struct notifier_block *);
-#endif
 
 	mutex_lock(&nlmsvc_mutex);
 	/*
@@ -356,24 +392,18 @@ int lockd_up(void)
 	 */
 	if (nlmsvc_users)
 		printk(KERN_WARNING
-			"lockd_up: no pid, %d users??\n", nlmsvc_users);
+			"lockd_up: ct%d no pid, %d users??\n",
+			get_exec_env()->veid, nlmsvc_users);
 
 	error = -ENOMEM;
 	serv = svc_create(&nlmsvc_program, LOCKD_BUFSIZE, NULL);
 	if (!serv) {
-		printk(KERN_WARNING "lockd_up: create service failed\n");
+		printk(KERN_WARNING "lockd_up: ct%d create service failed\n",
+				get_exec_env()->veid);
 		goto out;
 	}
 
-	register_inetaddr_notifier(&lockd_inetaddr_notifier);
-#if IS_ENABLED(CONFIG_IPV6)
-	fn = symbol_get(register_inet6addr_notifier);
-	if (fn) {
-		fn(&lockd_inet6addr_notifier);
-		symbol_put_addr(fn);
-	}
-#endif
-
+	lockd_register_notifiers();
 	error = make_socks(serv);
 	if (error < 0)
 		goto err_start;
@@ -386,22 +416,24 @@ int lockd_up(void)
 		error = PTR_ERR(nlmsvc_rqst);
 		nlmsvc_rqst = NULL;
 		printk(KERN_WARNING
-			"lockd_up: svc_rqst allocation failed, error=%d\n",
-			error);
+			"lockd_up: ct%d svc_rqst allocation failed, error=%d\n",
+			get_exec_env()->veid, error);
 		goto err_start;
 	}
 
+	atomic_inc(&nlm_ntf_refcnt);
 	svc_sock_update_bufs(serv);
 	serv->sv_maxconn = nlm_max_connections;
 
-	nlmsvc_task = kthread_run(lockd, nlmsvc_rqst, serv->sv_name);
+	nlmsvc_task = kthread_run_ve(get_exec_env(), lockd, nlmsvc_rqst, serv->sv_name);
 	if (IS_ERR(nlmsvc_task)) {
 		error = PTR_ERR(nlmsvc_task);
 		lockd_svc_exit_thread();
 		nlmsvc_task = NULL;
 		nlmsvc_rqst = NULL;
 		printk(KERN_WARNING
-			"lockd_up: kthread_run failed, error=%d\n", error);
+			"lockd_up: ct%d kthread_run failed, error=%d\n",
+			get_exec_env()->veid, error);
 		goto destroy_and_out;
 	}
 
@@ -433,14 +465,15 @@ lockd_down(void)
 		if (--nlmsvc_users)
 			goto out;
 	} else {
-		printk(KERN_ERR "lockd_down: no users! task=%p\n",
-			nlmsvc_task);
-		BUG();
+		printk(KERN_ERR "lockd_down: ct%d no users! task=%p\n",
+			get_exec_env()->veid, nlmsvc_task);
+		goto out;
 	}
 
 	if (!nlmsvc_task) {
-		printk(KERN_ERR "lockd_down: no lockd running.\n");
-		BUG();
+		printk(KERN_ERR "lockd_down: ct%d no lockd running.\n",
+				get_exec_env()->veid);
+		goto out;
 	}
 	kthread_stop(nlmsvc_task);
 	lockd_svc_exit_thread();
@@ -585,7 +618,6 @@ static int lockd_authenticate(struct svc_rqst *rqstp)
 	return SVC_DENIED;
 }
 
-
 param_set_min_max(port, int, simple_strtol, 0, 65535)
 param_set_min_max(grace_period, unsigned long, simple_strtoul,
 		  nlm_grace_period_min, nlm_grace_period_max)
@@ -610,19 +642,75 @@ module_param(nlm_max_connections, uint, 0644);
 /*
  * Initialising and terminating the module.
  */
+#ifdef CONFIG_VE
+static void ve_nlm_init(struct ve_nlm_data *nlm_data)
+{
+	INIT_DELAYED_WORK(&nlm_data->_grace_period_end, grace_ender);
+	INIT_LIST_HEAD(&nlm_data->_grace_list);
+	atomic_set(&nlm_data->_nlm_ntf_refcnt, 0);
+	init_waitqueue_head(&nlm_data->_nlm_ntf_wq);
+	get_exec_env()->nlm_data = nlm_data;
+}
+
+static int ve_lockd_init(void *data)
+{
+	struct ve_nlm_data *nlm_data;
+
+	nlm_data = kzalloc(sizeof(struct ve_nlm_data), GFP_KERNEL);
+	if (nlm_data == NULL)
+		return -ENOMEM;
+	ve_nlm_init(nlm_data);
+	return 0;
+}
+
+static struct ve_hook lockd_ss_hook = {
+	.init	  = ve_lockd_init,
+	.owner	  = THIS_MODULE,
+	.priority = HOOK_PRIO_NET_POST,
+};
+
+static void ve_lockd_cleanup(void *data)
+{
+	struct ve_struct *ve = data;
+
+	if (!ve->nlm_data)
+		return;
+
+	kfree(ve->nlm_data);
+	ve->nlm_data = NULL;
+}
+
+static struct ve_hook lockd_cleanup_hook = {
+	.fini     = ve_lockd_cleanup,
+	.owner	  = THIS_MODULE,
+	.priority = HOOK_PRIO_NET_POST,
+};
+
+static struct ve_nlm_data ve0_nlm_data;
+#endif
 
 static int __init init_nlm(void)
 {
 #ifdef CONFIG_SYSCTL
 	nlm_sysctl_table = register_sysctl_table(nlm_sysctl_root);
-	return nlm_sysctl_table ? 0 : -ENOMEM;
-#else
-	return 0;
+	if (nlm_sysctl_table == NULL)
+		return -ENOMEM;
 #endif
+#ifdef CONFIG_VE
+	ve_nlm_init(&ve0_nlm_data);
+
+	ve_hook_register(VE_SS_CHAIN, &lockd_ss_hook);
+	ve_hook_register(VE_CLEANUP_CHAIN, &lockd_cleanup_hook);
+#endif
+	return 0;
 }
 
 static void __exit exit_nlm(void)
 {
+#ifdef CONFIG_VE
+	ve_hook_unregister(&lockd_ss_hook);
+	ve_hook_unregister(&lockd_cleanup_hook);
+#endif
 	/* FIXME: delete all NLM clients */
 	nlm_shutdown_hosts();
 #ifdef CONFIG_SYSCTL
@@ -676,3 +764,4 @@ static struct svc_program	nlmsvc_program = {
 	.pg_stats		= &nlmsvc_stats,	/* stats table */
 	.pg_authenticate = &lockd_authenticate	/* export authentication */
 };
+

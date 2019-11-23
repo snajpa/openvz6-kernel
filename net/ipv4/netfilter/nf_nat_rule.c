@@ -186,16 +186,27 @@ static struct xt_target ipt_dnat_reg __read_mostly = {
 
 static int __net_init nf_nat_rule_net_init(struct net *net)
 {
+	if (!net_ipt_permitted(net, VE_IP_IPTABLE_NAT))
+		return 0;
+
 	net->ipv4.nat_table = ipt_register_table(net, &nat_table,
 						 &nat_initial_table.repl);
 	if (IS_ERR(net->ipv4.nat_table))
 		return PTR_ERR(net->ipv4.nat_table);
+
+	net_ipt_module_set(net, VE_IP_IPTABLE_NAT);
+
 	return 0;
 }
 
 static void __net_exit nf_nat_rule_net_exit(struct net *net)
 {
+	if (!net_is_ipt_module_set(net, VE_IP_IPTABLE_NAT))
+		return;
+
 	ipt_unregister_table(net->ipv4.nat_table);
+
+	net_ipt_module_clear(net, VE_IP_IPTABLE_NAT);
 }
 
 static struct pernet_operations nf_nat_rule_net_ops = {

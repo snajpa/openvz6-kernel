@@ -4,6 +4,7 @@
  * Subject to the GPL, v.2
  */
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/err.h>
 #include <linux/sched.h>
 #include <linux/init.h>
@@ -14,16 +15,24 @@
 #include <asm/proto.h>
 #include <asm/vdso.h>
 
+#include <linux/utsname.h>
+#include <linux/version.h>
+#include <linux/ve.h>
+
 #include "vextern.h"		/* Just for VMAGIC.  */
 #undef VEXTERN
 
 unsigned int __read_mostly vdso_enabled = 1;
 
 extern char vdso_start[], vdso_end[];
+extern char vdso_rhel5_start[], vdso_rhel5_end[];
 extern unsigned short vdso_sync_cpuid;
 
 static struct page **vdso_pages;
 static unsigned vdso_size;
+
+static struct page **vdso_rhel5_pages;
+static unsigned vdso_rhel5_size;
 
 static inline void *var_ref(void *p, char *name)
 {
@@ -62,6 +71,12 @@ static int __init init_vdso_vars(void)
 		vdso_enabled = 0;
 	}
 
+	init_uts_ns.vdso.addr		= vbase;
+	init_uts_ns.vdso.pages		= vdso_pages;
+	init_uts_ns.vdso.nr_pages	= npages;
+	init_uts_ns.vdso.size		= vdso_size;
+	init_uts_ns.vdso.version_off	= (unsigned long)VDSO64_SYMBOL(0, linux_version_code);
+
 #define VEXTERN(x) \
 	*(typeof(__ ## x) **) var_ref(VDSO64_SYMBOL(vbase, x), #x) = &__ ## x;
 #include "vextern.h"
@@ -74,6 +89,47 @@ static int __init init_vdso_vars(void)
 	return -ENOMEM;
 }
 __initcall(init_vdso_vars);
+
+static int __init init_vdso_rhel5_vars(void)
+{
+	int npages = (vdso_rhel5_end - vdso_rhel5_start + PAGE_SIZE - 1) / PAGE_SIZE;
+	int i;
+	char *vbase;
+
+	vdso_rhel5_size = npages << PAGE_SHIFT;
+	vdso_rhel5_pages = kmalloc(sizeof(struct page *) * npages, GFP_KERNEL);
+	if (!vdso_rhel5_pages)
+		goto oom;
+	for (i = 0; i < npages; i++) {
+		struct page *p;
+		p = alloc_page(GFP_KERNEL);
+		if (!p)
+			goto oom;
+		vdso_rhel5_pages[i] = p;
+		copy_page(page_address(p), vdso_rhel5_start + i*PAGE_SIZE);
+	}
+
+	vbase = vmap(vdso_rhel5_pages, npages, 0, PAGE_KERNEL);
+	if (!vbase)
+		goto oom;
+
+	if (memcmp(vbase, "\177ELF", 4)) {
+		printk("VDSO: I'm broken; not ELF\n");
+		vdso_enabled = 0;
+	}
+
+#define VEXTERN(x) \
+	*(typeof(__ ## x) **) var_ref(VDSO64_SYMBOL(vbase, rhel5_ ## x), #x) = &__ ## x;
+#include "vextern.h"
+#undef VEXTERN
+	return 0;
+
+ oom:
+	printk("Cannot allocate vdso\n");
+	vdso_enabled = 0;
+	return -ENOMEM;
+}
+__initcall(init_vdso_rhel5_vars);
 
 struct linux_binprm;
 
@@ -123,17 +179,24 @@ static unsigned long vdso_addr(unsigned long start, unsigned len)
 
 /* Setup a VMA at program startup for the vsyscall page.
    Not called for compat tasks */
-int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+int __arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp,
+				unsigned long map_address, struct page ** vdso_pages,
+				unsigned vdso_size)
 {
 	struct mm_struct *mm = current->mm;
 	unsigned long addr;
 	int ret;
 
-	if (!vdso_enabled)
+	if (!vdso_enabled && map_address == 0) {
+		current->mm->context.vdso = NULL;
 		return 0;
+	}
 
 	down_write(&mm->mmap_sem);
-	addr = vdso_addr(mm->start_stack, vdso_size);
+	if (map_address)
+		addr = map_address;
+	else
+		addr = vdso_addr(mm->start_stack, vdso_size);
 	addr = get_unmapped_area(NULL, addr, vdso_size, 0, 0);
 	if (IS_ERR_VALUE(addr)) {
 		ret = addr;
@@ -155,6 +218,135 @@ up_fail:
 	up_write(&mm->mmap_sem);
 	return ret;
 }
+
+static DEFINE_MUTEX(vdso_mutex);
+
+static int uts_arch_setup_additional_pages(struct linux_binprm *bprm,
+					   int uses_interp,
+					   unsigned long map_address)
+{
+	struct uts_namespace *uts_ns = current->nsproxy->uts_ns;
+	struct ve_struct *ve = get_exec_env();
+	int i, n1, n2, n3, new_version;
+	struct page **new_pages, **p;
+
+	/*
+	 * For node or in case we've not changed UTS simply
+	 * map preallocated original vDSO.
+	 *
+	 * In turn if we already allocated one for this UTS
+	 * simply reuse it. It improves speed significantly.
+	 */
+	if (uts_ns == &init_uts_ns)
+		goto map_init_uts;
+
+	/*
+	 * Dirty lockless hack. Strictly speaking
+	 * we need to return @p here if it's non-nil,
+	 * but since there only one trasition possible
+	 * { =0 ; !=0 } we simply return @uts_ns->vdso.pages
+	 */
+	p = ACCESS_ONCE(uts_ns->vdso.pages);
+	smp_read_barrier_depends();
+	if (p)
+		goto map_uts;
+
+	if (sscanf(uts_ns->name.release, "%d.%d.%d", &n1, &n2, &n3) == 3) {
+		/*
+		 * If there were no changes on version simply reuse
+		 * preallocated one.
+		 */
+		new_version = KERNEL_VERSION(n1, n2, n3);
+		if (new_version == LINUX_VERSION_CODE)
+			goto map_init_uts;
+	} else {
+		/*
+		 * If admin is passed malformed string here
+		 * lets warn him once but continue working
+		 * not using vDSO virtualization at all. It's
+		 * better than walk out with error.
+		 */
+		pr_warn_once("Wrong release uts name format detected."
+			     " Ignoring vDSO virtualization.\n");
+		goto map_init_uts;
+	}
+
+	mutex_lock(&vdso_mutex);
+	if (uts_ns->vdso.pages) {
+		mutex_unlock(&vdso_mutex);
+		goto map_uts;
+	}
+
+	uts_ns->vdso.nr_pages	= init_uts_ns.vdso.nr_pages;
+	uts_ns->vdso.size	= init_uts_ns.vdso.size;
+	uts_ns->vdso.version_off= init_uts_ns.vdso.version_off;
+	new_pages		= kmalloc(sizeof(struct page *) * init_uts_ns.vdso.nr_pages, GFP_KERNEL);
+	if (!new_pages) {
+		pr_err("Can't allocate vDSO pages array for VE %d\n", ve->veid);
+		goto out_unlock;
+	}
+
+	for (i = 0; i < uts_ns->vdso.nr_pages; i++) {
+		struct page *p = alloc_page(GFP_KERNEL);
+		if (!p) {
+			pr_err("Can't allocate page for VE %d\n", ve->veid);
+			for (; i > 0; i--)
+				put_page(new_pages[i - 1]);
+			kfree(new_pages);
+			goto out_unlock;
+		}
+		new_pages[i] = p;
+		copy_page(page_address(p), page_address(init_uts_ns.vdso.pages[i]));
+	}
+
+	uts_ns->vdso.addr = vmap(new_pages, uts_ns->vdso.nr_pages, 0, PAGE_KERNEL);
+	if (!uts_ns->vdso.addr) {
+		pr_err("Can't map vDSO pages for VE %d\n", ve->veid);
+		for (i = 0; i < uts_ns->vdso.nr_pages; i++)
+			put_page(new_pages[i]);
+		kfree(new_pages);
+		goto out_unlock;
+	}
+
+	*((int *)(uts_ns->vdso.addr + uts_ns->vdso.version_off)) = new_version;
+	smp_wmb();
+	uts_ns->vdso.pages = new_pages;
+	mutex_unlock(&vdso_mutex);
+
+	pr_debug("vDSO version transition %d -> %d for VE %d\n",
+		 LINUX_VERSION_CODE, new_version, ve->veid);
+
+map_uts:
+	return __arch_setup_additional_pages(bprm, uses_interp, map_address,
+					     uts_ns->vdso.pages, uts_ns->vdso.size);
+map_init_uts:
+	return __arch_setup_additional_pages(bprm, uses_interp, map_address,
+					     init_uts_ns.vdso.pages, init_uts_ns.vdso.size);
+out_unlock:
+	mutex_unlock(&vdso_mutex);
+	return -ENOMEM;
+}
+
+int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp,
+				unsigned long map_address)
+{
+	return uts_arch_setup_additional_pages(bprm, uses_interp, map_address);
+}
+EXPORT_SYMBOL(arch_setup_additional_pages);
+
+int arch_setup_additional_pages_rhel5(struct linux_binprm *bprm, int uses_interp,
+				unsigned long map_address)
+{
+	return __arch_setup_additional_pages(bprm, uses_interp, map_address,
+					vdso_rhel5_pages, vdso_rhel5_size);
+}
+EXPORT_SYMBOL(arch_setup_additional_pages_rhel5);
+
+int vdso_is_rhel5(struct page *page)
+{
+	return page == vdso_rhel5_pages[0];
+}
+EXPORT_SYMBOL(vdso_is_rhel5);
 
 static __init int vdso_setup(char *s)
 {

@@ -61,6 +61,7 @@ struct anon_vma {
 
 	struct anon_vma *parent;	/* Parent of this anon_vma */
 #endif
+	struct user_beancounter *anon_vma_ub;
 };
 
 /*
@@ -175,6 +176,8 @@ void drop_anon_vma(struct anon_vma *);
 #define drop_anon_vma(x)	do {} while(0)
 #endif
 
+extern int anon_vma_link(struct vm_area_struct *vma);
+
 static inline void anon_vma_merge(struct vm_area_struct *vma,
 				  struct vm_area_struct *next)
 {
@@ -190,7 +193,7 @@ void page_add_anon_rmap(struct page *, struct vm_area_struct *, unsigned long);
 void do_page_add_anon_rmap(struct page *, struct vm_area_struct *,
 			   unsigned long, int);
 void page_add_new_anon_rmap(struct page *, struct vm_area_struct *, unsigned long);
-void page_add_file_rmap(struct page *);
+void page_add_file_rmap(struct page *, struct mm_struct *);
 void page_remove_rmap(struct page *);
 
 void hugepage_add_anon_rmap(struct page *, struct vm_area_struct *,
@@ -215,6 +218,7 @@ enum ttu_flags {
 	TTU_UNMAP = 0,			/* unmap mode */
 	TTU_MIGRATION = 1,		/* migration mode */
 	TTU_MUNLOCK = 2,		/* munlock mode */
+	TTU_VSWAP = 3,			/* vswap mode */
 	TTU_ACTION_MASK = 0xff,
 
 	TTU_IGNORE_MLOCK = (1 << 8),	/* ignore mlock */
@@ -255,8 +259,8 @@ int try_to_munlock(struct page *);
 /*
  * Called by memory-failure.c to kill processes.
  */
-struct anon_vma *page_lock_anon_vma(struct page *page);
-void page_unlock_anon_vma(struct anon_vma *anon_vma);
+extern struct anon_vma *page_lock_anon_vma(struct page *page);
+extern void page_unlock_anon_vma(struct anon_vma *anon_vma);
 int page_mapped_in_vma(struct page *page, struct vm_area_struct *vma);
 
 struct rmap_walk_control {

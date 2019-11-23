@@ -19,6 +19,8 @@
 #include <asm/kmemcheck.h>		/* kmemcheck_*(), ...		*/
 #include <asm/reboot.h>
 
+#include <bc/oom_kill.h>
+
 /*
  * Page fault error code bits:
  *
@@ -744,7 +746,7 @@ show_signal_msg(struct pt_regs *regs, unsigned long error_code,
 	if (!printk_ratelimit())
 		return;
 
-	printk("%s%s[%d]: segfault at %lx ip %p sp %p error %lx",
+	ve_printk(VE_LOG, "%s%s[%d]: segfault at %lx ip %p sp %p error %lx",
 		task_pid_nr(tsk) > 1 ? KERN_INFO : KERN_EMERG,
 		tsk->comm, task_pid_nr(tsk), address,
 		(void *)regs->ip, (void *)regs->sp, error_code);
@@ -831,6 +833,7 @@ bad_area_access_error(struct pt_regs *regs, unsigned long error_code,
 	__bad_area(regs, error_code, address, SEGV_ACCERR);
 }
 
+#if 0
 /* TODO: fixup for "mm-invoke-oom-killer-from-page-fault.patch" */
 static void
 out_of_memory(struct pt_regs *regs, unsigned long error_code,
@@ -842,8 +845,9 @@ out_of_memory(struct pt_regs *regs, unsigned long error_code,
 	 */
 	up_read(&current->mm->mmap_sem);
 
-	pagefault_out_of_memory();
+	out_of_memory_in_ub(get_exec_ub(), 0);
 }
+#endif
 
 static void
 do_sigbus(struct pt_regs *regs, unsigned long error_code, unsigned long address,
@@ -898,7 +902,14 @@ mm_fault_error(struct pt_regs *regs, unsigned long error_code,
 			return;
 		}
 
-		out_of_memory(regs, error_code, address);
+		/*
+		 * This fault can be caused by two different reasons:
+		 * 1) Buddy allocator failed to alloc a page for pud and friends.
+		 * 2) OOM-killed failed to provide us requred memory.
+		 * Current task can't execute in such circumstances.
+		 */
+		up_read(&current->mm->mmap_sem);
+		send_sig(SIGKILL, current, 0);
 	} else {
 		if (fault & (VM_FAULT_SIGBUS|VM_FAULT_HWPOISON|
 			     VM_FAULT_HWPOISON_LARGE))
@@ -998,7 +1009,7 @@ spurious_fault(unsigned long error_code, unsigned long address)
 	return ret;
 }
 
-int show_unhandled_signals = 1;
+int show_unhandled_signals = 0;
 
 static inline int
 access_error(unsigned long error_code, int write, struct vm_area_struct *vma)

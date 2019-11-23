@@ -109,7 +109,7 @@ int blk_execute_rq(struct request_queue *q, struct gendisk *bd_disk,
 
 	rq->end_io_data = &wait;
 	blk_execute_rq_nowait(q, bd_disk, rq, at_head, blk_end_sync_rq);
-	wait_for_completion(&wait);
+	wait_for_completion_io(&wait);
 
 	if (rq->errors)
 		err = -EIO;

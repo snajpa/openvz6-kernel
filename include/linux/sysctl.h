@@ -996,6 +996,8 @@ extern int proc_dostring(struct ctl_table *, int,
 			 void __user *, size_t *, loff_t *);
 extern int proc_dointvec(struct ctl_table *, int,
 			 void __user *, size_t *, loff_t *);
+extern int proc_dointvec_once(struct ctl_table *, int,
+			      void __user *, size_t *, loff_t *);
 extern int proc_dointvec_minmax(struct ctl_table *, int,
 				void __user *, size_t *, loff_t *);
 extern int proc_dointvec_jiffies(struct ctl_table *, int,
@@ -1117,9 +1119,17 @@ struct ctl_table_header *__register_sysctl_paths(
 struct ctl_table_header *register_sysctl_table(struct ctl_table * table);
 struct ctl_table_header *register_sysctl_paths(const struct ctl_path *path,
 						struct ctl_table *table);
+struct ctl_table_header *register_sysctl_glob_table(struct ctl_table *, int);
+struct ctl_table_header *register_sysctl_glob_paths(const struct ctl_path *,
+						struct ctl_table *, int);
+struct ctl_table *sysctl_ve_table(struct ctl_table *, struct ctl_table *, int);
 
 void unregister_sysctl_table(struct ctl_table_header * table);
 int sysctl_check_table(struct nsproxy *namespaces, struct ctl_table *table);
+
+extern int ve_allow_kthreads;
+extern int ve_allow_module_load;
+extern int sysctl_ve_netns_nr;
 
 #endif /* __KERNEL__ */
 

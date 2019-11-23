@@ -82,6 +82,7 @@ struct inet_timewait_death_row {
 	struct inet_hashinfo 	*hashinfo;
 	int			sysctl_tw_recycle;
 	int			sysctl_max_tw_buckets;
+	int			ub_managed;
 };
 
 extern void inet_twdr_hangman(unsigned long data);
@@ -138,6 +139,7 @@ struct inet_timewait_sock {
 	unsigned long		tw_ttd;
 	struct inet_bind_bucket	*tw_tb;
 	struct hlist_node	tw_death_node;
+	envid_t			tw_owner_env;
 };
 
 static inline void inet_twsk_add_node_rcu(struct inet_timewait_sock *tw,
@@ -217,14 +219,14 @@ extern void inet_twsk_schedule(struct inet_timewait_sock *tw,
 extern void inet_twsk_deschedule(struct inet_timewait_sock *tw,
 				 struct inet_timewait_death_row *twdr);
 
-extern void inet_twsk_purge(struct net *net, struct inet_hashinfo *hashinfo,
+extern void inet_twsk_purge(struct inet_hashinfo *hashinfo,
 			    struct inet_timewait_death_row *twdr, int family);
 
 static inline
 struct net *twsk_net(const struct inet_timewait_sock *twsk)
 {
 #ifdef CONFIG_NET_NS
-	return twsk->tw_net;
+	return rcu_dereference(twsk->tw_net);
 #else
 	return &init_net;
 #endif
@@ -234,7 +236,7 @@ static inline
 void twsk_net_set(struct inet_timewait_sock *twsk, struct net *net)
 {
 #ifdef CONFIG_NET_NS
-	twsk->tw_net = net;
+	rcu_assign_pointer(twsk->tw_net, net);
 #endif
 }
 #endif	/* _INET_TIMEWAIT_SOCK_ */

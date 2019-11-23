@@ -37,6 +37,7 @@
 #include <linux/kobject.h>
 #include <linux/mutex.h>
 #include <linux/file.h>
+#include <linux/ve_proto.h>
 #include <asm/uaccess.h>
 #include <linux/lockdep.h>
 #include "internal.h"
@@ -48,7 +49,9 @@ static char *sb_writers_name[SB_FREEZE_LEVELS] = {
 };
 
 LIST_HEAD(super_blocks);
+EXPORT_SYMBOL(super_blocks);
 DEFINE_SPINLOCK(sb_lock);
+EXPORT_SYMBOL(sb_lock);
 
 static int init_sb_writers(struct super_block *s, struct file_system_type *type)
 {
@@ -64,7 +67,7 @@ static int init_sb_writers(struct super_block *s, struct file_system_type *type)
 		if (err < 0)
 			goto err_out;
 		lockdep_init_map(&s->s_writers.lock_map[i], sb_writers_name[i],
-				 &type->s_writers_key[i], 0);
+				 &type->proto->s_writers_key[i], 0);
 	}
 	init_waitqueue_head(&s->s_writers.wait);
 	init_waitqueue_head(&s->s_writers.wait_unfrozen);
@@ -109,22 +112,41 @@ static struct super_block *alloc_super(struct file_system_type *type)
 			s = NULL;
 			goto out;
 		}
+#ifdef CONFIG_SMP
+		s->s_files = alloc_percpu(struct list_head);
+		if (!s->s_files) {
+			security_sb_free(s);
+			kfree(s);
+			s = NULL;
+			goto out;
+		} else {
+			int i;
+
+			for_each_possible_cpu(i)
+				INIT_LIST_HEAD(per_cpu_ptr(s->s_files, i));
+		}
+#else
 		INIT_LIST_HEAD(&s->s_files);
+#endif
 		if (init_sb_writers(s, type))
 			goto err_out;
+
+		s->s_bdi = &default_backing_dev_info;
 		INIT_LIST_HEAD(&s->s_instances);
 		INIT_HLIST_HEAD(&s->s_anon);
 		INIT_LIST_HEAD(&s->s_inodes);
 		INIT_LIST_HEAD(&s->s_dentry_lru);
 		init_rwsem(&s->s_umount);
 		mutex_init(&s->s_lock);
-		lockdep_set_class(&s->s_umount, &type->s_umount_key);
+		lockdep_set_class(&s->s_umount,
+				&type->proto->s_umount_key);
 		/*
 		 * The locking rules for s_lock are up to the
 		 * filesystem. For example ext3fs has different
 		 * lock ordering than usbfs:
 		 */
-		lockdep_set_class(&s->s_lock, &type->s_lock_key);
+		lockdep_set_class(&s->s_lock,
+				&type->proto->s_lock_key);
 		/*
 		 * sget() can have s_umount recursion.
 		 *
@@ -144,6 +166,8 @@ static struct super_block *alloc_super(struct file_system_type *type)
 		s->s_count = 1;
 		atomic_set(&s->s_active, 1);
 		mutex_init(&s->s_vfs_rename_mutex);
+		lockdep_set_class(&s->s_vfs_rename_mutex,
+				&type->proto->s_rename_mutex_key);
 		mutex_init(&s->s_dquot.dqio_mutex);
 		mutex_init(&s->s_dquot.dqonoff_mutex);
 		init_rwsem(&s->s_dquot.dqptr_sem);
@@ -176,6 +200,9 @@ err_out:
  */
 static inline void destroy_super(struct super_block *s)
 {
+#ifdef CONFIG_SMP
+	free_percpu(s->s_files);
+#endif
 	security_sb_free(s);
 	destroy_sb_writers(s);
 	kfree(s->s_subtype);
@@ -220,6 +247,7 @@ int __put_super_and_need_restart(struct super_block *sb)
 	BUG_ON(sb->s_count == 0);
 	return 0;
 }
+EXPORT_SYMBOL(__put_super_and_need_restart);
 
 /**
  *	put_super	-	drop a temporary reference to superblock
@@ -234,7 +262,7 @@ void put_super(struct super_block *sb)
 	__put_super(sb);
 	spin_unlock(&sb_lock);
 }
-
+EXPORT_SYMBOL(put_super);
 
 /**
  *	deactivate_super	-	drop an active reference to superblock
@@ -249,8 +277,9 @@ void deactivate_super(struct super_block *s)
 {
 	struct file_system_type *fs = s->s_type;
 	if (atomic_dec_and_test(&s->s_active)) {
-		vfs_dq_off(s, 0);
 		down_write(&s->s_umount);
+		if (!(s->s_type->fs_flags & FS_HANDLE_QUOTA))
+			vfs_dq_off(s, 0);
 		fs->kill_sb(s);
 		put_filesystem(fs);
 		put_super(s);
@@ -274,7 +303,8 @@ void deactivate_locked_super(struct super_block *s)
 {
 	struct file_system_type *fs = s->s_type;
 	if (atomic_dec_and_test(&s->s_active)) {
-		vfs_dq_off(s, 0);
+		if (!(s->s_type->fs_flags & FS_HANDLE_QUOTA))
+			vfs_dq_off(s, 0);
 		fs->kill_sb(s);
 		put_filesystem(fs);
 		put_super(s);
@@ -361,11 +391,13 @@ void generic_shutdown_super(struct super_block *sb)
 		/* bad name - it should be evict_inodes() */
 		invalidate_inodes(sb, true);
 
+		if (sb->dq_op && sb->dq_op->shutdown)
+			sb->dq_op->shutdown(sb);
 		if (sop->put_super)
 			sop->put_super(sb);
 
 		/* Forget any remaining inodes */
-		if (invalidate_inodes(sb, true)) {
+		if (invalidate_inodes_check(sb, true, 1)) {
 			printk("VFS: Busy inodes after unmount of %s. "
 			   "Self-destruct in 5 seconds.  Have a nice day...\n",
 			   sb->s_id);
@@ -612,6 +644,7 @@ rescan:
 	spin_unlock(&sb_lock);
 	return NULL;
 }
+EXPORT_SYMBOL(user_get_super);
 
 /*
  * This is an internal function, please use sb_end_{write,pagefault,intwrite}
@@ -632,6 +665,9 @@ void __sb_end_write(struct super_block *sb, int level)
 	if (waitqueue_active(&sb->s_writers.wait))
 		wake_up(&sb->s_writers.wait);
 	rwsem_release(&sb->s_writers.lock_map[level-1], 1, _RET_IP_);
+
+	if (sb->s_op->end_write)
+		sb->s_op->end_write(sb, level);
 }
 EXPORT_SYMBOL(__sb_end_write);
 
@@ -646,7 +682,7 @@ EXPORT_SYMBOL(__sb_end_write);
  * already hold a freeze protection for a higher freeze level.
  */
 static void acquire_freeze_lock(struct super_block *sb, int level, bool trylock,
-				unsigned long ip)
+				int force_write, unsigned long ip)
 {
 	int i;
 
@@ -656,6 +692,12 @@ static void acquire_freeze_lock(struct super_block *sb, int level, bool trylock,
 				trylock = true;
 				break;
 			}
+		if (!trylock && force_write && debug_locks) {
+			if (lock_is_held(&sb->s_writers.lock_map[level-1]))
+				trylock = true;
+			else
+				WARN(1, "Unprotected force-write");
+		}
 	}
 	rwsem_acquire_read(&sb->s_writers.lock_map[level-1], 0, trylock, ip);
 }
@@ -667,19 +709,29 @@ static void acquire_freeze_lock(struct super_block *sb, int level, bool trylock,
  */
 int __sb_start_write(struct super_block *sb, int level, bool wait)
 {
+	int force_write = wait && (current->flags & PF_FSTRANS);
+
 	/* Out of tree modules don't use this mechanism */
 	if (unlikely(!sb_has_new_freeze(sb)))
 		return 1;
 retry:
+	if (sb->s_op->start_write && !sb->s_op->start_write(sb, level, wait))
+		return 0;
+
+	/* CAP_FS_FREEZE is aplicable only if task may block */
 	if (unlikely(sb->s_writers.frozen >= level)) {
-		if (!wait)
+		if (!wait) {
+			if (sb->s_op->end_write)
+				sb->s_op->end_write(sb, level);
 			return 0;
-		wait_event(sb->s_writers.wait_unfrozen,
-			   sb->s_writers.frozen < level);
+		}
+		if (!force_write)
+			wait_event(sb->s_writers.wait_unfrozen,
+				   sb->s_writers.frozen < level);
 	}
 
 #ifdef CONFIG_LOCKDEP
-	acquire_freeze_lock(sb, level, !wait, _RET_IP_);
+	acquire_freeze_lock(sb, level, !wait, force_write, _RET_IP_);
 #endif
 	percpu_counter_inc(&sb->s_writers.counter[level-1]);
 	/*
@@ -687,7 +739,7 @@ retry:
 	 * freeze_super() first sets frozen and then checks the counter.
 	 */
 	smp_mb();
-	if (unlikely(sb->s_writers.frozen >= level)) {
+	if (unlikely(sb->s_writers.frozen >= level && !force_write)) {
 		__sb_end_write(sb, level);
 		goto retry;
 	}
@@ -787,8 +839,13 @@ int do_remount_sb(struct super_block *sb, int flags, void *data, int force)
 
 	if (sb->s_op->remount_fs) {
 		retval = sb->s_op->remount_fs(sb, &flags, data);
-		if (retval)
+		if (retval) {
+			/* Remount failed, fallback quota to original state */
+			if (remount_ro &&
+			    !(sb->s_type->fs_flags & FS_HANDLE_QUOTA))
+				vfs_dq_quota_on_remount(sb);
 			return retval;
+		}
 	}
 	sb->s_flags = (sb->s_flags & ~MS_RMT_MASK) | (flags & MS_RMT_MASK);
 	if (remount_rw && !(sb->s_type->fs_flags & FS_HANDLE_QUOTA))
@@ -852,6 +909,13 @@ static DEFINE_IDA(unnamed_dev_ida);
 static DEFINE_SPINLOCK(unnamed_dev_lock);/* protects the above */
 static int unnamed_dev_start = 0; /* don't bother trying below it */
 
+/* for compatibility with coreutils still unaware of new minor sizes */
+int unnamed_dev_majors[] = {
+	0, 144, 145, 146, 242, 243, 244, 245,
+	246, 247, 248, 249, 250, 251, 252, 253
+};
+EXPORT_SYMBOL(unnamed_dev_majors);
+
 int set_anon_super(struct super_block *s, void *data)
 {
 	int dev;
@@ -871,7 +935,7 @@ int set_anon_super(struct super_block *s, void *data)
 	else if (error)
 		return -EAGAIN;
 
-	if ((dev & MAX_ID_MASK) == (1 << MINORBITS)) {
+	if ((dev & MAX_ID_MASK) >= (1 << MINORBITS)) {
 		spin_lock(&unnamed_dev_lock);
 		ida_remove(&unnamed_dev_ida, dev);
 		if (unnamed_dev_start > dev)
@@ -879,7 +943,8 @@ int set_anon_super(struct super_block *s, void *data)
 		spin_unlock(&unnamed_dev_lock);
 		return -EMFILE;
 	}
-	s->s_dev = MKDEV(0, dev & MINORMASK);
+	s->s_dev = make_unnamed_dev(dev);
+	s->s_bdi = &noop_backing_dev_info;
 	return 0;
 }
 
@@ -887,8 +952,9 @@ EXPORT_SYMBOL(set_anon_super);
 
 void kill_anon_super(struct super_block *sb)
 {
-	int slot = MINOR(sb->s_dev);
+	int slot;
 
+	slot = unnamed_dev_idx(sb->s_dev);
 	generic_shutdown_super(sb);
 	spin_lock(&unnamed_dev_lock);
 	ida_remove(&unnamed_dev_ida, slot);
@@ -1009,12 +1075,27 @@ int get_sb_bdev(struct file_system_type *fs_type,
 		close_bdev_exclusive(bdev, mode);
 	} else {
 		char b[BDEVNAME_SIZE];
+#ifdef CONFIG_VE
+		void *data_orig = data;
+		struct ve_struct *ve = get_exec_env();
 
+		if (!ve_is_super(ve)) {
+			error = ve_devmnt_process(ve, bdev->bd_dev, &data, 0);
+			if (error) {
+				deactivate_locked_super(s);
+				goto error;
+			}
+		}
+#endif
 		s->s_flags = flags;
 		s->s_mode = mode;
 		strlcpy(s->s_id, bdevname(bdev, b), sizeof(s->s_id));
 		sb_set_blocksize(s, block_size(bdev));
 		error = fill_super(s, data, flags & MS_SILENT ? 1 : 0);
+#ifdef CONFIG_VE
+		if (data_orig != data)
+			free_page((unsigned long)data);
+#endif
 		if (error) {
 			deactivate_locked_super(s);
 			goto error;
@@ -1138,6 +1219,8 @@ vfs_kern_mount(struct file_system_type *type, int flags, const char *name, void 
 	if (error < 0)
 		goto out_free_secdata;
 	BUG_ON(!mnt->mnt_sb);
+	WARN_ON(!mnt->mnt_sb->s_bdi);
+	WARN_ON(mnt->mnt_sb->s_bdi == &default_backing_dev_info);
 	mnt->mnt_sb->s_flags |= MS_BORN;
 
  	error = security_sb_kern_mount(mnt->mnt_sb, flags, secdata);

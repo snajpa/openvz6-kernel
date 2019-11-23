@@ -151,12 +151,12 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 
 	read_lock_irqsave(&tasklist_lock, flags);
 
-	do_each_thread(g, p) {
+	do_each_thread_all(g, p) {
 		if (!p->se.on_rq || task_cpu(p) != rq_cpu)
 			continue;
 
 		print_task(m, rq, p);
-	} while_each_thread(g, p);
+	} while_each_thread_all(g, p);
 
 	read_unlock_irqrestore(&tasklist_lock, flags);
 }
@@ -220,6 +220,11 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 		   cfs_rq->load_contribution);
 	SEQ_printf(m, "  .%-30s: %d\n", "load_tg",
 		   atomic_read(&tg->load_weight));
+#endif
+
+#ifdef CONFIG_CFS_CPULIMIT
+	SEQ_printf(m, "  .%-30s: %d\n", "nr_cpus_active",
+		   atomic_read(&tg->nr_cpus_active));
 #endif
 
 	print_cfs_group_stats(m, cpu, cfs_rq->tg);
@@ -359,9 +364,11 @@ static int sched_debug_show(struct seq_file *m, void *v)
 	return 0;
 }
 
-static void sysrq_sched_debug_show(void)
+void show_sched_debug(void)
 {
+	read_lock(&tasklist_lock);
 	sched_debug_show(NULL, NULL);
+	read_unlock(&tasklist_lock);
 }
 
 static int sched_debug_open(struct inode *inode, struct file *filp)

@@ -10,6 +10,7 @@
 #include <linux/types.h>
 #include <linux/ip.h>
 #include <linux/netfilter.h>
+#include <net/net_namespace.h>
 #include <linux/module.h>
 #include <linux/skbuff.h>
 #include <linux/icmp.h>
@@ -197,7 +198,7 @@ static ctl_table ip_ct_sysctl_table[] = {
 	{
 		.ctl_name	= NET_IPV4_NF_CONNTRACK_MAX,
 		.procname	= "ip_conntrack_max",
-		.data		= &nf_conntrack_max,
+		.data		= &init_net.ct.max,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
@@ -367,6 +368,33 @@ struct nf_conntrack_l3proto nf_conntrack_l3proto_ipv4 __read_mostly = {
 	.me		 = THIS_MODULE,
 };
 
+static int nf_conntrack_l3proto_ipv4_init_net(struct net *net)
+{
+	if (!net_ipt_permitted(net, VE_IP_CONNTRACK))
+		return 0;
+	/*
+	 * FIXME:
+	 * Need virtualize per-net sysctls
+	 */
+
+	net_ipt_module_set(net, VE_IP_CONNTRACK);
+	return 0;
+}
+
+static void nf_conntrack_l3proto_ipv4_fini_net(struct net *net)
+{
+	/* A dummy call in a sake of consistency */
+	if (net_is_ipt_module_set(net, VE_IP_CONNTRACK))
+		net_ipt_module_clear(net, VE_IP_CONNTRACK);
+
+	return;
+}
+
+static struct pernet_operations nf_conntrack_ipv4_net_ops = {
+	.init = nf_conntrack_l3proto_ipv4_init_net,
+	.exit = nf_conntrack_l3proto_ipv4_fini_net,
+};
+
 module_param_call(hashsize, nf_conntrack_set_hashsize, param_get_uint,
 		  &nf_conntrack_htable_size, 0600);
 
@@ -380,6 +408,12 @@ static int __init nf_conntrack_l3proto_ipv4_init(void)
 
 	need_conntrack();
 	nf_defrag_ipv4_enable();
+
+	ret = register_pernet_subsys(&nf_conntrack_ipv4_net_ops);
+	if (ret) {
+		printk(KERN_ERR "nf_conntrack_ipv4: Unable to register pernet operations\n");
+		return ret;
+	}
 
 	ret = nf_register_sockopt(&so_getorigdst);
 	if (ret < 0) {
@@ -452,6 +486,7 @@ static void __exit nf_conntrack_l3proto_ipv4_fini(void)
 	nf_conntrack_l4proto_unregister(&nf_conntrack_l4proto_udp4);
 	nf_conntrack_l4proto_unregister(&nf_conntrack_l4proto_tcp4);
 	nf_unregister_sockopt(&so_getorigdst);
+	unregister_pernet_subsys(&nf_conntrack_ipv4_net_ops);
 }
 
 module_init(nf_conntrack_l3proto_ipv4_init);

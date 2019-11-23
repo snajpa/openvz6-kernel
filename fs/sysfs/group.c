@@ -62,6 +62,8 @@ static int internal_create_group(struct kobject *kobj, int update,
 	struct sysfs_dirent *sd;
 	int error;
 
+	if (!ve_sysfs_alowed())
+		return 0;
 	BUG_ON(!kobj);
 
 	/* RHEL specific
@@ -182,6 +184,9 @@ void sysfs_remove_group(struct kobject * kobj,
 {
 	struct sysfs_dirent *dir_sd = kobj->sd;
 	struct sysfs_dirent *sd;
+
+	if (!ve_sysfs_alowed())
+		return;
 
 	if (grp->name) {
 		sd = sysfs_get_dirent(dir_sd, grp->name);

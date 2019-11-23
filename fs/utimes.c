@@ -40,6 +40,20 @@ SYSCALL_DEFINE2(utime, char __user *, filename, struct utimbuf __user *, times)
 
 #endif
 
+SYSCALL_DEFINE2(lutime, char __user *, filename, struct utimbuf __user *, times)
+{
+	struct timespec tv[2];
+
+	if (times) {
+		if (get_user(tv[0].tv_sec, &times->actime) ||
+		    get_user(tv[1].tv_sec, &times->modtime))
+			return -EFAULT;
+		tv[0].tv_nsec = 0;
+		tv[1].tv_nsec = 0;
+	}
+	return do_utimes(AT_FDCWD, filename, times ? tv : NULL, AT_SYMLINK_NOFOLLOW);
+}
+
 static bool nsec_valid(long nsec)
 {
 	if (nsec == UTIME_OMIT || nsec == UTIME_NOW)

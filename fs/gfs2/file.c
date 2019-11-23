@@ -364,6 +364,13 @@ static int gfs2_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
 	loff_t size;
 	int ret;
 
+	if (vma->vm_file->f_op->get_host) {
+		struct file *file = vma->vm_file->f_op->get_host(vma->vm_file);
+		inode = file->f_path.dentry->d_inode;
+		ip = GFS2_I(inode);
+		sdp = GFS2_SB(inode);
+	}
+
 	sb_start_pagefault(inode->i_sb);
 
 	ret = gfs2_rsqa_alloc(ip);
@@ -590,14 +597,14 @@ static int gfs2_release(struct inode *inode, struct file *file)
 static int gfs2_fsync(struct file *file, struct dentry *dentry, int datasync)
 {
 	struct inode *inode = dentry->d_inode;
-	int sync_state = inode->i_state & I_DIRTY;
+	int sync_state = inode->i_state & I_DIRTY_ALL;
 	struct gfs2_inode *ip = GFS2_I(inode);
 	int ret;
 
 	if (!gfs2_is_jdata(ip))
 		sync_state &= ~I_DIRTY_PAGES;
 	if (datasync)
-		sync_state &= ~I_DIRTY_SYNC;
+		sync_state &= ~(I_DIRTY_SYNC|I_DIRTY_TIME);
 
 	if (sync_state) {
 		ret = sync_inode_metadata(inode, 1);

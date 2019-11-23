@@ -1,15 +1,15 @@
 /*
  * Code for the vDSO.  This version uses the old int $0x80 method.
  *
- * First get the common code for the sigreturn entry points.
- * This must come first.
+ * NOTE:
+ * 1) __kernel_vsyscall _must_ be first in this page.
+ * 2) there are alignment constraints on this stub, see vsyscall-sigreturn.S
+ *    for details.
  */
-#include "sigreturn.S"
 
 	.text
 	.globl __kernel_vsyscall
 	.type __kernel_vsyscall,@function
-	ALIGN
 __kernel_vsyscall:
 .LSTART_vsyscall:
 	int $0x80
@@ -54,3 +54,8 @@ VDSO32_vsyscall_eh_frame_size = 0x40
 	.section .data,"aw",@progbits
 	.space VDSO32_vsyscall_eh_frame_size-(.LENDFDEDLSI-.LSTARTFRAMEDLSI), 0
 	.previous
+
+/*
+ * Get the common code for the sigreturn entry points.
+ */
+#include "sigreturn.S"

@@ -47,6 +47,8 @@
 					   overrides the coredump filter bits */
 #define MADV_DODUMP	17		/* Clear the MADV_NODUMP flag */
 
+#define MADV_DEACTIVATE	32		/* deactivate page */
+
 /* compatibility flags */
 #define MAP_FILE	0
 

@@ -682,6 +682,13 @@ static void __cpuinit init_amd(struct cpuinfo_x86 *c)
 #endif
 
 	/*
+	 * Family 0x12 and above processors have APIC timer
+	 * running in deep C states.
+	 */
+	if (c->x86 > 0x11)
+		set_cpu_cap(c, X86_FEATURE_ARAT);
+
+	/*
 	 * Disable GART TLB Walk Errors on Fam10h. We do this here
 	 * because this is always needed when GART is enabled, even in a
 	 * kernel which has no MCE support built in.

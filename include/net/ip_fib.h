@@ -217,6 +217,7 @@ extern int fib_validate_source(__be32 src, __be32 dst, u8 tos, int oif,
 			       u32 *itag, u32 mark);
 extern void fib_select_default(struct net *net, const struct flowi *flp,
 			       struct fib_result *res);
+extern void fib_free_table(struct fib_table *tb);
 
 /* Exported by fib_semantics.c */
 extern int ip_fib_check_default(__be32 gw, struct net_device *dev);

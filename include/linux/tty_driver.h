@@ -309,7 +309,13 @@ struct tty_driver {
 
 	const struct tty_operations *ops;
 	struct list_head tty_drivers;
+	struct ve_struct *owner_env;
 };
+
+#ifdef CONFIG_LEGACY_PTYS
+extern struct tty_driver *pty_driver;
+extern struct tty_driver *pty_slave_driver;
+#endif
 
 extern struct list_head tty_drivers;
 
@@ -318,6 +324,9 @@ extern void put_tty_driver(struct tty_driver *driver);
 extern void tty_set_operations(struct tty_driver *driver,
 			const struct tty_operations *op);
 extern struct tty_driver *tty_find_polling_driver(char *name, int *line);
+
+int init_ve_tty_class(void);
+void fini_ve_tty_class(void);
 
 extern void tty_driver_kref_put(struct tty_driver *driver);
 

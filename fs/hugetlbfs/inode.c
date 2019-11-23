@@ -958,7 +958,7 @@ static int can_do_hugetlb_shm(void)
  * otherwise hugetlb_reserve_pages reserves one less hugepages than intended.
  */
 struct file *hugetlb_file_setup(const char *name, size_t size,
-				int acctflag, struct user_struct **user,
+				vm_flags_t acctflag, struct user_struct **user,
 				int creat_flags)
 {
 	int error = -ENOMEM;

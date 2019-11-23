@@ -26,6 +26,7 @@
 #include <linux/file.h>
 #include <linux/fdtable.h>
 #include <linux/mm.h>
+#include <linux/virtinfo.h>
 #include <linux/stat.h>
 #include <linux/fcntl.h>
 #include <linux/smp_lock.h>
@@ -61,6 +62,9 @@
 #include <asm/mmu_context.h>
 #include <asm/tlb.h>
 #include "internal.h"
+
+#include <bc/vmpages.h>
+#include <bc/kmem.h>
 
 int core_uses_pid;
 char core_pattern[CORENAME_MAX_SIZE] = "core";
@@ -278,9 +282,14 @@ static int __bprm_mm_init(struct linux_binprm *bprm)
 	struct vm_area_struct *vma = NULL;
 	struct mm_struct *mm = bprm->mm;
 
-	bprm->vma = vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
+	err = -ENOMEM;
+	if (ub_memory_charge(mm, PAGE_SIZE, VM_STACK_FLAGS | mm->def_flags,
+				NULL, UB_SOFT))
+		goto err_charge;
+
+	bprm->vma = vma = allocate_vma(mm, GFP_KERNEL | __GFP_ZERO);
 	if (!vma)
-		return -ENOMEM;
+		goto err_alloc;
 
 	down_write(&mm->mmap_sem);
 	vma->vm_mm = mm;
@@ -313,7 +322,10 @@ static int __bprm_mm_init(struct linux_binprm *bprm)
 err:
 	up_write(&mm->mmap_sem);
 	bprm->vma = NULL;
-	kmem_cache_free(vm_area_cachep, vma);
+	free_vma(mm, vma);
+err_alloc:
+	ub_memory_uncharge(mm, PAGE_SIZE, VM_STACK_FLAGS | mm->def_flags, NULL);
+err_charge:
 	return err;
 }
 
@@ -572,6 +584,8 @@ static int shift_arg_pages(struct vm_area_struct *vma, unsigned long shift)
 	unsigned long new_start = old_start - shift;
 	unsigned long new_end = old_end - shift;
 	struct mmu_gather *tlb;
+	unsigned long moved;
+	struct vm_area_struct *prev;
 
 	BUG_ON(new_start > new_end);
 
@@ -589,12 +603,11 @@ static int shift_arg_pages(struct vm_area_struct *vma, unsigned long shift)
 		return -ENOMEM;
 
 	/*
-	 * move the page tables downwards, on failure we rely on
-	 * process cleanup to remove whatever mess we made.
+	 * move the page tables downwards, on failure undo changes.
 	 */
-	if (length != move_page_tables(vma, old_start,
-				       vma, new_start, length))
-		return -ENOMEM;
+	moved = move_page_tables(vma, old_start, vma, new_start, length);
+	if (length != moved)
+		goto undo;
 
 	lru_add_drain();
 	tlb = tlb_gather_mmu(mm, 0);
@@ -622,6 +635,36 @@ static int shift_arg_pages(struct vm_area_struct *vma, unsigned long shift)
 	vma_adjust(vma, new_start, new_end, vma->vm_pgoff, NULL);
 
 	return 0;
+
+undo:
+	/*
+	 * move the page tables back.
+	 */
+	length = move_page_tables(vma, new_start, vma, old_start, moved);
+	if (WARN_ON(length != moved))
+		return -EFAULT;
+
+	/*
+	 * release unused page tables.
+	 */
+	find_vma_prev(mm, vma->vm_start, &prev);
+	tlb = tlb_gather_mmu(mm, 0);
+	if (new_end > old_start)
+		free_pgd_range(tlb, new_start, old_start,
+				prev ? prev->vm_end : FIRST_USER_ADDRESS,
+				old_start);
+	else
+		free_pgd_range(tlb, new_start, new_end,
+				prev ? prev->vm_end : FIRST_USER_ADDRESS,
+				old_start);
+	tlb_finish_mmu(tlb, new_start, new_end);
+
+	/*
+	 * shrink the vma to the old range.
+	 */
+	vma_adjust(vma, old_start, old_end, vma->vm_pgoff, NULL);
+
+	return -ENOMEM;
 }
 
 #define EXTRA_STACK_VM_PAGES	20	/* random */
@@ -791,10 +834,10 @@ int kernel_read(struct file *file, loff_t offset,
 
 EXPORT_SYMBOL(kernel_read);
 
-static int exec_mmap(struct mm_struct *mm)
+static int exec_mmap(struct linux_binprm *bprm)
 {
 	struct task_struct *tsk;
-	struct mm_struct * old_mm, *active_mm;
+	struct mm_struct *old_mm, *active_mm, *mm;
 
 	/* Notify parent that we're no longer interested in the old VM */
 	tsk = current;
@@ -814,17 +857,18 @@ static int exec_mmap(struct mm_struct *mm)
 			return -EINTR;
 		}
 	}
+
+	mm = bprm->mm;
+	mm->vps_dumpable = VD_PTRACE_COREDUMP;
 	task_lock(tsk);
 	active_mm = tsk->active_mm;
 	tsk->mm = mm;
 	tsk->active_mm = mm;
 	activate_mm(active_mm, mm);
-	if (old_mm && tsk->signal->oom_score_adj == OOM_SCORE_ADJ_MIN) {
-		atomic_dec(&old_mm->oom_disable_count);
-		atomic_inc(&tsk->mm->oom_disable_count);
-	}
 	task_unlock(tsk);
 	arch_pick_mmap_layout(mm);
+	bprm->mm = NULL;		/* We're using it now */
+
 	if (old_mm) {
 		up_read(&old_mm->mmap_sem);
 		BUG_ON(active_mm != old_mm);
@@ -930,6 +974,12 @@ static int de_thread(struct task_struct *tsk)
 		transfer_pid(leader, tsk, PIDTYPE_PGID);
 		transfer_pid(leader, tsk, PIDTYPE_SID);
 		list_replace_rcu(&leader->tasks, &tsk->tasks);
+#ifdef CONFIG_VE
+		list_replace_rcu(&leader->ve_task_info.vetask_list,
+				&tsk->ve_task_info.vetask_list);
+		list_replace(&leader->ve_task_info.aux_list,
+			     &tsk->ve_task_info.aux_list);
+#endif
 
 		tsk->group_leader = tsk;
 		leader->group_leader = tsk;
@@ -1060,11 +1110,9 @@ int flush_old_exec(struct linux_binprm * bprm)
 	 * Release all of the old mmap stuff
 	 */
 	acct_arg_size(bprm, 0);
-	retval = exec_mmap(bprm->mm);
+	retval = exec_mmap(bprm);
 	if (retval)
 		goto out;
-
-	bprm->mm = NULL;		/* We're using it now */
 
 	current->flags &= ~PF_RANDOMIZE;
 	flush_thread();
@@ -1265,7 +1313,7 @@ int check_unsafe_exec(struct linux_binprm *bprm)
 		bprm->unsafe |= LSM_UNSAFE_NO_NEW_PRIVS;
 
 	n_fs = 1;
-	write_lock(&p->fs->lock);
+	spin_lock(&p->fs->lock);
 	rcu_read_lock();
 	for (t = next_thread(p); t != p; t = next_thread(t)) {
 		if (t->fs == p->fs)
@@ -1282,7 +1330,7 @@ int check_unsafe_exec(struct linux_binprm *bprm)
 			res = 1;
 		}
 	}
-	write_unlock(&p->fs->lock);
+	spin_unlock(&p->fs->lock);
 
 	return res;
 }
@@ -1763,7 +1811,7 @@ static int zap_process(struct task_struct *start, int exit_code)
 			signal_wake_up(t, 1);
 			nr++;
 		}
-	} while_each_thread(start, t);
+	} while_each_thread_ve(start, t);
 
 	return nr;
 }
@@ -1821,7 +1869,7 @@ static int zap_threads(struct task_struct *tsk, struct mm_struct *mm,
 	 *	next_thread().
 	 */
 	rcu_read_lock();
-	for_each_process(g) {
+	for_each_process_all(g) {
 		if (g == tsk->group_leader)
 			continue;
 		if (g->flags & PF_KTHREAD)
@@ -1837,7 +1885,7 @@ static int zap_threads(struct task_struct *tsk, struct mm_struct *mm,
 				}
 				break;
 			}
-		} while_each_thread(g, p);
+		} while_each_thread_all(g, p);
 	}
 	rcu_read_unlock();
 done:
@@ -1944,6 +1992,7 @@ void set_dumpable(struct mm_struct *mm, int value)
 		break;
 	}
 }
+EXPORT_SYMBOL_GPL(set_dumpable);
 
 /*
  * This returns the actual value of the suid_dumpable flag. For things
@@ -2006,7 +2055,7 @@ static void wait_for_dump_helpers(struct file *file)
  * is a special value that we use to trap recursive
  * core dumps
  */
-static int umh_pipe_setup(struct subprocess_info *info)
+static int umh_pipe_setup(struct subprocess_info *info, struct cred *new)
 {
 	struct file *rp, *wp;
 	struct fdtable *fdt;
@@ -2078,7 +2127,8 @@ void do_coredump(long signr, int exit_code, struct pt_regs *regs)
 	/*
 	 * If another thread got here first, or we are not dumpable, bail out.
 	 */
-	if (mm->core_state || !get_dumpable(mm)) {
+	if (mm->core_state || !get_dumpable(mm) ||
+	    mm->vps_dumpable != VD_PTRACE_COREDUMP) {
 		up_write(&mm->mmap_sem);
 		put_cred(cred);
 		goto fail;

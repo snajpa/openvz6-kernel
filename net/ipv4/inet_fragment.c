@@ -19,6 +19,7 @@
 #include <linux/random.h>
 #include <linux/skbuff.h>
 #include <linux/rtnetlink.h>
+#include <linux/sched.h>
 
 #include <net/inet_frag.h>
 
@@ -296,6 +297,10 @@ static struct inet_frag_queue *inet_frag_alloc(struct netns_frags *nf,
 		return NULL;
 
 	q->net = nf;
+#ifdef CONFIG_VE
+	q->owner_ve = get_exec_env();
+#endif
+
 	f->constructor(q, arg);
 	add_frag_mem_limit(q, f->qsize);
 

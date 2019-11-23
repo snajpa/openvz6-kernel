@@ -274,7 +274,7 @@ struct ts_config *textsearch_prepare(const char *algo, const void *pattern,
 	 * especially when the module is located on a NFS mount.
 	 */
 	if (ops == NULL && flags & TS_AUTOLOAD) {
-		request_module("ts_%s", algo);
+		ve0_request_module("ts_%s", algo);
 		ops = lookup_ts_algo(algo);
 	}
 #endif

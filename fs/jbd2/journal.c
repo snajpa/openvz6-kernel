@@ -487,7 +487,6 @@ int __jbd2_log_start_commit(journal_t *journal, tid_t target)
 			  journal->j_commit_request,
 			  journal->j_commit_sequence);
 		wake_up(&journal->j_wait_commit);
-		return 1;
 	} else if (!tid_geq(journal->j_commit_request, target))
 		/* This should never happen, but if it does, preserve
 		   the evidence before kjournald goes into a loop and
@@ -496,7 +495,8 @@ int __jbd2_log_start_commit(journal_t *journal, tid_t target)
 		     journal->j_commit_request, journal->j_commit_sequence,
 		     target, journal->j_running_transaction ? 
 		     journal->j_running_transaction->t_tid : 0);
-	return 0;
+
+	return tid_gt(target, journal->j_commit_sequence);
 }
 
 int jbd2_log_start_commit(journal_t *journal, tid_t tid)
@@ -642,12 +642,11 @@ int jbd2_log_wait_commit(journal_t *journal, tid_t tid)
 				!tid_gt(tid, journal->j_commit_sequence));
 		spin_lock(&journal->j_state_lock);
 	}
-	spin_unlock(&journal->j_state_lock);
-
 	if (unlikely(is_journal_aborted(journal))) {
 		printk(KERN_EMERG "journal commit I/O error\n");
 		err = -EIO;
 	}
+	spin_unlock(&journal->j_state_lock);
 	return err;
 }
 

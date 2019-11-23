@@ -82,6 +82,9 @@ struct sha512_state {
 	u8 buf[SHA512_BLOCK_SIZE];
 };
 
+extern int crypto_sha1_update(struct shash_desc *desc, const u8 *data,
+			      unsigned int len);
+
 extern int crypto_sha256_update(struct shash_desc *desc, const u8 *data,
 			      unsigned int len);
 

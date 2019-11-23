@@ -459,6 +459,7 @@ config UNIX98_PTYS
 config DEVPTS_MULTIPLE_INSTANCES
 	bool "Support multiple instances of devpts"
 	depends on UNIX98_PTYS
+	default y if VE
 	default n
 	---help---
 	  Enable support for multiple instances of devpts filesystem.

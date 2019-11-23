@@ -86,7 +86,7 @@ extern void macvlan_count_rx(const struct macvlan_dev *vlan,
 			     unsigned int len, bool success,
 			     bool multicast);
 
-extern void macvlan_dellink(struct net_device *dev);
+extern void macvlan_dellink(struct net_device *dev, struct list_head *head);
 
 extern int macvlan_link_register(struct rtnl_link_ops *ops);
 

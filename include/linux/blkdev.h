@@ -393,6 +393,7 @@ struct request_queue
 #ifdef CONFIG_BLK_DEV_IO_TRACE
 	struct blk_trace	*blk_trace;
 #endif
+
 	/*
 	 * DEPRECATED: please use "for flush operations" members below!
 	 * These members (through orig_bar_rq) are preserved purely
@@ -420,6 +421,7 @@ struct request_queue
 	unsigned int		flush_queue_delayed:1;
 	unsigned int		flush_pending_idx:1;
 	unsigned int		flush_running_idx:1;
+	atomic_t		flush_tag;
 	unsigned long		flush_pending_since;
 	struct list_head	flush_queue[2];
 	struct list_head	flush_data_in_flight;
@@ -429,6 +431,10 @@ struct request_queue
 	/* Throttle data */
 	struct throtl_data *td;
 #endif
+#ifdef CONFIG_BLK_DEV_CBT
+	struct cbt_info	*cbt;
+#endif
+
 	/*
 	 * Delayed queue handling
 	 */
@@ -1401,6 +1407,17 @@ static inline int blk_integrity_rq(struct request *rq)
 
 #endif /* CONFIG_BLK_DEV_INTEGRITY */
 
+#if defined (CONFIG_BLK_DEV_CBT)
+extern void blk_cbt_update_size(struct block_device *bdev);
+extern void blk_cbt_release(struct request_queue *q);
+extern void blk_cbt_bio_queue(struct request_queue *q, struct bio *bio);
+extern int blk_cbt_ioctl(struct block_device *bdev, unsigned cmd, char __user *arg);
+#else /* CONFIG_BLK_DEV_CBT */
+#define blk_cbt_update_size(b) (0)
+#define blk_cbt_release(q) (0)
+#define blk_cbt_bio_queue(q,bio) (0)
+#define blk_cbt_ioctl(b,c,a) (-ENOTTY)
+#endif /* CONFIG_BLK_DEV_CBT */
 struct block_device_operations {
 	int (*open) (struct block_device *, fmode_t);
 	int (*release) (struct gendisk *, fmode_t);

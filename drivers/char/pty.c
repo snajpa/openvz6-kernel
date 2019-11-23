@@ -29,6 +29,8 @@
 #include <linux/bitops.h>
 #include <linux/devpts_fs.h>
 
+#include <bc/misc.h>
+
 #include <asm/system.h>
 
 #ifdef CONFIG_UNIX98_PTYS
@@ -39,6 +41,8 @@ static struct tty_driver *pts_driver;
 static void pty_close(struct tty_struct *tty, struct file *filp)
 {
 	BUG_ON(!tty);
+
+	ub_pty_uncharge(tty);
 	if (tty->driver->subtype == PTY_TYPE_MASTER)
 		WARN_ON(tty->count > 1);
 	else {
@@ -56,7 +60,8 @@ static void pty_close(struct tty_struct *tty, struct file *filp)
 	if (tty->driver->subtype == PTY_TYPE_MASTER) {
 		set_bit(TTY_OTHER_CLOSED, &tty->flags);
 #ifdef CONFIG_UNIX98_PTYS
-		if (tty->driver == ptm_driver)
+		if (tty->link->driver_data &&
+		    tty->driver->flags & TTY_DRIVER_DEVPTS_MEM)
 			devpts_pty_kill(tty->link);
 #endif
 		tty_vhangup(tty->link);
@@ -197,6 +202,10 @@ static int pty_open(struct tty_struct *tty, struct file *filp)
 	if (test_bit(TTY_PTY_LOCK, &tty->link->flags))
 		goto out;
 	if (tty->link->count != 1)
+		goto out;
+
+	retval = -ENOMEM;
+	if (ub_pty_charge(tty))
 		goto out;
 
 	clear_bit(TTY_OTHER_CLOSED, &tty->link->flags);
@@ -356,9 +365,12 @@ static const struct tty_operations slave_pty_ops_bsd = {
 	.resize = pty_resize
 };
 
+struct tty_driver *pty_driver, *pty_slave_driver;
+EXPORT_SYMBOL(pty_driver);
+EXPORT_SYMBOL(pty_slave_driver);
+
 static void __init legacy_pty_init(void)
 {
-	struct tty_driver *pty_driver, *pty_slave_driver;
 
 	if (legacy_count <= 0)
 		return;
@@ -589,7 +601,7 @@ static int __ptmx_open(struct inode *inode, struct file *filp)
 		return index;
 
 	mutex_lock(&tty_mutex);
-	tty = tty_init_dev(ptm_driver, index, 1);
+	tty = tty_init_dev(ptm_driver, index, NULL, 1);
 	mutex_unlock(&tty_mutex);
 
 	if (IS_ERR(tty)) {
@@ -598,8 +610,8 @@ static int __ptmx_open(struct inode *inode, struct file *filp)
 	}
 
 	set_bit(TTY_PTY_LOCK, &tty->flags); /* LOCK THE SLAVE */
-	filp->private_data = tty;
-	file_move(filp, &tty->tty_files);
+
+	tty_add_file(tty, filp);
 
 	retval = devpts_pty_new(inode, tty->link);
 	if (retval)
@@ -692,10 +704,474 @@ static void __init unix98_pty_init(void)
 static inline void unix98_pty_init(void) { }
 #endif
 
+#ifdef CONFIG_VTTYS
+
+static struct tty_driver *vttm_driver;
+struct tty_driver *vtty_driver;
+
+#include <linux/file.h>
+#include <linux/anon_inodes.h>
+
+static struct tty_struct *vtty_masters;
+static DEFINE_SPINLOCK(vtty_lock);
+
+static void vtty_line_name(int veid, int idx, char *p)
+{
+	snprintf(p, 64, "v%dtty%d", veid, idx+1);
+}
+
+static void vtty_install_master(int veid, struct tty_struct *vtty)
+{
+	pr_debug("%s %d %d %p\n", __func__, veid, vtty->index, vtty);
+	vtty_line_name(veid, vtty->index, vtty->name);
+	spin_lock(&vtty_lock);
+	vtty->driver_data = vtty_masters;
+	vtty_masters = vtty;
+	spin_unlock(&vtty_lock);
+}
+
+static struct tty_struct *vtty_lookup_master(const char *name)
+{
+	struct tty_struct *tty;
+
+	spin_lock(&vtty_lock);
+	for ( tty = vtty_masters ; tty ; tty = tty->driver_data ) {
+		if (!strcmp(tty->name, name))
+			break;
+	}
+	spin_unlock(&vtty_lock);
+	pr_debug("%s %s %p\n", __func__, name, tty);
+	return tty;
+}
+
+static void vtty_remove_master(struct tty_struct *vtty)
+{
+	struct tty_struct **ptty;
+
+	pr_debug("%s %s %d %p\n", __func__, vtty->name, vtty->index, vtty);
+	spin_lock(&vtty_lock);
+	for ( ptty = &vtty_masters ; *ptty ;
+			ptty = (struct tty_struct **)&(*ptty)->driver_data ) {
+		if (*ptty == vtty) {
+			*ptty = vtty->driver_data;
+			break;
+		}
+	}
+	spin_unlock(&vtty_lock);
+}
+
+static void vtty_install_slave(struct ve_struct *ve, struct tty_struct *vtty)
+{
+	pr_debug("%s %d %d %p\n", __func__, ve->veid, vtty->index, vtty);
+	spin_lock(&vtty_lock);
+	vtty->owner_env = ve;
+	ve->vtty[vtty->index] = vtty;
+	spin_unlock(&vtty_lock);
+}
+
+static struct tty_struct *vtty_lookup_slave(struct ve_struct *ve, int idx)
+{
+	pr_debug("%s %d %d %p\n", __func__, ve->veid, idx, ve->vtty[idx]);
+	return ve->vtty[idx];
+}
+
+static void vtty_remove_slave(struct tty_struct *vtty)
+{
+	pr_debug("%s %d %d %p\n", __func__,
+			vtty->owner_env->veid, vtty->index, vtty);
+	spin_lock(&vtty_lock);
+	if (vtty->owner_env->vtty[vtty->index] == vtty) {
+		vtty->owner_env->vtty[vtty->index] = NULL;
+		vtty->owner_env = get_ve0();
+	}
+	spin_unlock(&vtty_lock);
+}
+
+static struct tty_struct *vtty_lookup(struct tty_driver *driver,
+				      struct inode *inode, int idx)
+{
+	struct tty_struct *tty;
+	struct ve_struct *ve = get_exec_env();
+
+	BUG_ON(driver != vtty_driver);
+
+	if (idx < 0 || idx >= MAX_NR_VTTY)
+		return ERR_PTR(-EIO);
+	tty = vtty_lookup_slave(ve, idx);
+	if (!tty) {
+		char name[64];
+
+		vtty_line_name(ve->veid, idx, name);
+		tty = vtty_lookup_master(name);
+		if (tty) {
+			tty = tty->link;
+			vtty_install_slave(ve, tty);
+		}
+	}
+	if (tty && test_bit(TTY_CLOSING, &tty->flags)) {
+		if (test_bit(TTY_CLOSING, &tty->link->flags)) {
+			pr_debug("%s %d %d %p close-race\n", __func__,
+					ve->veid, idx, tty);
+			tty = NULL;
+		} else
+			clear_bit(TTY_CLOSING, &tty->flags);
+	}
+	pr_debug("%s %s %d %p %d\n", __func__,
+			driver->name, idx, tty, tty ? tty->count : -1);
+	return tty;
+}
+
+static int vtty_install(struct tty_driver *driver, struct tty_struct *tty)
+{
+	struct tty_struct *o_tty;
+	int idx = tty->index;
+	struct ve_struct *ve = get_exec_env();
+
+	BUG_ON(driver != vtty_driver);
+
+	o_tty = alloc_tty_struct();
+	if (!o_tty)
+		return -ENOMEM;
+	if (!try_module_get(driver->other->owner)) {
+		/* This cannot in fact currently happen */
+		free_tty_struct(o_tty);
+		return -ENOMEM;
+	}
+	initialize_tty_struct(o_tty, driver->other, idx);
+
+	tty->termios = kzalloc(sizeof(struct ktermios[2]), GFP_KERNEL);
+	if (tty->termios == NULL)
+		goto free_mem_out;
+	*tty->termios = driver->init_termios;
+	tty->termios_locked = tty->termios + 1;
+
+	o_tty->termios = kzalloc(sizeof(struct ktermios[2]), GFP_KERNEL);
+	if (o_tty->termios == NULL)
+		goto free_mem_out;
+	*o_tty->termios = driver->other->init_termios;
+	o_tty->termios_locked = o_tty->termios + 1;
+
+	tty_driver_kref_get(driver->other);
+	tty_driver_kref_get(driver);
+
+	tty->link   = o_tty;
+	o_tty->link = tty;
+
+	vtty_install_slave(ve, tty);
+	vtty_install_master(ve->veid, o_tty);
+
+	tty->count++;
+	tty->count++;	 /* master hold slave reference */
+	o_tty->count++;  /* slave hold master reference */
+	set_bit(TTY_EXTRA_REFERENCE, &o_tty->flags);
+
+	pr_debug("%s %s %d %p %d\n", __func__,
+			driver->name, idx, tty, tty->count);
+	pr_debug("%s %s %d %p %d\n", __func__,
+			driver->other->name, idx, o_tty, o_tty->count);
+
+	return 0;
+
+free_mem_out:
+	kfree(tty->termios);
+	module_put(o_tty->driver->owner);
+	free_tty_struct(o_tty);
+	return -ENOMEM;
+}
+
+static int vtty_open(struct tty_struct *tty, struct file *filp)
+{
+	pr_debug("%s %s %d %p %d\n", __func__,
+			tty->driver->name, tty->index, tty, tty->count);
+	set_bit(TTY_THROTTLED, &tty->flags);
+	return 0;
+}
+
+static void vtty_close(struct tty_struct *tty, struct file *filp)
+{
+	struct tty_struct *o_tty = tty->link;
+
+	pr_debug("%s %s %d %p %d\n", __func__,
+			tty->driver->name, tty->index, tty, tty->count);
+	pr_debug("%s %s %d %p %d\n", __func__,
+			o_tty->driver->name, o_tty->index, o_tty, o_tty->count);
+
+	if (tty->count > 2)
+		return;
+
+	if (tty->driver == vtty_driver) {
+		if (o_tty->count == 1) {
+			clear_bit(TTY_EXTRA_REFERENCE, &o_tty->flags);
+			o_tty->count--;
+			tty->count--;
+		}
+	} else {
+		if (o_tty->count == 1) {
+			clear_bit(TTY_EXTRA_REFERENCE, &tty->flags);
+			tty->count--;
+		} else
+			o_tty->count++;
+	}
+
+	pr_debug("%s %s %d %p %d\n", __func__,
+			tty->driver->name, tty->index, tty, tty->count);
+	pr_debug("%s %s %d %p %d\n", __func__,
+			o_tty->driver->name, o_tty->index, o_tty, o_tty->count);
+
+	if (tty->count == 1) {
+		set_bit(TTY_OTHER_CLOSED, &tty->flags);
+		set_bit(TTY_OTHER_CLOSED, &o_tty->flags);
+	}
+
+	tty->packet = 0;
+	wake_up_interruptible(&tty->read_wait);
+	wake_up_interruptible(&tty->write_wait);
+	o_tty->packet = 0;
+	wake_up_interruptible(&o_tty->read_wait);
+	wake_up_interruptible(&o_tty->write_wait);
+
+	if (tty->count == 1) {
+		tty_vhangup(o_tty);
+		tty_vhangup(tty);
+	}
+}
+
+static void vtty_remove(struct tty_driver *driver, struct tty_struct *tty)
+{
+	pr_debug("%s %s %d %p %d\n", __func__,
+			driver->name, tty->index, tty, tty->count);
+}
+
+static void vtty_shutdown(struct tty_struct *tty)
+{
+	pr_debug("%s %s %d %p %d\n", __func__,
+			tty->driver->name, tty->index, tty, tty->count);
+	if (tty->driver == vtty_driver)
+		vtty_remove_slave(tty);
+	else
+		vtty_remove_master(tty);
+	kfree(tty->termios);
+}
+
+static int vtty_write(struct tty_struct *tty, const unsigned char *buf, int c)
+{
+	struct tty_struct *to = tty->link;
+
+	if (tty->stopped)
+		return 0;
+
+	if (c > 0) {
+		/* Stuff the data into the input queue of the other end */
+		c = tty_insert_flip_string(to, buf, c);
+		/* And shovel */
+		if (c) {
+			tty_flip_buffer_push(to);
+			tty_wakeup(tty);
+		} else if (to->count < 2)
+			/* thow out data */
+			tty_perform_flush(to, TCIFLUSH);
+	}
+	return c;
+}
+
+static int vtty_write_room(struct tty_struct *tty)
+{
+	struct tty_struct *to = tty->link;
+
+	if (tty->stopped)
+		return 0;
+	if (to->count < 2)
+		return 4096;
+	return pty_space(to);
+}
+
+static const struct tty_operations vttm_ops = {
+	.lookup = vtty_lookup,
+	.install = vtty_install,
+	.remove = vtty_remove,
+	.open = vtty_open,
+	.close = vtty_close,
+	.shutdown = vtty_shutdown,
+	.write = vtty_write,
+	.write_room = vtty_write_room,
+	.flush_buffer = pty_flush_buffer,
+	.chars_in_buffer = pty_chars_in_buffer,
+	.unthrottle = pty_unthrottle,
+	.set_termios = pty_set_termios,
+	.resize = pty_resize,
+};
+
+static const struct tty_operations vtty_ops = {
+	.lookup = vtty_lookup,
+	.install = vtty_install,
+	.remove = vtty_remove,
+	.open = vtty_open,
+	.close = vtty_close,
+	.shutdown = vtty_shutdown,
+	.write = vtty_write,
+	.write_room = vtty_write_room,
+	.flush_buffer = pty_flush_buffer,
+	.chars_in_buffer = pty_chars_in_buffer,
+	.unthrottle = pty_unthrottle,
+	.set_termios = pty_set_termios,
+};
+
+static struct file_operations vtty_fops;
+
+int vtty_open_master(int veid, int idx)
+{
+	struct tty_struct *tty;
+	struct file *file;
+	int fd, err;
+	char name[64];
+
+	err = -ENODEV;
+	if (idx < 0 || idx >= MAX_NR_VTTY)
+		goto err_out;
+
+	fd = get_unused_fd_flags(0);
+	err = fd;
+	if (fd < 0)
+		goto err_out;
+
+	vtty_line_name(veid, idx, name);
+	file = anon_inode_getfile(name, &vtty_fops, NULL, O_RDWR);
+	err = PTR_ERR(file);
+	if (IS_ERR(file))
+		goto err_file;
+
+	lock_kernel();
+	mutex_lock(&tty_mutex);
+	tty = vtty_lookup_master(name);
+	if (!tty || (test_bit(TTY_CLOSING, &tty->flags) &&
+		     test_bit(TTY_CLOSING, &tty->link->flags))) {
+		tty = tty_init_dev(vtty_driver, idx, tty, 1);
+		err = PTR_ERR(tty);
+		if (IS_ERR(tty))
+			goto err_tty;
+		tty->count--;
+		vtty_remove_slave(tty);
+		tty = tty->link;
+		vtty_remove_master(tty);
+		vtty_install_master(veid, tty);
+	}
+
+	pr_debug("%s %s %d %p %d\n", __func__,
+			tty->driver->name, tty->index, tty, tty->count);
+
+	err = -EBUSY;
+	if (tty->count > 1)
+		goto err_tty;
+
+	tty->count++;
+	mutex_unlock(&tty_mutex);
+	tty_add_file(tty, file);
+	clear_bit(TTY_CLOSING, &tty->flags);
+	set_bit(TTY_THROTTLED, &tty->flags);
+	unlock_kernel();
+
+	fd_install(fd, file);
+	return fd;
+
+err_tty:
+	mutex_unlock(&tty_mutex);
+	unlock_kernel();
+	file->f_op = NULL;
+	fput(file);
+err_file:
+	put_unused_fd(fd);
+err_out:
+	return err;
+}
+EXPORT_SYMBOL(vtty_open_master);
+
+#include <linux/ve_proto.h>
+
+static int vtty_ve_init(void *data)
+{
+	return 0;
+}
+
+static void vtty_ve_fini(void *data)
+{
+	struct ve_struct *ve = data;
+	struct tty_struct *vtty;
+	int idx;
+
+	mutex_lock(&tty_mutex);
+	for (idx = 0 ; idx < MAX_NR_VTTY ; idx++) {
+		vtty = vtty_lookup_slave(ve, idx);
+		if (vtty)
+			vtty_remove_slave(vtty);
+	}
+	mutex_unlock(&tty_mutex);
+}
+
+static struct ve_hook vtty_ve_hook = {
+	.init		= vtty_ve_init,
+	.fini		= vtty_ve_fini,
+	.owner		= THIS_MODULE,
+};
+
+static void __init vtty_init(void)
+{
+	tty_default_fops(&vtty_fops);
+
+	vttm_driver = alloc_tty_driver(MAX_NR_VTTY);
+	if (!vttm_driver)
+		panic("Couldn't allocate vttm driver");
+	vtty_driver = alloc_tty_driver(MAX_NR_VTTY);
+	if (!vtty_driver)
+		panic("Couldn't allocate vtty driver");
+
+	vttm_driver->owner = THIS_MODULE;
+	vttm_driver->driver_name = "vttm";
+	vttm_driver->name = "vttm";
+	vttm_driver->name_base = 1;
+	vttm_driver->major = TTY_MAJOR;
+	vttm_driver->minor_start = 1;
+	vttm_driver->type = TTY_DRIVER_TYPE_PTY;
+	vttm_driver->subtype = PTY_TYPE_MASTER;
+	vttm_driver->init_termios = tty_std_termios;
+	vttm_driver->init_termios.c_iflag = 0;
+	vttm_driver->init_termios.c_oflag = 0;
+	vttm_driver->init_termios.c_cflag = B38400 | CS8 | CREAD;
+	vttm_driver->init_termios.c_lflag = 0;
+	vttm_driver->flags = TTY_DRIVER_RESET_TERMIOS | TTY_DRIVER_REAL_RAW |
+		TTY_DRIVER_DYNAMIC_DEV | TTY_DRIVER_DEVPTS_MEM |
+		TTY_DRIVER_INSTALLED;
+	vttm_driver->other = vtty_driver;
+	tty_set_operations(vttm_driver, &vttm_ops);
+	cdev_init(&vttm_driver->cdev, &vtty_fops);
+
+	vtty_driver->owner = THIS_MODULE;
+	vtty_driver->driver_name = "vtty";
+	vtty_driver->name = "vtty";
+	vtty_driver->name_base = 1;
+	vtty_driver->major = TTY_MAJOR;
+	vtty_driver->minor_start = 1;
+	vtty_driver->type = TTY_DRIVER_TYPE_PTY;
+	vtty_driver->subtype = PTY_TYPE_SLAVE;
+	vtty_driver->init_termios = tty_std_termios;
+	vtty_driver->init_termios.c_cflag = B38400 | CS8 | CREAD;
+	vtty_driver->flags = TTY_DRIVER_RESET_TERMIOS | TTY_DRIVER_REAL_RAW |
+		TTY_DRIVER_DYNAMIC_DEV | TTY_DRIVER_DEVPTS_MEM |
+		TTY_DRIVER_INSTALLED;
+	vtty_driver->other = vttm_driver;
+	tty_set_operations(vtty_driver, &vtty_ops);
+	cdev_init(&vtty_driver->cdev, &vtty_fops);
+
+	ve_hook_register(VE_SS_CHAIN, &vtty_ve_hook);
+}
+#else
+static inline void ve_pty_init(void) { }
+#endif
+
 static int __init pty_init(void)
 {
 	legacy_pty_init();
 	unix98_pty_init();
+	vtty_init();
 	return 0;
 }
 module_init(pty_init);

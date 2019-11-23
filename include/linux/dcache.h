@@ -102,6 +102,7 @@ struct dentry {
 	struct qstr d_name;
 
 	struct list_head d_lru;		/* LRU list */
+	struct list_head d_bclru;		/* LRU list */
 	/*
 	 * d_child and d_rcu can share memory
 	 */
@@ -116,9 +117,15 @@ struct dentry {
 	struct super_block *d_sb;	/* The root of the dentry tree */
 	void *d_fsdata;			/* fs-specific data */
 
+	unsigned int d_lru_time;
+
+	struct user_beancounter *d_ub;
 	unsigned char d_iname[DNAME_INLINE_LEN_MIN];	/* small names */
 };
 
+#define DNAME_INLINE_LEN (sizeof(struct dentry)-offsetof(struct dentry,d_iname))
+
+extern struct kmem_cache *dentry_cache;
 /*
  * dentry->d_lock spinlock nesting subclasses:
  *
@@ -194,6 +201,8 @@ d_automount:	no		no		no	 yes
 #define DCACHE_FSNOTIFY_PARENT_WATCHED 0x0080
      /* Parent inode is watched by some fsnotify listener */
 
+#define DCACHE_BCTOP		0x0100
+
 #define DCACHE_MOUNTED		0x10000	/* is a mountpoint */
 #define DCACHE_NEED_AUTOMOUNT	0x20000	/* handle automount on this dir */
 #define DCACHE_MANAGE_TRANSIT	0x40000	/* manage transit from this dirent */
@@ -260,6 +269,7 @@ extern struct dentry * d_obtain_alias(struct inode *);
 extern void shrink_dcache_sb(struct super_block *);
 extern void shrink_dcache_parent(struct dentry *);
 extern void shrink_dcache_for_umount(struct super_block *);
+extern int __shrink_dcache_ub(struct user_beancounter *ub, int count, int popup);
 extern int d_invalidate(struct dentry *);
 
 /* only used at mount-time */
@@ -331,6 +341,7 @@ extern char *dynamic_dname(struct dentry *, char *, int, const char *, ...);
 extern char *__d_path(const struct path *path, struct path *root, char *, int);
 extern char *d_path(const struct path *, char *, int);
 extern char *dentry_path(struct dentry *, char *, int);
+extern int d_root_check(struct path *path);
 
 /* Allocation counts.. */
 
@@ -386,6 +397,7 @@ static inline struct dentry *dget_parent(struct dentry *dentry)
 }
 
 extern void dput(struct dentry *);
+extern void dput_nocache(struct dentry *dentry, int nocache);
 
 static inline bool d_managed(struct dentry *dentry)
 {

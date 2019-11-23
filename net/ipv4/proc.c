@@ -54,7 +54,7 @@ static int sockstat_seq_show(struct seq_file *seq, void *v)
 	int orphans, sockets;
 
 	local_bh_disable();
-	orphans = percpu_counter_sum_positive(&tcp_orphan_count);
+	orphans = percpu_counter_sum_positive(&get_exec_ub_top()->ub_orphan_count);
 	sockets = percpu_counter_sum_positive(&tcp_sockets_allocated);
 	local_bh_enable();
 

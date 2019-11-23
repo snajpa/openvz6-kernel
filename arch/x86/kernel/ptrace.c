@@ -31,6 +31,7 @@
 #include <asm/desc.h>
 #include <asm/prctl.h>
 #include <asm/proto.h>
+#include <asm/unistd.h>
 
 #include "tls.h"
 
@@ -504,6 +505,25 @@ static unsigned long getreg(struct task_struct *task, unsigned long offset)
 		if (seg != GS_TLS_SEL)
 			return 0;
 		return get_desc_base(&task->thread.tls_array[GS_TLS]);
+	}
+#endif
+#ifdef CONFIG_VE
+	case offsetof(struct user_regs_struct, ax): {
+		struct pt_regs *regs;
+		unsigned long ret;
+
+		regs = task_pt_regs(task);
+		ret = *pt_regs_access(regs, offset);
+
+		if (ve_is_super(get_exec_env()) &&
+				!ve_is_super(task->ve_task_info.owner_env) &&
+				((regs->orig_ax == __NR_vfork) ||
+				 (regs->orig_ax == __NR_clone) ||
+				 (regs->orig_ax == __NR_fork)) &&
+				(long)ret > 0)
+			ret = vpid_to_pid_ve((pid_t)ret, task->ve_task_info.owner_env);
+
+		return ret;
 	}
 #endif
 	}
@@ -1240,7 +1260,7 @@ void send_sigtrap(struct task_struct *tsk, struct pt_regs *regs,
  * We must return the syscall number to actually look up in the table.
  * This can be -1L to skip running any syscall at all.
  */
-asmregparm long syscall_trace_enter(struct pt_regs *regs)
+long syscall_trace_enter(struct pt_regs *regs)
 {
 	long ret = 0;
 
@@ -1285,7 +1305,7 @@ asmregparm long syscall_trace_enter(struct pt_regs *regs)
 	return ret ?: regs->orig_ax;
 }
 
-asmregparm void syscall_trace_leave(struct pt_regs *regs)
+void syscall_trace_leave(struct pt_regs *regs)
 {
 	bool step;
 

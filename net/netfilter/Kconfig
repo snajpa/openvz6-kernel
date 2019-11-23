@@ -966,6 +966,12 @@ config NETFILTER_XT_MATCH_OSF
 
 	  To compile it as a module, choose M here.  If unsure, say N.
 
+config NETFILTER_XT_MATCH_WDOG_TMO
+	tristate '"wdog_tmo" watchdog timer match'
+	depends on NETFILTER_ADVANCED && NETFILTER_NETLINK && FENCE_WATCHDOG
+	help
+	  This option selects the watchdog timer match module.
+
 endif # NETFILTER_XTABLES
 
 endmenu

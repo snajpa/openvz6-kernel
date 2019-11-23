@@ -10,6 +10,7 @@
 #include <linux/in6.h>
 #include <asm/atomic.h>
 
+struct ve_struct;
 struct flowi {
 	int	oif;
 	int	iif;
@@ -77,6 +78,9 @@ struct flowi {
 #define fl_icmp_code	uli_u.icmpt.code
 #define fl_ipsec_spi	uli_u.spi
 #define fl_mh_type	uli_u.mht.type
+#ifdef CONFIG_VE
+	struct ve_struct *owner_env;
+#endif
 	__u32           secid;	/* used by xfrm; see secid.txt */
 } __attribute__((__aligned__(BITS_PER_LONG/8)));
 

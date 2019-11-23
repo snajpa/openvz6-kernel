@@ -13,6 +13,7 @@
 #include <linux/stat.h>
 #include <linux/tty.h>
 #include <linux/seq_file.h>
+#include <linux/sched.h>
 #include <linux/bitops.h>
 
 /*
@@ -70,6 +71,9 @@ static int show_tty_driver(struct seq_file *m, void *v)
 	dev_t from = MKDEV(p->major, p->minor_start);
 	dev_t to = from + p->num;
 
+	if (!ve_accessible_strict(p->owner_env, get_exec_env()))
+		goto out;
+
 	if (&p->tty_drivers == tty_drivers.next) {
 		/* pseudo-drivers first */
 		seq_printf(m, "%-20s /dev/%-8s ", "/dev/tty", "tty");
@@ -97,6 +101,7 @@ static int show_tty_driver(struct seq_file *m, void *v)
 	}
 	if (from != to)
 		show_tty_range(m, p, from, to - from);
+out:
 	return 0;
 }
 

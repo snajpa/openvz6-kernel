@@ -43,6 +43,7 @@
 #include <linux/reboot.h>
 #include <linux/notifier.h>
 #include <linux/jiffies.h>
+#include <linux/device.h>
 
 extern void ctrl_alt_del(void);
 
@@ -162,6 +163,7 @@ unsigned char kbd_sysrq_xlate[KEY_MAX + 1] =
 static int sysrq_down;
 static int sysrq_alt_use;
 #endif
+int sysrq_key_scancode = KEY_SYSRQ;
 static int sysrq_alt;
 
 /*
@@ -1067,6 +1069,9 @@ static int emulate_raw(struct vc_data *vc, unsigned int keycode,
 {
 	int code;
 
+	if (keycode == sysrq_key_scancode && sysrq_alt)
+		goto sysrq;
+
 	switch (keycode) {
 		case KEY_PAUSE:
 			put_queue(vc, 0xe1);
@@ -1085,6 +1090,7 @@ static int emulate_raw(struct vc_data *vc, unsigned int keycode,
 			break;
 
 		case KEY_SYSRQ:
+sysrq:
 			/*
 			 * Real AT keyboards (that's what we're trying
 			 * to emulate here emit 0xe0 0x2a 0xe0 0x37 when
@@ -1179,7 +1185,8 @@ static void kbd_keycode(unsigned int keycode, int down, int hw_raw)
 				printk(KERN_WARNING "keyboard.c: can't emulate rawmode for keycode %d\n", keycode);
 
 #ifdef CONFIG_MAGIC_SYSRQ	       /* Handle the SysRq Hack */
-	if (keycode == KEY_SYSRQ && (sysrq_down || (down == 1 && sysrq_alt))) {
+	if ((keycode == sysrq_key_scancode || keycode == KEY_SYSRQ) &&
+				(sysrq_down || (down == 1 && sysrq_alt))) {
 		if (!sysrq_down) {
 			sysrq_down = down;
 			sysrq_alt_use = sysrq_alt;
@@ -1311,7 +1318,7 @@ static void kbd_event(struct input_handle *handle, unsigned int event_type,
  * likes it, it can open it and get events from it. In this (kbd_connect)
  * function, we should decide which VT to bind that keyboard to initially.
  */
-static int kbd_connect(struct input_handler *handler, struct input_dev *dev,
+static int __kbd_connect(struct input_handler *handler, struct input_dev *dev,
 			const struct input_device_id *id)
 {
 	struct input_handle *handle;
@@ -1350,11 +1357,79 @@ static int kbd_connect(struct input_handler *handler, struct input_dev *dev,
 	return error;
 }
 
-static void kbd_disconnect(struct input_handle *handle)
+static void __kbd_disconnect(struct input_handle *handle)
 {
 	input_close_device(handle);
 	input_unregister_handle(handle);
 	kfree(handle);
+}
+
+extern struct mutex input_mutex;
+/*
+ * To unbind keyboard need write "unbind" in kbd_bind
+ * To bind keyboard to all TTYs need write "all" in kbd_bind (by default)
+ * To bind keyboard to specified TTY... (not implemented)
+ */
+static ssize_t kbd_bind_store(struct device *dev,
+                                struct device_attribute *attr,
+                                const char *buf, size_t len)
+{
+	struct list_head *node;
+	int ret = -EINVAL;
+	struct input_dev *idev;
+	char *s;
+
+	if (buf[len] != '\0')
+		return -EINVAL;
+
+	if (!ve_is_super(get_exec_env()))
+		return -EPERM;
+
+	s = strchr(buf, '\n');
+	if (s)
+		*s = '\0';
+
+	mutex_lock(&input_mutex);
+	if (!strcmp(buf, "unbind")) {
+		list_for_each(node, &kbd_handler.h_list) {
+			struct input_handle *handle = to_handle_h(node);
+			idev = handle->dev;
+			if (&idev->dev == dev) {
+				__kbd_disconnect(handle);
+				ret = len;
+				break;
+			}
+		}
+	} else if (!strcmp(buf, "all")) {
+		idev = container_of(dev, struct input_dev, dev);
+		ret = __kbd_connect(&kbd_handler, idev, NULL);
+		if (!ret)
+			ret = len;
+	}
+	mutex_unlock(&input_mutex);
+
+	return ret;
+}
+
+static DEVICE_ATTR(kbd_bind, S_IWUSR, NULL , kbd_bind_store);
+
+static int kbd_connect(struct input_handler *handler, struct input_dev *dev,
+			const struct input_device_id *id)
+{
+	int error;
+	error = device_create_file(&dev->dev, &dev_attr_kbd_bind);
+	if (error)
+		return error;
+	error = __kbd_connect(handler, dev, id);
+	if (error)
+		device_remove_file(&dev->dev, &dev_attr_kbd_bind);
+	return error;
+}
+
+static void kbd_disconnect(struct input_handle *handle)
+{
+	device_remove_file(&handle->dev->dev, &dev_attr_kbd_bind);
+	__kbd_disconnect(handle);
 }
 
 /*

@@ -134,6 +134,9 @@ struct in_ifaddr
 extern int register_inetaddr_notifier(struct notifier_block *nb);
 extern int unregister_inetaddr_notifier(struct notifier_block *nb);
 
+extern struct in_ifaddr *inet_alloc_ifa(void);
+extern struct in_device *inetdev_init(struct net_device *dev);
+extern int inet_insert_ifa(struct in_ifaddr *ifa);
 extern struct net_device *ip_dev_find(struct net *net, __be32 addr);
 extern int		inet_addr_onlink(struct in_device *in_dev, __be32 a, __be32 b);
 extern int		devinet_ioctl(struct net *net, unsigned int cmd, void __user *);

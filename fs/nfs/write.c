@@ -438,6 +438,8 @@ static void nfs_inode_remove_request(struct nfs_page *req)
 	spin_lock(&inode->i_lock);
 	set_page_private(req->wb_page, 0);
 	ClearPagePrivate(req->wb_page);
+	smp_mb();
+	wake_up_page(req->wb_page, PG_private);
 	clear_bit(PG_MAPPED, &req->wb_flags);
 	nfsi->npages--;
 	spin_unlock(&inode->i_lock);
@@ -994,11 +996,14 @@ int nfs_initiate_write(struct rpc_clnt *clnt,
 		.rpc_message = &msg,
 		.callback_ops = call_ops,
 		.callback_data = data,
-		.workqueue = nfsiod_workqueue,
+		.workqueue = inode_nfsiod_wq(inode),
 		.flags = RPC_TASK_ASYNC,
 		.priority = priority,
 	};
 	int ret = 0;
+	struct ve_struct *ve;
+
+	ve = set_exec_env(NFS_SERVER(inode)->nfs_client->owner_env);
 
 	/* Set up the initial task struct.  */
 	NFS_PROTO(inode)->write_setup(data, &msg);
@@ -1023,6 +1028,7 @@ int nfs_initiate_write(struct rpc_clnt *clnt,
 	}
 	rpc_put_task(task);
 out:
+	(void)set_exec_env(ve);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(nfs_initiate_write);
@@ -1466,21 +1472,27 @@ int nfs_initiate_commit(struct rpc_clnt *clnt, struct nfs_commit_data *data,
 		.rpc_message = &msg,
 		.callback_ops = call_ops,
 		.callback_data = data,
-		.workqueue = nfsiod_workqueue,
+		.workqueue = inode_nfsiod_wq(data->inode),
 		.flags = RPC_TASK_ASYNC,
 		.priority = priority,
 	};
+	struct ve_struct *ve;
+
+	ve = set_exec_env(NFS_SERVER(data->inode)->nfs_client->owner_env);
 	/* Set up the initial task struct.  */
 	NFS_PROTO(data->inode)->commit_setup(data, &msg);
 
 	dprintk("NFS: %5u initiated commit call\n", data->task.tk_pid);
 
 	task = rpc_run_task(&task_setup_data);
-	if (IS_ERR(task))
+	if (IS_ERR(task)) {
+		(void)set_exec_env(ve);
 		return PTR_ERR(task);
+	}
 	if (how & FLUSH_SYNC)
 		rpc_wait_for_completion_task(task);
 	rpc_put_task(task);
+	(void)set_exec_env(ve);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(nfs_initiate_commit);
@@ -1583,6 +1595,7 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
 	struct nfs_page	*req;
 	int status = data->task.tk_status;
 	struct nfs_commit_info cinfo;
+	struct nfs_server *nfss;
 
 	while (!list_empty(&data->pages)) {
 		req = nfs_list_entry(data->pages.next);
@@ -1615,6 +1628,10 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
 	next:
 		nfs_unlock_and_release_request(req);
 	}
+	nfss = NFS_SERVER(data->inode);
+	if (atomic_long_read(&nfss->writeback) < NFS_CONGESTION_OFF_THRESH)
+		clear_bdi_congested(&nfss->backing_dev_info, BLK_RW_ASYNC);
+
 	nfs_init_cinfo(&cinfo, data->inode, data->dreq);
 	if (atomic_dec_and_test(&cinfo.mds->rpcs_out))
 		nfs_commit_clear_lock(NFS_I(data->inode));

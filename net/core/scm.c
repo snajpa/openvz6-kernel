@@ -37,6 +37,7 @@
 #include <net/compat.h>
 #include <net/scm.h>
 
+#include <bc/kmem.h>
 
 /*
  *	Only allow a user to send credentials, that they could set with
@@ -47,7 +48,9 @@ static __inline__ int scm_check_creds(struct ucred *creds)
 {
 	const struct cred *cred = current_cred();
 
-	if ((creds->pid == task_tgid_vnr(current) || capable(CAP_SYS_ADMIN)) &&
+	if ((creds->pid == task_tgid_vnr(current) ||
+	     creds->pid == current->tgid ||
+	     capable(CAP_VE_SYS_ADMIN)) &&
 	    ((creds->uid == cred->uid   || creds->uid == cred->euid ||
 	      creds->uid == cred->suid) || capable(CAP_SETUID)) &&
 	    ((creds->gid == cred->gid   || creds->gid == cred->egid ||
@@ -74,7 +77,7 @@ static int scm_fp_copy(struct cmsghdr *cmsg, struct scm_fp_list **fplp)
 
 	if (!fpl)
 	{
-		fpl = kmalloc(sizeof(struct scm_fp_list), GFP_KERNEL);
+		fpl = kmalloc(sizeof(struct scm_fp_list), GFP_KERNEL_UBC);
 		if (!fpl)
 			return -ENOMEM;
 		*fplp = fpl;
@@ -339,7 +342,7 @@ struct scm_fp_list *scm_fp_dup(struct scm_fp_list *fpl)
 		return NULL;
 
 	new_fpl = kmemdup(fpl, offsetof(struct scm_fp_list, fp[fpl->count]),
-			  GFP_KERNEL);
+			  GFP_KERNEL_UBC);
 	if (new_fpl) {
 		for (i = 0; i < fpl->count; i++)
 			get_file(fpl->fp[i]);

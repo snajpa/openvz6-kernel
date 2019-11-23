@@ -19,6 +19,10 @@
 #include <linux/u64_stats_sync.h>
 #include <net/route.h>
 
+#include <linux/ve.h>
+#include <linux/ve_proto.h>
+#include <linux/vzcalluser.h>
+
 #define BR_HASH_BITS 8
 #define BR_HASH_SIZE (1 << BR_HASH_BITS)
 
@@ -38,7 +42,7 @@
 #define BR_STP_PROG	"/sbin/bridge-stp"
 
 typedef struct bridge_id bridge_id;
-typedef struct mac_addr mac_addr;
+typedef struct br_mac_addr br_mac_addr;
 typedef __u16 port_id;
 
 struct bridge_id
@@ -47,7 +51,7 @@ struct bridge_id
 	unsigned char	addr[6];
 };
 
-struct mac_addr
+struct br_mac_addr
 {
 	unsigned char	addr[6];
 };
@@ -84,7 +88,7 @@ struct net_bridge_fdb_entry
 
 	struct rcu_head			rcu;
 	unsigned long			ageing_timer;
-	mac_addr			addr;
+	br_mac_addr			addr;
 	unsigned char			is_local;
 	unsigned char			is_static;
 };
@@ -179,6 +183,8 @@ struct net_bridge
 
 	struct br_cpu_netstats __percpu *stats;
 
+	struct net_device		*master_dev;
+	unsigned char			via_phys_dev;
 	spinlock_t			hash_lock;
 	struct hlist_head		hash[BR_HASH_SIZE];
 	struct list_head		age_list;
@@ -273,9 +279,15 @@ static inline int br_is_root_bridge(const struct net_bridge *br)
 
 /* br_device.c */
 extern void br_dev_setup(struct net_device *dev);
-extern void br_dev_delete(struct net_device *dev);
+extern void br_dev_delete(struct net_device *dev, struct list_head *head);
 extern netdev_tx_t br_dev_xmit(struct sk_buff *skb,
 			       struct net_device *dev);
+struct cpt_context;
+struct rst_ops;
+struct cpt_netdev_image;
+extern int br_rst(loff_t start, struct cpt_netdev_image *di,
+		struct rst_ops *ops, struct cpt_context *ctx);
+
 #ifdef CONFIG_NET_POLL_CONTROLLER
 static inline struct netpoll_info *br_netpoll_info(struct net_bridge *br)
 {
@@ -320,6 +332,7 @@ extern void br_fdb_fini(void);
 extern void br_fdb_flush(struct net_bridge *br);
 extern void br_fdb_changeaddr(struct net_bridge_port *p,
 			      const unsigned char *newaddr);
+extern void br_fdb_change_mac_address(struct net_bridge *br, const u8 *newaddr);
 extern void br_fdb_cleanup(unsigned long arg);
 extern void br_fdb_delete_by_port(struct net_bridge *br,
 				  const struct net_bridge_port *p, int do_all);
@@ -336,17 +349,19 @@ extern void br_fdb_update(struct net_bridge *br,
 			  const unsigned char *addr);
 
 /* br_forward.c */
-extern void br_deliver(const struct net_bridge_port *to,
-		struct sk_buff *skb);
+extern int br_deliver(const struct net_bridge_port *to,
+		struct sk_buff *skb, int free);
 extern int br_dev_queue_push_xmit(struct sk_buff *skb);
 extern void br_forward(const struct net_bridge_port *to,
 		struct sk_buff *skb, struct sk_buff *skb0);
 extern int br_forward_finish(struct sk_buff *skb);
 extern void br_flood_deliver(struct net_bridge *br, struct sk_buff *skb);
+extern void br_xmit_deliver(struct net_bridge *br, struct net_bridge_port *port, struct sk_buff *skb);
 extern void br_flood_forward(struct net_bridge *br, struct sk_buff *skb,
 			     struct sk_buff *skb2);
 
 /* br_if.c */
+extern struct net_device *new_bridge_dev(struct net *net, const char *name);
 extern void br_port_carrier_check(struct net_bridge_port *p);
 extern int br_add_bridge(struct net *net, const char *name);
 extern int br_del_bridge(struct net *net, const char *name);

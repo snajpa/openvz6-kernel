@@ -293,6 +293,36 @@ void smp_trace_x86_platform_ipi(struct pt_regs *regs)
 	set_irq_regs(old_regs);
 }
 
+/*
+ * Handler for MONITOR_IPI_VECTOR
+ */
+void smp_monitor_ipi(struct pt_regs *regs)
+{
+	ack_APIC_irq();
+}
+
+void smp_trace_monitor_ipi(struct pt_regs *regs)
+{
+	trace_monitor_ipi_entry(MONITOR_IPI_VECTOR);
+	ack_APIC_irq();
+	trace_monitor_ipi_exit(MONITOR_IPI_VECTOR);
+}
+
+/*
+ * Handler for MONITOR_POSTED_INTERRUPT_VECTOR
+ */
+void smp_monitor_posted_interrupt(struct pt_regs *regs)
+{
+	ack_APIC_irq();
+}
+
+void smp_trace_monitor_posted_interrupt(struct pt_regs *regs)
+{
+	trace_monitor_posted_interrupt_entry(MONITOR_POSTED_INTERRUPT_VECTOR);
+	ack_APIC_irq();
+	trace_monitor_posted_interrupt_exit(MONITOR_POSTED_INTERRUPT_VECTOR);
+}
+
 EXPORT_SYMBOL_GPL(vector_used_by_percpu_irq);
 
 #ifdef CONFIG_HOTPLUG_CPU

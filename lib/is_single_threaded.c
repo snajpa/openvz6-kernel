@@ -30,7 +30,7 @@ bool current_is_single_threaded(void)
 
 	ret = false;
 	rcu_read_lock();
-	for_each_process(p) {
+	for_each_process_all(p) {
 		if (unlikely(p->flags & PF_KTHREAD))
 			continue;
 		if (unlikely(p == task->group_leader))
@@ -48,7 +48,7 @@ bool current_is_single_threaded(void)
 			 * forked before exiting.
 			 */
 			smp_rmb();
-		} while_each_thread(p, t);
+		} while_each_thread_all(p, t);
 	}
 	ret = true;
 found:

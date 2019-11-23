@@ -40,6 +40,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/completion.h>
+#include <linux/quotaops.h>
 #include <linux/buffer_head.h>
 #include <linux/sort.h>
 #include <linux/fs.h>
@@ -1681,4 +1682,31 @@ const struct quotactl_ops gfs2_quotactl_ops = {
 	.get_xstate     = gfs2_quota_get_xstate,
 	.get_xquota	= gfs2_xquota_get,
 	.set_xquota	= gfs2_xquota_set,
+};
+
+static qsize_t *gfs2_get_reserved_space(struct inode *inode)
+{
+	return &GFS2_I(inode)->i_reserved_quota;
+}
+
+const struct dquot_operations gfs2_quota_operations = {
+	.initialize	= dquot_initialize,
+	.drop		= dquot_drop,
+	.alloc_space	= dquot_alloc_space,
+	.reserve_space	= dquot_reserve_space,
+	.claim_space	= dquot_claim_space,
+	.release_rsv	= dquot_release_reserved_space,
+	.alloc_inode	= dquot_alloc_inode,
+	.free_space	= dquot_free_space,
+	.free_inode	= dquot_free_inode,
+	.transfer	= dquot_transfer,
+	.write_dquot	= dquot_commit,
+	.acquire_dquot	= dquot_acquire,
+	.release_dquot	= dquot_release,
+	.mark_dirty	= dquot_mark_dquot_dirty,
+	.write_info	= dquot_commit_info,
+	.alloc_dquot	= dquot_alloc,
+	.destroy_dquot	= dquot_destroy,
+
+	.get_reserved_space = gfs2_get_reserved_space,
 };

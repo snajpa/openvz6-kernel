@@ -1,0 +1,171 @@
+1. DM-like snapshots
+--------------------
+
+   Not done because WILL NOT DO. This functionality is
+   available, if we use DM over ploop or acronis trueimage on ploop
+   device.
+
+2. Tracking changes
+-------------------
+
+   [ Done. Approach B. ]
+
+   This functionality is required to implement
+   iterative migration. Naive implementation is very easy: just
+   a huge bitmap of dirty bits and ioctl to read&clear a chunk from this map.
+   Real implemenation can become tricky, because we definitely
+   will not want to copy all the data from original image etc. etc.
+
+   Not done because of three reasons: first, it requires non-trivial
+   support from migration tools (similar to vzfs-track+rsync),
+   second, it is easy to add any moment, third, it is not clear
+   that this is required, the case is covered by item #3 in this list,
+   suboptimally, but covered.
+
+   Anyway, even here we have a fork:
+
+   A. We can track virtual sectors.
+   B. We can track offsets in backing files.
+
+   Fork (B) allows to copy raw images via network (obvious speedup),
+	but those images can contain lots of dead data: unused and covered
+	by deltas.
+   Fork (A) allows to copy only relevant data droping dead deltas
+	and even omitting space not used by fs,
+	but then we lose snapshots and cannot stream raw files.
+
+3. Merging writable delta
+-------------------------
+
+   [Done]
+
+   Also a MUST for migration with shared image, where all the changes
+   after image was frozen go to delta.
+   Obvisously, we must not continue to work over delta after
+   migration is complete.
+
+   The only solution that I see is a new kind of delta "transparent delta".
+   It is a super-top delta above top delta. We read from it, but we
+   write to top delta. And background process copying data from
+   super-top to top. Seems, implementation is quite hairy.
+   One idea is to keep two maps: one is normal, not considering
+   super-top at all, another is just for super-top. Each incoming
+   requests looks up super-top map first, if it does not find anything,
+   it proceeds to normal path. If it finds and this is read, this is just
+   read. If it is write, it must read data from super-top
+   (if not whole cluster), write/allocate data in normal map, update
+   normal map and upon completion it must clear map entry in super-top.
+   Background process just scans super-top and triggers zero-length
+   writes on everything it finds. After a single pass the super-top delta
+   is clean.
+
+   More general approach. If we need to get rid of multiple deltas,
+   it is utterly stupid to merge deltas one by one. Instead we
+   can split delta list to two parts: folding and normal. Folding
+   deltas are batch of deltas to get rid of, all they are folded
+   to top level normal delta. Now it is obvious that we must have
+   two maps: normal and folding. Outline of algo:
+
+	1. Lookup folding map. If there is no map, proceed along normal path.
+	2. Otherwise, schedule read of folding map.
+	3. When map is calculated. If it is read request, just read.
+	4. If it is write, schedule read from folded delta.
+	   Cluster is locked out.
+	5. When it is complete, copy new data there and do the same
+	   things as we used to do in normal path, but after completion
+	   of update of normal index (or completion of write, if index
+	   is not changed), we schedule zeroing of folded delta index.
+	   Here is a trouble: we cannot just zero folded index, it can
+	   uncover an obsolete entry in lower folded delta. Seems, we
+	   have to reserve a special index value to mark invalidated
+	   entry.
+
+    OK, plan is ready, but technically it is not easy to accomplish it.
+
+4. Shrinking image
+------------------
+
+   [ Done ]
+
+   Naive solution is mostly trivial. We snapshot image with syncing
+   journal, then scan image in user space to collect unused blocks
+   and to plan optimal order of copies. Process of shrinking has to be made
+   by kernel, because we must switch maps atomically, but all logically
+   non-ttrivial part resides in user space. Then we can merge accumulated
+   delta back (and spoil the image again :-))
+
+   Reality hurts. Such merge will result in severely reordered image
+   unless we copy all of it to new place. Copying everything is optimal
+   from viewpoint of performance in future, but expensive. Naive shrinking
+   will kill perfroamnce, but it is quick. Apparently, correct solution
+   is somewhere between. Where?
+
+
+5. Reliability of EXT3 when we are out of disk space
+----------------------------------------------------
+
+   Right now it behaves very good from viewpoint of image integrity.
+   No errors after replaying journal. But when we run out of space kernel
+   spews a lot of errors, this behaviour is still not acceptable.
+
+6. Alignment disaster
+---------------------
+
+If ploop is partitioned f.e. for use with Parallels VM, by default
+each partition starts at odd sector offset, which means writes are
+suboptimal. Solutions are:
+
+	A. Give "correct" disk geometry to VM. Not crippled LBA default,
+	   but something with tracks aligned at least to pages.
+	B. dmonakhov's idea. Each cluster is augmented with 8 additional
+	   sectors. Alignment is established by the first write.
+	   1 sector of 8 is not used and can be used f.e. to store some
+	   metainformation: checksums, back reference from cluster
+	   to location in image, which would allow to recover even
+	   if indices are corrupted. Drawback: severe impact on performance
+	   due to unknown reasons, seems something specific to modern SATA
+	   disks.
+	C. Ignore the issue. Only growing images are impacted.
+	   And frankly, growing == bad performance in any case.
+
+
+Take C for now. Impact of performance in compilebench and bonnie
+is practically invisible.
+
+
+7. ext3 block allocation eats disk space
+----------------------------------------
+
+ext3 crock quickly sweeps the whole disk, even if you delete and
+create the same set of files. This is creepy. Moreovere,
+rm followed by creat almost always allocates new set of blocks,
+because transaction truncating file is still not commited. Grr...
+
+This means growing images with ext3 inside are just non-sense.
+
+	One solution (ignoring obvious: never use growing images)
+	is to create minimal size ext3 and resize it when it is full.
+	Difficult to embed to block device because of hierarchy violation.
+
+
+8. Memory allocation
+--------------------
+
+Currently bogus. This will take some time and a lot of brain efforts.
+All the allocations in ploop are made with GFP_NOFS, which means
+it can run out of resources.
+
+Obviously, we must supply allocation pools for all the objects and
+balance size of pools in a way which will make deadlocks impossible.
+
+Right now it is obviously wrong. And, I guess, this bogosity is shared
+with mainstream. F.e. we allocate at least one new bio for each incoming
+bio in fast path (or a lot of bios, when image is fragmented). Imagine,
+that burst of writeback exhausted all bio mempool and all of them are
+sent to us. We cannot allocate new bio before some bio is released,
+bio cannot be released before we make some forward progress, which
+we cannot do not allocating new bio. Of course, this is marginal pathological
+case, but there are too much of such cases to expect that deadlocks
+will never occur in real life.
+
+

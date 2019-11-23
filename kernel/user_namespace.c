@@ -60,6 +60,7 @@ int create_user_ns(struct cred *new)
 
 	return 0;
 }
+EXPORT_SYMBOL(create_user_ns);
 
 /*
  * Deferred destructor for a user namespace.  This is required because

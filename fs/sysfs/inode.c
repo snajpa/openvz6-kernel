@@ -22,8 +22,6 @@
 #include <linux/security.h>
 #include "sysfs.h"
 
-extern struct super_block * sysfs_sb;
-
 static const struct address_space_operations sysfs_aops = {
 	.readpage	= simple_readpage,
 	.write_begin	= simple_write_begin,
@@ -39,6 +37,7 @@ static struct backing_dev_info sysfs_backing_dev_info = {
 static const struct inode_operations sysfs_inode_operations ={
 	.setattr	= sysfs_setattr,
 	.setxattr	= sysfs_setxattr,
+	.getattr	= sysfs_getattr,
 };
 
 int __init sysfs_inode_init(void)
@@ -161,6 +160,23 @@ out:
 	return error;
 }
 
+static void sysfs_inode_refresh_nlink(struct inode *inode, struct sysfs_dirent *sd)
+{
+	if (sysfs_type(sd) == SYSFS_DIR)
+		inode->i_nlink = sd->s_dir.subdirs + 2;
+}
+
+int sysfs_getattr(struct vfsmount *mnt, struct dentry *dentry,
+		struct kstat *stat)
+{
+	struct sysfs_dirent *sd = dentry->d_fsdata;
+	struct inode *inode = dentry->d_inode;
+
+	sysfs_inode_refresh_nlink(inode, sd);
+	generic_fillattr(inode, stat);
+	return 0;
+}
+
 static inline void set_default_inode_attr(struct inode * inode, mode_t mode)
 {
 	inode->i_mode = mode;
@@ -219,7 +235,11 @@ static void sysfs_init_inode(struct sysfs_dirent *sd, struct inode *inode)
 	case SYSFS_DIR:
 		inode->i_op = &sysfs_dir_inode_operations;
 		inode->i_fop = &sysfs_dir_operations;
-		inode->i_nlink = sd->s_dir.subdirs + 2;
+		break;
+	case SYSFS_DIR_LINK:
+		inode->i_op = &sysfs_dirlink_inode_operations;
+		inode->i_fop = &sysfs_dirlink_operations;
+		inode->i_nlink = 2; /* who cares */
 		break;
 	case SYSFS_KOBJ_ATTR:
 		inode->i_size = PAGE_SIZE;
@@ -236,7 +256,7 @@ static void sysfs_init_inode(struct sysfs_dirent *sd, struct inode *inode)
 	default:
 		BUG();
 	}
-
+	sysfs_inode_refresh_nlink(inode, sd);
 	unlock_new_inode(inode);
 }
 
@@ -258,7 +278,7 @@ struct inode * sysfs_get_inode(struct sysfs_dirent *sd)
 {
 	struct inode *inode;
 
-	inode = iget_locked(sysfs_sb, sd->s_ino);
+	inode = iget_locked(sd_sysfs_sb(sd), sd->s_ino);
 	if (inode && (inode->i_state & I_NEW))
 		sysfs_init_inode(sd, inode);
 

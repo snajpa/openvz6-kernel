@@ -192,19 +192,20 @@ static int __init ic_open_devs(void)
 	struct ic_device *d, **last;
 	struct net_device *dev;
 	unsigned short oflags;
+	struct net *net = get_exec_env()->ve_netns;
 
 	last = &ic_first_dev;
 	rtnl_lock();
 
 	/* bring loopback device up first */
-	for_each_netdev(&init_net, dev) {
+	for_each_netdev(net, dev) {
 		if (!(dev->flags & IFF_LOOPBACK))
 			continue;
 		if (dev_change_flags(dev, dev->flags | IFF_UP) < 0)
 			printk(KERN_ERR "IP-Config: Failed to open %s\n", dev->name);
 	}
 
-	for_each_netdev(&init_net, dev) {
+	for_each_netdev(net, dev) {
 		if (dev->flags & IFF_LOOPBACK)
 			continue;
 		if (user_dev_name[0] ? !strcmp(dev->name, user_dev_name) :
@@ -458,9 +459,6 @@ ic_rarp_recv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
 	__be32 sip, tip;
 	unsigned char *sha, *tha;		/* s for "source", t for "target" */
 	struct ic_device *d;
-
-	if (!net_eq(dev_net(dev), &init_net))
-		goto drop;
 
 	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL)
 		return NET_RX_DROP;
@@ -884,9 +882,6 @@ static int __init ic_bootp_recv(struct sk_buff *skb, struct net_device *dev, str
 	struct iphdr *h;
 	struct ic_device *d;
 	int len, ext_len;
-
-	if (!net_eq(dev_net(dev), &init_net))
-		goto drop;
 
 	/* Perform verifications before taking the lock.  */
 	if (skb->pkt_type == PACKET_OTHERHOST)

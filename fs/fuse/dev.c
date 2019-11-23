@@ -19,6 +19,7 @@
 #include <linux/pipe_fs_i.h>
 #include <linux/swap.h>
 #include <linux/splice.h>
+#include <linux/bio.h>
 
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 
@@ -126,7 +127,7 @@ static void fuse_req_init_context(struct fuse_req *req)
 {
 	req->in.h.uid = current_fsuid();
 	req->in.h.gid = current_fsgid();
-	req->in.h.pid = current->pid;
+	req->in.h.pid = task_pid_vnr(current);
 }
 
 static bool fuse_block_alloc(struct fuse_conn *fc, bool for_background)
@@ -479,7 +480,8 @@ __acquires(&fc->lock)
 	}
 }
 
-static void __fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
+static void __fuse_request_send(struct fuse_conn *fc, struct fuse_req *req,
+				struct fuse_file *ff)
 {
 	BUG_ON(req->background);
 	spin_lock(&fc->lock);
@@ -487,6 +489,8 @@ static void __fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
 		req->out.h.error = -ENOTCONN;
 	else if (fc->conn_error)
 		req->out.h.error = -ECONNREFUSED;
+	else if (ff && test_bit(FUSE_S_FAIL_IMMEDIATELY, &ff->ff_state))
+		req->out.h.error = -EIO;
 	else {
 		queue_request(fc, req);
 		/* acquire extra reference, since request is still needed
@@ -498,10 +502,16 @@ static void __fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
 	spin_unlock(&fc->lock);
 }
 
-void fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
+void fuse_request_check_and_send(struct fuse_conn *fc, struct fuse_req *req,
+				 struct fuse_file *ff)
 {
 	req->isreply = 1;
-	__fuse_request_send(fc, req);
+	__fuse_request_send(fc, req, ff);
+}
+
+void fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
+{
+	fuse_request_check_and_send(fc, req, NULL);
 }
 EXPORT_SYMBOL_GPL(fuse_request_send);
 
@@ -524,7 +534,13 @@ static void fuse_request_send_nowait_locked(struct fuse_conn *fc,
 static void fuse_request_send_nowait(struct fuse_conn *fc, struct fuse_req *req)
 {
 	spin_lock(&fc->lock);
-	if (fc->connected) {
+	if (req->page_cache && req->ff &&
+	    test_bit(FUSE_S_FAIL_IMMEDIATELY, &req->ff->ff_state)) {
+		BUG_ON(req->in.h.opcode != FUSE_READ);
+		req->out.h.error = -EIO;
+		req->background = 0;
+		request_end(fc, req);
+	} else if (fc->connected) {
 		fuse_request_send_nowait_locked(fc, req);
 		spin_unlock(&fc->lock);
 	} else {
@@ -568,7 +584,7 @@ void fuse_force_forget(struct file *file, u64 nodeid)
 	req->in.args[0].size = sizeof(inarg);
 	req->in.args[0].value = &inarg;
 	req->isreply = 0;
-	__fuse_request_send(fc, req);
+	__fuse_request_send(fc, req, NULL);
 	/* ignore errors */
 	fuse_put_request(fc, req);
 }
@@ -892,7 +908,8 @@ static int fuse_ref_page(struct fuse_copy_state *cs, struct page *page,
  * done atomically
  */
 static int fuse_copy_page(struct fuse_copy_state *cs, struct page **pagep,
-			  unsigned offset, unsigned count, int zeroing)
+			  unsigned offset, unsigned count, int zeroing,
+			  bool move_disabled)
 {
 	int err;
 	struct page *page = *pagep;
@@ -908,6 +925,9 @@ static int fuse_copy_page(struct fuse_copy_state *cs, struct page **pagep,
 		} else if (!cs->len) {
 			if (cs->move_pages && page &&
 			    offset == 0 && count == PAGE_SIZE) {
+				/* read-ahead doesn't use bvec */
+				BUG_ON(move_disabled);
+
 				err = fuse_try_move_page(cs, pagep);
 				if (err <= 0)
 					return err;
@@ -942,12 +962,30 @@ static int fuse_copy_pages(struct fuse_copy_state *cs, unsigned nbytes,
 		unsigned offset = req->page_descs[i].offset;
 		unsigned count = min(nbytes, req->page_descs[i].length);
 		err = fuse_copy_page(cs, &req->pages[i], offset, count,
-				     zeroing);
+				     zeroing, false);
 		if (err)
 			return err;
 
 		nbytes -= count;
 	}
+	return 0;
+}
+
+static int fuse_copy_bvec(struct fuse_copy_state *cs, unsigned nbytes,
+			   int zeroing)
+{
+	unsigned i;
+	struct fuse_req *req = cs->req;
+
+	for (i = 0; i < req->num_bvecs && (nbytes || zeroing); i++) {
+		struct bio_vec *bvec = &req->bvec[i];
+
+		int err = fuse_copy_page(cs, &bvec->bv_page,
+				bvec->bv_offset, bvec->bv_len, zeroing, true);
+		if (err)
+			return err;
+	}
+
 	return 0;
 }
 
@@ -967,7 +1005,7 @@ static int fuse_copy_one(struct fuse_copy_state *cs, void *val, unsigned size)
 
 /* Copy request arguments to/from userspace buffer */
 static int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
-			  unsigned argpages, struct fuse_arg *args,
+			  unsigned argpages, unsigned argbvec, struct fuse_arg *args,
 			  int zeroing)
 {
 	int err = 0;
@@ -977,6 +1015,8 @@ static int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
 		struct fuse_arg *arg = &args[i];
 		if (i == numargs - 1 && argpages)
 			err = fuse_copy_pages(cs, arg->size, zeroing);
+		else if (i == numargs - 1 && argbvec)
+			err = fuse_copy_bvec(cs, arg->size, zeroing);
 		else
 			err = fuse_copy_one(cs, arg->value, arg->size);
 	}
@@ -1158,11 +1198,23 @@ static ssize_t fuse_dev_do_read(struct fuse_conn *fc, struct file *file,
 		request_end(fc, req);
 		goto restart;
 	}
+	if (req->in.h.opcode == FUSE_WRITE && req->inode) {
+		struct inode *inode = req->inode;
+		struct fuse_inode *fi = get_fuse_inode(inode);
+		struct fuse_write_in *inarg = &req->misc.write.in;
+		if (fi->shrink_in_flight) {
+			printk("fuse_dev_do_read: shrink_in_flight=%ld for "
+			       "fh=%llu nodeid=%llu offset=%llu size=%u\n",
+			       fi->shrink_in_flight, inarg->fh,
+			       req->in.h.nodeid, inarg->offset, inarg->size);
+			add_taint(TAINT_CRAP);
+		}
+	}
 	spin_unlock(&fc->lock);
 	cs->req = req;
 	err = fuse_copy_one(cs, &in->h, sizeof(in->h));
 	if (!err)
-		err = fuse_copy_args(cs, in->numargs, in->argpages,
+		err = fuse_copy_args(cs, in->numargs, in->argpages, in->argbvec,
 				     (struct fuse_arg *) in->args, 0);
 	fuse_copy_finish(cs);
 	spin_lock(&fc->lock);
@@ -1403,6 +1455,36 @@ err:
 	return err;
 }
 
+static int fuse_notify_inval_files(struct fuse_conn *fc, unsigned int size,
+				   struct fuse_copy_state *cs)
+{
+	struct fuse_notify_inval_files_out outarg;
+	int err = -EINVAL;
+
+	if (size != sizeof(outarg))
+		goto err;
+
+	err = fuse_copy_one(cs, &outarg, sizeof(outarg));
+	if (err)
+		goto err;
+	fuse_copy_finish(cs);
+
+	down_read(&fc->killsb);
+	err = -ENOENT;
+	if (!fc->sb)
+		goto err_unlock;
+
+	err = fuse_invalidate_files(fc, outarg.ino);
+
+err_unlock:
+	up_read(&fc->killsb);
+	return err;
+
+err:
+	fuse_copy_finish(cs);
+	return err;
+}
+
 static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
 		       unsigned int size, struct fuse_copy_state *cs)
 {
@@ -1415,6 +1497,9 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
 
 	case FUSE_NOTIFY_INVAL_ENTRY:
 		return fuse_notify_inval_entry(fc, size, cs);
+
+	case FUSE_NOTIFY_INVAL_FILES:
+		return fuse_notify_inval_files(fc, size, cs);
 
 	default:
 		fuse_copy_finish(cs);
@@ -1453,8 +1538,8 @@ static int copy_out_args(struct fuse_copy_state *cs, struct fuse_out *out,
 			return -EINVAL;
 		lastarg->size -= diffsize;
 	}
-	return fuse_copy_args(cs, out->numargs, out->argpages, out->args,
-			      out->page_zeroing);
+	return fuse_copy_args(cs, out->numargs, out->argpages, out->argbvec,
+			out->args, out->page_zeroing);
 }
 
 /*
@@ -1726,8 +1811,8 @@ static void end_queued_requests(struct fuse_conn *fc)
 {
 	fc->max_background = UINT_MAX;
 	flush_bg_queue(fc);
-	end_requests(fc, &fc->pending);
 	end_requests(fc, &fc->processing);
+	end_requests(fc, &fc->pending);
 	while (forget_pending(fc))
 		kfree(dequeue_forget(fc));
 }

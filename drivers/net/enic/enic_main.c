@@ -78,6 +78,11 @@ MODULE_LICENSE("GPL");
 MODULE_VERSION(DRV_VERSION);
 MODULE_DEVICE_TABLE(pci, enic_id_table);
 
+#define NO_VLAN0_DEFAULT 0
+static unsigned int no_vlan0 __read_mostly = NO_VLAN0_DEFAULT;
+module_param(no_vlan0, uint, 0644);
+MODULE_PARM_DESC(no_vlan0, "When set, the vlan header is ignored if the vlan id is 0 (ie, untagged priority frames)");
+
 #define ENIC_LARGE_PKT_THRESHOLD		1000
 #define ENIC_MAX_COALESCE_TIMERS		10
 /*  Interrupt moderation table, which will be used to decide the
@@ -1168,7 +1173,7 @@ static void enic_rq_indicate_buf(struct vnic_rq *rq,
 		    ipv4_csum_ok)
 			skb->ip_summed = CHECKSUM_UNNECESSARY;
 
-		if (vlan_stripped)
+		if ((vlan_stripped) && (((vlan_tci & VLAN_VID_MASK) != 0) || (!no_vlan0)))
 			__vlan_hwaccel_put_tag(skb, vlan_tci);
 
 		skb_mark_napi_id(skb, &enic->napi[rq->index]);

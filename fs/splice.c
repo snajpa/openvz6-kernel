@@ -30,6 +30,7 @@
 #include <linux/syscalls.h>
 #include <linux/uio.h>
 #include <linux/security.h>
+#include <linux/virtinfo.h>
 
 /*
  * Attempt to steal a page from a pipe buffer. This should perhaps go into
@@ -100,6 +101,7 @@ static int page_cache_pipe_buf_confirm(struct pipe_inode_info *pipe,
 	int err;
 
 	if (!PageUptodate(page)) {
+		virtinfo_notifier_call(VITYPE_IO, VIRTINFO_IO_PREPARE, NULL);
 		lock_page(page);
 
 		/*
@@ -290,11 +292,22 @@ __generic_file_splice_read(struct file *in, loff_t *ppos,
 	req_pages = (len + loff + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
 	nr_pages = min(req_pages, (unsigned)PIPE_BUFFERS);
 
+	check_pagecache_limits(mapping, mapping_gfp_mask(mapping));
+
 	/*
 	 * Lookup the (hopefully) full range of pages we need.
 	 */
 	spd.nr_pages = find_get_pages_contig(mapping, index, nr_pages, pages);
 	index += spd.nr_pages;
+
+	while (spd.nr_pages < nr_pages && mapping->host->i_peer_file) {
+		page = pick_peer_page(mapping->host, &in->f_ra, index,
+				      req_pages - spd.nr_pages);
+		if (!page)
+			break;
+		pages[spd.nr_pages++] = page;
+		index++;
+	}
 
 	/*
 	 * If find_get_pages_contig() returned fewer pages than we needed,
@@ -370,12 +383,17 @@ __generic_file_splice_read(struct file *in, loff_t *ppos,
 			 * for an in-flight io page
 			 */
 			if (flags & SPLICE_F_NONBLOCK) {
-				if (!trylock_page(page)) {
+				if ((virtinfo_notifier_call(VITYPE_IO,
+						VIRTINFO_IO_CONGESTION, NULL) &
+							NOTIFY_FAIL) ||
+						!trylock_page(page)) {
 					error = -EAGAIN;
 					break;
 				}
-			} else
+			} else {
+				virtinfo_notifier_call(VITYPE_IO, VIRTINFO_IO_PREPARE, NULL);
 				lock_page(page);
+			}
 
 			/*
 			 * Page was truncated, or invalidated by the
@@ -963,6 +981,10 @@ ssize_t splice_write_to_file(struct pipe_inode_info *pipe, struct file *out,
 
 	splice_from_pipe_begin(&sd);
 	do {
+		if (fatal_signal_pending(current)) {
+			ret = -EINTR;
+			break;
+		}
 		ret = splice_from_pipe_next(pipe, &sd);
 		if (ret <= 0)
 			break;
@@ -1003,7 +1025,7 @@ static ssize_t generic_file_splice_write_actor(struct pipe_inode_info *pipe,
 	struct inode *inode = out->f_mapping->host;
 	ssize_t ret;
 
-	mutex_lock_nested(&inode->i_mutex, I_MUTEX_CHILD);
+	mutex_lock(&inode->i_mutex);
 	ret = file_remove_suid(out);
 	if (!ret) {
 		file_update_time(out);
@@ -1310,6 +1332,7 @@ long do_splice_direct(struct file *in, loff_t *ppos, struct file *out,
 
 	return ret;
 }
+EXPORT_SYMBOL(do_splice_direct);
 
 static int splice_pipe_to_pipe(struct pipe_inode_info *ipipe,
 			       struct pipe_inode_info *opipe,

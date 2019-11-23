@@ -740,5 +740,7 @@ extern int ipv6_static_sysctl_register(void);
 extern void ipv6_static_sysctl_unregister(void);
 #endif
 
+extern bool ipv6_is_enabled(void);
+
 #endif /* __KERNEL__ */
 #endif /* _NET_IPV6_H */

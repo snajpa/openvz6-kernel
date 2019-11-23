@@ -30,6 +30,11 @@ struct as_io_context {
 	sector_t seek_mean;
 };
 
+enum {
+	CIC_IOPRIO_CHANGED,
+	CIC_CGROUP_CHANGED,
+};
+
 struct cfq_queue;
 struct cfq_io_context {
 	void *key;
@@ -47,6 +52,8 @@ struct cfq_io_context {
 
 	struct list_head queue_list;
 	struct hlist_node cic_list;
+
+	unsigned long changed;
 
 	void (*dtor)(struct io_context *); /* destructor */
 	void (*exit)(struct io_context *); /* called on task exit */
@@ -66,11 +73,6 @@ struct io_context {
 	spinlock_t lock;
 
 	unsigned short ioprio;
-	unsigned short ioprio_changed;
-
-#ifdef CONFIG_BLK_CGROUP
-	unsigned short cgroup_changed;
-#endif
 
 	/*
 	 * For request batching
@@ -82,6 +84,9 @@ struct io_context {
 	struct radix_tree_root radix_root;
 	struct hlist_head cic_list;
 	void *ioc_data;
+#ifdef CONFIG_BEANCOUNTERS
+	struct user_beancounter *ioc_ub;
+#endif
 };
 
 static inline struct io_context *ioc_task_link(struct io_context *ioc)
@@ -102,9 +107,13 @@ struct task_struct;
 #ifdef CONFIG_BLOCK
 int put_io_context(struct io_context *ioc);
 void exit_io_context(struct task_struct *task);
+void ioc_task_unlink(struct io_context *ioc);
 struct io_context *get_io_context(gfp_t gfp_flags, int node);
 struct io_context *alloc_io_context(gfp_t gfp_flags, int node);
+struct io_context *current_io_context(gfp_t gfp_flags, int node);
 void copy_io_context(struct io_context **pdst, struct io_context **psrc);
+void ioc_ioprio_changed(struct io_context *ioc, int ioprio);
+void ioc_cgroup_changed(struct io_context *ioc);
 #else
 static inline void exit_io_context(struct task_struct *task)
 {

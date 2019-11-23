@@ -11,94 +11,19 @@
 #include <linux/fs.h>
 #include <linux/rbtree.h>
 
-struct sysfs_open_dirent;
-
-/* type-specific structures for sysfs_dirent->s_* union members */
-struct sysfs_elem_dir {
-	struct kobject		*kobj;
-#ifdef __GENKSYMS__
-	struct sysfs_dirent	*children;
+#ifndef CONFIG_VE
+extern struct vfsmount *sysfs_mount;
+extern struct super_block *sysfs_sb;
+#define sd_sysfs_sb(sd) sysfs_sb
+#define ve_sysfs_alowed()	1
+#else
+#include <linux/sched.h>
+#include <linux/ve.h>
+#define sysfs_mount		(get_exec_env()->sysfs_mnt)
+#define sysfs_sb		(get_exec_env()->_sysfs_sb)
+#define sd_sysfs_sb(sd)		((sd)->owner_env->_sysfs_sb)
+#define ve_sysfs_alowed()	(sysfs_sb != NULL)
 #endif
-
-#ifndef __GENKSYMS__
-	unsigned long		subdirs;
-
-	struct rb_root		inode_tree;
-	struct rb_root		name_tree;
-#endif
-};
-
-struct sysfs_elem_symlink {
-	struct sysfs_dirent	*target_sd;
-};
-
-struct sysfs_elem_attr {
-	struct attribute	*attr;
-	struct sysfs_open_dirent *open;
-};
-
-struct sysfs_elem_bin_attr {
-	struct bin_attribute	*bin_attr;
-	struct hlist_head	buffers;
-};
-
-struct sysfs_inode_attrs {
-	struct iattr	ia_iattr;
-	void		*ia_secdata;
-	u32		ia_secdata_len;
-};
-
-/*
- * sysfs_dirent - the building block of sysfs hierarchy.  Each and
- * every sysfs node is represented by single sysfs_dirent.
- *
- * As long as s_count reference is held, the sysfs_dirent itself is
- * accessible.  Dereferencing s_elem or any other outer entity
- * requires s_active reference.
- */
-struct sysfs_dirent {
-	atomic_t		s_count;
-	atomic_t		s_active;
-	struct sysfs_dirent	*s_parent;
-#ifdef __GENKSYMS__
-	struct sysfs_dirent	*s_sibling;
-#endif
-	const char		*s_name;
-
-#ifndef __GENKSYMS__
-	struct rb_node		inode_node;
-	struct rb_node		name_node;
-
-	union {
-		struct completion	*completion;
-		struct sysfs_dirent	*removed_list;
-	} u;
-#endif
-
-	union {
-		struct sysfs_elem_dir		s_dir;
-		struct sysfs_elem_symlink	s_symlink;
-		struct sysfs_elem_attr		s_attr;
-		struct sysfs_elem_bin_attr	s_bin_attr;
-	};
-
-	unsigned int		s_flags;
-	ino_t			s_ino;
-	umode_t			s_mode;
-	struct sysfs_inode_attrs *s_iattr;
-};
-
-#define SD_DEACTIVATED_BIAS		INT_MIN
-
-#define SYSFS_TYPE_MASK			0x00ff
-#define SYSFS_DIR			0x0001
-#define SYSFS_KOBJ_ATTR			0x0002
-#define SYSFS_KOBJ_BIN_ATTR		0x0004
-#define SYSFS_KOBJ_LINK			0x0008
-#define SYSFS_COPY_NAME			(SYSFS_DIR | SYSFS_KOBJ_LINK)
-
-#define SYSFS_FLAG_MASK			~SYSFS_TYPE_MASK
-#define SYSFS_FLAG_REMOVED		0x0200
 
 static inline unsigned int sysfs_type(struct sysfs_dirent *sd)
 {
@@ -118,8 +43,12 @@ struct sysfs_addrm_cxt {
 /*
  * mount.c
  */
+#ifdef CONFIG_VE
+#define ve_sysfs_root	(get_exec_env()->_sysfs_root)
+#else
 extern struct sysfs_dirent sysfs_root;
-extern struct super_block *sysfs_sb;
+#define ve_sysfs_root	(&sysfs_root)
+#endif
 extern struct kmem_cache *sysfs_dir_cachep;
 
 /*
@@ -131,6 +60,9 @@ extern spinlock_t sysfs_assoc_lock;
 
 extern const struct file_operations sysfs_dir_operations;
 extern const struct inode_operations sysfs_dir_inode_operations;
+
+extern const struct file_operations sysfs_dirlink_operations;
+extern const struct inode_operations sysfs_dirlink_inode_operations;
 
 struct dentry *sysfs_get_dentry(struct sysfs_dirent *sd);
 struct sysfs_dirent *sysfs_get_active_two(struct sysfs_dirent *sd);
@@ -171,6 +103,11 @@ static inline void __sysfs_put(struct sysfs_dirent *sd)
 }
 #define sysfs_put(sd) __sysfs_put(sd)
 
+struct dentry * __sysfs_lookup_at(struct sysfs_dirent *parent_sd, struct dentry *dentry,
+		struct nameidata *nd);
+int __sysfs_readdir_at(struct sysfs_dirent *parent_sd, struct file * filp,
+		void * dirent, filldir_t filldir);
+
 /*
  * inode.c
  */
@@ -179,6 +116,8 @@ void sysfs_delete_inode(struct inode *inode);
 int sysfs_setattr(struct dentry *dentry, struct iattr *iattr);
 int sysfs_setxattr(struct dentry *dentry, const char *name, const void *value,
 		size_t size, int flags);
+int sysfs_getattr(struct vfsmount *mnt, struct dentry *dentry,
+		struct kstat *stat);
 int sysfs_hash_and_remove(struct sysfs_dirent *dir_sd, const char *name);
 int sysfs_inode_init(void);
 

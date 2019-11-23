@@ -332,6 +332,19 @@ extern void call_rcu(struct rcu_head *head,
 extern void call_rcu_bh(struct rcu_head *head,
 			void (*func)(struct rcu_head *head));
 
+/**
+ * call_rcu_in_process() - Queue an RCU for invocation in process context.
+ * Not guarantee grace period, must be combined with other rcu calls for this.
+ * @head: structure to be used for queueing the RCU updates.
+ * @func: actual callback function to be invoked.
+ *
+ * If called in non-interrupt context it does nothing and return 0,
+ * otherwise it schedule head for invocation and return 1.
+ */
+extern int call_rcu_in_process(struct rcu_head *head,
+		void (*func)(struct rcu_head *head));
+
+#define rcu_in_process_barrier		flush_scheduled_work
 
 extern void kfree(const void *);
 

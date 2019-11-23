@@ -149,42 +149,42 @@ void ir_raw_init(void);
 
 /* from ir-nec-decoder.c */
 #ifdef CONFIG_IR_NEC_DECODER_MODULE
-#define load_nec_decode()	request_module("ir-nec-decoder")
+#define load_nec_decode()	request_module_nowait("ir-nec-decoder")
 #else
 #define load_nec_decode()	0
 #endif
 
 /* from ir-rc5-decoder.c */
 #ifdef CONFIG_IR_RC5_DECODER_MODULE
-#define load_rc5_decode()	request_module("ir-rc5-decoder")
+#define load_rc5_decode()	request_module_nowait("ir-rc5-decoder")
 #else
 #define load_rc5_decode()	0
 #endif
 
 /* from ir-rc6-decoder.c */
 #ifdef CONFIG_IR_RC6_DECODER_MODULE
-#define load_rc6_decode()	request_module("ir-rc6-decoder")
+#define load_rc6_decode()	request_module_nowait("ir-rc6-decoder")
 #else
 #define load_rc6_decode()	0
 #endif
 
 /* from ir-jvc-decoder.c */
 #ifdef CONFIG_IR_JVC_DECODER_MODULE
-#define load_jvc_decode()	request_module("ir-jvc-decoder")
+#define load_jvc_decode()	request_module_nowait("ir-jvc-decoder")
 #else
 #define load_jvc_decode()	0
 #endif
 
 /* from ir-sony-decoder.c */
 #ifdef CONFIG_IR_SONY_DECODER_MODULE
-#define load_sony_decode()	request_module("ir-sony-decoder")
+#define load_sony_decode()	request_module_nowait("ir-sony-decoder")
 #else
 #define load_sony_decode()	0
 #endif
 
 /* from ir-lirc-codec.c */
 #ifdef CONFIG_IR_LIRC_CODEC_MODULE
-#define load_lirc_codec()	request_module("ir-lirc-codec")
+#define load_lirc_codec()	request_module_nowait("ir-lirc-codec")
 #else
 #define load_lirc_codec()	0
 #endif

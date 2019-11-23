@@ -77,6 +77,7 @@
 #include <linux/file.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/vzcalluser.h>
 
 #include <linux/nsproxy.h>
 #include <net/net_namespace.h>
@@ -452,6 +453,8 @@ static int pppoe_rcv(struct sk_buff *skb, struct net_device *dev,
 		goto drop;
 
 	pn = pppoe_pernet(dev_net(dev));
+	if (!pn) /* no VE_FEATURE_PPP */
+		goto drop;
 
 	/* Note that get_item does a sock_hold(), so sk_pppox(po)
 	 * is known to be safe.
@@ -510,6 +513,9 @@ static int pppoe_disc_rcv(struct sk_buff *skb, struct net_device *dev,
 		goto abort;
 
 	pn = pppoe_pernet(dev_net(dev));
+	if (!pn) /* no VE_FEATURE_PPP */
+		goto abort;
+
 	po = get_item(pn, ph->sid, eth_hdr(skb)->h_source, dev->ifindex);
 	if (po) {
 		struct sock *sk = sk_pppox(po);
@@ -564,6 +570,9 @@ static struct proto pppoe_sk_proto __read_mostly = {
 static int pppoe_create(struct net *net, struct socket *sock)
 {
 	struct sock *sk;
+
+	if (!(get_exec_env()->features & VE_FEATURE_PPP))
+		return -EACCES;
 
 	sk = sk_alloc(net, PF_PPPOX, GFP_KERNEL, &pppoe_sk_proto);
 	if (!sk)
@@ -1170,6 +1179,9 @@ static __net_init int pppoe_init_net(struct net *net)
 	struct proc_dir_entry *pde;
 	int err;
 
+	if (!(get_exec_env()->features & VE_FEATURE_PPP))
+		return net_assign_generic(net, pppoe_net_id, NULL);;
+
 	pn = kzalloc(sizeof(*pn), GFP_KERNEL);
 	if (!pn)
 		return -ENOMEM;
@@ -1199,8 +1211,11 @@ static __net_exit void pppoe_exit_net(struct net *net)
 {
 	struct pppoe_net *pn;
 
-	proc_net_remove(net, "pppoe");
 	pn = net_generic(net, pppoe_net_id);
+	if (!pn) /* no VE_FEATURE_PPP */
+		return;
+
+	proc_net_remove(net, "pppoe");
 	/*
 	 * if someone has cached our net then
 	 * further net_generic call will return NULL
@@ -1212,13 +1227,14 @@ static __net_exit void pppoe_exit_net(struct net *net)
 static struct pernet_operations pppoe_net_ops = {
 	.init = pppoe_init_net,
 	.exit = pppoe_exit_net,
+	.id = &pppoe_net_id,
 };
 
 static int __init pppoe_init(void)
 {
 	int err;
 
-	err = register_pernet_gen_device(&pppoe_net_id, &pppoe_net_ops);
+	err = register_pernet_device(&pppoe_net_ops);
 	if (err)
 		goto out;
 
@@ -1239,7 +1255,7 @@ static int __init pppoe_init(void)
 out_unregister_pppoe_proto:
 	proto_unregister(&pppoe_sk_proto);
 out_unregister_net_ops:
-	unregister_pernet_gen_device(pppoe_net_id, &pppoe_net_ops);
+	unregister_pernet_device(&pppoe_net_ops);
 out:
 	return err;
 }
@@ -1251,7 +1267,7 @@ static void __exit pppoe_exit(void)
 	dev_remove_pack(&pppoes_ptype);
 	unregister_pppox_proto(PX_PROTO_OE);
 	proto_unregister(&pppoe_sk_proto);
-	unregister_pernet_gen_device(pppoe_net_id, &pppoe_net_ops);
+	unregister_pernet_device(&pppoe_net_ops);
 }
 
 module_init(pppoe_init);

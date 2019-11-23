@@ -542,6 +542,7 @@ static void blk_release_queue(struct kobject *kobj)
 	blk_throtl_release(q);
 	blk_trace_shutdown(q);
 
+	blk_cbt_release(q);
 	bdi_destroy(&q->backing_dev_info);
 	kmem_cache_free(blk_requestq_cachep, q);
 }

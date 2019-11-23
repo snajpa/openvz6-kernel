@@ -664,10 +664,12 @@ EXPORT_SYMBOL(jiffies_to_clock_t);
 unsigned long clock_t_to_jiffies(unsigned long x)
 {
 #if (HZ % USER_HZ)==0
+	WARN_ON((long)x < 0);
 	if (x >= ~0UL / (HZ / USER_HZ))
 		return ~0UL;
 	return x * (HZ / USER_HZ);
 #else
+	WARN_ON((long)x < 0);
 	/* Don't worry about loss of precision here .. */
 	if (x >= ~0UL / HZ * USER_HZ)
 		return ~0UL;
@@ -680,6 +682,7 @@ EXPORT_SYMBOL(clock_t_to_jiffies);
 
 u64 jiffies_64_to_clock_t(u64 x)
 {
+	WARN_ON((s64)x < 0);
 #if (TICK_NSEC % (NSEC_PER_SEC / USER_HZ)) == 0
 # if HZ < USER_HZ
 	x = div_u64(x * USER_HZ, HZ);
@@ -702,6 +705,7 @@ EXPORT_SYMBOL(jiffies_64_to_clock_t);
 
 u64 nsec_to_clock_t(u64 x)
 {
+	WARN_ON((s64)x < 0);
 #if (NSEC_PER_SEC % USER_HZ) == 0
 	return div_u64(x, NSEC_PER_SEC / USER_HZ);
 #elif (USER_HZ % 512) == 0

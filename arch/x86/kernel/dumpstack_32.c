@@ -99,8 +99,9 @@ void show_registers(struct pt_regs *regs)
 	print_modules();
 	__show_regs(regs, 0);
 
-	printk(KERN_EMERG "Process %.*s (pid: %d, ti=%p task=%p task.ti=%p)\n",
+	printk(KERN_EMERG "Process %.*s (pid: %d, veid: %u, ti=%p task=%p task.ti=%p)\n",
 		TASK_COMM_LEN, current->comm, task_pid_nr(current),
+		task_veid(current),
 		current_thread_info(), current, task_thread_info(current));
 	/*
 	 * When in-kernel, we also print out the stack and code at the

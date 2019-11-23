@@ -173,6 +173,19 @@ static void blkio_add_stat(uint64_t *stat, uint64_t add, bool direction,
 		stat[BLKIO_STAT_ASYNC] += add;
 }
 
+static void blkio_max_stat(uint64_t *stat, uint64_t cur, bool direction,
+				bool sync)
+{
+	if (direction)
+		stat[BLKIO_STAT_WRITE] = max(stat[BLKIO_STAT_WRITE], cur);
+	else
+		stat[BLKIO_STAT_READ] = max(stat[BLKIO_STAT_READ], cur);
+	if (sync)
+		stat[BLKIO_STAT_SYNC] = max(stat[BLKIO_STAT_SYNC], cur);
+	else
+		stat[BLKIO_STAT_ASYNC] = max(stat[BLKIO_STAT_ASYNC], cur);
+}
+
 /*
  * Decrements the appropriate stat variable if non-zero depending on the
  * request type. Panics on value being zero.
@@ -404,9 +417,12 @@ void blkiocg_update_completion_stats(struct blkio_group *blkg,
 	if (time_after64(now, io_start_time))
 		blkio_add_stat(stats->stat_arr[BLKIO_STAT_SERVICE_TIME],
 				now - io_start_time, direction, sync);
-	if (time_after64(io_start_time, start_time))
+	if (time_after64(io_start_time, start_time)) {
 		blkio_add_stat(stats->stat_arr[BLKIO_STAT_WAIT_TIME],
 				io_start_time - start_time, direction, sync);
+		blkio_max_stat(stats->stat_arr[BLKIO_STAT_WAIT_MAX],
+				io_start_time - start_time, direction, sync);
+	}
 	spin_unlock_irqrestore(&blkg->stats_lock, flags);
 }
 EXPORT_SYMBOL_GPL(blkiocg_update_completion_stats);
@@ -423,19 +439,75 @@ void blkiocg_update_io_merged_stats(struct blkio_group *blkg, bool direction,
 }
 EXPORT_SYMBOL_GPL(blkiocg_update_io_merged_stats);
 
-/*
- * This function allocates the per cpu stats for blkio_group. Should be called
- * from sleepable context as alloc_per_cpu() requires that.
- */
+static LIST_HEAD(stats_alloc_list);
+static DEFINE_SPINLOCK(stats_alloc_lock);
+
+static void blkio_stats_alloc_fn(struct work_struct *work)
+{
+	struct delayed_work *dw = container_of(work, struct delayed_work, work);
+	struct blkio_group_stats_cpu __percpu *stats;
+	struct blkio_group *blkg;
+
+	spin_lock_irq(&stats_alloc_lock);
+	while (!list_empty(&stats_alloc_list)) {
+		spin_unlock_irq(&stats_alloc_lock);
+
+		stats = alloc_percpu(struct blkio_group_stats_cpu);
+		if (!stats) {
+			/* Cannot fail, try again after timeout */
+			schedule_delayed_work(dw, HZ);
+			return;
+		}
+
+		spin_lock_irq(&stats_alloc_lock);
+		if (list_empty(&stats_alloc_list)) {
+			free_percpu(stats);
+			break;
+		}
+		blkg = list_first_entry(&stats_alloc_list,
+				struct blkio_group, stats_alloc_list);
+		list_del_init(&blkg->stats_alloc_list);
+		blkg->stats_cpu = stats;
+	}
+	spin_unlock_irq(&stats_alloc_lock);
+}
+
+static DECLARE_DELAYED_WORK(stats_alloc_work, blkio_stats_alloc_fn);
+static DEFINE_PER_CPU(struct blkio_group_stats_cpu, stats_plug);
+
 int blkio_alloc_blkg_stats(struct blkio_group *blkg)
 {
-	/* Allocate memory for per cpu stats */
-	blkg->stats_cpu = alloc_percpu(struct blkio_group_stats_cpu);
-	if (!blkg->stats_cpu)
-		return -ENOMEM;
+	unsigned long flags;
+
+	/* Set temporary plug */
+	blkg->stats_cpu = &per_cpu_var(stats_plug);
+
+	/* Queue per cpu stat allocation from worker thread. */
+	spin_lock_irqsave(&stats_alloc_lock, flags);
+	list_add(&blkg->stats_alloc_list, &stats_alloc_list);
+	spin_unlock_irqrestore(&stats_alloc_lock, flags);
+
+	schedule_delayed_work(&stats_alloc_work, 0);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(blkio_alloc_blkg_stats);
+
+void blkio_free_blkg_stats(struct blkio_group *blkg)
+{
+	unsigned long flags;
+
+	if (!blkg->stats_cpu)
+		return;
+
+	/* Cancel pending stats allocation */
+	spin_lock_irqsave(&stats_alloc_lock, flags);
+	list_del_init(&blkg->stats_alloc_list);
+	spin_unlock_irqrestore(&stats_alloc_lock, flags);
+
+	if (blkg->stats_cpu != &per_cpu_var(stats_plug))
+		free_percpu(blkg->stats_cpu);
+}
+EXPORT_SYMBOL_GPL(blkio_free_blkg_stats);
 
 void blkiocg_add_blkio_group(struct blkio_cgroup *blkcg,
 		struct blkio_group *blkg, void *key, dev_t dev,
@@ -449,6 +521,7 @@ void blkiocg_add_blkio_group(struct blkio_cgroup *blkcg,
 	blkg->blkcg_id = css_id(&blkcg->css);
 	hlist_add_head_rcu(&blkg->blkcg_node, &blkcg->blkg_list);
 	blkg->plid = plid;
+	blkg->blk_ub = blkcg->blk_ub;
 	spin_unlock_irqrestore(&blkcg->lock, flags);
 	/* Need to take css reference ? */
 	cgroup_path(blkcg->css.cgroup, blkg->path, sizeof(blkg->path));
@@ -626,7 +699,7 @@ static uint64_t blkio_fill_stat(char *str, int chars_left, uint64_t val,
 }
 
 
-static uint64_t blkio_read_stat_cpu(struct blkio_group *blkg,
+uint64_t blkio_read_stat_cpu(struct blkio_group *blkg,
 			enum stat_type_cpu type, enum stat_sub_type sub_type)
 {
 	int cpu;
@@ -1202,6 +1275,9 @@ static int blkiocg_file_read_map(struct cgroup *cgrp, struct cftype *cft,
 		case BLKIO_PROP_io_wait_time:
 			return blkio_read_blkg_stats(blkcg, cft, cb,
 						BLKIO_STAT_WAIT_TIME, 1, 0);
+		case BLKIO_PROP_io_wait_max:
+			return blkio_read_blkg_stats(blkcg, cft, cb,
+						BLKIO_STAT_WAIT_MAX, 0, 0);
 		case BLKIO_PROP_io_merged:
 			return blkio_read_blkg_stats(blkcg, cft, cb,
 						BLKIO_STAT_MERGED, 1, 0);
@@ -1317,6 +1393,25 @@ blkiocg_file_write_u64(struct cgroup *cgrp, struct cftype *cft, u64 val)
 	return 0;
 }
 
+int blkio_cgroup_set_weight(struct cgroup *cgroup, u64 weight)
+{
+	return blkio_weight_write(cgroup_to_blkio_cgroup(cgroup), weight);
+}
+
+void blkio_cgroup_set_ub(struct cgroup *cgroup, struct user_beancounter *ub)
+{
+	struct blkio_cgroup *blkcg = cgroup_to_blkio_cgroup(cgroup);
+	struct blkio_group *blkg;
+	struct hlist_node *n;
+	unsigned long flags;
+
+	spin_lock_irqsave(&blkcg->lock, flags);
+	blkcg->blk_ub = ub;
+	hlist_for_each_entry(blkg, n, &blkcg->blkg_list, blkcg_node)
+		blkg->blk_ub = ub;
+	spin_unlock_irqrestore(&blkcg->lock, flags);
+}
+
 struct cftype blkio_files[] = {
 	{
 		.name = "weight_device",
@@ -1367,6 +1462,12 @@ struct cftype blkio_files[] = {
 		.name = "io_wait_time",
 		.private = BLKIOFILE_PRIVATE(BLKIO_POLICY_PROP,
 				BLKIO_PROP_io_wait_time),
+		.read_map = blkiocg_file_read_map,
+	},
+	{
+		.name = "io_wait_max",
+		.private = BLKIOFILE_PRIVATE(BLKIO_POLICY_PROP,
+				BLKIO_PROP_io_wait_max),
 		.read_map = blkiocg_file_read_map,
 	},
 	{
@@ -1545,6 +1646,7 @@ done:
 	INIT_HLIST_HEAD(&blkcg->blkg_list);
 
 	INIT_LIST_HEAD(&blkcg->policy_list);
+	blkcg->blk_ub = &ub0;
 	return &blkcg->css;
 }
 
@@ -1576,7 +1678,7 @@ static void blkiocg_attach_task(struct cgroup *cgrp, struct task_struct *tsk)
 	task_lock(tsk);
 	ioc = tsk->io_context;
 	if (ioc)
-		ioc->cgroup_changed = 1;
+		ioc_cgroup_changed(ioc);
 	task_unlock(tsk);
 }
 

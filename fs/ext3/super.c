@@ -189,6 +189,11 @@ static void ext3_handle_error(struct super_block *sb)
 			journal_abort(journal, -EIO);
 	}
 	if (test_opt (sb, ERRORS_RO)) {
+		/*
+		 * Make shure updated value of ->s_mount_state will be visiable
+		 * before ->s_flags update.
+		 */
+		smp_wmb();
 		ext3_msg(sb, KERN_CRIT,
 			"error: remounting filesystem read-only");
 		sb->s_flags |= MS_RDONLY;
@@ -297,9 +302,13 @@ void ext3_abort (struct super_block * sb, const char * function,
 
 	ext3_msg(sb, KERN_CRIT,
 		"error: remounting filesystem read-only");
-	EXT3_SB(sb)->s_mount_state |= EXT3_ERROR_FS;
+	EXT3_SB(sb)->s_mount_state |= EXT3_ERROR_FS | EXT3_MOUNT_ABORT;
+	/*
+	 * Make shure updated value of ->s_mount_state will be visiable
+	 * before ->s_flags update.
+	 */
+	smp_wmb();
 	sb->s_flags |= MS_RDONLY;
-	EXT3_SB(sb)->s_mount_opt |= EXT3_MOUNT_ABORT;
 	if (EXT3_SB(sb)->s_journal)
 		journal_abort(EXT3_SB(sb)->s_journal, -EIO);
 }
@@ -413,6 +422,7 @@ static void ext3_put_super (struct super_block * sb)
 	struct ext3_super_block *es = sbi->s_es;
 	int i, err;
 
+	vfs_dq_off(sb, 0);
 	ext3_xattr_put_super(sb);
 	err = journal_destroy(sbi->s_journal);
 	sbi->s_journal = NULL;
@@ -1297,7 +1307,7 @@ static int ext3_setup_super(struct super_block *sb, struct ext3_super_block *es,
 		res = MS_RDONLY;
 	}
 	if (read_only)
-		return res;
+		goto out;
 	if (!(sbi->s_mount_state & EXT3_VALID_FS))
 		ext3_msg(sb, KERN_WARNING,
 			"warning: mounting unchecked fs, "
@@ -1349,6 +1359,8 @@ static int ext3_setup_super(struct super_block *sb, struct ext3_super_block *es,
 	} else {
 		ext3_msg(sb, KERN_INFO, "using internal journal");
 	}
+out:
+	sb->s_mnt_count = le16_to_cpu(es->s_mnt_count);
 	return res;
 }
 
@@ -1937,6 +1949,7 @@ static int ext3_fill_super (struct super_block *sb, void *data, int silent)
 	sb->s_qcop = &ext3_qctl_operations;
 	sb->dq_op = &ext3_quota_operations;
 #endif
+	memcpy(sb->s_uuid, es->s_uuid, sizeof(es->s_uuid));
 	INIT_LIST_HEAD(&sbi->s_orphan); /* unlinked but open files */
 	mutex_init(&sbi->s_resize_lock);
 
@@ -3075,7 +3088,8 @@ static struct file_system_type ext3_fs_type = {
 	.name		= "ext3",
 	.get_sb		= ext3_get_sb,
 	.kill_sb	= kill_block_super,
-	.fs_flags	= FS_REQUIRES_DEV  | FS_HAS_NEW_FREEZE | FS_HANDLE_QUOTA,
+	.fs_flags	= FS_REQUIRES_DEV | FS_HAS_NEW_FREEZE |
+			  FS_HANDLE_QUOTA | FS_VIRTUALIZED,
 };
 
 static int __init init_ext3_fs(void)

@@ -764,7 +764,7 @@ int nilfs_mark_inode_dirty(struct inode *inode)
  * construction. This function can be called both as a single operation
  * and as a part of indivisible file operations.
  */
-void nilfs_dirty_inode(struct inode *inode)
+void nilfs_dirty_inode(struct inode *inode, int flags)
 {
 	struct nilfs_transaction_info ti;
 

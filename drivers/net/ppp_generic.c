@@ -53,6 +53,9 @@
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
 
+#include <linux/ve_task.h>
+#include <linux/vzcalluser.h>
+
 #define PPP_VERSION	"2.4.2"
 
 /*
@@ -379,8 +382,10 @@ static int ppp_open(struct inode *inode, struct file *file)
 	/*
 	 * This could (should?) be enforced by the permissions on /dev/ppp.
 	 */
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
+	if (!net_generic(get_exec_env()->ve_netns, ppp_net_id)) /* no VE_FEATURE_PPP */
+		return -EACCES;
 	return 0;
 }
 
@@ -880,6 +885,9 @@ static __net_init int ppp_init_net(struct net *net)
 	struct ppp_net *pn;
 	int err;
 
+	if (!(get_exec_env()->features & VE_FEATURE_PPP))
+		return net_assign_generic(net, ppp_net_id, NULL);
+
 	pn = kzalloc(sizeof(*pn), GFP_KERNEL);
 	if (!pn)
 		return -ENOMEM;
@@ -906,6 +914,9 @@ static __net_exit void ppp_exit_net(struct net *net)
 	struct ppp_net *pn;
 
 	pn = net_generic(net, ppp_net_id);
+	if (!pn) /* no VE_FEATURE_PPP */
+		return;
+
 	idr_destroy(&pn->units_idr);
 	/*
 	 * if someone has cached our net then
@@ -918,6 +929,7 @@ static __net_exit void ppp_exit_net(struct net *net)
 static struct pernet_operations ppp_net_ops = {
 	.init = ppp_init_net,
 	.exit = ppp_exit_net,
+	.id = &ppp_net_id,
 };
 
 #define PPP_MAJOR	108
@@ -930,7 +942,7 @@ static int __init ppp_init(void)
 
 	printk(KERN_INFO "PPP generic driver version " PPP_VERSION "\n");
 
-	err = register_pernet_gen_device(&ppp_net_id, &ppp_net_ops);
+	err = register_pernet_device(&ppp_net_ops);
 	if (err) {
 		printk(KERN_ERR "failed to register PPP pernet device (%d)\n", err);
 		goto out;
@@ -956,7 +968,7 @@ static int __init ppp_init(void)
 out_chrdev:
 	unregister_chrdev(PPP_MAJOR, "ppp");
 out_net:
-	unregister_pernet_gen_device(ppp_net_id, &ppp_net_ops);
+	unregister_pernet_device(&ppp_net_ops);
 out:
 	return err;
 }
@@ -1096,6 +1108,7 @@ static void ppp_setup(struct net_device *dev)
 	dev->type = ARPHRD_PPP;
 	dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
 	dev->features |= NETIF_F_NETNS_LOCAL;
+	dev->vz_features |= NETIF_F_VIRTUAL;
 	dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
 	set_netdev_ops_ext(dev, &ppp_netdev_ops_ext);
 }
@@ -2164,11 +2177,13 @@ int ppp_register_net_channel(struct net *net, struct ppp_channel *chan)
 	struct channel *pch;
 	struct ppp_net *pn;
 
+	pn = ppp_pernet(net);
+	if (!pn)
+		return -EACCES;
+
 	pch = kzalloc(sizeof(struct channel), GFP_KERNEL);
 	if (!pch)
 		return -ENOMEM;
-
-	pn = ppp_pernet(net);
 
 	pch->ppp = NULL;
 	pch->chan = chan;
@@ -2611,16 +2626,16 @@ ppp_create_interface(struct net *net, int unit, int *retp)
 	 */
 	dev_net_set(dev, net);
 
-	ret = -EEXIST;
 	mutex_lock(&pn->all_ppp_mutex);
 
 	if (unit < 0) {
 		unit = unit_get(&pn->units_idr, ppp);
 		if (unit < 0) {
-			*retp = unit;
+			ret = unit;
 			goto out2;
 		}
 	} else {
+		ret = -EEXIST;
 		if (unit_find(&pn->units_idr, unit))
 			goto out2; /* unit already exists */
 		/*
@@ -2695,10 +2710,10 @@ static void ppp_shutdown_interface(struct ppp *ppp)
 		ppp->closing = 1;
 		ppp_unlock(ppp);
 		unregister_netdev(ppp->dev);
+		unit_put(&pn->units_idr, ppp->file.index);
 	} else
 		ppp_unlock(ppp);
 
-	unit_put(&pn->units_idr, ppp->file.index);
 	ppp->file.dead = 1;
 	ppp->owner = NULL;
 	wake_up_interruptible(&ppp->file.rwait);
@@ -2878,7 +2893,7 @@ static void __exit ppp_cleanup(void)
 	unregister_chrdev(PPP_MAJOR, "ppp");
 	device_destroy(ppp_class, MKDEV(PPP_MAJOR, 0));
 	class_destroy(ppp_class);
-	unregister_pernet_gen_device(ppp_net_id, &ppp_net_ops);
+	unregister_pernet_device(&ppp_net_ops);
 }
 
 /*
@@ -2886,8 +2901,7 @@ static void __exit ppp_cleanup(void)
  * by holding all_ppp_mutex
  */
 
-/* associate pointer with specified number */
-static int unit_set(struct idr *p, void *ptr, int n)
+static int __unit_alloc(struct idr *p, void *ptr, int n)
 {
 	int unit, err;
 
@@ -2898,10 +2912,24 @@ again:
 	}
 
 	err = idr_get_new_above(p, ptr, n, &unit);
-	if (err == -EAGAIN)
-		goto again;
+	if (err < 0) {
+		if (err == -EAGAIN)
+			goto again;
+		return err;
+	}
 
-	if (unit != n) {
+	return unit;
+}
+
+/* associate pointer with specified number */
+static int unit_set(struct idr *p, void *ptr, int n)
+{
+	int unit;
+
+	unit = __unit_alloc(p, ptr, n);
+	if (unit < 0)
+		return unit;
+	else if (unit != n) {
 		idr_remove(p, unit);
 		return -EINVAL;
 	}
@@ -2912,19 +2940,7 @@ again:
 /* get new free unit number and associate pointer with it */
 static int unit_get(struct idr *p, void *ptr)
 {
-	int unit, err;
-
-again:
-	if (!idr_pre_get(p, GFP_KERNEL)) {
-		printk(KERN_ERR "PPP: No free memory for idr\n");
-		return -ENOMEM;
-	}
-
-	err = idr_get_new_above(p, ptr, 0, &unit);
-	if (err == -EAGAIN)
-		goto again;
-
-	return unit;
+	return __unit_alloc(p, ptr, 0);
 }
 
 /* put unit number back to a pool */

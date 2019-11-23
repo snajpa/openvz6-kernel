@@ -50,7 +50,7 @@
 static struct lock_class_key rcu_lock_key;
 struct lockdep_map rcu_lock_map =
 	STATIC_LOCKDEP_MAP_INIT("rcu_read_lock", &rcu_lock_key);
-EXPORT_SYMBOL_GPL(rcu_lock_map);
+EXPORT_SYMBOL(rcu_lock_map);
 #endif
 
 int rcu_scheduler_active __read_mostly;
@@ -66,6 +66,53 @@ void wakeme_after_rcu(struct rcu_head  *head)
 	rcu = container_of(head, struct rcu_synchronize, head);
 	complete(&rcu->completion);
 }
+
+static DEFINE_PER_CPU(struct work_struct, rcu_in_process_work);
+static DEFINE_PER_CPU(struct rcu_head *, rcu_in_process_head);
+
+static void do_rcu_in_process(struct work_struct *work)
+{
+	struct rcu_head *head;
+
+	local_irq_disable();
+	while ((head = __get_cpu_var(rcu_in_process_head))) {
+		__get_cpu_var(rcu_in_process_head) = head->next;
+		local_irq_enable();
+		head->func(head);
+		local_irq_disable();
+	}
+	local_irq_enable();
+}
+
+static int __init init_rcu_in_process(void)
+{
+       int cpu;
+
+       for_each_possible_cpu(cpu)
+	       INIT_WORK(&per_cpu(rcu_in_process_work, cpu),
+			       do_rcu_in_process);
+       return 0;
+}
+module_init(init_rcu_in_process)
+
+int call_rcu_in_process(struct rcu_head *head,
+		void (*func)(struct rcu_head *head))
+{
+	unsigned long flags;
+
+	if (!in_interrupt())
+		return 0;
+
+	head->func = func;
+	local_irq_save(flags);
+	head->next = __get_cpu_var(rcu_in_process_head);
+	__get_cpu_var(rcu_in_process_head) = head;
+	local_irq_restore(flags);
+	schedule_work_on(smp_processor_id(),
+			&__get_cpu_var(rcu_in_process_work));
+	return 1;
+}
+EXPORT_SYMBOL_GPL(call_rcu_in_process);
 
 #ifdef CONFIG_TREE_PREEMPT_RCU
 

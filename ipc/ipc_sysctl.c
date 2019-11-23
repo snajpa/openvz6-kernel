@@ -306,19 +306,14 @@ static struct ctl_table ipc_kern_table[] = {
 	{}
 };
 
-static struct ctl_table ipc_root_table[] = {
-	{
-		.ctl_name	= CTL_KERN,
-		.procname	= "kernel",
-		.mode		= 0555,
-		.child		= ipc_kern_table,
-	},
+static struct ctl_path ipc_path[] = {
+	{ .ctl_name = CTL_KERN, .procname = "kernel", },
 	{}
 };
 
 static int __init ipc_sysctl_init(void)
 {
-	register_sysctl_table(ipc_root_table);
+	register_sysctl_glob_paths(ipc_path, ipc_kern_table, 1);
 	return 0;
 }
 

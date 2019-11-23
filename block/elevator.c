@@ -868,12 +868,12 @@ void elv_unregister(struct elevator_type *e)
 	 */
 	if (e->ops.trim) {
 		read_lock(&tasklist_lock);
-		do_each_thread(g, p) {
+		do_each_thread_all(g, p) {
 			task_lock(p);
 			if (p->io_context)
 				e->ops.trim(p->io_context);
 			task_unlock(p);
-		} while_each_thread(g, p);
+		} while_each_thread_all(g, p);
 		read_unlock(&tasklist_lock);
 	}
 

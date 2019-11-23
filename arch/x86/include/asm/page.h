@@ -15,6 +15,9 @@
 
 #ifndef __ASSEMBLY__
 
+#include <asm/alternative.h>
+#include <asm/nops.h>
+
 struct page;
 
 static inline void clear_user_page(void *page, unsigned long vaddr,
@@ -52,6 +55,22 @@ static inline void copy_user_page(void *to, void *from, unsigned long vaddr,
 #define pfn_to_kaddr(pfn)      __va((pfn) << PAGE_SHIFT)
 extern bool __virt_addr_valid(unsigned long kaddr);
 #define virt_addr_valid(kaddr)	__virt_addr_valid((unsigned long) (kaddr))
+
+extern void do_zero_free_page(struct page *page, int order);
+
+static __always_inline void maybe_zero_free_page(struct page *page, int order)
+{
+	asm volatile(ALTERNATIVE("jmp 1f", "", X86_FEATURE_ZERO_FREE_PAGES));
+	do_zero_free_page(page, order);
+	asm volatile ("1:");
+}
+
+static __always_inline void arch_free_page(struct page *page, int order)
+{
+	maybe_zero_free_page(page, order);
+}
+
+#define HAVE_ARCH_FREE_PAGE
 
 #endif	/* __ASSEMBLY__ */
 

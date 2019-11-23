@@ -14,6 +14,7 @@
 #include <linux/nfs_fs.h>
 
 #include "callback.h"
+#include "internal.h"
 
 #ifdef CONFIG_NFS_V4
 static const int nfs_set_port_min = 0;
@@ -60,6 +61,24 @@ static ctl_table nfs_cb_sysctls[] = {
 		.mode		= 0644,
 		.proc_handler	= &proc_dointvec,
 	},
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "nfs4_ct_enable",
+		.data		= &nfs_enable_v4_in_ct,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
+	},
+#ifdef CONFIG_NFS_QUOTA
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "quota_reserve_blocks_thresh",
+		.data		= &nfs_quota_reserve_barrier,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
+	},
+#endif
 	{ .ctl_name = 0 }
 };
 

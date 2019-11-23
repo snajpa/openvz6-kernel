@@ -60,6 +60,9 @@ struct inet_frag_queue {
 	u16			max_size;
 
 	struct netns_frags	*net;
+#ifdef CONFIG_VE
+	struct ve_struct	*owner_ve;
+#endif
 };
 
 #define INETFRAGS_HASHSZ	1024

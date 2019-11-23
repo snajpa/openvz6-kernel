@@ -670,9 +670,9 @@ __SYSCALL(__NR_fanotify_mark, sys_ni_syscall)
 #define __NR_prlimit64				302
 __SYSCALL(__NR_prlimit64, sys_ni_syscall)
 #define __NR_name_to_handle_at			303
-__SYSCALL(__NR_name_to_handle_at, sys_ni_syscall)
+__SYSCALL(__NR_name_to_handle_at, sys_name_to_handle_at)
 #define __NR_open_by_handle_at			304
-__SYSCALL(__NR_open_by_handle_at, sys_ni_syscall)
+__SYSCALL(__NR_open_by_handle_at, sys_open_by_handle_at)
 #define __NR_clock_adjtime			305
 __SYSCALL(__NR_clock_adjtime, sys_clock_adjtime)
 #define __NR_syncfs                             306
@@ -687,6 +687,35 @@ __SYSCALL(__NR_get_cpu, sys_ni_syscall)
 __SYSCALL(__NR_process_vm_readv, sys_process_vm_readv)
 #define __NR_process_vm_writev			311
 __SYSCALL(__NR_process_vm_writev, sys_process_vm_writev)
+#define __NR_fairsched_nodemask			497
+__SYSCALL(__NR_fairsched_nodemask, sys_fairsched_nodemask)
+#define __NR_fairsched_cpumask			498
+__SYSCALL(__NR_fairsched_cpumask, sys_fairsched_cpumask)
+#define __NR_fairsched_vcpus			499
+__SYSCALL(__NR_fairsched_vcpus, sys_fairsched_vcpus)
+#define __NR_getluid				500
+__SYSCALL(__NR_getluid, sys_getluid)
+#define __NR_setluid				501
+__SYSCALL(__NR_setluid, sys_setluid)
+#define __NR_setublimit				502
+__SYSCALL(__NR_setublimit, sys_setublimit)
+#define __NR_ubstat				503
+__SYSCALL(__NR_ubstat, sys_ubstat)
+#define __NR_fairsched_mknod			504 /* FairScheduler syscalls */
+__SYSCALL(__NR_fairsched_mknod, sys_fairsched_mknod)
+#define __NR_fairsched_rmnod			505
+__SYSCALL(__NR_fairsched_rmnod, sys_fairsched_rmnod)
+#define __NR_fairsched_chwt			506
+__SYSCALL(__NR_fairsched_chwt, sys_fairsched_chwt)
+#define __NR_fairsched_mvpr			507
+__SYSCALL(__NR_fairsched_mvpr, sys_fairsched_mvpr)
+#define __NR_fairsched_rate			508
+__SYSCALL(__NR_fairsched_rate, sys_fairsched_rate)
+#define __NR_lchmod				509
+__SYSCALL(__NR_lchmod, sys_lchmod)
+#define __NR_lutime				510
+__SYSCALL(__NR_lutime, sys_lutime)
+
 
 #ifndef __NO_STUBS
 #define __ARCH_WANT_OLD_READDIR
@@ -711,6 +740,7 @@ __SYSCALL(__NR_process_vm_writev, sys_process_vm_writev)
 #define __ARCH_WANT_SYS_RT_SIGSUSPEND
 #define __ARCH_WANT_SYS_TIME
 #define __ARCH_WANT_COMPAT_SYS_TIME
+#define __ARCH_WANT_SYS_RT_SIGSUSPEND
 #endif	/* __NO_STUBS */
 
 #ifdef __KERNEL__

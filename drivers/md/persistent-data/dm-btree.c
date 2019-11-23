@@ -331,15 +331,22 @@ EXPORT_SYMBOL_GPL(dm_btree_del);
 
 /*----------------------------------------------------------------*/
 
-static int btree_lookup_raw(struct ro_spine *s, dm_block_t block, uint64_t key,
-			    int (*search_fn)(struct btree_node *, uint64_t),
-			    uint64_t *result_key, void *v, size_t value_size)
+static int __btree_lookup_raw(struct ro_spine *s, dm_block_t block, uint64_t key,
+			      int (*search_fn)(struct btree_node *, uint64_t),
+			      uint64_t *result_key, void *v, size_t value_size,
+			      bool spine_is_long, int *idx)
 {
 	int i, r;
 	uint32_t flags, nr_entries;
 
 	do {
-		r = ro_step(s, block);
+		if (spine_is_long)
+			r = ro_step_long(container_of(s, struct ro_spine_long,
+						      ro_spine),
+					 block, idx ? *idx : -1);
+		else
+			r = ro_step(s, block);
+
 		if (r < 0)
 			return r;
 
@@ -347,18 +354,48 @@ static int btree_lookup_raw(struct ro_spine *s, dm_block_t block, uint64_t key,
 
 		flags = le32_to_cpu(ro_node(s)->header.flags);
 		nr_entries = le32_to_cpu(ro_node(s)->header.nr_entries);
-		if (i < 0 || i >= nr_entries)
+		if (i < 0) {
+			if (idx)
+				i = 0;
+			else
+				return -ENODATA;
+		} else if (i >= nr_entries)
 			return -ENODATA;
 
 		if (flags & INTERNAL_NODE)
 			block = value64(ro_node(s), i);
 
+		if (idx)
+			*idx = i;
 	} while (!(flags & LEAF_NODE));
 
-	*result_key = le64_to_cpu(ro_node(s)->keys[i]);
-	memcpy(v, value_ptr(ro_node(s), i), value_size);
+	if (result_key)
+		*result_key = le64_to_cpu(ro_node(s)->keys[i]);
+	if (v)
+		memcpy(v, value_ptr(ro_node(s), i), value_size);
 
 	return 0;
+}
+
+static int btree_lookup_raw(struct ro_spine *s, dm_block_t block, uint64_t key,
+			    int (*search_fn)(struct btree_node *, uint64_t),
+			    uint64_t *result_key, void *v, size_t value_size)
+{
+	return __btree_lookup_raw(s, block, key,
+				  search_fn,
+				  result_key, v, value_size,
+				  false, NULL);
+}
+
+static int btree_lookup_raw_long(struct ro_spine_long *s, dm_block_t block, uint64_t key,
+				 int (*search_fn)(struct btree_node *, uint64_t),
+				 uint64_t *result_key, void *v, size_t value_size,
+				 int *idx)
+{
+	return __btree_lookup_raw(&s->ro_spine, block, key,
+				  search_fn,
+				  result_key, v, value_size,
+				  true, idx);
 }
 
 int dm_btree_lookup(struct dm_btree_info *info, dm_block_t root,
@@ -903,3 +940,118 @@ int dm_btree_walk(struct dm_btree_info *info, dm_block_t root,
 	return walk_node(info, root, fn, context);
 }
 EXPORT_SYMBOL_GPL(dm_btree_walk);
+
+int dm_btree_iterate(struct dm_btree_info *info, dm_block_t root, uint64_t key,
+		     uint64_t start_block, uint64_t end_block,
+		     dm_block_t *blks, int max_blks, int *n)
+{
+	__le64 internal_value_le;
+	size_t size;
+	void *value_p;
+	uint64_t rkey;
+	struct ro_spine_long spine;
+	struct ro_spine_long *s = &spine;
+	int r;
+	int idx;
+
+	BUG_ON(info->levels != 2);
+	init_ro_spine_long(s, info);
+	*n = 0;
+
+	/* let's find second level root */
+	value_p = &internal_value_le;
+	size = sizeof(uint64_t);
+
+	r = btree_lookup_raw_long(s, root, key,
+				  lower_bound, &rkey,
+				  value_p, size, NULL);
+	if (r)
+		goto done;
+
+	if (rkey != key) {
+		r = -ENODATA;
+		goto done;
+	}
+
+	root = le64_to_cpu(internal_value_le);
+	/* now 'root' points to second level btree */
+
+	idx = -1; /* disable ro_pop_long on the root */
+	r = btree_lookup_raw_long(s, root, start_block,
+				  lower_bound, NULL,
+				  NULL, 0, &idx);
+	if (r)
+		goto done;
+
+	BUG_ON(idx < 0);
+	BUG_ON(idx > le32_to_cpu(ro_node_long(s)->header.nr_entries));
+	BUG_ON(le32_to_cpu(ro_node_long(s)->header.flags) & INTERNAL_NODE);
+	BUG_ON(!(le32_to_cpu(ro_node_long(s)->header.flags) & LEAF_NODE));
+
+	/*
+	 * The intention is to loop until blks[] is full. Other cases are:
+	 * 1) All nodes in b-tree were scanned, nothing more to do
+	 * 2) If a node greater than (or equal to) end_block found, all
+	 *    further nodes are even greater
+	 * 3) The tree is so deep, that RO_SPINE_LONG_LEN=16 is not enough
+	 *    to pop ancestor pointing to the next provisioned block (-ENOSPC)
+	 * 4) An internal error (e.g. I/O) happened
+	 */
+	for (;;) {
+		uint64_t new_start_block;
+		uint32_t nr_entries = le32_to_cpu(ro_node_long(s)->header.nr_entries);
+		int i;
+
+		for (i = idx; i < nr_entries; i++) {
+			uint64_t result_key = le64_to_cpu(ro_node_long(s)->keys[i]);
+			BUG_ON(r);
+			if (result_key >= start_block && result_key <= end_block) {
+				blks[(*n)++] = result_key;
+				if (*n == max_blks) /* partial luck */
+					goto done;
+			}
+			if (result_key >= end_block) /* great luck */
+				goto done;
+		}
+
+		/* ascend through the spine up to a node pointing to the next
+		 * provisioned block */
+		do {
+			r = ro_pop_long(s, &idx);
+			switch (r) {
+			case 0:
+				break;
+			case -ENODATA: /* hard luck - no more nodes in the spine */
+				r = 0;
+				goto done;
+			default: /* bad luck - either ENOSPC or internal error */
+				goto done;
+			}
+
+			nr_entries = le32_to_cpu(ro_node_long(s)->header.nr_entries);
+		} while (idx == nr_entries - 1);
+
+		BUG_ON(!(le32_to_cpu(ro_node_long(s)->header.flags) & INTERNAL_NODE));
+		BUG_ON(le32_to_cpu(ro_node_long(s)->header.flags) & LEAF_NODE);
+
+		idx++;
+		BUG_ON(idx >= nr_entries);
+
+		new_start_block = le64_to_cpu(ro_node_long(s)->keys[idx]);
+		root = value64(ro_node_long(s), idx);
+		r = btree_lookup_raw_long(s, root, new_start_block,
+					  lower_bound, NULL,
+					  NULL, 0, &idx);
+		if (r)
+			goto done;
+
+		BUG_ON(idx < 0);
+		BUG_ON(idx > le32_to_cpu(ro_node_long(s)->header.nr_entries));
+		BUG_ON(le32_to_cpu(ro_node_long(s)->header.flags) & INTERNAL_NODE);
+		BUG_ON(!(le32_to_cpu(ro_node_long(s)->header.flags) & LEAF_NODE));
+	}
+done:
+	exit_ro_spine_long(s);
+	return r;
+}
+EXPORT_SYMBOL_GPL(dm_btree_iterate);

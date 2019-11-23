@@ -24,7 +24,8 @@
 #include <asm/uaccess.h>
 
 static struct vfsmount *anon_inode_mnt __read_mostly;
-static struct inode *anon_inode_inode;
+struct inode *anon_inode_inode;
+EXPORT_SYMBOL(anon_inode_inode);
 static const struct file_operations anon_inode_fops;
 
 static int anon_inodefs_get_sb(struct file_system_type *fs_type, int flags,
@@ -97,9 +98,10 @@ static const struct address_space_operations anon_aops = {
  * hence saving memory and avoiding code duplication for the file/inode/dentry
  * setup.  Returns the newly created file* or an error pointer.
  */
-struct file *anon_inode_getfile(const char *name,
-				const struct file_operations *fops,
-				void *priv, int flags)
+static struct file *__anon_inode_getfile(const char *name,
+					 const struct file_operations *fops,
+					 void *priv, int flags,
+					 const struct dentry_operations *dops)
 {
 	struct qstr this;
 	struct path path;
@@ -132,7 +134,7 @@ struct file *anon_inode_getfile(const char *name,
 	 */
 	atomic_inc(&anon_inode_inode->i_count);
 
-	path.dentry->d_op = &anon_inodefs_dentry_operations;
+	path.dentry->d_op = dops;
 	/* Do not publish this dentry inside the global dentry hash table */
 	path.dentry->d_flags &= ~DCACHE_UNHASHED;
 	d_instantiate(path.dentry, anon_inode_inode);
@@ -156,6 +158,13 @@ err_module:
 	module_put(fops->owner);
 	return ERR_PTR(error);
 }
+struct file *anon_inode_getfile(const char *name,
+				const struct file_operations *fops,
+				void *priv, int flags)
+{
+	return __anon_inode_getfile(name, fops, priv, flags,
+				    &anon_inodefs_dentry_operations);
+}
 EXPORT_SYMBOL_GPL(anon_inode_getfile);
 
 /**
@@ -174,8 +183,9 @@ EXPORT_SYMBOL_GPL(anon_inode_getfile);
  * hence saving memory and avoiding code duplication for the file/inode/dentry
  * setup.  Returns new descriptor or an error code.
  */
-int anon_inode_getfd(const char *name, const struct file_operations *fops,
-		     void *priv, int flags)
+int __anon_inode_getfd(const char *name, const struct file_operations *fops,
+		       void *priv, int flags,
+		       const struct dentry_operations *dops)
 {
 	int error, fd;
 	struct file *file;
@@ -185,7 +195,7 @@ int anon_inode_getfd(const char *name, const struct file_operations *fops,
 		return error;
 	fd = error;
 
-	file = anon_inode_getfile(name, fops, priv, flags);
+	file = __anon_inode_getfile(name, fops, priv, flags, dops);
 	if (IS_ERR(file)) {
 		error = PTR_ERR(file);
 		goto err_put_unused_fd;
@@ -198,6 +208,13 @@ err_put_unused_fd:
 	put_unused_fd(fd);
 	return error;
 }
+int anon_inode_getfd(const char *name, const struct file_operations *fops,
+		     void *priv, int flags)
+{
+	return __anon_inode_getfd(name, fops, priv, flags,
+				  &anon_inodefs_dentry_operations);
+}
+EXPORT_SYMBOL(__anon_inode_getfd);
 EXPORT_SYMBOL_GPL(anon_inode_getfd);
 
 /*
@@ -223,7 +240,7 @@ static struct inode *anon_inode_mkinode(void)
 	 * that it already _is_ on the dirty list.
 	 */
 	inode->i_state = I_DIRTY;
-	inode->i_mode = S_IFREG | S_IRUSR | S_IWUSR;
+	inode->i_mode = S_IRUSR | S_IWUSR;
 	inode->i_uid = current_fsuid();
 	inode->i_gid = current_fsgid();
 	inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;

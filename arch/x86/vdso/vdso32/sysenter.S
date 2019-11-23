@@ -1,10 +1,11 @@
 /*
  * Code for the vDSO.  This version uses the sysenter instruction.
  *
- * First get the common code for the sigreturn entry points.
- * This must come first.
+ * NOTE:
+ * 1) __kernel_vsyscall _must_ be first in this page.
+ * 2) there are alignment constraints on this stub, see vsyscall-sigreturn.S
+ *    for details.
  */
-#include "sigreturn.S"
 
 /*
  * The caller puts arg2 in %ecx, which gets pushed. The kernel will use
@@ -27,7 +28,6 @@
 	.text
 	.globl __kernel_vsyscall
 	.type __kernel_vsyscall,@function
-	ALIGN
 __kernel_vsyscall:
 .LSTART_vsyscall:
 	push %ecx
@@ -38,9 +38,12 @@ __kernel_vsyscall:
 .Lenter_kernel:
 	movl %esp,%ebp
 	sysenter
+__kernel_vsyscall_end:
 
 	/* 7: align return point with nop's to make disassembly easier */
-	.space 7,0x90
+	/* For CPT: VSYSCALL32_SYSEXIT value must 0x420 for backward
+	   compatibility with another kernel */
+	.space __kernel_vsyscall + 0x20 - __kernel_vsyscall_end - 2 ,0x90
 
 	/* 14: System call restart point is here! (SYSENTER_RETURN-2) */
 	jmp .Lenter_kernel
@@ -114,3 +117,8 @@ VDSO32_SYSENTER_RETURN:	/* Symbol used by sysenter.c via vdso32-syms.h */
 	 * to verify it matches the other versions.
 	 */
 VDSO32_vsyscall_eh_frame_size = (.LENDFDEDLSI-.LSTARTFRAMEDLSI)
+
+/*
+ * Get the common code for the sigreturn entry points.
+ */
+#include "sigreturn.S"

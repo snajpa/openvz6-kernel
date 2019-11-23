@@ -32,6 +32,7 @@
 #include <linux/init.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/if_ether.h>
+#include <linux/vzcalluser.h>
 
 #include <net/sock.h>
 #include <net/snmp.h>
@@ -52,6 +53,9 @@
 #include <net/dsfield.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
+
+#include <linux/cpt_image.h>
+#include <linux/cpt_export.h>
 
 /*
    This version of net/ipv6/sit.c is cloned of net/ipv4/ip_gre.c
@@ -86,6 +90,9 @@ static struct ip_tunnel * ipip6_tunnel_lookup(struct net *net,
 	unsigned h1 = HASH(local);
 	struct ip_tunnel *t;
 	struct sit_net *sitn = net_generic(net, sit_net_id);
+
+	if (sitn == NULL)
+		return NULL;
 
 	for (t = sitn->tunnels_r_l[h0^h1]; t; t = t->next) {
 		if (local == t->parms.iph.saddr &&
@@ -251,7 +258,7 @@ static int ipip6_tunnel_get_prl(struct ip_tunnel *t,
 	/* For simple GET or for root users,
 	 * we try harder to allocate.
 	 */
-	kp = (cmax <= 1 || capable(CAP_NET_ADMIN)) ?
+	kp = (cmax <= 1 || capable(CAP_NET_ADMIN) || capable(CAP_VE_NET_ADMIN)) ?
 		kcalloc(cmax, sizeof(*kp), GFP_KERNEL) :
 		NULL;
 
@@ -823,7 +830,7 @@ ipip6_tunnel_ioctl (struct net_device *dev, struct ifreq *ifr, int cmd)
 	case SIOCADDTUNNEL:
 	case SIOCCHGTUNNEL:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			goto done;
 
 		err = -EFAULT;
@@ -881,7 +888,7 @@ ipip6_tunnel_ioctl (struct net_device *dev, struct ifreq *ifr, int cmd)
 
 	case SIOCDELTUNNEL:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			goto done;
 
 		if (dev == sitn->fb_tunnel_dev) {
@@ -914,7 +921,7 @@ ipip6_tunnel_ioctl (struct net_device *dev, struct ifreq *ifr, int cmd)
 	case SIOCDELPRL:
 	case SIOCCHGPRL:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			goto done;
 		err = -EINVAL;
 		if (dev == sitn->fb_tunnel_dev)
@@ -954,11 +961,14 @@ static int ipip6_tunnel_change_mtu(struct net_device *dev, int new_mtu)
 	return 0;
 }
 
+static void sit_cpt(struct net_device *dev,
+		struct cpt_ops *ops, struct cpt_context *ctx);
 static const struct net_device_ops ipip6_netdev_ops = {
 	.ndo_uninit	= ipip6_tunnel_uninit,
 	.ndo_start_xmit	= ipip6_tunnel_xmit,
 	.ndo_do_ioctl	= ipip6_tunnel_ioctl,
 	.ndo_change_mtu	= ipip6_tunnel_change_mtu,
+	.ndo_cpt	= sit_cpt,
 };
 
 static void ipip6_tunnel_setup(struct net_device *dev)
@@ -1014,24 +1024,132 @@ static struct xfrm_tunnel sit_handler = {
 	.priority	=	1,
 };
 
-static void sit_destroy_tunnels(struct sit_net *sitn)
+static void sit_destroy_tunnels(struct sit_net *sitn, struct list_head *head)
 {
 	int prio;
 
 	for (prio = 1; prio < 4; prio++) {
 		int h;
 		for (h = 0; h < HASH_SIZE; h++) {
-			struct ip_tunnel *t;
-			while ((t = sitn->tunnels[prio][h]) != NULL)
-				unregister_netdevice(t->dev);
+			struct ip_tunnel *t = sitn->tunnels[prio][h];
+
+			while (t != NULL) {
+				unregister_netdevice_queue(t->dev, head);
+				t = t->next;
+			}
 		}
 	}
 }
+
+static void sit_cpt(struct net_device *dev,
+		struct cpt_ops *ops, struct cpt_context *ctx)
+{
+	struct cpt_tunnel_image v;
+	struct ip_tunnel *t;
+	struct sit_net *sitn;
+
+	t = netdev_priv(dev);
+	sitn = net_generic(get_exec_env()->ve_netns, sit_net_id);
+	BUG_ON(sitn == NULL);
+
+	v.cpt_next = CPT_NULL;
+	v.cpt_object = CPT_OBJ_NET_IPIP_TUNNEL;
+	v.cpt_hdrlen = sizeof(v);
+	v.cpt_content = CPT_CONTENT_VOID;
+
+	/* mark fb dev */
+	v.cpt_tnl_flags = CPT_TUNNEL_SIT;
+	if (dev == sitn->fb_tunnel_dev)
+		v.cpt_tnl_flags |= CPT_TUNNEL_FBDEV;
+
+	v.cpt_i_flags = t->parms.i_flags;
+	v.cpt_o_flags = t->parms.o_flags;
+	v.cpt_i_key = t->parms.i_key;
+	v.cpt_o_key = t->parms.o_key;
+
+	BUILD_BUG_ON(sizeof(v.cpt_iphdr) != sizeof(t->parms.iph));
+	memcpy(&v.cpt_iphdr, &t->parms.iph, sizeof(t->parms.iph));
+
+	ops->write(&v, sizeof(v), ctx);
+}
+
+static int sit_rst(loff_t start, struct cpt_netdev_image *di,
+		struct rst_ops *ops, struct cpt_context *ctx)
+{
+	int err = -ENODEV;
+	struct cpt_tunnel_image v;
+	struct net_device *dev;
+	struct ip_tunnel *t;
+	loff_t pos;
+	int fbdev;
+	struct sit_net *sitn;
+
+	sitn = net_generic(get_exec_env()->ve_netns, sit_net_id);
+	if (sitn == NULL)
+		return -EOPNOTSUPP;
+
+	pos = start + di->cpt_hdrlen;
+	err = ops->get_object(CPT_OBJ_NET_IPIP_TUNNEL,
+			pos, &v, sizeof(v), ctx);
+	if (err)
+		return err;
+
+	/* some sanity */
+	if (v.cpt_content != CPT_CONTENT_VOID)
+		return -EINVAL;
+
+	if (!(v.cpt_tnl_flags & CPT_TUNNEL_SIT))
+		return 1;
+
+	if (v.cpt_tnl_flags & CPT_TUNNEL_FBDEV) {
+		fbdev = 1;
+		err = 0;
+		dev = sitn->fb_tunnel_dev;
+	} else {
+		fbdev = 0;
+		err = -ENOMEM;
+		dev = alloc_netdev(sizeof(struct ip_tunnel), di->cpt_name,
+				ipip6_tunnel_setup);
+		if (!dev)
+			goto out;
+	}
+
+	t = netdev_priv(dev);
+	t->parms.i_flags = v.cpt_i_flags;
+	t->parms.o_flags = v.cpt_o_flags;
+	t->parms.i_key = v.cpt_i_key;
+	t->parms.o_key = v.cpt_o_key;
+
+	BUILD_BUG_ON(sizeof(v.cpt_iphdr) != sizeof(t->parms.iph));
+	memcpy(&t->parms.iph, &v.cpt_iphdr, sizeof(t->parms.iph));
+
+	if (!fbdev) {
+		ipip6_tunnel_init(dev);
+		err = register_netdevice(dev);
+		if (err) {
+			free_netdev(dev);
+			goto out;
+		}
+
+		dev_hold(dev);
+		ipip6_tunnel_link(sitn, t);
+	}
+out:
+	return err;
+}
+
+static struct netdev_rst sit_netdev_rst = {
+	.cpt_object = CPT_OBJ_NET_IPIP_TUNNEL,
+	.ndo_rst = sit_rst,
+};
 
 static int sit_init_net(struct net *net)
 {
 	int err;
 	struct sit_net *sitn;
+
+	if (!(get_exec_env()->features & VE_FEATURE_SIT))
+		return net_assign_generic(net, sit_net_id, NULL);
 
 	err = -ENOMEM;
 	sitn = kzalloc(sizeof(struct sit_net), GFP_KERNEL);
@@ -1076,25 +1194,33 @@ err_alloc:
 static void sit_exit_net(struct net *net)
 {
 	struct sit_net *sitn;
+	LIST_HEAD(list);
 
 	sitn = net_generic(net, sit_net_id);
+	if (sitn == NULL) /* no VE_FEATURE_SIT */
+		return;
+
 	rtnl_lock();
-	sit_destroy_tunnels(sitn);
-	unregister_netdevice(sitn->fb_tunnel_dev);
+	sit_destroy_tunnels(sitn, &list);
+	unregister_netdevice_queue(sitn->fb_tunnel_dev, &list);
+	unregister_netdevice_many(&list);
 	rtnl_unlock();
+	net_assign_generic(net, sit_net_id, NULL);
 	kfree(sitn);
 }
 
 static struct pernet_operations sit_net_ops = {
 	.init = sit_init_net,
 	.exit = sit_exit_net,
+	.id = &sit_net_id,
 };
 
 static void __exit sit_cleanup(void)
 {
+	unregister_netdev_rst(&sit_netdev_rst);
 	xfrm4_tunnel_deregister(&sit_handler, AF_INET6);
 
-	unregister_pernet_gen_device(sit_net_id, &sit_net_ops);
+	unregister_pernet_device(&sit_net_ops);
 }
 
 static int __init sit_init(void)
@@ -1103,16 +1229,17 @@ static int __init sit_init(void)
 
 	printk(KERN_INFO "IPv6 over IPv4 tunneling driver\n");
 
-	err = register_pernet_gen_device(&sit_net_id, &sit_net_ops);
+	err = register_pernet_device(&sit_net_ops);
 	if (err < 0)
 		return err;
 
 	err = xfrm4_tunnel_register(&sit_handler, AF_INET6);
 	if (err < 0) {
-		unregister_pernet_gen_device(sit_net_id, &sit_net_ops);
+		unregister_pernet_device(&sit_net_ops);
 		printk(KERN_INFO "sit init: Can't add protocol\n");
 		return -EAGAIN;
-	}
+	} else
+		register_netdev_rst(&sit_netdev_rst);
 
 	return err;
 }

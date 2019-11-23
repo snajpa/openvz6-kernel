@@ -404,6 +404,7 @@ static int autofs_dev_ioctl_setpipefd(struct file *fp,
 		swap(sbi->oz_pgrp, new_pid);
 		sbi->pipefd = pipefd;
 		sbi->pipe = pipe;
+		sbi->pipe_pid = task_pid_vnr(current);
 		sbi->catatonic = 0;
 	}
 out:

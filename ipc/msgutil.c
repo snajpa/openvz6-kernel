@@ -8,6 +8,7 @@
  * See the file COPYING for more details.
  */
 
+#include <linux/module.h>
 #include <linux/spinlock.h>
 #include <linux/init.h>
 #include <linux/security.h>
@@ -18,6 +19,8 @@
 #include <asm/uaccess.h>
 
 #include "util.h"
+
+#include <bc/kmem.h>
 
 DEFINE_SPINLOCK(mq_lock);
 
@@ -48,52 +51,53 @@ struct msg_msgseg {
 #define DATALEN_MSG	(PAGE_SIZE-sizeof(struct msg_msg))
 #define DATALEN_SEG	(PAGE_SIZE-sizeof(struct msg_msgseg))
 
-struct msg_msg *load_msg(const void __user *src, int len)
+struct msg_msg *sysv_msg_load(int (*load)(void * dst, int len, int offset,
+					  void * data), int len, void * data)
 {
 	struct msg_msg *msg;
 	struct msg_msgseg **pseg;
 	int err;
 	int alen;
+	int offset = 0;
 
 	alen = len;
 	if (alen > DATALEN_MSG)
 		alen = DATALEN_MSG;
 
-	msg = kmalloc(sizeof(*msg) + alen, GFP_KERNEL);
+	msg = kmalloc(sizeof(*msg) + alen, GFP_KERNEL_UBC);
 	if (msg == NULL)
 		return ERR_PTR(-ENOMEM);
 
 	msg->next = NULL;
 	msg->security = NULL;
 
-	if (copy_from_user(msg + 1, src, alen)) {
+	if (load(msg + 1, alen, offset, data)) {
 		err = -EFAULT;
 		goto out_err;
 	}
 
 	len -= alen;
-	src = ((char __user *)src) + alen;
+	offset += alen;
 	pseg = &msg->next;
 	while (len > 0) {
 		struct msg_msgseg *seg;
 		alen = len;
 		if (alen > DATALEN_SEG)
 			alen = DATALEN_SEG;
-		seg = kmalloc(sizeof(*seg) + alen,
-						 GFP_KERNEL);
+		seg = kmalloc(sizeof(*seg) + alen, GFP_KERNEL_UBC);
 		if (seg == NULL) {
 			err = -ENOMEM;
 			goto out_err;
 		}
 		*pseg = seg;
 		seg->next = NULL;
-		if (copy_from_user(seg + 1, src, alen)) {
+		if (load(seg + 1, alen, offset, data)) {
 			err = -EFAULT;
 			goto out_err;
 		}
 		pseg = &seg->next;
 		len -= alen;
-		src = ((char __user *)src) + alen;
+		offset += alen;
 	}
 
 	err = security_msg_msg_alloc(msg);
@@ -106,32 +110,57 @@ out_err:
 	free_msg(msg);
 	return ERR_PTR(err);
 }
+EXPORT_SYMBOL_GPL(sysv_msg_load);
 
-int store_msg(void __user *dest, struct msg_msg *msg, int len)
+static int do_load_msg(void * dst, int len, int offset, void * data)
+{
+	return copy_from_user(dst, data + offset, len);
+}
+
+struct msg_msg *load_msg(const void __user *src, int len)
+{
+	return sysv_msg_load(do_load_msg, len, (void*)src);
+}
+
+int sysv_msg_store(struct msg_msg *msg,
+		   int (*store)(void * src, int len, int offset, void * data),
+		   int len, void * data)
 {
 	int alen;
+	int offset = 0;
 	struct msg_msgseg *seg;
-
+	
 	alen = len;
 	if (alen > DATALEN_MSG)
 		alen = DATALEN_MSG;
-	if (copy_to_user(dest, msg + 1, alen))
+	if (store(msg + 1, alen, offset, data))
 		return -1;
 
 	len -= alen;
-	dest = ((char __user *)dest) + alen;
+	offset += alen;
 	seg = msg->next;
 	while (len > 0) {
 		alen = len;
 		if (alen > DATALEN_SEG)
 			alen = DATALEN_SEG;
-		if (copy_to_user(dest, seg + 1, alen))
+		if (store(seg + 1, alen, offset, data))
 			return -1;
 		len -= alen;
-		dest = ((char __user *)dest) + alen;
+		offset += alen;
 		seg = seg->next;
 	}
 	return 0;
+}
+EXPORT_SYMBOL_GPL(sysv_msg_store);
+
+static int do_store_msg(void * src, int len, int offset, void * data)
+{
+	return copy_to_user(data + offset, src, len);
+}
+
+int store_msg(void __user *dest, struct msg_msg *msg, int len)
+{
+	return sysv_msg_store(msg, do_store_msg, len, dest);
 }
 
 void free_msg(struct msg_msg *msg)

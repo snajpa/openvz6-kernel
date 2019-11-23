@@ -24,7 +24,19 @@
 #include <linux/sched.h>
 #include <linux/init_task.h>
 
+#ifdef CONFIG_VE
+static inline struct vfsmount *ve_devmnt(void)
+{
+	return get_exec_env()->devtmpfs_mnt;
+}
+#else
 static struct vfsmount *dev_mnt;
+
+static inline struct vfsmount *ve_devmnt(void)
+{
+	return dev_mnt;
+}
+#endif
 
 #if defined CONFIG_DEVTMPFS_MOUNT
 static int dev_mount = 1;
@@ -45,11 +57,12 @@ static int dev_get_sb(struct file_system_type *fs_type, int flags,
 	return get_sb_single(fs_type, flags, data, shmem_fill_super, mnt);
 }
 
-static struct file_system_type dev_fs_type = {
+struct file_system_type dev_fs_type = {
 	.name = "devtmpfs",
 	.get_sb = dev_get_sb,
 	.kill_sb = kill_litter_super,
 };
+EXPORT_SYMBOL(dev_fs_type);
 
 #ifdef CONFIG_BLOCK
 static inline int is_blockdev(struct device *dev)
@@ -65,6 +78,7 @@ static int dev_mkdir(const char *name, mode_t mode)
 	struct nameidata nd;
 	struct dentry *dentry;
 	int err;
+	struct vfsmount *dev_mnt = ve_devmnt();
 
 	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
 			      name, LOOKUP_PARENT, &nd);
@@ -89,6 +103,7 @@ static int create_path(const char *nodepath)
 	char *path;
 	struct nameidata nd;
 	int err = 0;
+	struct vfsmount *dev_mnt = ve_devmnt();
 
 	path = kstrdup(nodepath, GFP_KERNEL);
 	if (!path)
@@ -136,10 +151,12 @@ int devtmpfs_create_node(struct device *dev)
 	const char *tmp = NULL;
 	const char *nodename;
 	const struct cred *curr_cred;
+	struct user_beancounter *curr_ub;
 	mode_t mode = 0;
 	struct nameidata nd;
 	struct dentry *dentry;
 	int err;
+	struct vfsmount *dev_mnt = ve_devmnt();
 
 	if (!dev_mnt)
 		return 0;
@@ -155,6 +172,7 @@ int devtmpfs_create_node(struct device *dev)
 	else
 		mode |= S_IFCHR;
 
+	curr_ub = set_exec_ub(&ub0);
 	curr_cred = override_creds(&init_cred);
 	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
 			      nodename, LOOKUP_PARENT, &nd);
@@ -188,6 +206,7 @@ int devtmpfs_create_node(struct device *dev)
 out:
 	kfree(tmp);
 	revert_creds(curr_cred);
+	(void)set_exec_ub(curr_ub);
 	return err;
 }
 
@@ -196,6 +215,7 @@ static int dev_rmdir(const char *name)
 	struct nameidata nd;
 	struct dentry *dentry;
 	int err;
+	struct vfsmount *dev_mnt = ve_devmnt();
 
 	err = vfs_path_lookup(dev_mnt->mnt_root, dev_mnt,
 			      name, LOOKUP_PARENT, &nd);
@@ -246,6 +266,8 @@ static int delete_path(const char *nodepath)
 
 static int dev_mynode(struct device *dev, struct inode *inode, struct kstat *stat)
 {
+	struct vfsmount *dev_mnt = ve_devmnt();
+
 	/* did we create it */
 	if (inode->i_private != &dev_mnt)
 		return 0;
@@ -275,6 +297,7 @@ int devtmpfs_delete_node(struct device *dev)
 	struct kstat stat;
 	int deleted = 1;
 	int err;
+	struct vfsmount *dev_mnt = ve_devmnt();
 
 	if (!dev_mnt)
 		return 0;
@@ -339,6 +362,7 @@ int devtmpfs_mount(const char *mountpoint)
 {
 	struct path path;
 	int err;
+	struct vfsmount *dev_mnt = ve_devmnt();
 
 	if (!dev_mount)
 		return 0;
@@ -382,7 +406,11 @@ int __init devtmpfs_init(void)
 		unregister_filesystem(&dev_fs_type);
 		return err;
 	}
+#ifdef CONFIG_VE
+	get_ve0()->devtmpfs_mnt = mnt;
+#else
 	dev_mnt = mnt;
+#endif
 
 	printk(KERN_INFO "devtmpfs: initialized\n");
 	return 0;

@@ -1,0 +1,63 @@
+Finite set of requests. Each incoming bio is either redirected directly,
+or attached to request. Both cases are accounted in "active_reqs".
+
+Requests can be:
+
+- in entry_queue
+	Idle requests, still not processed.
+	Main thread fetches them one by one, only if ready_queue is empty.
+	If head of entry queue is barrier, machine processes only
+	ready_queue until all active requests are drained.
+
+- in ready_queue
+	Requests which are ready for the next step or for completion.
+
+- in one of internal queues
+	Some private logic is responsible for placing them into ready_queue,
+	when it is ready to proceed.
+
+- in flight, attached only to set of bios. In this case after completion
+  of all the child bios, it moves to some internal queue or to ready_queue
+  by bio completion callback.
+
+
+States of main process:
+
+- Pre-barrier flush. Barrier request is at head of entry queue.
+  Entry queue is not processed. ready_queue is processed. This state
+  is exited when "active_reqs" is zero. Entered Barrier state.
+
+- Barrier state. Entry queue is frozen. ready_queue is processed until
+  "active_reqs" is zero.
+
+- Running. If something is on ready_queue, it is processed.
+  If ready_queue is empty, entry_queue is checked.
+  If we see a barrier, we enter Pre-barrier flush.
+
+
+EVENTS:
+
+- Mitigation timer expires:
+	if (sleeping && entry_queue && !barrier_state)
+		wakeup()
+
+- Fast bio completion
+	--active_reqs
+	if (active_reqs == 0 && sleeping && entry_queue && !barrier_state)
+		wakeup();
+
+- Bio completion
+	add preq to ready queue
+	if (sleeping)
+		wakeup();
+
+
+Request states.
+
+1. E_ENTRY
+	Request is still not processed, it is either in entry queue or
+	in some internal queue, or it returned from that internal
+	queue to ready_queue. In any case, processing must be started
+	from the very beginning.
+
+2.

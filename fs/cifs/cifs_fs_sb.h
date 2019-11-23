@@ -21,6 +21,8 @@
 #ifndef _CIFS_FS_SB_H
 #define _CIFS_FS_SB_H
 
+#include <linux/backing-dev.h>
+
 #define CIFS_MOUNT_NO_PERM      1 /* do not do client vfs_perm check */
 #define CIFS_MOUNT_SET_UID      2 /* set current's euid in create etc. */
 #define CIFS_MOUNT_SERVER_INUM  4 /* inode numbers from uniqueid from server  */
@@ -65,5 +67,6 @@ struct cifs_sb_info {
 	char   *prepath; /* relative path under the share to mount to */
 	char   *mountdata; /* options received at mount time or via DFS refs */
 	struct delayed_work prune_tlinks;
+	struct backing_dev_info bdi;
 };
 #endif				/* _CIFS_FS_SB_H */

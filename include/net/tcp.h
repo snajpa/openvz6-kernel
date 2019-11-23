@@ -44,6 +44,13 @@
 #include <net/dst.h>
 
 #include <linux/seq_file.h>
+#include <bc/net.h>
+
+#define TCP_PAGE(sk)	(sk->sk_sndmsg_page)
+#define TCP_OFF(sk)	(sk->sk_sndmsg_off)
+
+#define TW_WSCALE_MASK		0x0f
+#define TW_WSCALE_SPEC		0x10
 
 extern struct inet_hashinfo tcp_hashinfo;
 
@@ -240,7 +247,9 @@ extern int sysctl_tcp_mem[3];
 extern int sysctl_tcp_wmem[3];
 extern int sysctl_tcp_rmem[3];
 extern int sysctl_tcp_app_win;
+#ifndef sysctl_tcp_adv_win_scale
 extern int sysctl_tcp_adv_win_scale;
+#endif
 extern int sysctl_tcp_tw_reuse;
 extern int sysctl_tcp_frto;
 extern int sysctl_tcp_frto_response;
@@ -261,6 +270,9 @@ extern int sysctl_tcp_limit_output_bytes;
 extern int sysctl_tcp_challenge_ack_limit;
 extern int sysctl_tcp_min_tso_segs;
 extern int sysctl_tcp_invalid_ratelimit;
+extern int sysctl_tcp_use_sg;
+extern int sysctl_tcp_max_tw_kmem_fraction;
+extern int sysctl_tcp_max_tw_buckets_ub;
 
 extern atomic_t tcp_memory_allocated;
 extern struct percpu_counter tcp_sockets_allocated;
@@ -588,6 +600,7 @@ extern int tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 			 sk_read_actor_t recv_actor);
 
 extern void tcp_initialize_rcv_mss(struct sock *sk);
+extern void tcp_rbtree_insert(struct rb_root *root, struct sk_buff *skb);
 
 extern int tcp_mtu_to_mss(struct sock *sk, int pmtu);
 extern int tcp_mss_to_mtu(struct sock *sk, int mss);
@@ -664,7 +677,11 @@ extern u32	__tcp_select_window(struct sock *sk);
  * to use only the low 32-bits of jiffies and hide the ugly
  * casts with the following macro.
  */
+#ifdef CONFIG_VE
+#define tcp_time_stamp		((__u32)(jiffies + get_exec_env()->jiffies_fixup))
+#else
 #define tcp_time_stamp		((__u32)(jiffies))
+#endif
 
 #define tcp_flag_byte(th) (((u_int8_t *)th)[13])
 
@@ -1010,7 +1027,13 @@ static inline int tcp_prequeue(struct sock *sk, struct sk_buff *skb)
 
 		tp->ucopy.memory = 0;
 	} else if (skb_queue_len(&tp->ucopy.prequeue) == 1) {
-		wake_up_interruptible_poll(sk->sk_sleep,
+		/*
+		 * It's unclean how sk->sk_sleep might be nil here,
+		 * so to not panicing rather warn-on-once. psbm-27040.
+		 * 	-- cyrillos
+		 */
+		WARN_ON_ONCE(!sk->sk_sleep);
+		wake_up_interruptible_sync_poll(sk->sk_sleep,
 					   POLLIN | POLLRDNORM | POLLRDBAND);
 		if (!inet_csk_ack_scheduled(sk))
 			inet_csk_reset_xmit_timer(sk, ICSK_TIME_DACK,
@@ -1310,6 +1333,8 @@ static inline void		tcp_put_md5sig_pool(void)
 	put_cpu();
 }
 
+static inline void tcp_init_send_head(struct sock *sk);
+
 /* write queue abstraction */
 static inline void tcp_write_queue_purge(struct sock *sk)
 {
@@ -1317,6 +1342,7 @@ static inline void tcp_write_queue_purge(struct sock *sk)
 
 	while ((skb = __skb_dequeue(&sk->sk_write_queue)) != NULL)
 		sk_wmem_free_skb(sk, skb);
+	tcp_init_send_head(sk);
 	sk_mem_reclaim(sk);
 	tcp_clear_all_retrans_hints(tcp_sk(sk));
 }
@@ -1607,6 +1633,11 @@ struct tcp_request_sock_ops {
 						  struct sk_buff *skb);
 #endif
 };
+
+#ifdef CONFIG_TCP_MD5SIG
+extern const struct tcp_request_sock_ops tcp_request_sock_ipv4_ops;
+extern const struct tcp_request_sock_ops tcp_request_sock_ipv6_ops;
+#endif
 
 extern void tcp_v4_init(void);
 extern void tcp_init(void);

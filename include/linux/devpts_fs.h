@@ -26,6 +26,7 @@ struct tty_struct *devpts_get_tty(struct inode *pts_inode, int number);
 /* unlink */
 void devpts_pty_kill(struct tty_struct *tty);
 
+extern struct file_system_type devpts_fs_type;
 #else
 
 /* Dummy stubs in the no-pty case */

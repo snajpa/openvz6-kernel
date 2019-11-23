@@ -5,6 +5,7 @@
 #include "nfs4_fs.h"
 #include <linux/mount.h>
 #include <linux/security.h>
+#include "ve.h"
 
 #define NFS_MS_MASK (MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_SYNCHRONOUS)
 
@@ -141,6 +142,7 @@ extern void nfs_umount(const struct nfs_mount_request *info);
 
 /* client.c */
 extern struct rpc_program nfs_program;
+extern spinlock_t nfs_client_lock;
 
 extern void nfs_cleanup_cb_ident_idr(void);
 extern void nfs_put_client(struct nfs_client *);
@@ -166,6 +168,9 @@ extern int nfs4_check_client_ready(struct nfs_client *clp);
 extern struct nfs_client *nfs4_set_ds_client(struct nfs_server* mds_srv,
 					     const struct sockaddr *ds_addr,
 					     int ds_addrlen, int ds_proto);
+void nfs_init_timeout_values(struct rpc_timeout *to, int proto,
+				    unsigned int timeo, unsigned int retrans);
+
 #ifdef CONFIG_PROC_FS
 extern int __init nfs_fs_proc_init(void);
 extern void nfs_fs_proc_exit(void);
@@ -236,6 +241,77 @@ extern const u32 nfs41_maxread_overhead;
 extern const u32 nfs41_maxwrite_overhead;
 #endif
 
+/* quota.c */
+typedef enum  {
+	NFS_DQ_SYNC_PREALLOC_RELEASE,
+	NFS_DQ_SYNC_PREALLOC_HOLD,
+} nfs_dq_sync_flags_t;
+
+#ifdef CONFIG_NFS_QUOTA
+extern void nfs_dq_init(struct inode *inode);
+extern struct inode * nfs_dq_reserve_inode(struct inode * dir);
+extern void nfs_dq_release_inode(struct inode *inode);
+extern void nfs_dq_swap_inode(struct inode * inode, struct inode * dummy);
+extern int nfs_dq_transfer_inode(struct inode *inode, struct iattr *attr);
+extern void nfs_dq_delete_inode(struct inode *);
+
+extern void nfs_dq_init_sb(struct super_block *sb);
+extern void nfs_dq_init_nfs_inode(struct nfs_inode *nfsi);
+
+extern long nfs_dq_prealloc_space(struct inode *inode, loff_t pos, size_t size);
+extern void nfs_dq_release_preallocated_blocks(struct inode *inode,
+						blkcnt_t blocks);
+extern void nfs_dq_sync_blocks(struct inode *inode, struct nfs_fattr *fattr,
+						nfs_dq_sync_flags_t flag);
+extern void nfs_dq_init_prealloc_list(struct nfs_server *server);
+
+extern blkcnt_t nfs_quota_reserve_barrier;
+#else
+static inline void nfs_dq_init(struct inode *inode)
+{
+}
+static inline struct inode *nfs_dq_reserve_inode(struct inode *dir)
+{
+	return NULL;
+}
+static inline void nfs_dq_release_inode(struct inode *inode)
+{
+}
+static inline void nfs_dq_swap_inode(struct inode * inode, struct inode * dummy)
+{
+}
+static inline int nfs_dq_transfer_inode(struct inode * inode, struct iattr *attr)
+{
+	return 0;
+}
+static inline void nfs_dq_delete_inode(struct inode * inode)
+{
+}
+static inline void nfs_dq_init_sb(struct super_block *sb)
+{
+}
+static inline void nfs_dq_init_nfs_inode(struct nfs_inode *nfsi)
+{
+}
+static inline long nfs_dq_prealloc_space(struct inode *inode, loff_t pos,
+						size_t size)
+{
+	return 0;
+}
+static inline void nfs_dq_release_preallocated_blocks(struct inode *inode,
+						blkcnt_t blocks)
+{
+}
+static inline void nfs_dq_sync_blocks(struct inode *inode,
+					struct nfs_fattr *fattr,
+					nfs_dq_sync_flags_t flag)
+{
+}
+static inline void nfs_dq_init_prealloc_list(struct nfs_server *server)
+{
+}
+#endif
+
 /* nfs4proc.c */
 #ifdef CONFIG_NFS_V4
 extern struct rpc_procinfo nfs4_procedures[];
@@ -258,11 +334,14 @@ extern int nfs_access_cache_shrinker(struct shrinker *shrink,
 
 /* file.c */
 int nfs_check_flags(int);
+int nfs_set_flags(struct file *file, int flags);
 
 /* inode.c */
-extern struct workqueue_struct *nfsiod_workqueue;
+extern int nfsiod_start(void);
+extern void nfsiod_stop(void);
 extern struct inode *nfs_alloc_inode(struct super_block *sb);
 extern void nfs_destroy_inode(struct inode *);
+extern void nfs_delete_inode(struct inode *);
 extern int nfs_write_inode(struct inode *, struct writeback_control *);
 extern void nfs_clear_inode(struct inode *);
 #ifdef CONFIG_NFS_V4
@@ -285,6 +364,8 @@ extern void __exit unregister_nfs_fs(void);
 extern void nfs_sb_active(struct super_block *sb);
 extern void nfs_sb_deactive(struct super_block *sb);
 extern void nfs_sb_deactive_async(struct super_block *sb);
+
+extern int nfs_enable_v4_in_ct;
 
 /* namespace.c */
 extern char *nfs_path(const char *base,
@@ -437,9 +518,9 @@ unsigned long nfs_block_bits(unsigned long bsize, unsigned char *nrbitsp)
 /*
  * Calculate the number of 512byte blocks used.
  */
-static inline blkcnt_t nfs_calc_block_size(u64 tsize)
+static inline blkcnt_t nfs_calc_block_size(struct inode *inode, u64 tsize)
 {
-	blkcnt_t used = (tsize + 511) >> 9;
+	blkcnt_t used = (tsize + (1 << inode->i_blkbits) - 1) >> inode->i_blkbits;
 	return (used > ULONG_MAX) ? ULONG_MAX : used;
 }
 

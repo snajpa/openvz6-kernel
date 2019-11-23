@@ -1877,6 +1877,7 @@ COMPATIBLE_IOCTL(TIOCLINUX)
 COMPATIBLE_IOCTL(TIOCSBRK)
 COMPATIBLE_IOCTL(TIOCCBRK)
 ULONG_IOCTL(TIOCMIWAIT)
+COMPATIBLE_IOCTL(TIOCGSID)
 COMPATIBLE_IOCTL(TIOCGICOUNT)
 /* Little t */
 COMPATIBLE_IOCTL(TIOCGETD)
@@ -2741,7 +2742,7 @@ static void compat_ioctl_error(struct file *filp, unsigned int fd,
 	 sprintf(buf,"'%c'", (cmd>>_IOC_TYPESHIFT) & _IOC_TYPEMASK);
 	if (!isprint(buf[1]))
 		sprintf(buf, "%02x", buf[1]);
-	compat_printk("ioctl32(%s:%d): Unknown cmd fd(%d) "
+	ve_compat_printk(VE_LOG, "ioctl32(%s:%d): Unknown cmd fd(%d) "
 			"cmd(%08x){t:%s;sz:%u} arg(%08x) on %s\n",
 			current->comm, current->pid,
 			(int)fd, (unsigned int)cmd, buf,

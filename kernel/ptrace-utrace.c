@@ -681,6 +681,10 @@ int ptrace_attach(struct task_struct *task)
 
 	task_lock(task);
 	retval = __ptrace_may_access(task, PTRACE_MODE_ATTACH);
+	if (!retval) {
+		if (!task->mm || task->mm->vps_dumpable == VD_LICDATA_ACCESS)
+			retval = -EACCES;
+	}
 	task_unlock(task);
 	if (retval)
 		goto unlock_creds;

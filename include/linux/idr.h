@@ -42,12 +42,6 @@
 #define MAX_ID_BIT (1U << MAX_ID_SHIFT)
 #define MAX_ID_MASK (MAX_ID_BIT - 1)
 
-/* Leave the possibility of an incomplete final layer */
-#define MAX_LEVEL (MAX_ID_SHIFT + IDR_BITS - 1) / IDR_BITS
-
-/* Number of id_layer structs to leave in free list */
-#define IDR_FREE_MAX MAX_LEVEL + MAX_LEVEL
-
 struct idr_layer {
 	unsigned long		 bitmap; /* A zero bit means "space here" */
 	struct idr_layer	*ary[1<<IDR_BITS];

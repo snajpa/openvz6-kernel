@@ -392,7 +392,7 @@ static struct task_struct *find_early_kill_thread(struct task_struct *tsk)
 	do {
 		if ((t->flags & PF_MCE_PROCESS) && (t->flags & PF_MCE_EARLY))
 			return t;
-	} while_each_thread(tsk, t);
+	} while_each_thread_all(tsk, t);
 	return NULL;
 }
 
@@ -432,7 +432,7 @@ static void collect_procs_anon(struct page *page, struct list_head *to_kill,
 	av = page_lock_anon_vma(page);
 	if (av == NULL)	/* Not actually mapped anymore */
 		goto out;
-	for_each_process (tsk) {
+	for_each_process_all (tsk) {
 		struct anon_vma_chain *vmac;
 		struct task_struct *t = task_early_kill(tsk, force_early);
 
@@ -473,7 +473,7 @@ static void collect_procs_file(struct page *page, struct list_head *to_kill,
 
 	read_lock(&tasklist_lock);
 	spin_lock(&mapping->i_mmap_lock);
-	for_each_process(tsk) {
+	for_each_process_all(tsk) {
 		pgoff_t pgoff = page->index << (PAGE_CACHE_SHIFT - PAGE_SHIFT);
 		struct task_struct *t = task_early_kill(tsk, force_early);
 

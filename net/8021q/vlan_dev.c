@@ -24,6 +24,7 @@
 #include <linux/skbuff.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/sched.h>
 #include <linux/ethtool.h>
 #include <net/arp.h>
 
@@ -119,6 +120,7 @@ static int vlan_dev_hard_header(struct sk_buff *skb, struct net_device *dev,
 static netdev_tx_t vlan_dev_hard_start_xmit(struct sk_buff *skb,
 					    struct net_device *dev)
 {
+	struct ve_struct *env;
 	struct vlan_ethhdr *veth = (struct vlan_ethhdr *)(skb->data);
 	unsigned int len;
 	int ret;
@@ -140,7 +142,10 @@ static netdev_tx_t vlan_dev_hard_start_xmit(struct sk_buff *skb,
 
 	skb->dev = vlan_dev_info(dev)->real_dev;
 	len = skb->len;
+	skb->owner_env = skb->dev->owner_env;
+	env = set_exec_env(skb->owner_env);
 	ret = dev_queue_xmit(skb);
+	set_exec_env(env);
 
 	if (likely(ret == NET_XMIT_SUCCESS || ret == NET_XMIT_CN)) {
 		struct vlan_pcpu_stats *stats;
@@ -739,4 +744,6 @@ void vlan_setup(struct net_device *dev)
 	dev->ethtool_ops	= &vlan_ethtool_ops;
 
 	memset(dev->broadcast, 0, ETH_ALEN);
+	if (!ve_is_super(get_exec_env()))
+		dev->vz_features |= NETIF_F_VIRTUAL;
 }

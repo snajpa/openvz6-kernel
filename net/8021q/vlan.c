@@ -22,6 +22,7 @@
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
+#include <linux/sched.h>
 #include <linux/init.h>
 #include <linux/rculist.h>
 #include <net/p8022.h>
@@ -63,7 +64,7 @@ static struct vlan_group *vlan_group_alloc(struct net_device *real_dev)
 {
 	struct vlan_group *grp;
 
-	grp = kzalloc(sizeof(struct vlan_group), GFP_KERNEL);
+	grp = kzalloc(sizeof(struct vlan_group), GFP_KERNEL_UBC);
 	if (!grp)
 		return NULL;
 
@@ -83,7 +84,7 @@ static int vlan_group_prealloc_vid(struct vlan_group *vg, u16 vlan_id)
 		return 0;
 
 	size = sizeof(struct net_device *) * VLAN_GROUP_ARRAY_PART_LEN;
-	array = kzalloc(size, GFP_KERNEL);
+	array = kzalloc(size, GFP_KERNEL_UBC);
 	if (array == NULL)
 		return -ENOBUFS;
 
@@ -96,13 +97,14 @@ static void vlan_rcu_free(struct rcu_head *rcu)
 	vlan_group_free(container_of(rcu, struct vlan_group, rcu));
 }
 
-void unregister_vlan_dev(struct net_device *dev)
+void unregister_vlan_dev(struct net_device *dev, struct list_head *head)
 {
 	struct vlan_dev_info *vlan = vlan_dev_info(dev);
 	struct net_device *real_dev = vlan->real_dev;
 	const struct net_device_ops *ops = real_dev->netdev_ops;
 	struct vlan_group *grp;
 	u16 vlan_id = vlan->vlan_id;
+	struct ve_struct *env;
 
 	ASSERT_RTNL();
 
@@ -119,9 +121,12 @@ void unregister_vlan_dev(struct net_device *dev)
 	vlan_group_set_device(grp, vlan_id, NULL);
 	grp->nr_vlans--;
 
-	synchronize_net();
+	if (!head)
+		synchronize_net();
 
-	unregister_netdevice(dev);
+	env = set_exec_env(dev->owner_env);
+	unregister_netdevice_queue(dev, head);
+	set_exec_env(env);
 
 	/* If the group is now empty, kill off the group. */
 	if (grp->nr_vlans == 0) {
@@ -367,6 +372,7 @@ static int vlan_device_event(struct notifier_block *unused, unsigned long event,
 	int i, flgs;
 	struct net_device *vlandev;
 	struct vlan_dev_info *vlan;
+	LIST_HEAD(list);
 
 	if (is_vlan_dev(dev))
 		__vlan_device_event(dev, event);
@@ -491,8 +497,9 @@ static int vlan_device_event(struct notifier_block *unused, unsigned long event,
 			if (grp->nr_vlans == 1)
 				i = VLAN_N_VID;
 
-			unregister_vlan_dev(vlandev);
+			unregister_vlan_dev(vlandev, &list);
 		}
+		unregister_netdevice_many(&list);
 		break;
 
 	case NETDEV_NOTIFY_PEERS:
@@ -516,6 +523,17 @@ out:
 static struct notifier_block vlan_notifier_block __read_mostly = {
 	.notifier_call = vlan_device_event,
 };
+
+static inline int vlan_check_caps(void)
+{
+	if (capable(CAP_NET_ADMIN))
+		return 1;
+#ifdef CONFIG_VE
+	if (capable(CAP_VE_NET_ADMIN))
+		return 1;
+#endif
+	return 0;
+}
 
 /*
  *	VLAN IOCTL handler.
@@ -558,7 +576,7 @@ static int vlan_ioctl_handler(struct net *net, void __user *arg)
 	switch (args.cmd) {
 	case SET_VLAN_INGRESS_PRIORITY_CMD:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!vlan_check_caps())
 			break;
 		vlan_dev_set_ingress_priority(dev,
 					      args.u.skb_priority,
@@ -568,7 +586,7 @@ static int vlan_ioctl_handler(struct net *net, void __user *arg)
 
 	case SET_VLAN_EGRESS_PRIORITY_CMD:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!vlan_check_caps())
 			break;
 		err = vlan_dev_set_egress_priority(dev,
 						   args.u.skb_priority,
@@ -577,7 +595,7 @@ static int vlan_ioctl_handler(struct net *net, void __user *arg)
 
 	case SET_VLAN_FLAG_CMD:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!vlan_check_caps())
 			break;
 		err = vlan_dev_change_flags(dev,
 					    args.vlan_qos ? args.u.flag : 0,
@@ -586,7 +604,7 @@ static int vlan_ioctl_handler(struct net *net, void __user *arg)
 
 	case SET_VLAN_NAME_TYPE_CMD:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!vlan_check_caps())
 			break;
 		if ((args.u.name_type >= 0) &&
 		    (args.u.name_type < VLAN_NAME_TYPE_HIGHEST)) {
@@ -602,16 +620,16 @@ static int vlan_ioctl_handler(struct net *net, void __user *arg)
 
 	case ADD_VLAN_CMD:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!vlan_check_caps())
 			break;
 		err = register_vlan_device(dev, args.u.VID);
 		break;
 
 	case DEL_VLAN_CMD:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!vlan_check_caps())
 			break;
-		unregister_vlan_dev(dev);
+		unregister_vlan_dev(dev, NULL);
 		err = 0;
 		break;
 
@@ -642,47 +660,28 @@ out:
 
 static int vlan_init_net(struct net *net)
 {
+	struct vlan_net *vn = net_generic(net, vlan_net_id);
 	int err;
-	struct vlan_net *vn;
-
-	err = -ENOMEM;
-	vn = kzalloc(sizeof(struct vlan_net), GFP_KERNEL);
-	if (vn == NULL)
-		goto err_alloc;
-
-	err = net_assign_generic(net, vlan_net_id, vn);
-	if (err < 0)
-		goto err_assign;
 
 	vn->name_type = VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD;
 
 	err = vlan_proc_init(net);
-	if (err < 0)
-		goto err_proc;
 
-	return 0;
-
-err_proc:
-	/* nothing */
-err_assign:
-	kfree(vn);
-err_alloc:
 	return err;
 }
 
 static void vlan_exit_net(struct net *net)
 {
-	struct vlan_net *vn;
-
-	vn = net_generic(net, vlan_net_id);
 	rtnl_kill_links(net, &vlan_link_ops);
+
 	vlan_proc_cleanup(net);
-	kfree(vn);
 }
 
 static struct pernet_operations vlan_net_ops = {
 	.init = vlan_init_net,
 	.exit = vlan_exit_net,
+	.id   = &vlan_net_id,
+	.size = sizeof(struct vlan_net),
 };
 
 static int __init vlan_proto_init(void)
@@ -692,7 +691,7 @@ static int __init vlan_proto_init(void)
 	pr_info("%s v%s %s\n", vlan_fullname, vlan_version, vlan_copyright);
 	pr_info("All bugs added by %s\n", vlan_buggyright);
 
-	err = register_pernet_gen_device(&vlan_net_id, &vlan_net_ops);
+	err = register_pernet_device(&vlan_net_ops);
 	if (err < 0)
 		goto err0;
 
@@ -716,7 +715,7 @@ err4:
 err3:
 	unregister_netdevice_notifier(&vlan_notifier_block);
 err2:
-	unregister_pernet_gen_device(vlan_net_id, &vlan_net_ops);
+	unregister_pernet_device(&vlan_net_ops);
 err0:
 	return err;
 }
@@ -728,7 +727,7 @@ static void __exit vlan_cleanup_module(void)
 
 	unregister_netdevice_notifier(&vlan_notifier_block);
 
-	unregister_pernet_gen_device(vlan_net_id, &vlan_net_ops);
+	unregister_pernet_device(&vlan_net_ops);
 	rcu_barrier(); /* Wait for completion of call_rcu()'s */
 
 	vlan_gvrp_uninit();

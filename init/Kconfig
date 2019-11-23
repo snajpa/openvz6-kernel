@@ -251,6 +251,18 @@ config BSD_PROCESS_ACCT_V3
 	  for processing it. A preliminary version of these tools is available
 	  at <http://www.gnu.org/software/acct/>.
 
+config FHANDLE
+	bool "open by fhandle syscalls"
+	select EXPORTFS
+	help
+	  If you say Y here, a user level program will be able to map
+	  file names to handle and then later use the handle for
+	  different file system operations. This is useful in implementing
+	  userspace file servers, which now track files using handles instead
+	  of names. The handle would remain the same even if file names
+	  get renamed. Enables open_by_handle_at(2) and name_to_handle_at(2)
+	  syscalls.
+
 config TASKSTATS
 	bool "Export task/process statistics through netlink (EXPERIMENTAL)"
 	depends on NET
@@ -286,7 +298,7 @@ config TASK_XACCT
 
 config TASK_IO_ACCOUNTING
 	bool "Enable per-task storage I/O accounting (EXPERIMENTAL)"
-	depends on TASK_XACCT
+	depends on TASK_XACCT && BEANCOUNTERS
 	help
 	  Collect information on the number of bytes of storage I/O which this
 	  task has caused.
@@ -470,6 +482,10 @@ config CFS_BANDWIDTH
 	  restriction.
 	  See tip/Documentation/scheduler/sched-bwc.txt for more information.
 
+config CFS_CPULIMIT
+	bool
+	depends on CFS_BANDWIDTH
+
 config RT_GROUP_SCHED
 	bool "Group scheduling for SCHED_RR/FIFO"
 	depends on EXPERIMENTAL
@@ -506,6 +522,19 @@ config CGROUP_SCHED
 
 endchoice
 
+config VZ_FAIRSCHED
+	bool "OpenVZ fairsched compat"
+	select CPUSETS
+	select CGROUP_CPUACCT
+	select CGROUP_SCHED
+	select FAIR_GROUP_SCHED
+	select CFS_BANDWIDTH
+	select CFS_CPULIMIT
+	default y
+	help
+	  This option add task cpu cgroup control with OpenVZ compatible
+	  syscall and procfs interface.
+
 menuconfig CGROUPS
 	boolean "Control Group support"
 	depends on EVENTFD
@@ -535,7 +564,7 @@ config CGROUP_DEBUG
 
 config CGROUP_NS
 	bool "Namespace cgroup subsystem"
-	depends on CGROUPS
+	depends on CGROUPS && !VE
 	help
 	  Provides a simple namespace cgroup subsystem to
 	  provide hierarchical naming of sets of namespaces,
@@ -588,7 +617,7 @@ config RESOURCE_COUNTERS
 
 config CGROUP_MEM_RES_CTLR
 	bool "Memory Resource Controller for Control Groups"
-	depends on CGROUPS && RESOURCE_COUNTERS
+	depends on CGROUPS && RESOURCE_COUNTERS && !BEANCOUNTERS
 	select MM_OWNER
 	help
 	  Provides a memory resource controller that manages both anonymous
@@ -720,6 +749,16 @@ config SYSFS_DEPRECATED_V2
 	  older userspace tools, you might need to say Y here. Do not say Y,
 	  if the original kernel, that came with your distribution, has
 	  this option set to N.
+
+config SYSFS_DEPRECATED_DYN
+	bool "make deprecated sysfs layout dynamically"
+	depends on SYSFS
+	default y
+	select SYSFS_DEPRECATED_V2
+	help
+	  This option works like the DEPRECATED_V2 but allows selecting the
+	  sysfs layout dynamically, i.e. on boot. To select the old
+	  (deprecated) layout, supply old_sysfs kernel boot parameter.
 
 config RELAY
 	bool "Kernel->user space relay support (formerly relayfs)"

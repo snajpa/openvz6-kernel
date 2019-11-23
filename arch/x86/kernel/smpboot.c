@@ -847,6 +847,12 @@ do_rest:
 	initial_code = (unsigned long)start_secondary;
 	stack_start.sp = (void *) c_idle.idle->thread.sp;
 
+#ifdef CONFIG_VE
+	/* Cosmetic: sleep_time won't be changed afterwards for the idle
+	* thread;  keep it 0 rather than -cycles. */
+	VE_TASK_INFO(c_idle.idle)->sleep_time = 0;
+#endif
+
 	/* start_ip had better be page-aligned! */
 	start_ip = setup_trampoline();
 

@@ -107,6 +107,14 @@ extern long do_msgsnd(int msqid, long mtype, void __user *mtext,
 extern long do_msgrcv(int msqid, long *pmtype, void __user *mtext,
 			size_t msgsz, long msgtyp, int msgflg);
 
+int sysvipc_walk_msg(int (*func)(int, struct msg_queue*, void *), void *arg);
+int sysvipc_setup_msg(key_t key, int msqid, int msgflg);
+int sysv_msg_store(struct msg_msg *msg,
+		   int (*store)(void * src, int len, int offset, void * data),
+		   int len, void * data);
+struct msg_msg *sysv_msg_load(int (*load)(void * dst, int len, int offset,
+					  void * data), int len, void * data);
+
 #endif /* __KERNEL__ */
 
 #endif /* _LINUX_MSG_H */

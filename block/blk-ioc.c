@@ -43,7 +43,9 @@ int put_io_context(struct io_context *ioc)
 			ioc->aic->dtor(ioc->aic);
 		cfq_dtor(ioc);
 		rcu_read_unlock();
-
+#ifdef CONFIG_BEANCOUNTERS
+		put_beancounter(ioc->ioc_ub);
+#endif
 		kmem_cache_free(iocontext_cachep, ioc);
 		return 1;
 	}
@@ -75,6 +77,12 @@ void exit_io_context(struct task_struct *task)
 	task->io_context = NULL;
 	task_unlock(task);
 
+	ioc_task_unlink(ioc);
+}
+EXPORT_SYMBOL(exit_io_context);
+
+void ioc_task_unlink(struct io_context *ioc)
+{
 	if (atomic_dec_and_test(&ioc->nr_tasks)) {
 		if (ioc->aic && ioc->aic->exit)
 			ioc->aic->exit(ioc->aic);
@@ -83,6 +91,7 @@ void exit_io_context(struct task_struct *task)
 	}
 	put_io_context(ioc);
 }
+EXPORT_SYMBOL(ioc_task_unlink);
 
 struct io_context *alloc_io_context(gfp_t gfp_flags, int node)
 {
@@ -93,7 +102,6 @@ struct io_context *alloc_io_context(gfp_t gfp_flags, int node)
 		atomic_long_set(&ret->refcount, 1);
 		atomic_set(&ret->nr_tasks, 1);
 		spin_lock_init(&ret->lock);
-		ret->ioprio_changed = 0;
 		ret->ioprio = 0;
 		ret->last_waited = jiffies; /* doesn't matter... */
 		ret->nr_batch_requests = 0; /* because this is 0 */
@@ -101,8 +109,8 @@ struct io_context *alloc_io_context(gfp_t gfp_flags, int node)
 		INIT_RADIX_TREE(&ret->radix_root, GFP_ATOMIC | __GFP_HIGH);
 		INIT_HLIST_HEAD(&ret->cic_list);
 		ret->ioc_data = NULL;
-#if defined(CONFIG_BLK_CGROUP) || defined(CONFIG_BLK_CGROUP_MODULE)
-		ret->cgroup_changed = 0;
+#ifdef CONFIG_BEANCOUNTERS
+		ret->ioc_ub = get_beancounter(get_exec_ub_top());
 #endif
 	}
 
@@ -135,6 +143,7 @@ struct io_context *current_io_context(gfp_t gfp_flags, int node)
 
 	return ret;
 }
+EXPORT_SYMBOL(current_io_context);
 
 /*
  * If the current task has no IO context then create one and initialise it.
@@ -173,6 +182,51 @@ void copy_io_context(struct io_context **pdst, struct io_context **psrc)
 	}
 }
 EXPORT_SYMBOL(copy_io_context);
+
+void ioc_set_changed(struct io_context *ioc, int which)
+{
+	struct cfq_io_context *cic;
+	struct hlist_node *n;
+
+	hlist_for_each_entry(cic, n, &ioc->cic_list, cic_list)
+		set_bit(which, &cic->changed);
+}
+
+/**
+ * ioc_ioprio_changed - notify ioprio change
+ * @ioc: io_context of interest
+ * @ioprio: new ioprio
+ *
+ * @ioc's ioprio has changed to @ioprio.  Set %CIC_IOPRIO_CHANGED for all
+ * cic's.  iosched is responsible for checking the bit and applying it on
+ * request issue path.
+ */
+void ioc_ioprio_changed(struct io_context *ioc, int ioprio)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ioc->lock, flags);
+	ioc->ioprio = ioprio;
+	ioc_set_changed(ioc, CIC_IOPRIO_CHANGED);
+	spin_unlock_irqrestore(&ioc->lock, flags);
+}
+
+/**
+ * ioc_cgroup_changed - notify cgroup change
+ * @ioc: io_context of interest
+ *
+ * @ioc's cgroup has changed.  Set %CIC_CGROUP_CHANGED for all cic's.
+ * iosched is responsible for checking the bit and applying it on request
+ * issue path.
+ */
+void ioc_cgroup_changed(struct io_context *ioc)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ioc->lock, flags);
+	ioc_set_changed(ioc, CIC_CGROUP_CHANGED);
+	spin_unlock_irqrestore(&ioc->lock, flags);
+}
 
 static int __init blk_ioc_init(void)
 {

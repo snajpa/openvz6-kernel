@@ -52,25 +52,33 @@ struct writeback_control {
 	unsigned for_reclaim:1;		/* Invoked from the page allocator */
 	unsigned range_cyclic:1;	/* range_start is cyclic */
 	unsigned more_io:1;		/* more io to be dispatched */
+	unsigned for_sync:1;		/* sync_fs() will be executed after this work is done */
+
+	struct user_beancounter *wb_ub;	/* only for this beancounter */
 
 	/* reserved for Red Hat */
 	unsigned long rh_reserved[5];
+
+	void *fsdata; /* Private fs data */
 };
 
 /*
  * fs/fs-writeback.c
  */	
 struct bdi_writeback;
+struct user_beancounter;
 int inode_wait(void *);
 void writeback_inodes_sb(struct super_block *);
 void writeback_inodes_sb_nr(struct super_block *, unsigned long nr);
+void writeback_inodes_sb_ub(struct super_block *, struct user_beancounter *);
 int writeback_inodes_sb_if_idle(struct super_block *);
 int writeback_inodes_sb_nr_if_idle(struct super_block *, unsigned long nr);
 void sync_inodes_sb(struct super_block *);
+void sync_inodes_sb_ub(struct super_block *, struct user_beancounter *);
 void writeback_inodes_wb(struct bdi_writeback *wb,
 		struct writeback_control *wbc);
 long wb_do_writeback(struct bdi_writeback *wb, int force_wait);
-void wakeup_flusher_threads(long nr_pages);
+void wakeup_flusher_threads(struct user_beancounter *, long nr_pages);
 
 /* writeback.h requires fs.h; it, too, is not included from here. */
 static inline void wait_on_inode(struct inode *inode)

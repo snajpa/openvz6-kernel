@@ -48,6 +48,7 @@
 #include <linux/nfs_fs.h>
 #include <linux/nfs_page.h>
 #include <linux/sunrpc/clnt.h>
+#include <linux/task_io_accounting_ops.h>
 
 #include <asm/system.h>
 #include <asm/uaccess.h>
@@ -419,6 +420,8 @@ static ssize_t nfs_direct_read(struct kiocb *iocb, const struct iovec *iov,
 	struct nfs_direct_req *dreq;
 	struct nfs_lock_context *l_ctx;
 
+	virtinfo_notifier_call(VITYPE_IO, VIRTINFO_IO_PREPARE, NULL);
+
 	dreq = nfs_direct_req_alloc();
 	if (dreq == NULL)
 		goto out;
@@ -437,6 +440,9 @@ static ssize_t nfs_direct_read(struct kiocb *iocb, const struct iovec *iov,
 	result = nfs_direct_read_schedule_iovec(dreq, iov, nr_segs, pos);
 	if (!result)
 		result = nfs_direct_wait(dreq);
+	if (result > 0)
+		task_io_account_read(result);
+
 out_release:
 	nfs_direct_req_release(dreq);
 out:
@@ -805,6 +811,8 @@ static ssize_t nfs_direct_write(struct kiocb *iocb, const struct iovec *iov,
 	struct nfs_direct_req *dreq;
 	struct nfs_lock_context *l_ctx;
 
+	virtinfo_notifier_call(VITYPE_IO, VIRTINFO_IO_PREPARE, NULL);
+
 	dreq = nfs_direct_req_alloc();
 	if (!dreq)
 		goto out;
@@ -823,6 +831,8 @@ static ssize_t nfs_direct_write(struct kiocb *iocb, const struct iovec *iov,
 	result = nfs_direct_write_schedule_iovec(dreq, iov, nr_segs, pos);
 	if (!result)
 		result = nfs_direct_wait(dreq);
+	if (result > 0)
+		task_io_account_write(result);
 out_release:
 	nfs_direct_req_release(dreq);
 out:

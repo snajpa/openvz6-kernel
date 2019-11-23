@@ -21,6 +21,8 @@
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 
+#include <bc/beancounter.h>
+
 const struct file_operations generic_ro_fops = {
 	.llseek		= generic_file_llseek,
 	.read		= do_sync_read,
@@ -369,23 +371,28 @@ EXPORT_SYMBOL(vfs_read);
 ssize_t do_sync_write(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
 {
 	struct iovec iov = { .iov_base = (void __user *)buf, .iov_len = len };
-	struct kiocb kiocb;
+	struct kiocb *kiocb;
 	ssize_t ret;
 
-	init_sync_kiocb(&kiocb, filp);
-	kiocb.ki_pos = *ppos;
-	kiocb.ki_left = len;
+	kiocb = kzalloc(sizeof(struct kiocb), GFP_KERNEL);
+	if (!kiocb)
+		return -ENOMEM;
+
+	init_sync_kiocb(kiocb, filp);
+	kiocb->ki_pos = *ppos;
+	kiocb->ki_left = len;
 
 	for (;;) {
-		ret = filp->f_op->aio_write(&kiocb, &iov, 1, kiocb.ki_pos);
+		ret = filp->f_op->aio_write(kiocb, &iov, 1, kiocb->ki_pos);
 		if (ret != -EIOCBRETRY)
 			break;
-		wait_on_retry_sync_kiocb(&kiocb);
+		wait_on_retry_sync_kiocb(kiocb);
 	}
 
 	if (-EIOCBQUEUED == ret)
-		ret = wait_on_sync_kiocb(&kiocb);
-	*ppos = kiocb.ki_pos;
+		ret = wait_on_sync_kiocb(kiocb);
+	*ppos = kiocb->ki_pos;
+	kfree(kiocb);
 	return ret;
 }
 

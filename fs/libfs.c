@@ -543,8 +543,10 @@ int simple_fill_super(struct super_block *s, int magic, struct tree_descr *files
 		if (!dentry)
 			goto out;
 		inode = new_inode(s);
-		if (!inode)
+		if (!inode) {
+			dput(dentry);
 			goto out;
+		}
 		inode->i_mode = S_IFREG | files->mode;
 		inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
 		inode->i_fop = files->ops;
@@ -555,6 +557,7 @@ int simple_fill_super(struct super_block *s, int magic, struct tree_descr *files
 	return 0;
 out:
 	d_genocide(root);
+	shrink_dcache_parent(root);
 	dput(root);
 	return -ENOMEM;
 }
@@ -904,7 +907,7 @@ int simple_fsync(struct file *file, struct dentry *dentry, int datasync)
 	int ret;
 
 	ret = sync_mapping_buffers(inode->i_mapping);
-	if (!(inode->i_state & I_DIRTY))
+	if (!(inode->i_state & I_DIRTY_ALL))
 		return ret;
 	if (datasync && !(inode->i_state & I_DIRTY_DATASYNC))
 		return ret;

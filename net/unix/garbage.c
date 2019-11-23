@@ -137,6 +137,7 @@ void unix_inflight(struct user_struct *user, struct file *fp)
 	user->unix_inflight++;
 	spin_unlock(&unix_gc_lock);
 }
+EXPORT_SYMBOL(unix_inflight);
 
 void unix_notinflight(struct user_struct *user, struct file *fp)
 {

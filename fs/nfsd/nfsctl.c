@@ -14,6 +14,9 @@
 #include <linux/sunrpc/clnt.h>
 #include <linux/sunrpc/gss_api.h>
 
+#include <linux/ve_proto.h>
+#include <linux/vzcalluser.h>
+
 #include "nfsd.h"
 #include "cache.h"
 
@@ -451,7 +454,7 @@ static ssize_t write_getfs(struct file *file, char *buf, size_t size)
 
 	ipv6_addr_set_v4mapped(sin->sin_addr.s_addr, &in6);
 
-	clp = auth_unix_lookup(&init_net, &in6);
+	clp = auth_unix_lookup(current->nsproxy->net_ns, &in6);
 	if (!clp)
 		err = -EPERM;
 	else {
@@ -514,7 +517,7 @@ static ssize_t write_getfd(struct file *file, char *buf, size_t size)
 
 	ipv6_addr_set_v4mapped(sin->sin_addr.s_addr, &in6);
 
-	clp = auth_unix_lookup(&init_net, &in6);
+	clp = auth_unix_lookup(current->nsproxy->net_ns, &in6);
 	if (!clp)
 		err = -EPERM;
 	else {
@@ -841,7 +844,7 @@ static ssize_t __write_versions(struct file *file, char *buf, size_t size)
 	ssize_t tlen = 0;
 	char *sep;
 
-	if (size>0) {
+	if (size>0 && ve_is_super(get_exec_env())) {
 		if (nfsd_serv)
 			/* Cannot change versions without updating
 			 * nfsd_serv->sv_xdrsize, and reallocing
@@ -1050,12 +1053,12 @@ static ssize_t __write_ports_addxprt(char *buf)
 	if (err != 0)
 		return err;
 
-	err = svc_create_xprt(nfsd_serv, transport, &init_net,
+	err = svc_create_xprt(nfsd_serv, transport, current->nsproxy->net_ns,
 				PF_INET, port, SVC_SOCK_ANONYMOUS);
 	if (err < 0)
 		goto out_err;
 
-	err = svc_create_xprt(nfsd_serv, transport, &init_net,
+	err = svc_create_xprt(nfsd_serv, transport, current->nsproxy->net_ns,
 				PF_INET6, port, SVC_SOCK_ANONYMOUS);
 	if (err < 0 && err != -EAFNOSUPPORT)
 		goto out_close;
@@ -1405,32 +1408,45 @@ static ssize_t write_recoverydir(struct file *file, char *buf, size_t size)
 
 static int nfsd_fill_super(struct super_block * sb, void * data, int silent)
 {
+#define NFSD_DEPR_FILES							\
+	[NFSD_Svc] = {".svc", &transaction_ops, S_IWUSR},		\
+	[NFSD_Add] = {".add", &transaction_ops, S_IWUSR},		\
+	[NFSD_Del] = {".del", &transaction_ops, S_IWUSR},		\
+	[NFSD_Export] = {".export", &transaction_ops, S_IWUSR},		\
+	[NFSD_Unexport] = {".unexport", &transaction_ops, S_IWUSR},	\
+	[NFSD_Getfd] = {".getfd", &transaction_ops, S_IWUSR|S_IRUSR},	\
+	[NFSD_Getfs] = {".getfs", &transaction_ops, S_IWUSR|S_IRUSR}
+
+#define NFSD_V3_FILES							\
+	[NFSD_List] = {"exports", &exports_operations, S_IRUGO},	\
+	[NFSD_Export_features] = {"export_features",			\
+				&export_features_operations, S_IRUGO},	\
+	[NFSD_FO_UnlockIP] = {"unlock_ip",				\
+				&transaction_ops, S_IWUSR|S_IRUSR},	\
+	[NFSD_FO_UnlockFS] = {"unlock_filesystem",			\
+				&transaction_ops, S_IWUSR|S_IRUSR},	\
+	[NFSD_Fh] = {"filehandle", &transaction_ops, S_IWUSR|S_IRUSR},	\
+	[NFSD_Threads] = {"threads", &transaction_ops, S_IWUSR|S_IRUSR},\
+	[NFSD_Pool_Threads] = {"pool_threads",				\
+				&transaction_ops, S_IWUSR|S_IRUSR},	\
+	[NFSD_Pool_Stats] = {"pool_stats",				\
+				&pool_stats_operations, S_IRUGO},	\
+	[NFSD_Reply_Cache_Stats] = {"reply_cache_stats",		\
+				&reply_cache_stats_operations, S_IRUGO},\
+	[NFSD_Versions] = {"versions",					\
+				&transaction_ops, S_IWUSR|S_IRUSR},	\
+	[NFSD_Ports] = {"portlist",					\
+				&transaction_ops, S_IWUSR|S_IRUGO},	\
+	[NFSD_MaxBlkSize] = {"max_block_size",				\
+				&transaction_ops, S_IWUSR|S_IRUGO},	\
+	[NFSD_SupportedEnctypes] = {"supported_krb5_enctypes",		\
+				&supported_enctypes_ops, S_IRUGO}
+
 	static struct tree_descr nfsd_files[] = {
 #ifdef CONFIG_NFSD_DEPRECATED
-		[NFSD_Svc] = {".svc", &transaction_ops, S_IWUSR},
-		[NFSD_Add] = {".add", &transaction_ops, S_IWUSR},
-		[NFSD_Del] = {".del", &transaction_ops, S_IWUSR},
-		[NFSD_Export] = {".export", &transaction_ops, S_IWUSR},
-		[NFSD_Unexport] = {".unexport", &transaction_ops, S_IWUSR},
-		[NFSD_Getfd] = {".getfd", &transaction_ops, S_IWUSR|S_IRUSR},
-		[NFSD_Getfs] = {".getfs", &transaction_ops, S_IWUSR|S_IRUSR},
+		NFSD_DEPR_FILES,
 #endif
-		[NFSD_List] = {"exports", &exports_operations, S_IRUGO},
-		[NFSD_Export_features] = {"export_features",
-					&export_features_operations, S_IRUGO},
-		[NFSD_FO_UnlockIP] = {"unlock_ip",
-					&transaction_ops, S_IWUSR|S_IRUSR},
-		[NFSD_FO_UnlockFS] = {"unlock_filesystem",
-					&transaction_ops, S_IWUSR|S_IRUSR},
-		[NFSD_Fh] = {"filehandle", &transaction_ops, S_IWUSR|S_IRUSR},
-		[NFSD_Threads] = {"threads", &transaction_ops, S_IWUSR|S_IRUSR},
-		[NFSD_Pool_Threads] = {"pool_threads", &transaction_ops, S_IWUSR|S_IRUSR},
-		[NFSD_Pool_Stats] = {"pool_stats", &pool_stats_operations, S_IRUGO},
-		[NFSD_Reply_Cache_Stats] = {"reply_cache_stats", &reply_cache_stats_operations, S_IRUGO},
-		[NFSD_Versions] = {"versions", &transaction_ops, S_IWUSR|S_IRUSR},
-		[NFSD_Ports] = {"portlist", &transaction_ops, S_IWUSR|S_IRUGO},
-		[NFSD_MaxBlkSize] = {"max_block_size", &transaction_ops, S_IWUSR|S_IRUGO},
-		[NFSD_SupportedEnctypes] = {"supported_krb5_enctypes", &supported_enctypes_ops, S_IRUGO},
+		NFSD_V3_FILES,
 #ifdef CONFIG_NFSD_V4
 		[NFSD_Leasetime] = {"nfsv4leasetime", &transaction_ops, S_IWUSR|S_IRUSR},
 		[NFSD_Gracetime] = {"nfsv4gracetime", &transaction_ops, S_IWUSR|S_IRUSR},
@@ -1438,7 +1454,16 @@ static int nfsd_fill_super(struct super_block * sb, void * data, int silent)
 #endif
 		/* last one */ {""}
 	};
-	return simple_fill_super(sb, 0x6e667364, nfsd_files);
+	static struct tree_descr ve_nfsd_files[] = {
+#ifdef CONFIG_NFSD_DEPRECATED
+		NFSD_DEPR_FILES,
+#endif
+		NFSD_V3_FILES,
+		/* last one */ {""}
+	};
+
+	return simple_fill_super(sb, 0x6e667364,
+		ve_is_super(get_exec_env()) ? nfsd_files : ve_nfsd_files);
 }
 
 static int nfsd_get_sb(struct file_system_type *fs_type,
@@ -1457,28 +1482,153 @@ static struct file_system_type nfsd_fs_type = {
 #ifdef CONFIG_PROC_FS
 static int create_proc_exports_entry(void)
 {
-	struct proc_dir_entry *entry;
+	struct proc_dir_entry *root, *entry;
 
-	entry = proc_mkdir("fs/nfs", NULL);
+	root = get_exec_env()->proc_root;
+	entry = proc_mkdir("fs/nfs", root);
 	if (!entry)
 		return -ENOMEM;
 	entry = proc_create("exports", 0, entry, &exports_operations);
-	if (!entry)
+	if (!entry) {
+		remove_proc_entry("fs/nfs", root);
 		return -ENOMEM;
+	}
 	return 0;
+}
+
+void remove_proc_exports_entry(void)
+{
+	struct proc_dir_entry *entry;
+
+	entry = get_exec_env()->proc_root;
+	remove_proc_entry("fs/nfs/exports", entry);
+	remove_proc_entry("fs/nfs", entry);
 }
 #else /* CONFIG_PROC_FS */
 static int create_proc_exports_entry(void)
 {
 	return 0;
 }
+
+void remove_proc_exports_entry(void)
+{
+}
 #endif
+
+static int ve_init_nfsctl(void *data)
+{
+	struct ve_struct *ve = data;
+	struct ve_nfsd_data *d;
+	int err = -ENOMEM;
+
+	if (!(ve->features & VE_FEATURE_NFSD))
+		return 0;
+
+	d = kzalloc(sizeof(struct ve_nfsd_data), GFP_KERNEL);
+	if (d == NULL)
+		goto err_data;
+
+	atomic_set(&d->_nfsd_ntf_refcnt, 0);
+	init_waitqueue_head(&d->_nfsd_ntf_wq);
+
+	ve->nfsd_data = d;
+
+	err = create_proc_exports_entry();
+	if (err)
+		goto err_proc;
+
+	err = nfsd_export_init();
+	if (err)
+		goto err_exp;
+
+	err = nfsd_stat_init();
+	if (err)
+		goto err_stat;
+
+	err = register_ve_fs_type(ve, &nfsd_fs_type, &d->nfsd_fs, NULL);
+	if (err) {
+		printk("Can't register nfsdfs\n");
+		goto err_nfsdfs;
+	}
+
+	return 0;
+
+err_nfsdfs:
+	nfsd_stat_shutdown();
+err_stat:
+	nfsd_export_shutdown();
+err_exp:
+	remove_proc_exports_entry();
+err_proc:
+	kfree(d);
+	ve->nfsd_data = NULL;
+err_data:
+	return err;
+}
+
+static void ve_exit_nfsctl(void *data)
+{
+	struct ve_struct *ve = data;
+	struct ve_nfsd_data *d = ve->nfsd_data;
+
+	if (d == NULL)
+		return;
+
+	if (nfsd_up)
+		wait_for_completion(&nfsd_exited);
+
+	nfsd_stat_shutdown();
+
+	unregister_ve_fs_type(d->nfsd_fs, NULL);
+	kfree(d->nfsd_fs);
+	nfsd_export_shutdown();
+	remove_proc_exports_entry();
+
+	ve->nfsd_data = NULL;
+	kfree(d);
+}
+
+static struct ve_hook nfsd_ctl_hook = {
+	.init = ve_init_nfsctl,
+	.fini = ve_exit_nfsctl,
+	.owner	  = THIS_MODULE,
+	.priority = HOOK_PRIO_NET_POST,
+};
+
+static struct ve_nfsd_data ve0_nfsd_data;
+
+int report_stale = 0;
+static struct ctl_table_header *nfs_ctl;
+static ctl_table debug_table[] = {
+	{
+		.ctl_name	= 9475,
+		.procname	= "nfs_stale",
+		.data		= &report_stale,
+		.maxlen		= sizeof(report_stale),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
+	},
+	{ .ctl_name = 0 }
+};
+static ctl_table root_table[] = {
+	{
+		.ctl_name	= CTL_DEBUG,
+		.procname	= "debug",
+		.mode		= 0555,
+		.child		= debug_table,
+	},
+	{ .ctl_name = 0 }
+};
 
 static int __init init_nfsd(void)
 {
 	int retval;
 	printk(KERN_INFO "Installing knfsd (copyright (C) 1996 okir@monad.swb.de).\n");
 
+	atomic_set(&ve0_nfsd_data._nfsd_ntf_refcnt, 0);
+	init_waitqueue_head(&ve0_nfsd_data._nfsd_ntf_wq);
+
+	get_ve0()->nfsd_data = &ve0_nfsd_data;
 	retval = nfs4_state_init(); /* nfs4 locking state */
 	if (retval)
 		return retval;
@@ -1499,10 +1649,11 @@ static int __init init_nfsd(void)
 	retval = register_filesystem(&nfsd_fs_type);
 	if (retval)
 		goto out_free_all;
+	ve_hook_register(VE_SS_CHAIN, &nfsd_ctl_hook);
+	nfs_ctl = register_sysctl_table(root_table);
 	return 0;
 out_free_all:
-	remove_proc_entry("fs/nfs/exports", NULL);
-	remove_proc_entry("fs/nfs", NULL);
+	remove_proc_exports_entry();
 out_free_idmap:
 	nfsd_idmap_shutdown();
 out_free_lockd:
@@ -1513,20 +1664,23 @@ out_free_cache:
 out_free_stat:
 	nfsd_stat_shutdown();
 	nfsd4_free_slabs();
+	get_ve0()->nfsd_data = NULL;
 	return retval;
 }
 
 static void __exit exit_nfsd(void)
 {
+	unregister_sysctl_table(nfs_ctl);
+	ve_hook_unregister(&nfsd_ctl_hook);
 	nfsd_export_shutdown();
 	nfsd_reply_cache_shutdown();
-	remove_proc_entry("fs/nfs/exports", NULL);
-	remove_proc_entry("fs/nfs", NULL);
+	remove_proc_exports_entry();
 	nfsd_stat_shutdown();
 	nfsd_lockd_shutdown();
 	nfsd_idmap_shutdown();
 	nfsd4_free_slabs();
 	unregister_filesystem(&nfsd_fs_type);
+	get_ve0()->nfsd_data = NULL;
 }
 
 MODULE_AUTHOR("Olaf Kirch <okir@monad.swb.de>");

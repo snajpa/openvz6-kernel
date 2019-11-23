@@ -58,7 +58,7 @@ static void drop_slab(void)
 	int nr_objects;
 
 	do {
-		nr_objects = shrink_slab(1000, GFP_KERNEL, 1000);
+		nr_objects = shrink_slab(1000, GFP_KERNEL|__GFP_REPEAT, 1000);
 	} while (nr_objects > 10);
 }
 
@@ -67,10 +67,20 @@ int drop_caches_sysctl_handler(ctl_table *table, int write,
 {
 	proc_dointvec_minmax(table, write, buffer, length, ppos);
 	if (write) {
+		static int stfu;
+
 		if (sysctl_drop_caches & 1)
 			drop_pagecache();
 		if (sysctl_drop_caches & 2)
 			drop_slab();
+		if (!stfu) {
+			pr_info("%s (%d): drop_caches: %d\n",
+				current->comm, task_pid_nr(current),
+				sysctl_drop_caches);
+		}
+		stfu |= sysctl_drop_caches & 4;
+		if (sysctl_drop_caches & 8)
+			stfu = 0;
 	}
 	return 0;
 }

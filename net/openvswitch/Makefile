@@ -3,6 +3,7 @@
 #
 
 obj-$(CONFIG_OPENVSWITCH) += openvswitch.o
+obj-$(CONFIG_OVS_BRCOMPAT) += brcompat.o
 
 openvswitch-y := \
 	actions.o \

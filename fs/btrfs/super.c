@@ -1508,7 +1508,7 @@ static int btrfs_unfreeze(struct super_block *sb)
 	return 0;
 }
 
-static void btrfs_fs_dirty_inode(struct inode *inode)
+static void btrfs_fs_dirty_inode(struct inode *inode, int flags)
 {
 	int ret;
 

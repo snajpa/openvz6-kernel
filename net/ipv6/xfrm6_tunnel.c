@@ -343,14 +343,6 @@ static int __net_init xfrm6_tunnel_net_init(struct net *net)
 {
 	struct xfrm6_tunnel_net *xfrm6_tn = xfrm6_tunnel_pernet(net);
 	unsigned int i;
-	int err;
-
-	xfrm6_tn = kzalloc(sizeof(struct xfrm6_tunnel_net), GFP_KERNEL);
-	if (!xfrm6_tn)
-		return -ENOMEM;
-	err = net_assign_generic(net, xfrm6_tunnel_net_id, xfrm6_tn);
-	if (err)
-		goto free;
 
 	for (i = 0; i < XFRM6_TUNNEL_SPI_BYADDR_HSIZE; i++)
 		INIT_HLIST_HEAD(&xfrm6_tn->spi_byaddr[i]);
@@ -359,10 +351,6 @@ static int __net_init xfrm6_tunnel_net_init(struct net *net)
 	xfrm6_tn->spi = 0;
 
 	return 0;
-
-free:
-	kfree(xfrm6_tn);
-	return err;
 }
 
 static void __net_exit xfrm6_tunnel_net_exit(struct net *net)
@@ -372,6 +360,8 @@ static void __net_exit xfrm6_tunnel_net_exit(struct net *net)
 static struct pernet_operations xfrm6_tunnel_net_ops = {
 	.init	= xfrm6_tunnel_net_init,
 	.exit	= xfrm6_tunnel_net_exit,
+	.id	= &xfrm6_tunnel_net_id,
+	.size	= sizeof(struct xfrm6_tunnel_net),
 };
 
 static int __init xfrm6_tunnel_init(void)
@@ -390,8 +380,7 @@ static int __init xfrm6_tunnel_init(void)
 	rv = xfrm6_tunnel_spi_init();
 	if (rv < 0)
 		goto dereg46;
-	rv = register_pernet_gen_subsys(&xfrm6_tunnel_net_id,
-					&xfrm6_tunnel_net_ops);
+	rv = register_pernet_subsys(&xfrm6_tunnel_net_ops);
 	if (rv < 0)
 		goto deregspi;
 	return 0;
@@ -410,8 +399,7 @@ err:
 
 static void __exit xfrm6_tunnel_fini(void)
 {
-	unregister_pernet_gen_subsys(xfrm6_tunnel_net_id,
-				     &xfrm6_tunnel_net_ops);
+	unregister_pernet_subsys(&xfrm6_tunnel_net_ops);
 	xfrm6_tunnel_spi_fini();
 	xfrm6_tunnel_deregister(&xfrm46_tunnel_handler, AF_INET);
 	xfrm6_tunnel_deregister(&xfrm6_tunnel_handler, AF_INET6);

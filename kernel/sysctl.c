@@ -54,6 +54,10 @@
 #include <linux/kprobes.h>
 #include <linux/kmod.h>
 #include <linux/capability.h>
+#include <linux/cpuset.h>
+#include <linux/ve_task.h>
+#include <linux/mmgang.h>
+#include <linux/mnt_namespace.h>
 
 #include <asm/uaccess.h>
 #include <asm/processor.h>
@@ -79,22 +83,41 @@ extern int sysctl_panic_on_oom;
 extern int sysctl_oom_kill_allocating_task;
 extern int sysctl_oom_dump_tasks;
 extern int sysctl_would_have_oomkilled;
+extern int sysctl_oom_relaxation;
 extern int max_threads;
 extern int core_uses_pid;
 extern int suid_dumpable;
 extern char core_pattern[];
 extern unsigned int core_pipe_limit;
-extern int pid_max;
 extern int pid_max_min, pid_max_max;
 extern int sysctl_drop_caches;
 extern int percpu_pagelist_fraction;
 extern int compat_log;
+int ve_allow_kthreads = 1;
+EXPORT_SYMBOL(ve_allow_kthreads);
+int ve_allow_module_load = 1;
+EXPORT_SYMBOL(ve_allow_module_load);
+
+#ifdef CONFIG_MAGIC_SYSRQ
+extern int sysrq_key_scancode;
+#endif
+extern unsigned relatime_interval; /* fs/inode.c */
+
+extern int alloc_fail_warn;
+int decode_call_traces = 1;
+
+#ifdef CONFIG_VE
+int glob_ve_meminfo = 0;
+#endif
 extern int latencytop_enabled;
 extern int sysctl_nr_open_min, sysctl_nr_open_max;
 #ifndef CONFIG_MMU
 extern int sysctl_nr_trim_pages;
 #endif
 extern int kexec_load_disabled;
+extern int kexec_preserve_uptime;
+extern int kexec_reuse_crash;
+extern int pramcache_ploop_nosync;
 /* bz790921 */
 int unmap_area_factor_sysctl_handler(ctl_table *table, int write,
 			void __user *buffer, size_t *length, loff_t *ppos);
@@ -113,6 +136,7 @@ int exec_shield = (1<<0);
  * (1<<2) 4: vdso just below .text of main (unless too low)
  * (1<<3) 8: vdso just below .text of PT_INTERP (unless too low)
  * are ignored because the vdso is placed completely randomly
+ * (1<<4) 16: strict exec area randomization on ia32
  */
 
 static int __init setup_exec_shield(char *str)
@@ -141,6 +165,7 @@ static int __maybe_unused one = 1;
 static int __maybe_unused two = 2;
 static unsigned long one_ul = 1;
 static int one_hundred = 100;
+static int two_hundred = 200;
 #ifdef CONFIG_PRINTK
 static int ten_thousand = 10000;
 #endif
@@ -198,6 +223,16 @@ extern int unaligned_dump_stack;
 extern int max_lock_depth;
 #endif
 
+#ifdef CONFIG_MEMORY_GANGS
+extern int vm_usage_factor;
+extern int vm_shadow_factor;
+extern int vm_age_factor;
+extern unsigned long commitment_for_unlimited_containers;
+extern int commitment_for_unlimited_containers_handler(struct ctl_table *table,
+		int write, void __user *buffer, size_t *lenp, loff_t *ppos);
+extern int vm_force_scan_thresh;
+#endif /* CONFIG_MEMORY_GANGS */
+
 #ifdef CONFIG_PROC_SYSCTL
 static int proc_do_cad_pid(struct ctl_table *table, int write,
 		  void __user *buffer, size_t *lenp, loff_t *ppos);
@@ -219,9 +254,56 @@ static struct ctl_table_header root_table_header = {
 	.root = &sysctl_table_root,
 	.set = &sysctl_table_root.default_set,
 };
-static struct ctl_table_root sysctl_table_root = {
+
+#ifdef CONFIG_VE
+static int sysctl_root_perms(struct ctl_table_root *root,
+			struct nsproxy *namespaces, struct ctl_table *table)
+{
+	if (ve_is_super(get_exec_env()))
+		return table->mode;
+	else if (table->mode & S_ISVTX)
+		return table->mode;
+	else
+		return table->mode & ~0222;
+}
+
+struct ctl_table *sysctl_ve_table(struct ctl_table *orig,
+		struct ctl_table *onstack, int write)
+{
+	if (!(orig->mode & S_ISVTX))
+		return orig;
+
+	*onstack = *orig;
+	if (orig->extra1 != NULL) { /* per-ve_struct variable */
+		onstack->data = (void *)get_exec_env() +
+			(unsigned long)orig->extra1;
+		onstack->extra1 = NULL;
+	}
+	else if (write && !ve_is_super(get_exec_env())) /* immutable */
+		return NULL;
+
+	return onstack;
+}
+
+static struct ctl_table_root sysctl_table_groot = {
 	.root_list = LIST_HEAD_INIT(sysctl_table_root.root_list),
+	.default_set.list = LIST_HEAD_INIT(sysctl_table_groot.default_set.list),
+	.default_set.parent = &sysctl_table_root.default_set,
+};
+#else
+#define sysctl_root_perms NULL
+#define sysctl_table_groot sysctl_table_root
+struct ctl_table_root *sysctl_ve_table(struct ctl_table *orig,
+		struct ctl_table *onstack, int write)
+{
+	return orig;
+}
+#endif
+
+static struct ctl_table_root sysctl_table_root = {
+	.root_list = LIST_HEAD_INIT(sysctl_table_groot.root_list),
 	.default_set.list = LIST_HEAD_INIT(root_table_header.ctl_entry),
+	.permissions = sysctl_root_perms,
 };
 
 static struct ctl_table kern_table[];
@@ -235,6 +317,9 @@ extern struct ctl_table inotify_table[];
 #endif
 #ifdef CONFIG_EPOLL
 extern struct ctl_table epoll_table[];
+#endif
+#ifdef CONFIG_PRAMCACHE
+extern struct ctl_table pramcache_table[];
 #endif
 
 #ifdef HAVE_ARCH_PICK_MMAP_LAYOUT
@@ -310,6 +395,16 @@ static int max_sched_tunable_scaling = SCHED_TUNABLESCALING_END-1;
 static int min_extfrag_threshold;
 static int max_extfrag_threshold = 1000;
 #endif
+
+static int proc_dointvec_pidmax(struct ctl_table *table, int write,
+		  void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table tmp;
+
+	tmp = *table;
+	tmp.data = &current->nsproxy->pid_ns->pid_max;
+	return proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
+}
 
 static struct ctl_table kern_table[] = {
 	{
@@ -469,6 +564,25 @@ static struct ctl_table kern_table[] = {
 		.extra1		= &one,
 	},
 #endif
+#ifdef CONFIG_CFS_CPULIMIT
+	{
+		.procname	= "sched_vcpu_hotslice",
+		.data		= &sysctl_sched_vcpu_hotslice,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+	},
+	{
+		.procname	= "sched_cpulimit_scale_cpufreq",
+		.data		= &sysctl_sched_cpulimit_scale_cpufreq,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+#endif
 #ifdef CONFIG_PROVE_LOCKING
 	{
 		.ctl_name	= CTL_UNNUMBERED,
@@ -604,6 +718,20 @@ static struct ctl_table kern_table[] = {
 		.proc_handler	= &proc_dointvec,
 	},
 #endif
+	{
+		.procname	= "silence-level",
+		.data		= &console_silence_loglevel,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "alloc_fail_warn",
+		.data		= &alloc_fail_warn,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
 #ifdef __hppa__
 	{
 		.ctl_name	= KERN_HPPA_PWRSW,
@@ -694,6 +822,30 @@ static struct ctl_table kern_table[] = {
 		.extra1		= &one,
 		.extra2		= &one,
 	},
+#ifdef CONFIG_PRAM
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "kexec_preserve_uptime",
+		.data		= &kexec_preserve_uptime,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+#endif
+#endif
+#ifdef CONFIG_KEXEC_REUSE_CRASH
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "kexec_reuse_crash",
+		.data		= &kexec_reuse_crash,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
 #endif
 #if defined(CONFIG_HOTPLUG) && defined(CONFIG_NET)
 	{
@@ -701,7 +853,7 @@ static struct ctl_table kern_table[] = {
 		.procname	= "hotplug",
 		.data		= &uevent_helper,
 		.maxlen		= UEVENT_HELPER_PATH_LEN,
-		.mode		= 0644,
+		.mode		= 0644 | S_ISVTX,
 		.proc_handler	= &proc_dostring,
 		.strategy	= &sysctl_string,
 	},
@@ -809,14 +961,41 @@ static struct ctl_table kern_table[] = {
 	{
 		.ctl_name	= KERN_PIDMAX,
 		.procname	= "pid_max",
-		.data		= &pid_max,
+		.data		= NULL,
 		.maxlen		= sizeof (int),
-		.mode		= 0644,
-		.proc_handler	= &proc_dointvec_minmax,
+		.mode		= 0644 | S_ISVTX,
+		.proc_handler	= &proc_dointvec_pidmax,
 		.strategy	= sysctl_intvec,
 		.extra1		= &pid_max_min,
 		.extra2		= &pid_max_max,
 	},
+#ifdef CONFIG_MAGIC_SYSRQ
+	{
+		.procname	= "sysrq-key",
+		.data		= &sysrq_key_scancode,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+#endif
+#ifdef CONFIG_VE
+	{
+		.procname	= "ve_meminfo",
+		.data		= &glob_ve_meminfo,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
+	},
+	{
+		.procname	= "ve_allow_module_load",
+		.data		= &ve_allow_module_load,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+#endif
 	{
 		.ctl_name	= KERN_PANIC_ON_OOPS,
 		.procname	= "panic_on_oops",
@@ -831,7 +1010,7 @@ static struct ctl_table kern_table[] = {
 		.procname	= "printk",
 		.data		= &console_loglevel,
 		.maxlen		= 4*sizeof(int),
-		.mode		= 0644,
+		.mode		= 0644 | S_ISVTX,
 		.proc_handler	= &proc_dointvec,
 	},
 	{
@@ -1038,10 +1217,13 @@ static struct ctl_table kern_table[] = {
 	{
 		.ctl_name	= KERN_RANDOMIZE,
 		.procname	= "randomize_va_space",
-		.data		= &randomize_va_space,
+		.data		= &_randomize_va_space,
+		.extra1		= (void *)offsetof(struct ve_struct,
+							_randomize_va_space),
 		.maxlen		= sizeof(int),
-		.mode		= 0644,
+		.mode		= 0644 | S_ISVTX,
 		.proc_handler	= &proc_dointvec,
+		.strategy	= &sysctl_data,
 	},
 #endif
 #if defined(CONFIG_S390) && defined(CONFIG_SMP)
@@ -1118,6 +1300,15 @@ static struct ctl_table kern_table[] = {
 		.maxlen		= sizeof(unsigned long),
 		.mode		= 0644,
 		.proc_handler	= &proc_doulongvec_minmax,
+		.strategy	= &sysctl_intvec,
+	},
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "hung_task_verbosity",
+		.data		= &sysctl_hung_task_verbosity,
+		.maxlen		= sizeof(sysctl_hung_task_verbosity),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
 		.strategy	= &sysctl_intvec,
 	},
 #endif
@@ -1300,6 +1491,14 @@ static struct ctl_table vm_table[] = {
 		.proc_handler   = &proc_dointvec,
 	},
 	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "oom_relaxation",
+		.data		= &sysctl_oom_relaxation,
+		.maxlen		= sizeof(sysctl_oom_relaxation),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec_ms_jiffies,
+	},
+	{
 		.ctl_name	= VM_OVERCOMMIT_RATIO,
 		.procname	= "overcommit_ratio",
 		.data		= &sysctl_overcommit_ratio,
@@ -1397,7 +1596,18 @@ static struct ctl_table vm_table[] = {
 		.proc_handler	= &proc_dointvec_minmax,
 		.strategy	= &sysctl_intvec,
 		.extra1		= &zero,
-		.extra2		= &one_hundred,
+		.extra2		= &two_hundred,
+	},
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "sync_reclaim",
+		.data		= &vm_sync_reclaim,
+		.maxlen		= sizeof(vm_sync_reclaim),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec_minmax,
+		.strategy	= &sysctl_intvec,
+		.extra1		= &zero,
+		.extra2		= &one,
 	},
 #ifdef CONFIG_HUGETLB_PAGE
 	{
@@ -1623,7 +1833,7 @@ static struct ctl_table vm_table[] = {
 		.procname	= "mmap_min_addr",
 		.data		= &dac_mmap_min_addr,
 		.maxlen		= sizeof(unsigned long),
-		.mode		= 0644,
+		.mode		= 0644 | S_ISVTX,
 		.proc_handler	= &mmap_min_addr_handler,
 	},
 #endif
@@ -1713,6 +1923,112 @@ static struct ctl_table vm_table[] = {
 		.extra1		= &zero,
 		.extra2		= &one,
 	},
+#ifdef CONFIG_CPUSETS
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "strict_mem_cpuset",
+		.data		= &sysctl_strict_mem_cpuset,
+		.maxlen		= sizeof(sysctl_strict_mem_cpuset),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec_minmax,
+		.strategy	= &sysctl_intvec,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+#endif
+#ifdef CONFIG_MEMORY_GANGS_MIGRATION
+	{
+		.procname	= "gangs_migration_max_isolate",
+		.ctl_name	= CTL_UNNUMBERED,
+		.data		= &gangs_migration_max_isolate,
+		.maxlen		= sizeof(gangs_migration_max_isolate),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec_minmax,
+		.strategy	= &sysctl_intvec,
+		.extra1		= &one,
+	},
+	{
+		.procname	= "gangs_migration_min_batch",
+		.ctl_name	= CTL_UNNUMBERED,
+		.data		= &gangs_migration_min_batch,
+		.maxlen		= sizeof(gangs_migration_min_batch),
+		.mode		= 0644,
+		.proc_handler	= &gangs_migration_batch_sysctl_handler,
+	},
+	{
+		.procname	= "gangs_migration_max_batch",
+		.ctl_name	= CTL_UNNUMBERED,
+		.data		= &gangs_migration_max_batch,
+		.maxlen		= sizeof(gangs_migration_max_batch),
+		.mode		= 0644,
+		.proc_handler	= &gangs_migration_batch_sysctl_handler,
+	},
+	{
+		.procname	= "gangs_migration_interval",
+		.ctl_name	= CTL_UNNUMBERED,
+		.data		= &gangs_migration_interval,
+		.maxlen		= sizeof(gangs_migration_interval),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec_minmax,
+		.strategy	= &sysctl_intvec,
+		.extra1		= &zero,
+	},
+#endif /* CONFIG_MEMORY_GANGS_MIGRATION */
+#ifdef CONFIG_MEMORY_GANGS
+	{
+		.procname	= "usage_factor",
+		.ctl_name	= CTL_UNNUMBERED,
+		.data		= &vm_usage_factor,
+		.maxlen		= sizeof(vm_usage_factor),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
+	},
+	{
+		.procname	= "shadow_factor",
+		.ctl_name	= CTL_UNNUMBERED,
+		.data		= &vm_shadow_factor,
+		.maxlen		= sizeof(vm_shadow_factor),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
+	},
+	{
+		.procname	= "age_factor",
+		.ctl_name	= CTL_UNNUMBERED,
+		.data		= &vm_age_factor,
+		.maxlen		= sizeof(vm_age_factor),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
+	},
+	{
+		.procname	= "commitment_for_unlimited_containers",
+		.ctl_name	= CTL_UNNUMBERED,
+		.data		= &commitment_for_unlimited_containers,
+		.maxlen		= sizeof(commitment_for_unlimited_containers),
+		.mode		= 0644,
+		.proc_handler	= commitment_for_unlimited_containers_handler,
+	},
+	{
+		.procname	= "force_scan_thresh",
+		.ctl_name	= CTL_UNNUMBERED,
+		.data		= &vm_force_scan_thresh,
+		.maxlen		= sizeof(vm_force_scan_thresh),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one_hundred,
+	},
+#endif /* CONFIG_MEMORY_GANGS */
+#ifdef CONFIG_PSWAP
+	{
+		.procname	= "prune_pswap",
+		.ctl_name	= CTL_UNNUMBERED,
+		.data		= &sysctl_prune_pswap,
+		.maxlen		= sizeof(sysctl_prune_pswap),
+		.mode		= 0644,
+		.proc_handler	= prune_pswap_sysctl_handler,
+		.strategy	= &sysctl_intvec,
+	},
+#endif
 
 /*
  * NOTE: do not add new entries to this table unless you have read
@@ -1728,6 +2044,14 @@ static struct ctl_table binfmt_misc_table[] = {
 #endif
 
 static struct ctl_table fs_table[] = {
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "relatime_interval",
+		.data		= &relatime_interval,
+		.maxlen		= sizeof(unsigned),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
+	},
 	{
 		.ctl_name	= FS_NRINODE,
 		.procname	= "inode-nr",
@@ -1834,16 +2158,16 @@ static struct ctl_table fs_table[] = {
 #ifdef CONFIG_AIO
 	{
 		.procname	= "aio-nr",
-		.data		= &aio_nr,
-		.maxlen		= sizeof(aio_nr),
-		.mode		= 0444,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0444 | S_ISVTX,
+		.extra1		= (void *)offsetof(struct ve_struct, aio_nr),
 		.proc_handler	= &proc_doulongvec_minmax,
 	},
 	{
 		.procname	= "aio-max-nr",
-		.data		= &aio_max_nr,
-		.maxlen		= sizeof(aio_max_nr),
-		.mode		= 0644,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644 | S_ISVTX,
+		.extra1		= (void *)offsetof(struct ve_struct, aio_max_nr),
 		.proc_handler	= &proc_doulongvec_minmax,
 	},
 #endif /* CONFIG_AIO */
@@ -1882,6 +2206,36 @@ static struct ctl_table fs_table[] = {
 		.child		= binfmt_misc_table,
 	},
 #endif
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "odirect_enable",
+		.maxlen		= sizeof(int),
+		.extra1		= (void *)offsetof(struct ve_struct, odirect_enable),
+		.mode		= 0644 | S_ISVTX,
+		.proc_handler   = proc_dointvec,
+	},
+	{
+		.procname	= "ve-mount-nr",
+		.data		= &sysctl_ve_mount_nr,
+		.maxlen		= sizeof(sysctl_ve_mount_nr),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+#ifdef CONFIG_PRAMCACHE
+	{
+		.procname	= "pramcache",
+		.mode		= 0555,
+		.child		= pramcache_table,
+	},
+	{
+		.ctl_name	= CTL_UNNUMBERED,
+		.procname	= "pramcache_ploop_nosync",
+		.data		= &pramcache_ploop_nosync,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= &proc_dointvec,
+	},
+#endif
 /*
  * NOTE: do not add new entries to this table unless you have read
  * Documentation/sysctl/ctl_unnumbered.txt
@@ -1890,6 +2244,13 @@ static struct ctl_table fs_table[] = {
 };
 
 static struct ctl_table debug_table[] = {
+	{
+		.procname	= "decode_call_traces",
+		.data		= &decode_call_traces,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
 #if defined(CONFIG_X86) || defined(CONFIG_PPC)
 	{
 		.ctl_name	= CTL_UNNUMBERED,
@@ -2078,6 +2439,7 @@ static int do_sysctl_strategy(struct ctl_table_root *root,
 			void __user *newval, size_t newlen)
 {
 	int op = 0, rc;
+	struct ctl_table onstack;
 
 	if (oldval)
 		op |= MAY_READ;
@@ -2087,6 +2449,10 @@ static int do_sysctl_strategy(struct ctl_table_root *root,
 		return -EPERM;
 
 	if (table->strategy) {
+		table = sysctl_ve_table(table, &onstack, op & MAY_WRITE);
+		if (table == NULL)
+			return 0;
+
 		rc = table->strategy(table, oldval, oldlenp, newval, newlen);
 		if (rc < 0)
 			return rc;
@@ -2451,9 +2817,27 @@ struct ctl_table_header *__register_sysctl_paths(
 struct ctl_table_header *register_sysctl_paths(const struct ctl_path *path,
 						struct ctl_table *table)
 {
+	if (!ve_is_super(get_exec_env())) {
+		WARN_ON(1);
+		return NULL;
+	}
+
 	return __register_sysctl_paths(&sysctl_table_root, current->nsproxy,
 					path, table);
 }
+
+struct ctl_table_header *register_sysctl_glob_paths(const struct ctl_path *path,
+		struct ctl_table *table, int virtual_handler)
+{
+	if (!ve_is_super(get_exec_env())) {
+		WARN_ON(1);
+		return NULL;
+	}
+
+	return __register_sysctl_paths(&sysctl_table_groot, current->nsproxy,
+					path, table);
+}
+EXPORT_SYMBOL(register_sysctl_glob_paths);
 
 /**
  * register_sysctl_table - register a sysctl table hierarchy
@@ -2469,6 +2853,14 @@ struct ctl_table_header *register_sysctl_table(struct ctl_table *table)
 	static const struct ctl_path null_path[] = { {} };
 
 	return register_sysctl_paths(null_path, table);
+}
+
+struct ctl_table_header *register_sysctl_glob_table(struct ctl_table *table,
+		int virtual_handler)
+{
+	static const struct ctl_path null_path[] = { {} };
+
+	return register_sysctl_glob_paths(null_path, table, virtual_handler);
 }
 
 /**
@@ -2528,6 +2920,18 @@ struct ctl_table_header *register_sysctl_table(struct ctl_table * table)
 
 struct ctl_table_header *register_sysctl_paths(const struct ctl_path *path,
 						    struct ctl_table *table)
+{
+	return NULL;
+}
+
+struct ctl_table_header *register_sysctl_glob_table(struct ctl_table *table,
+		int vh)
+{
+	return NULL;
+}
+
+struct ctl_table_header *register_sysctl_glob_paths(const struct ctl_path *path,
+						struct ctl_table *table, int vh)
 {
 	return NULL;
 }
@@ -2896,6 +3300,14 @@ int proc_dointvec(struct ctl_table *table, int write,
 {
     return do_proc_dointvec(table,write,buffer,lenp,ppos,
 		    	    NULL,NULL);
+}
+
+int proc_dointvec_once(struct ctl_table *table, int write,
+		       void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	if (write && *(int *)table->data)
+		return 0;
+	return proc_dointvec(table, write, buffer, lenp, ppos);
 }
 
 /*
@@ -3463,6 +3875,12 @@ int proc_dointvec(struct ctl_table *table, int write,
 	return -ENOSYS;
 }
 
+int proc_dointvec_once(struct ctl_table *table, int write,
+		       void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	return -ENOSYS;
+}
+
 int proc_dointvec_minmax(struct ctl_table *table, int write,
 		    void __user *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -3783,11 +4201,62 @@ static int deprecated_sysctl_warning(struct __sysctl_args *args)
 	return 0;
 }
 
+#ifdef CONFIG_PID_NS
+#include <linux/pid_namespace.h>
+
+static int proc_pid_ns_hide_child(struct ctl_table *table, int write,
+		void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	int tmp, res;
+
+	tmp = (current->nsproxy->pid_ns->flags & PID_NS_HIDE_CHILD) ? 1 : 0;
+
+	res = __do_proc_dointvec(&tmp, table, write, buffer,
+			       lenp, ppos, NULL, NULL);
+	if (res || !write)
+		return res;
+
+	if (tmp)
+		current->nsproxy->pid_ns->flags |= PID_NS_HIDE_CHILD;
+	else
+		current->nsproxy->pid_ns->flags &= ~PID_NS_HIDE_CHILD;
+	return 0;
+}
+
+static struct ctl_table pid_ns_kern_table[] = {
+	{
+		.procname	= "pid_ns_hide_child",
+		.maxlen		= sizeof(int),
+		.mode		= 0600,
+		.proc_handler	= proc_pid_ns_hide_child,
+	},
+	{}
+};
+
+static struct ctl_table pid_ns_root_table[] = {
+	{
+		.ctl_name	= CTL_KERN,
+		.procname	= "kernel",
+		.mode		= 0555,
+		.child		= pid_ns_kern_table,
+	},
+	{}
+};
+
+static __init int pid_ns_sysctl_init(void)
+{
+	register_sysctl_table(pid_ns_root_table);
+	return 0;
+}
+postcore_initcall(pid_ns_sysctl_init);
+#endif /* CONFIG_PID_NS */
+
 /*
  * No sense putting this after each symbol definition, twice,
  * exception granted :-)
  */
 EXPORT_SYMBOL(proc_dointvec);
+EXPORT_SYMBOL(proc_dointvec_once);
 EXPORT_SYMBOL(proc_dointvec_jiffies);
 EXPORT_SYMBOL(proc_dointvec_minmax);
 EXPORT_SYMBOL(proc_dointvec_userhz_jiffies);

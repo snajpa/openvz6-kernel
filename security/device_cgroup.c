@@ -12,11 +12,24 @@
 #include <linux/seq_file.h>
 #include <linux/rcupdate.h>
 #include <linux/mutex.h>
+#include <linux/ve.h>
+#include <linux/vzcalluser.h>
+#include <linux/major.h>
 
 #define ACC_MKNOD 1
 #define ACC_READ  2
 #define ACC_WRITE 4
-#define ACC_MASK (ACC_MKNOD | ACC_READ | ACC_WRITE)
+#define ACC_QUOTA 8
+#define ACC_HIDDEN 16
+#define ACC_MOUNT 64
+#define ACC_MASK (ACC_MKNOD | ACC_READ | ACC_WRITE | ACC_QUOTA | ACC_MOUNT)
+
+static inline int convert_bits(int acc)
+{
+	/* ...10x <-> ...01x   trial: guess hwy */
+	return ((((acc & 06) == 00) || ((acc & 06) == 06)) ? acc : acc ^06) &
+		(ACC_READ | ACC_WRITE | ACC_QUOTA | ACC_MOUNT);
+}
 
 #define DEV_BLOCK 1
 #define DEV_CHAR  2
@@ -67,7 +80,7 @@ struct cgroup_subsys devices_subsys;
 static int devcgroup_can_attach(struct cgroup_subsys *ss,
 		struct cgroup *new_cgroup, struct task_struct *task)
 {
-	if (current != task && !capable(CAP_SYS_ADMIN))
+	if (current != task && !capable(CAP_SYS_ADMIN) && !capable(CAP_VE_SYS_ADMIN))
 			return -EPERM;
 
 	return 0;
@@ -130,10 +143,17 @@ static int dev_exception_add(struct dev_cgroup *dev_cgroup,
 /*
  * called under devcgroup_mutex
  */
-static void dev_exception_rm(struct dev_cgroup *dev_cgroup,
-			     struct dev_exception_item *ex)
+static int dev_exception_change(struct dev_cgroup *dev_cgroup,
+			struct dev_exception_item *ex)
 {
-	struct dev_exception_item *walk, *tmp;
+	struct dev_exception_item *excopy, *walk, *tmp;
+
+	if (ex->access != 0) {
+		excopy = kmemdup(ex, sizeof(*ex), GFP_KERNEL);
+		if (!excopy)
+			return -ENOMEM;
+	} else
+		excopy = NULL;
 
 	list_for_each_entry_safe(walk, tmp, &dev_cgroup->exceptions, list) {
 		if (walk->type != ex->type)
@@ -143,6 +163,41 @@ static void dev_exception_rm(struct dev_cgroup *dev_cgroup,
 		if (walk->minor != ex->minor)
 			continue;
 
+		if (ex->access == 0) {
+			list_del_rcu(&walk->list);
+			kfree_rcu(walk, rcu);
+		} else {
+			walk->access = ex->access;
+			kfree(excopy);
+			excopy = NULL;
+		}
+	}
+
+	if (excopy != NULL)
+		list_add_tail_rcu(&excopy->list, &dev_cgroup->exceptions);
+
+	return 0;
+}
+
+/*
+ * called under devcgroup_mutex
+ */
+static void dev_exception_rm(struct dev_cgroup *dev_cgroup,
+			     struct dev_exception_item *ex)
+{
+	struct dev_exception_item *walk, *tmp;
+
+	list_for_each_entry_safe(walk, tmp, &dev_cgroup->exceptions, list) {
+		if (walk->type == DEV_ALL)
+			goto remove;
+		if (walk->type != ex->type)
+			continue;
+		if (walk->major != ex->major)
+			continue;
+		if (walk->minor != ex->minor)
+			continue;
+
+remove:
 		walk->access &= ~ex->access;
 		if (!walk->access) {
 			list_del_rcu(&walk->list);
@@ -183,9 +238,9 @@ static struct cgroup_subsys_state *devcgroup_create(struct cgroup_subsys *ss,
 	INIT_LIST_HEAD(&dev_cgroup->exceptions);
 	parent_cgroup = cgroup->parent;
 
-	if (parent_cgroup == NULL)
+	if (parent_cgroup == NULL) {
 		dev_cgroup->behavior = DEVCG_DEFAULT_ALLOW;
-	else {
+	} else {
 		parent_dev_cgroup = cgroup_to_devcgroup(parent_cgroup);
 		mutex_lock(&devcgroup_mutex);
 		ret = dev_exceptions_copy(&dev_cgroup->exceptions,
@@ -274,8 +329,23 @@ static int devcgroup_seq_read(struct cgroup *cgroup, struct cftype *cft,
 			set_access(acc, ex->access);
 			set_majmin(maj, ex->major);
 			set_majmin(min, ex->minor);
-			seq_printf(m, "%c %s:%s %s\n", type_to_char(ex->type),
-				   maj, min, acc);
+
+			if (cft != NULL)
+				seq_printf(m, "%c %s:%s %s\n",
+					   type_to_char(ex->type),
+					   maj, min, acc);
+			else if (!(ex->access & ACC_HIDDEN)) {
+				int access;
+
+				access = convert_bits(ex->access);
+				if (access & (ACC_READ | ACC_WRITE))
+					access |= S_IXOTH;
+
+				seq_printf(m, "%10u %c %03o %s:%s\n",
+					   (unsigned)(unsigned long)m->private,
+					   type_to_char(ex->type),
+					   access, maj, min);
+			}
 		}
 	}
 	rcu_read_unlock();
@@ -299,6 +369,11 @@ static int may_access(struct dev_cgroup *dev_cgroup,
 	bool match = false;
 
 	list_for_each_entry_rcu(ex, &dev_cgroup->exceptions, list) {
+		short mismatched_bits;
+		bool allowed_mount;
+
+		if (ex->type & DEV_ALL)
+ 			goto found;
 		if ((refex->type & DEV_BLOCK) && !(ex->type & DEV_BLOCK))
 			continue;
 		if ((refex->type & DEV_CHAR) && !(ex->type & DEV_CHAR))
@@ -307,7 +382,13 @@ static int may_access(struct dev_cgroup *dev_cgroup,
 			continue;
 		if (ex->minor != ~0 && ex->minor != refex->minor)
 			continue;
-		if (refex->access & (~ex->access))
+found:
+		mismatched_bits = refex->access & (~ex->access) & ~ACC_MOUNT;
+		allowed_mount = !(mismatched_bits & ~ACC_WRITE) &&
+				(ex->access & ACC_MOUNT) &&
+				(refex->access & ACC_MOUNT);
+
+		if (mismatched_bits && !allowed_mount)
 			continue;
 		match = true;
 		break;
@@ -380,7 +461,7 @@ static int devcgroup_update_access(struct dev_cgroup *devcgroup,
 	struct cgroup *p = devcgroup->css.cgroup;
 	struct dev_cgroup *parent = NULL;
 
-	if (!capable(CAP_SYS_ADMIN))
+	if (!capable(CAP_SYS_ADMIN) && !capable(CAP_VE_SYS_ADMIN))
 		return -EPERM;
 
 	if (p->parent)
@@ -393,8 +474,13 @@ static int devcgroup_update_access(struct dev_cgroup *devcgroup,
 	case 'a':
 		switch (filetype) {
 		case DEVCG_ALLOW:
-			if (!may_allow_all(parent))
-				return -EPERM;
+			if (!may_allow_all(parent)) {
+				if (ve_is_super(get_exec_env()))
+					return -EPERM;
+				else
+					/* Fooling docker in CT - silently exit */
+					return 0;
+			}
 			dev_exception_clean(devcgroup);
 			devcgroup->behavior = DEVCG_DEFAULT_ALLOW;
 			if (!parent)
@@ -610,9 +696,83 @@ int __devcgroup_inode_permission(struct inode *inode, int mask)
 		access |= ACC_WRITE;
 	if (mask & MAY_READ)
 		access |= ACC_READ;
+	if (mask & MAY_MOUNT)
+		access |= ACC_MOUNT;
 
 	return __devcgroup_check_permission(type, imajor(inode), iminor(inode),
 			access);
+}
+
+/* Returns 1 if exists, 0 otherwise */
+int devcgroup_device_exist(struct cgroup *cgrp, unsigned type, dev_t device)
+{
+	struct dev_cgroup *dev_cgroup = cgroup_to_devcgroup(cgrp);
+	struct dev_exception_item *ex;
+
+	/*
+	 * Let's pretend that the device exists if minor (or major) was not set
+	 * in the rule. This will prevent the caller from mangling devtmpfs and
+	 * sysfs.
+	 */
+	if ((type & VE_USE_MASK) != VE_USE_MINOR)
+		return 1;
+
+	rcu_read_lock();
+
+	list_for_each_entry_rcu(ex, &dev_cgroup->exceptions, list) {
+		if (ex->type & DEV_ALL)
+			continue;
+		if ((ex->type & DEV_BLOCK) && (type == S_IFCHR))
+			continue;
+		if ((ex->type & DEV_CHAR) && (type == S_IFBLK))
+			continue;
+		if (ex->major != MAJOR(device))
+			continue;
+		if (ex->minor != MINOR(device))
+			continue;
+
+		rcu_read_unlock();
+		return 1;
+	}
+
+	rcu_read_unlock();
+	return 0;
+}
+
+int devcgroup_device_visible(int type, int major, int start_minor, int nr_minors)
+{
+	struct dev_cgroup *dev_cgroup;
+	struct dev_exception_item *ex;
+
+	rcu_read_lock();
+	dev_cgroup = task_devcgroup(current);
+
+	if (dev_cgroup->behavior == DEVCG_DEFAULT_ALLOW) {
+                rcu_read_unlock();
+                return 1;
+	}
+
+	list_for_each_entry_rcu(ex, &dev_cgroup->exceptions, list) {
+		if (ex->type & DEV_ALL)
+			goto found;
+		if ((ex->type & DEV_BLOCK) && (type == S_IFCHR))
+			continue;
+		if ((ex->type & DEV_CHAR) && (type == S_IFBLK))
+			continue;
+		if (ex->major != ~0 && ex->major != major)
+			continue;
+		if (ex->minor != ~0 && !(start_minor <= ex->minor &&
+					ex->minor < start_minor + nr_minors))
+			continue;
+found:
+		if (!(ex->access & (ACC_READ | ACC_WRITE | ACC_QUOTA)))
+			continue;
+		rcu_read_unlock();
+		return 1;
+	}
+
+	rcu_read_unlock();
+	return 0;
 }
 
 int devcgroup_inode_mknod(int mode, dev_t dev)
@@ -631,3 +791,132 @@ int devcgroup_inode_mknod(int mode, dev_t dev)
 			ACC_MKNOD);
 
 }
+
+#ifdef CONFIG_VE
+
+static struct dev_exception_item ve_devcgroup_ex_items[] = {
+	{ ~0,				~0,	DEV_ALL,  ACC_MKNOD				},
+	{ UNIX98_PTY_MASTER_MAJOR,	~0,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	},
+	{ UNIX98_PTY_SLAVE_MAJOR,	~0,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	},
+	{ PTY_MASTER_MAJOR,		~0,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	},
+	{ PTY_SLAVE_MAJOR,		~0,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	},
+	{ MEM_MAJOR,			3,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	}, /* null */
+	{ MEM_MAJOR,			5,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	}, /* zero */
+	{ MEM_MAJOR,			7,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	}, /* full */
+	{ TTYAUX_MAJOR,			0,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	}, /* tty */
+	{ TTYAUX_MAJOR,			1,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	}, /* console */
+	{ TTYAUX_MAJOR,			2,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	}, /* ptmx */
+	{ MEM_MAJOR,			8,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	}, /* random */
+	{ MEM_MAJOR,			9,	DEV_CHAR, ACC_MKNOD | ACC_READ | ACC_WRITE	}, /* urandom */
+	{ MEM_MAJOR,			11,	DEV_CHAR, ACC_MKNOD | ACC_WRITE			}, /* kmsg */
+};
+
+static LIST_HEAD(ve_devcgroup_ex_list);
+
+int ve_prep_devcgroup(struct ve_struct *ve)
+{
+	struct dev_cgroup *dev_cgroup = cgroup_to_devcgroup(ve->ve_cgroup);
+	size_t i;
+	int ret;
+
+	if (unlikely(list_empty(&ve_devcgroup_ex_list))) {
+		for (i = 0; i < ARRAY_SIZE(ve_devcgroup_ex_items); i++) {
+			ve_devcgroup_ex_items[i].access |= ACC_HIDDEN;
+			list_add(&ve_devcgroup_ex_items[i].list,
+				 &ve_devcgroup_ex_list);
+		}
+	}
+
+	/*
+	 * When allowing device cgroup inside a container
+	 * we use _very_ strict rules over them:
+	 *
+	 *  - DEVCG_DEFAULT_DENY is used for children behaviour
+	 *  - we ship predefined "exception" items which are known
+	 *    to be virtualized
+	 */
+	mutex_lock(&devcgroup_mutex);
+
+	dev_cgroup->behavior = DEVCG_DEFAULT_DENY;
+
+	dev_exception_clean(dev_cgroup);
+	ret = dev_exceptions_copy(&dev_cgroup->exceptions,
+				  &ve_devcgroup_ex_list);
+
+	mutex_unlock(&devcgroup_mutex);
+	return ret;
+}
+EXPORT_SYMBOL(ve_prep_devcgroup);
+
+int get_device_perms_ve(int dev_type, dev_t dev, int access_mode)
+{
+	short access = 0;
+	short type;
+
+	if (dev_type == S_IFBLK)
+		type = DEV_BLOCK;
+	else
+		type = DEV_CHAR;
+
+	access |= (access_mode & FMODE_READ ? ACC_READ : 0);
+	access |= (access_mode & FMODE_WRITE ? ACC_WRITE : 0);
+	access |= (access_mode & FMODE_QUOTACTL ? ACC_QUOTA : 0);
+
+	return __devcgroup_check_permission(type, MAJOR(dev), MINOR(dev),
+					    access);
+}
+EXPORT_SYMBOL(get_device_perms_ve);
+
+int set_device_perms_ve(struct ve_struct *ve,
+		unsigned type, dev_t dev, unsigned mask)
+{
+	int err = -EINVAL;
+	struct dev_exception_item new;
+
+	if ((type & S_IFMT) == S_IFBLK)
+		new.type = DEV_BLOCK;
+	else if ((type & S_IFMT) == S_IFCHR)
+		new.type = DEV_CHAR;
+	else
+		return -EINVAL;
+
+	new.access = convert_bits(mask) | (mask ? ACC_MKNOD : 0);
+	new.major = new.minor = ~0;
+
+	switch (type & VE_USE_MASK) {
+	default:
+		new.minor = MINOR(dev);
+	case VE_USE_MAJOR:
+		new.major = MAJOR(dev);
+	case 0:
+		;
+	}
+
+	mutex_lock(&devcgroup_mutex);
+	err = dev_exception_change(cgroup_to_devcgroup(ve->ve_cgroup), &new);
+	mutex_unlock(&devcgroup_mutex);
+	return err;
+}
+EXPORT_SYMBOL(set_device_perms_ve);
+
+#ifdef CONFIG_PROC_FS
+int devperms_seq_show(struct seq_file *m, void *v)
+{
+	struct ve_struct *ve = list_entry(v, struct ve_struct, ve_list);
+
+	if (m->private == (void *)0) {
+		seq_printf(m, "Version: 2.7\n");
+		m->private = (void *)-1;
+	}
+
+	if (ve_is_super(ve)) {
+		seq_printf(m, "%10u b 016 *:*\n%10u c 006 *:*\n", 0, 0);
+		return 0;
+	}
+
+	m->private = (void *)(unsigned long)ve->veid;
+	return devcgroup_seq_read(ve->ve_cgroup, NULL, m);
+}
+EXPORT_SYMBOL(devperms_seq_show);
+#endif
+#endif

@@ -17,6 +17,9 @@
 #include <linux/sunrpc/clnt.h>
 #include <linux/sunrpc/svc.h>
 #include <linux/lockd/lockd.h>
+#include <linux/nfs_mount.h>
+
+#include "ve.h"
 
 #define NLMDBG_FACILITY		NLMDBG_CLIENT
 #define NLMCLNT_GRACE_WAIT	(5*HZ)
@@ -27,7 +30,7 @@ static int	nlmclnt_test(struct nlm_rqst *, struct file_lock *);
 static int	nlmclnt_lock(struct nlm_rqst *, struct file_lock *);
 static int	nlmclnt_unlock(struct nlm_rqst *, struct file_lock *);
 static int	nlm_stat_to_errno(__be32 stat);
-static void	nlmclnt_locks_init_private(struct file_lock *fl, struct nlm_host *host);
+static void	nlmclnt_locks_init_private(struct file_lock *fl, struct nlm_host *host, long pid);
 static int	nlmclnt_cancel(struct nlm_host *, int , struct file_lock *);
 
 static const struct rpc_call_ops nlmclnt_unlock_ops;
@@ -92,7 +95,7 @@ static struct nlm_lockowner *__nlm_find_lockowner(struct nlm_host *host, fl_owne
 	return NULL;
 }
 
-static struct nlm_lockowner *nlm_find_lockowner(struct nlm_host *host, fl_owner_t owner)
+static struct nlm_lockowner *nlm_find_lockowner(struct nlm_host *host, fl_owner_t owner, long pid)
 {
 	struct nlm_lockowner *res, *new = NULL;
 
@@ -107,7 +110,7 @@ static struct nlm_lockowner *nlm_find_lockowner(struct nlm_host *host, fl_owner_
 			res = new;
 			atomic_set(&new->count, 1);
 			new->owner = owner;
-			new->pid = __nlm_alloc_pid(host);
+			new->pid = (pid < 0) ? __nlm_alloc_pid(host) : (uint32_t)pid;
 			new->host = nlm_get_host(host);
 			list_add(&new->list, &host->h_lockowners);
 			new = NULL;
@@ -117,6 +120,38 @@ static struct nlm_lockowner *nlm_find_lockowner(struct nlm_host *host, fl_owner_
 	kfree(new);
 	return res;
 }
+
+int nlmclnt_set_lockowner(struct inode *inode, struct file_lock *fl, u32 svid)
+{
+	struct nlm_host *host;
+	struct nfs_server *server = NFS_SERVER(inode);
+	struct nfs_client *clp = server->nfs_client;
+	const char *hostname = clp->cl_hostname;
+	const struct sockaddr *address = (struct sockaddr *)&clp->cl_addr;
+	size_t addrlen = clp->cl_addrlen;
+	unsigned short protocol = (clp->cl_proto == XPRT_TRANSPORT_UDP) 
+								? IPPROTO_UDP 
+								: IPPROTO_TCP;
+	u32 nfs_version = clp->rpc_ops->version;
+	int noresvport = server->flags & NFS_MOUNT_NORESVPORT ?	1 : 0;
+	u32 nlm_version = (nfs_version == 2) ? 1 : 4;
+
+	if (nfs_version > 3)
+		return 0;
+	if (server->flags & NFS_MOUNT_NONLM)
+		return 0;
+
+	host = nlmclnt_lookup_host(address, addrlen, protocol,
+				   nlm_version, hostname, noresvport);
+	if (host == NULL)
+		return -ENOLCK;
+
+	nlmclnt_locks_init_private(fl, host, svid);
+	nlm_release_host(host);
+
+	return 0;
+}
+EXPORT_SYMBOL(nlmclnt_set_lockowner);
 
 /*
  * Initialize arguments for TEST/LOCK/UNLOCK/CANCEL calls
@@ -155,13 +190,16 @@ int nlmclnt_proc(struct nlm_host *host, int cmd, struct file_lock *fl)
 {
 	struct nlm_rqst		*call;
 	int			status;
+	struct ve_struct *ve;
 
 	nlm_get_host(host);
 	call = nlm_alloc_call(host);
 	if (call == NULL)
 		return -ENOMEM;
 
-	nlmclnt_locks_init_private(fl, host);
+	ve = set_exec_env(host->owner_env);
+
+	nlmclnt_locks_init_private(fl, host, -1);
 	/* Set up the argument struct */
 	nlmclnt_setlockargs(call, fl);
 
@@ -182,6 +220,7 @@ int nlmclnt_proc(struct nlm_host *host, int cmd, struct file_lock *fl)
 	unlock_kernel();
 
 	dprintk("lockd: clnt proc returns %d\n", status);
+	(void)set_exec_env(ve);
 	return status;
 }
 EXPORT_SYMBOL_GPL(nlmclnt_proc);
@@ -459,16 +498,23 @@ static void nlmclnt_locks_release_private(struct file_lock *fl)
 	nlm_put_lockowner(fl->fl_u.nfs_fl.owner);
 }
 
+static u32 nlm_get_lockid(struct file_lock *fl, u64 *unused)
+{
+	return fl->fl_u.nfs_fl.owner->pid;
+}
+
 static const struct file_lock_operations nlmclnt_lock_ops = {
 	.fl_copy_lock = nlmclnt_locks_copy_lock,
 	.fl_release_private = nlmclnt_locks_release_private,
+	.fl_owner_id = nlm_get_lockid,
 };
 
-static void nlmclnt_locks_init_private(struct file_lock *fl, struct nlm_host *host)
+static void nlmclnt_locks_init_private(struct file_lock *fl, struct nlm_host *host,
+				       long pid)
 {
 	BUG_ON(fl->fl_ops != NULL);
 	fl->fl_u.nfs_fl.state = 0;
-	fl->fl_u.nfs_fl.owner = nlm_find_lockowner(host, fl->fl_owner);
+	fl->fl_u.nfs_fl.owner = nlm_find_lockowner(host, fl->fl_owner, pid);
 	INIT_LIST_HEAD(&fl->fl_u.nfs_fl.list);
 	fl->fl_ops = &nlmclnt_lock_ops;
 }

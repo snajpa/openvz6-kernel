@@ -115,6 +115,15 @@ vfs_setxattr(struct dentry *dentry, const char *name, const void *value,
 	struct inode *inode = dentry->d_inode;
 	int error;
 
+#if defined(CONFIG_VE) && defined(CONFIG_SYSCTL)
+	if (!ve_is_super(get_exec_env())) {
+		if (ve_xattr_policy == VE_XATTR_POLICY_IGNORE)
+			return 0;
+		else if (ve_xattr_policy == VE_XATTR_POLICY_REJECT)
+			return -EPERM;
+	}
+#endif
+
 	error = xattr_permission(inode, name, MAY_WRITE);
 	if (error)
 		return error;
@@ -130,7 +139,7 @@ out:
 	mutex_unlock(&inode->i_mutex);
 	return error;
 }
-EXPORT_SYMBOL_GPL(vfs_setxattr);
+EXPORT_SYMBOL(vfs_setxattr);
 
 ssize_t
 xattr_getsecurity(struct inode *inode, const char *name, void *value,
@@ -193,7 +202,7 @@ nolsm:
 
 	return error;
 }
-EXPORT_SYMBOL_GPL(vfs_getxattr);
+EXPORT_SYMBOL(vfs_getxattr);
 
 ssize_t
 vfs_listxattr(struct dentry *d, char *list, size_t size)
@@ -213,7 +222,7 @@ vfs_listxattr(struct dentry *d, char *list, size_t size)
 	}
 	return error;
 }
-EXPORT_SYMBOL_GPL(vfs_listxattr);
+EXPORT_SYMBOL(vfs_listxattr);
 
 int
 vfs_removexattr(struct dentry *dentry, const char *name)
@@ -240,7 +249,7 @@ vfs_removexattr(struct dentry *dentry, const char *name)
 		fsnotify_xattr(dentry);
 	return error;
 }
-EXPORT_SYMBOL_GPL(vfs_removexattr);
+EXPORT_SYMBOL(vfs_removexattr);
 
 
 /*

@@ -35,6 +35,8 @@
 #include <linux/in.h>
 #include <linux/in6.h>
 #include <linux/un.h>
+#include <linux/ve_proto.h>
+#include <linux/vzcalluser.h>
 
 #include <linux/sunrpc/clnt.h>
 #include <linux/sunrpc/rpc_pipe_fs.h>
@@ -645,6 +647,9 @@ static const struct rpc_call_ops rpc_default_ops = {
 struct rpc_task *rpc_run_task(const struct rpc_task_setup *task_setup_data)
 {
 	struct rpc_task *task;
+	struct ve_struct *ve;
+
+	ve = set_exec_env(task_setup_data->rpc_client->cl_xprt->owner_env);
 
 	task = rpc_new_task(task_setup_data);
 	if (IS_ERR(task))
@@ -659,6 +664,7 @@ struct rpc_task *rpc_run_task(const struct rpc_task_setup *task_setup_data)
 	atomic_inc(&task->tk_count);
 	rpc_execute(task);
 out:
+	(void)set_exec_env(ve);
 	return task;
 }
 EXPORT_SYMBOL_GPL(rpc_run_task);
@@ -1531,8 +1537,8 @@ call_status(struct rpc_task *task)
 		break;
 	default:
 		if (clnt->cl_chatty)
-			printk("%s: RPC call returned error %d\n",
-			       clnt->cl_protname, -status);
+			printk("ct%d %s: RPC call returned error %d\n",
+			       get_exec_env()->veid, clnt->cl_protname, -status);
 		rpc_exit(task, status);
 	}
 }
@@ -1561,8 +1567,8 @@ call_timeout(struct rpc_task *task)
 	}
 	if (RPC_IS_SOFT(task)) {
 		if (clnt->cl_chatty)
-			printk(KERN_NOTICE "%s: server %s not responding, timed out\n",
-				clnt->cl_protname, clnt->cl_server);
+			printk(KERN_NOTICE "ct%d %s: server %s not responding, timed out\n",
+				get_exec_env()->veid, clnt->cl_protname, clnt->cl_server);
 		if (task->tk_flags & RPC_TASK_TIMEOUT)
 			rpc_exit(task, -ETIMEDOUT);
 		else
@@ -1573,8 +1579,8 @@ call_timeout(struct rpc_task *task)
 	if (!(task->tk_flags & RPC_CALL_MAJORSEEN)) {
 		task->tk_flags |= RPC_CALL_MAJORSEEN;
 		if (clnt->cl_chatty)
-			printk(KERN_NOTICE "%s: server %s not responding, still trying\n",
-			clnt->cl_protname, clnt->cl_server);
+			printk(KERN_NOTICE "ct%d %s: server %s not responding, still trying\n",
+			get_exec_env()->veid, clnt->cl_protname, clnt->cl_server);
 	}
 	rpc_force_rebind(clnt);
 	/*
@@ -1605,8 +1611,8 @@ call_decode(struct rpc_task *task)
 
 	if (task->tk_flags & RPC_CALL_MAJORSEEN) {
 		if (clnt->cl_chatty)
-			printk(KERN_NOTICE "%s: server %s OK\n",
-				clnt->cl_protname, clnt->cl_server);
+			printk(KERN_NOTICE "ct%d %s: server %s OK\n",
+				get_exec_env()->veid, clnt->cl_protname, clnt->cl_server);
 		task->tk_flags &= ~RPC_CALL_MAJORSEEN;
 	}
 
@@ -1932,5 +1938,110 @@ void rpc_show_tasks(void)
 		spin_unlock(&clnt->cl_lock);
 	}
 	spin_unlock(&rpc_client_lock);
+}
+#endif
+
+#ifdef CONFIG_VE
+static int ve_sunrpc_start(void *data)
+{
+	struct ve_struct *ve = data;
+	int err;
+
+	if (!(ve->features & (VE_FEATURE_NFS | VE_FEATURE_NFSD)))
+		return 0;
+
+	err = -ENOMEM;
+	ve->ve_rpc_data = kzalloc(sizeof(struct ve_rpc_data), GFP_KERNEL);
+	if (ve->ve_rpc_data == NULL)
+		goto err_rd;
+	ve_rpc_data_init();
+
+	if (rpc_proc_init() == NULL)
+		goto err_proc;
+
+	err = ve_ip_map_init();
+	if (err)
+		goto err_map;
+	
+	err = register_rpc_pipefs();
+	if (err)
+		goto err_pipefs;
+
+	err = rpciod_start();
+	if (!err)
+		goto err_rpciod;
+
+	return 0;
+
+err_rpciod:
+	err = -ENOMEM;
+	unregister_rpc_pipefs();
+err_pipefs:
+	ve_ip_map_exit();
+err_map:
+	rpc_proc_exit();
+err_proc:
+	kfree(ve->ve_rpc_data);
+	ve->ve_rpc_data = NULL;
+err_rd:
+	return err;
+}
+
+void ve_sunrpc_stop(void *data)
+{
+	struct ve_struct *ve = (struct ve_struct *)data;
+	struct rpc_clnt *clnt;
+
+	if (ve->ve_rpc_data == NULL)
+		return;
+
+	dprintk("RPC:       killing all tasks for VE %d\n", ve->veid);
+
+	spin_lock(&rpc_client_lock);
+	list_for_each_entry(clnt, &all_clients, cl_clients) {
+		if (clnt->cl_xprt->owner_env != ve)
+			continue;
+
+		rpc_killall_tasks(clnt);
+		if (!wait_event_timeout(destroy_wait,
+			list_empty(&clnt->cl_tasks), 1*HZ))
+			printk(KERN_WARNING "CT%d: SUNRPC client %p shutdown: "
+					"timed out\n", ve->veid, clnt);
+
+	}
+	spin_unlock(&rpc_client_lock);
+
+	unregister_rpc_pipefs();
+	ve_ip_map_exit();
+	rpc_proc_exit();
+	if (ve_rpc_data_put(ve) == false)
+		printk(KERN_WARNING "CT%d: SUNRPC transports used outside CT. "
+				"Release all external references to CT's SUNRPC "
+				"data to continue shutdown.\n", ve->veid);
+}
+
+static struct ve_hook sunrpc_hook = {
+	.init	  = ve_sunrpc_start,
+	.fini	  = ve_sunrpc_stop,
+	.owner	  = THIS_MODULE,
+	.priority = HOOK_PRIO_NET_PRE,
+};
+
+void ve_sunrpc_hook_register(void)
+{
+	ve_hook_register(VE_SS_CHAIN, &sunrpc_hook);
+}
+
+void ve_sunrpc_hook_unregister(void)
+{
+	ve_hook_unregister(&sunrpc_hook);
+}
+#else
+void ve_sunrpc_hook_register(void)
+{
+}
+
+void ve_sunrpc_hook_unregister(void)
+{
 }
 #endif

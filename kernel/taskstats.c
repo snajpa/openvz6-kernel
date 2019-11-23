@@ -19,6 +19,7 @@
 #include <linux/kernel.h>
 #include <linux/taskstats_kern.h>
 #include <linux/tsacct_kern.h>
+#include <linux/pid_namespace.h>
 #include <linux/delayacct.h>
 #include <linux/cpumask.h>
 #include <linux/percpu.h>
@@ -44,6 +45,7 @@ static struct genl_family family = {
 	.name		= TASKSTATS_GENL_NAME,
 	.version	= TASKSTATS_GENL_VERSION,
 	.maxattr	= TASKSTATS_CMD_ATTR_MAX,
+	.netnsok	= true,
 };
 
 static struct nla_policy taskstats_cmd_get_policy[TASKSTATS_CMD_ATTR_MAX+1]
@@ -254,7 +256,7 @@ static int fill_tgid(pid_t tgid, struct task_struct *first,
 
 		stats->nvcsw += tsk->nvcsw;
 		stats->nivcsw += tsk->nivcsw;
-	} while_each_thread(first, tsk);
+	} while_each_thread_all(first, tsk);
 
 	unlock_task_sighand(first, &flags);
 	rc = 0;
@@ -297,6 +299,10 @@ static int add_del_listener(pid_t pid, const struct cpumask *mask, int isadd)
 	unsigned int cpu;
 
 	if (!cpumask_subset(mask, cpu_possible_mask))
+		return -EINVAL;
+
+	/* send_cpu_listeners() isn't pidns aware */
+	if (task_active_pid_ns(current) != &init_pid_ns)
 		return -EINVAL;
 
 	s = NULL;

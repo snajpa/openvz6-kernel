@@ -1979,7 +1979,8 @@ static int l2cap_sock_shutdown(struct socket *sock, int how)
 		l2cap_sock_clear_timer(sk);
 		__l2cap_sock_close(sk, 0);
 
-		if (sock_flag(sk, SOCK_LINGER) && sk->sk_lingertime)
+		if (sock_flag(sk, SOCK_LINGER) && sk->sk_lingertime &&
+		    !(current->flags & PF_EXITING))
 			err = bt_sock_wait_state(sk, BT_CLOSED,
 							sk->sk_lingertime);
 	}

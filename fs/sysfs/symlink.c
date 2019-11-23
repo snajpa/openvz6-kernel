@@ -29,10 +29,13 @@ static int sysfs_do_create_link(struct kobject *kobj, struct kobject *target,
 	struct sysfs_addrm_cxt acxt;
 	int error;
 
+	if (!ve_sysfs_alowed())
+		return 0;
+
 	BUG_ON(!name);
 
 	if (!kobj)
-		parent_sd = &sysfs_root;
+		parent_sd = ve_sysfs_root;
 	else
 		parent_sd = kobj->sd;
 
@@ -57,6 +60,7 @@ static int sysfs_do_create_link(struct kobject *kobj, struct kobject *target,
 	if (!sd)
 		goto out_put;
 
+	sd->owner_env = parent_sd->owner_env;
 	sd->s_symlink.target_sd = target_sd;
 	target_sd = NULL;	/* reference is now owned by the symlink */
 
@@ -115,8 +119,11 @@ void sysfs_remove_link(struct kobject * kobj, const char * name)
 {
 	struct sysfs_dirent *parent_sd = NULL;
 
+	if(!ve_sysfs_alowed())
+		return;
+
 	if (!kobj)
-		parent_sd = &sysfs_root;
+		parent_sd = ve_sysfs_root;
 	else
 		parent_sd = kobj->sd;
 

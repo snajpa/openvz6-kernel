@@ -730,7 +730,7 @@ mutex_lock_nested(struct mutex *lock, unsigned int subclass)
 			    subclass, NULL, _RET_IP_, NULL);
 }
 
-EXPORT_SYMBOL_GPL(mutex_lock_nested);
+EXPORT_SYMBOL(mutex_lock_nested);
 
 void __sched
 _mutex_lock_nest_lock(struct mutex *lock, struct lockdep_map *nest)
@@ -749,7 +749,7 @@ mutex_lock_killable_nested(struct mutex *lock, unsigned int subclass)
 	return __mutex_lock_common(lock, TASK_KILLABLE,
 				   subclass, NULL, _RET_IP_, NULL);
 }
-EXPORT_SYMBOL_GPL(mutex_lock_killable_nested);
+EXPORT_SYMBOL(mutex_lock_killable_nested);
 
 int __sched
 mutex_lock_interruptible_nested(struct mutex *lock, unsigned int subclass)
@@ -759,7 +759,7 @@ mutex_lock_interruptible_nested(struct mutex *lock, unsigned int subclass)
 				   subclass, NULL, _RET_IP_, NULL);
 }
 
-EXPORT_SYMBOL_GPL(mutex_lock_interruptible_nested);
+EXPORT_SYMBOL(mutex_lock_interruptible_nested);
 
 static inline int
 ww_mutex_deadlock_injection(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)

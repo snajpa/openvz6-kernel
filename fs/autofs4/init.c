@@ -12,6 +12,7 @@
 
 #include <linux/module.h>
 #include <linux/init.h>
+#include <linux/ve_proto.h>
 #include "autofs_i.h"
 
 static int autofs_get_sb(struct file_system_type *fs_type,
@@ -25,6 +26,20 @@ static struct file_system_type autofs_fs_type = {
 	.name		= "autofs",
 	.get_sb		= autofs_get_sb,
 	.kill_sb	= autofs4_kill_sb,
+	.fs_flags	= FS_VIRTUALIZED,
+};
+
+static void ve_autofs_stop(void *data)
+{
+	struct ve_struct *ve = data;
+
+	umount_ve_fs_type(&autofs_fs_type, ve->veid);
+}
+
+static struct ve_hook autofs4_hook = {
+	.fini	  = ve_autofs_stop,
+	.owner	  = THIS_MODULE,
+	.priority = HOOK_PRIO_FS,
 };
 
 static int __init init_autofs4_fs(void)
@@ -36,12 +51,14 @@ static int __init init_autofs4_fs(void)
 		return err;
 
 	autofs_dev_ioctl_init();
+	ve_hook_register(VE_INIT_EXIT_CHAIN, &autofs4_hook);
 
 	return err;
 }
 
 static void __exit exit_autofs4_fs(void)
 {
+	ve_hook_unregister(&autofs4_hook);
 	autofs_dev_ioctl_exit();
 	unregister_filesystem(&autofs_fs_type);
 }

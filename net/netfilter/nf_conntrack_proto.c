@@ -108,7 +108,7 @@ nf_ct_l3proto_try_module_get(unsigned short l3proto)
 
 retry:	p = nf_ct_l3proto_find_get(l3proto);
 	if (p == &nf_conntrack_l3proto_generic) {
-		ret = request_module("nf_conntrack-%d", l3proto);
+		ret = ve0_request_module("nf_conntrack-%d", l3proto);
 		if (!ret)
 			goto retry;
 

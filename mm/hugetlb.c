@@ -649,6 +649,7 @@ void free_huge_page(struct page *page)
 		(struct hugepage_subpool *)page_private(page);
 	bool restore_reserve;
 
+	ub_hugetlb_uncharge(page);
 	set_page_private(page, 0);
 	page->mapping = NULL;
 	BUG_ON(page_count(page));
@@ -2421,7 +2422,7 @@ void __unmap_hugepage_range(struct vm_area_struct *vma, unsigned long start,
 
 		page = pte_page(pte);
 		if (pte_dirty(pte))
-			set_page_dirty(page);
+			set_page_dirty_mm(page, mm);
 		list_add(&page->lru, &page_list);
 	}
 	spin_unlock(&mm->page_table_lock);
@@ -2593,7 +2594,8 @@ retry_avoidcopy:
 	 * When the original hugepage is shared one, it does not have
 	 * anon_vma prepared.
 	 */
-	if (unlikely(anon_vma_prepare(vma))) {
+	if (unlikely(anon_vma_prepare(vma)) ||
+	    ub_hugetlb_charge(mm_ub(mm), new_page)) {
 		page_cache_release(new_page);
 		page_cache_release(old_page);
 		/* Caller expects lock to be held */
@@ -2708,12 +2710,20 @@ retry:
 		clear_huge_page(page, address, pages_per_huge_page(h));
 		__SetPageUptodate(page);
 
+		if (ub_hugetlb_charge(mm_ub(mm), page)) {
+			put_page(page);
+			ret = VM_FAULT_OOM;
+			goto out;
+		}
+
 		if (vma->vm_flags & VM_MAYSHARE) {
 			int err;
 			struct inode *inode = mapping->host;
 
-			err = add_to_page_cache(page, mapping, idx, GFP_KERNEL);
+			__set_page_locked(page);
+			err = add_to_page_cache_nogang(page, mapping, idx, GFP_KERNEL);
 			if (err) {
+				__clear_page_locked(page);
 				put_page(page);
 				if (err == -EEXIST)
 					goto retry;
@@ -2727,6 +2737,7 @@ retry:
 		} else {
 			lock_page(page);
 			if (unlikely(anon_vma_prepare(vma))) {
+				ub_hugetlb_uncharge(page);
 				ret = VM_FAULT_OOM;
 				goto backout_unlocked;
 			}
@@ -3088,7 +3099,7 @@ void hugetlb_change_protection(struct vm_area_struct *vma,
 int hugetlb_reserve_pages(struct inode *inode,
 					long from, long to,
 					struct vm_area_struct *vma,
-					int acctflag)
+					vm_flags_t vm_flags)
 {
 	long ret, chg;
 	struct hstate *h = hstate_inode(inode);
@@ -3100,7 +3111,7 @@ int hugetlb_reserve_pages(struct inode *inode,
 	 * attempt will be made for VM_NORESERVE to allocate a page
 	 * without using reserves
 	 */
-	if (acctflag & VM_NORESERVE)
+	if (vm_flags & VM_NORESERVE)
 		return 0;
 
 	/*

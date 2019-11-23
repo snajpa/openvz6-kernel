@@ -264,7 +264,8 @@ int fib_validate_source(__be32 src, __be32 dst, u8 tos, int oif,
 	if (fib_lookup(net, &fl, &res))
 		goto last_resort;
 	if (res.type != RTN_UNICAST) {
-		if (res.type != RTN_LOCAL || !accept_local)
+		if (!(dev->vz_features & NETIF_F_VENET) ||
+		    res.type != RTN_LOCAL || !accept_local)
 			goto e_inval_res;
 	}
 	*spec_dst = FIB_RES_PREFSRC(res);
@@ -467,7 +468,7 @@ int ip_rt_ioctl(struct net *net, unsigned int cmd, void __user *arg)
 	switch (cmd) {
 	case SIOCADDRT:		/* Add a route */
 	case SIOCDELRT:		/* Delete a route */
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_VE_NET_ADMIN))
 			return -EPERM;
 
 		if (copy_from_user(&rt, arg, sizeof(rt)))
@@ -793,6 +794,9 @@ void fib_del_ifaddr(struct in_ifaddr *ifa, struct in_ifaddr *iprim)
 		subnet = 1;
 	}
 
+	if (in_dev->dead)
+		goto no_promotions;
+
 	/* Deletion is more complicated than add.
 	   We should take care of not to delete too much :-)
 
@@ -868,6 +872,7 @@ void fib_del_ifaddr(struct in_ifaddr *ifa, struct in_ifaddr *iprim)
 		}
 	}
 
+no_promotions:
 	if (!(ok&BRD_OK))
 		fib_magic(RTM_DELROUTE, RTN_BROADCAST, ifa->ifa_broadcast, 32, prim);
 	if (subnet && ifa->ifa_prefixlen < 31) {
@@ -976,11 +981,11 @@ static void nl_fib_lookup_exit(struct net *net)
 	net->ipv4.fibnl = NULL;
 }
 
-static void fib_disable_ip(struct net_device *dev, int force)
+static void fib_disable_ip(struct net_device *dev, int force, int delay)
 {
 	if (fib_sync_down_dev(dev, force))
 		fib_flush(dev_net(dev));
-	rt_cache_flush(dev_net(dev), 0);
+	rt_cache_flush(dev_net(dev), delay);
 	arp_ifdown(dev);
 }
 
@@ -1003,7 +1008,7 @@ static int fib_inetaddr_event(struct notifier_block *this, unsigned long event, 
 			/* Last address was deleted from this interface.
 			   Disable IP.
 			 */
-			fib_disable_ip(dev, 1);
+			fib_disable_ip(dev, 1, 0);
 		} else {
 			rt_cache_flush(dev_net(dev), -1);
 		}
@@ -1018,7 +1023,12 @@ static int fib_netdev_event(struct notifier_block *this, unsigned long event, vo
 	struct in_device *in_dev = __in_dev_get_rtnl(dev);
 
 	if (event == NETDEV_UNREGISTER) {
-		fib_disable_ip(dev, 2);
+		fib_disable_ip(dev, 2, -1);
+		return NOTIFY_DONE;
+	}
+
+	if (event == NETDEV_UNREGISTER_BATCH) {
+		rt_cache_flush_batch();
 		return NOTIFY_DONE;
 	}
 
@@ -1036,14 +1046,11 @@ static int fib_netdev_event(struct notifier_block *this, unsigned long event, vo
 		rt_cache_flush(dev_net(dev), -1);
 		break;
 	case NETDEV_DOWN:
-		fib_disable_ip(dev, 0);
+		fib_disable_ip(dev, 0, 0);
 		break;
 	case NETDEV_CHANGEMTU:
 	case NETDEV_CHANGE:
 		rt_cache_flush(dev_net(dev), 0);
-		break;
-	case NETDEV_UNREGISTER_BATCH:
-		rt_cache_flush_batch();
 		break;
 	}
 	return NOTIFY_DONE;
@@ -1097,7 +1104,7 @@ static void __net_exit ip_fib_net_exit(struct net *net)
 		hlist_for_each_entry_safe(tb, node, tmp, head, tb_hlist) {
 			hlist_del(node);
 			tb->tb_flush(tb);
-			kfree(tb);
+			fib_free_table(tb);
 		}
 	}
 	kfree(net->ipv4.fib_table_hash);

@@ -52,7 +52,7 @@
 
 #define NFSDBG_FACILITY		NFSDBG_CLIENT
 
-static DEFINE_SPINLOCK(nfs_client_lock);
+DEFINE_SPINLOCK(nfs_client_lock);
 static LIST_HEAD(nfs_client_list);
 static LIST_HEAD(nfs_volume_list);
 static DECLARE_WAIT_QUEUE_HEAD(nfs_client_active_wq);
@@ -163,6 +163,7 @@ static struct nfs_client *nfs_alloc_client(const struct nfs_client_initdata *cl_
 
 	atomic_set(&clp->cl_count, 1);
 	clp->cl_cons_state = NFS_CS_INITING;
+	clp->owner_env = get_exec_env();
 
 	memcpy(&clp->cl_addr, cl_init->addr, cl_init->addrlen);
 	clp->cl_addrlen = cl_init->addrlen;
@@ -196,6 +197,7 @@ static struct nfs_client *nfs_alloc_client(const struct nfs_client_initdata *cl_
 	if (!IS_ERR(cred))
 		clp->cl_machine_cred = cred;
 	nfs_fscache_get_client_cookie(clp);
+	ve_nfs_data_get();
 
 	return clp;
 
@@ -225,8 +227,12 @@ static void nfs4_shutdown_session(struct nfs_client *clp)
  */
 static void nfs4_destroy_callback(struct nfs_client *clp)
 {
+	struct ve_struct *ve;
+
+	ve = set_exec_env(clp->owner_env);
 	if (__test_and_clear_bit(NFS_CS_CALLBACK, &clp->cl_res_state))
 		nfs_callback_down(clp->cl_mvops->minor_version);
+	(void)set_exec_env(ve);
 }
 
 static void nfs4_shutdown_client(struct nfs_client *clp)
@@ -301,6 +307,7 @@ static void nfs_free_client(struct nfs_client *clp)
 	if (clp->cl_machine_cred != NULL)
 		put_rpccred(clp->cl_machine_cred);
 
+	ve_nfs_data_put(clp->owner_env);
 	kfree(clp->cl_hostname);
 	kfree(clp);
 
@@ -467,12 +474,17 @@ static struct nfs_client *nfs_match_client(const struct nfs_client_initdata *dat
 {
 	struct nfs_client *clp;
 	const struct sockaddr *sap = data->addr;
+	struct ve_struct *ve;
 
+	ve = get_exec_env();
 	list_for_each_entry(clp, &nfs_client_list, cl_share_link) {
 	        const struct sockaddr *clap = (struct sockaddr *)&clp->cl_addr;
 		/* Don't match clients that failed to initialise properly */
 		if (clp->cl_cons_state < 0)
 			continue;
+
+		if (!ve_accessible_strict(clp->owner_env, ve))
+				continue;
 
 		/* Different NFS versions cannot share the same nfs_client */
 		if (clp->rpc_ops != data->rpc_ops)
@@ -599,7 +611,7 @@ int nfs4_check_client_ready(struct nfs_client *clp)
 /*
  * Initialise the timeout values for a connection
  */
-static void nfs_init_timeout_values(struct rpc_timeout *to, int proto,
+void nfs_init_timeout_values(struct rpc_timeout *to, int proto,
 				    unsigned int timeo, unsigned int retrans)
 {
 	to->to_initval = timeo * HZ / 10;
@@ -784,7 +796,7 @@ static int nfs_init_server_rpcclient(struct nfs_server *server,
 		}
 	}
 	server->client->cl_softrtry = 0;
-	if (server->flags & NFS_MOUNT_SOFT)
+	if (server->flags & (NFS_MOUNT_SOFT | NFS_MOUNT_RESTORE))
 		server->client->cl_softrtry = 1;
 
 	return 0;
@@ -1091,6 +1103,8 @@ static struct nfs_server *nfs_alloc_server(void)
 	ida_init(&server->lockowner_id);
 	pnfs_init_server(server);
 
+	nfs_dq_init_prealloc_list(server);
+
 	return server;
 }
 
@@ -1205,11 +1219,15 @@ struct nfs_client *
 nfs4_find_client_no_ident(const struct sockaddr *addr)
 {
 	struct nfs_client *clp;
+	struct ve_struct *ve = get_exec_env();
 
 	spin_lock(&nfs_client_lock);
 	list_for_each_entry(clp, &nfs_client_list, cl_share_link) {
 		if (nfs4_cb_match_client(addr, clp, 0) == false)
 			continue;
+		if (!ve_accessible_strict(clp->owner_env, ve))
+			continue;
+
 		atomic_inc(&clp->cl_count);
 		spin_unlock(&nfs_client_lock);
 		return clp;
@@ -1249,6 +1267,7 @@ nfs4_find_client_sessionid(const struct sockaddr *addr,
 			   struct nfs4_sessionid *sid)
 {
 	struct nfs_client *clp;
+	struct ve_struct *ve = get_exec_env();
 
 	spin_lock(&nfs_client_lock);
 	list_for_each_entry(clp, &nfs_client_list, cl_share_link) {
@@ -1261,6 +1280,9 @@ nfs4_find_client_sessionid(const struct sockaddr *addr,
 		/* Match sessionid*/
 		if (memcmp(clp->cl_session->sess_id.data,
 		    sid->data, NFS4_MAX_SESSIONID_LEN) != 0)
+			continue;
+
+		if (!ve_accessible_strict(clp->owner_env, ve))
 			continue;
 
 		atomic_inc(&clp->cl_count);
@@ -1718,6 +1740,7 @@ struct nfs_server *nfs_clone_server(struct nfs_server *source,
 	struct nfs_server *server;
 	struct nfs_fattr *fattr_fsinfo;
 	int error;
+	struct ve_struct *ve;
 
 	dprintk("--> nfs_clone_server(,%llx:%llx,)\n",
 		(unsigned long long) fattr->fsid.major,
@@ -1726,6 +1749,8 @@ struct nfs_server *nfs_clone_server(struct nfs_server *source,
 	server = nfs_alloc_server();
 	if (!server)
 		return ERR_PTR(-ENOMEM);
+
+	ve = set_exec_env(source->nfs_client->owner_env);
 
 	error = -ENOMEM;
 	fattr_fsinfo = nfs_alloc_fattr();
@@ -1769,12 +1794,14 @@ struct nfs_server *nfs_clone_server(struct nfs_server *source,
 
 	nfs_free_fattr(fattr_fsinfo);
 	dprintk("<-- nfs_clone_server() = %p\n", server);
+	(void)set_exec_env(ve);
 	return server;
 
 out_free_server:
 	nfs_free_fattr(fattr_fsinfo);
 	nfs_free_server(server);
 	dprintk("<-- nfs_clone_server() = error %d\n", error);
+	(void)set_exec_env(ve);
 	return ERR_PTR(error);
 }
 

@@ -223,8 +223,18 @@ struct class_dev_iter {
 	const struct device_type	*type;
 };
 
+#ifndef CONFIG_VE
 extern struct kobject *sysfs_dev_block_kobj;
 extern struct kobject *sysfs_dev_char_kobj;
+#define ve_sysfs_dev_block_kobj sysfs_dev_block_kobj
+#define ve_sysfs_dev_char_kobj sysfs_dev_char_kobj
+#define ve_sysfs_block_kobj sysfs_block_kobj
+#else
+#define ve_sysfs_dev_block_kobj (get_exec_env()->dev_block_kobj)
+#define ve_sysfs_dev_char_kobj (get_exec_env()->dev_char_kobj)
+#define ve_sysfs_block_kobj (get_exec_env()->block_kobj)
+#endif
+
 extern int __must_check __class_register(struct class *class,
 					 struct lock_class_key *key);
 extern void class_unregister(struct class *class);
@@ -292,6 +302,15 @@ extern struct class * __must_check __class_create(struct module *owner,
 						  const char *name,
 						  struct lock_class_key *key);
 extern void class_destroy(struct class *cls);
+
+extern struct class net_class;
+extern struct kset *class_kset;
+
+int classes_init(void);
+void classes_fini(void);
+
+int devices_init(void);
+void devices_fini(void);
 
 /* This is a #define to keep the compiler from merging different
  * instances of the __key variable */
@@ -650,6 +669,7 @@ extern void put_device(struct device *dev);
 extern void wait_for_device_probe(void);
 
 #ifdef CONFIG_DEVTMPFS
+extern struct file_system_type dev_fs_type;
 extern int devtmpfs_create_node(struct device *dev);
 extern int devtmpfs_delete_node(struct device *dev);
 extern int devtmpfs_mount(const char *mountpoint);
@@ -665,6 +685,8 @@ extern void device_shutdown(void);
 /* drivers/base/sys.c */
 extern void sysdev_shutdown(void);
 
+/* net/core/net-sysfs.c */
+int is_dev_netdev(struct device *dev);
 /* debugging and troubleshooting/diagnostic helpers. */
 extern const char *dev_driver_string(const struct device *dev);
 

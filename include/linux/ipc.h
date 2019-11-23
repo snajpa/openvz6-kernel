@@ -79,6 +79,7 @@ struct ipc_kludge {
 
 #ifdef __KERNEL__
 #include <linux/spinlock.h>
+#include <linux/rcupdate.h>
 
 #define IPCMNI 32768  /* <= MAX_INT limit for ipc arrays (including sysctl changes) */
 
@@ -97,6 +98,15 @@ struct kern_ipc_perm
 	unsigned long	seq;
 	void		*security;
 };
+
+struct ipc_ids;
+
+extern struct kern_ipc_perm *ipc_lock(struct ipc_ids *, int);
+static inline void ipc_unlock(struct kern_ipc_perm *perm)
+{
+	spin_unlock(&perm->lock);
+	rcu_read_unlock();
+}
 
 #endif /* __KERNEL__ */
 

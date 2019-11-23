@@ -209,6 +209,11 @@ SECTIONS
 	}
 	jiffies = VVIRT(.jiffies);
 
+	.fence_wdog_jiffies64 : AT(VLOAD(.fence_wdog_jiffies64)) {
+		*(.fence_wdog_jiffies64)
+	}
+	fence_wdog_jiffies64 = VVIRT(.fence_wdog_jiffies64);
+
 	.vsyscall_3 ADDR(.vsyscall_0) + 3072: AT(VLOAD(.vsyscall_3)) {
 		*(.vsyscall_3)
 	}

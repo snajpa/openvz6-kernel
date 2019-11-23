@@ -103,17 +103,15 @@ static ctl_table mq_sysctl_dir[] = {
 	{ .ctl_name = 0 }
 };
 
-static ctl_table mq_sysctl_root[] = {
+static struct ctl_path mq_sysctl_path[] = {
 	{
 		.ctl_name	= CTL_FS,
 		.procname	= "fs",
-		.mode		= 0555,
-		.child		= mq_sysctl_dir,
 	},
-	{ .ctl_name = 0 }
+	{}
 };
 
 struct ctl_table_header *mq_register_sysctl_table(void)
 {
-	return register_sysctl_table(mq_sysctl_root);
+	return register_sysctl_glob_paths(mq_sysctl_path, mq_sysctl_dir, 1);
 }

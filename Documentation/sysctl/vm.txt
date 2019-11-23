@@ -181,6 +181,17 @@ To free pagecache, dentries and inodes:
 As this is a non-destructive operation and dirty objects are not freeable, the
 user should run `sync' first.
 
+You may see informational messages in your kernel log when this file is used:
+
+	cat (1234): drop_caches: 3
+
+These are informational only. They do not mean that anything is wrong
+with your system.
+To disable them:
+	echo 4 > /proc/sys/vm/drop_caches
+To enable them back:
+	echo 8 > /proc/sys/vm/drop_caches
+
 ==============================================================
 
 extfrag_threshold

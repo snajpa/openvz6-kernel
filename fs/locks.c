@@ -127,8 +127,11 @@
 #include <linux/time.h>
 #include <linux/rcupdate.h>
 #include <linux/pid_namespace.h>
+#include <linux/fs_struct.h>
 
 #include <asm/uaccess.h>
+
+#include <bc/misc.h>
 
 #define IS_POSIX(fl)	(fl->fl_flags & FL_POSIX)
 #define IS_FLOCK(fl)	(fl->fl_flags & FL_FLOCK)
@@ -146,10 +149,27 @@ static LIST_HEAD(blocked_list);
 static struct kmem_cache *filelock_cache __read_mostly;
 
 /* Allocate an empty lock structure. */
-static struct file_lock *locks_alloc_lock(void)
+struct file_lock *locks_alloc_lock(int charge)
 {
-	return kmem_cache_alloc(filelock_cache, GFP_KERNEL);
+	struct file_lock *fl;
+
+	fl = kmem_cache_alloc(filelock_cache, GFP_KERNEL);
+#ifdef CONFIG_BEANCOUNTERS
+	if (fl == NULL)
+		goto out;
+	fl->fl_charged = 0;
+	if (!charge)
+		goto out;
+	if (!ub_flock_charge(fl, 1))
+		goto out;
+
+	kmem_cache_free(filelock_cache, fl);
+	fl = NULL;
+out:
+#endif
+	return fl;
 }
+EXPORT_SYMBOL(locks_alloc_lock);
 
 void locks_release_private(struct file_lock *fl)
 {
@@ -168,15 +188,17 @@ void locks_release_private(struct file_lock *fl)
 EXPORT_SYMBOL_GPL(locks_release_private);
 
 /* Free a lock which is not in use. */
-static void locks_free_lock(struct file_lock *fl)
+void locks_free_lock(struct file_lock *fl)
 {
 	BUG_ON(waitqueue_active(&fl->fl_wait));
 	BUG_ON(!list_empty(&fl->fl_block));
 	BUG_ON(!list_empty(&fl->fl_link));
 
+	ub_flock_uncharge(fl);
 	locks_release_private(fl);
 	kmem_cache_free(filelock_cache, fl);
 }
+EXPORT_SYMBOL(locks_free_lock);
 
 void locks_init_lock(struct file_lock *fl)
 {
@@ -277,7 +299,7 @@ static int flock_make_lock(struct file *filp, struct file_lock **lock,
 	if (type < 0)
 		return type;
 	
-	fl = locks_alloc_lock();
+	fl = locks_alloc_lock(type != F_UNLCK);
 	if (fl == NULL)
 		return -ENOMEM;
 
@@ -464,7 +486,7 @@ static int lease_init(struct file *filp, int type, struct file_lock *fl)
 /* Allocate a file_lock initialised to this type of lease */
 static struct file_lock *lease_alloc(struct file *filp, int type)
 {
-	struct file_lock *fl = locks_alloc_lock();
+	struct file_lock *fl = locks_alloc_lock(1);
 	int error = -ENOMEM;
 
 	if (fl == NULL)
@@ -735,8 +757,13 @@ static int flock_lock_file(struct file *filp, struct file_lock *request)
 		goto find_conflict;
 
 	if (request->fl_type != F_UNLCK) {
+		/*
+		 * Nont F_UNLCK request must be already charged in
+		 * flock_make_lock(). Actually new_fl must be charged not the
+		 * request, but we try to fail earlier.
+		 */
 		error = -ENOMEM;
-		new_fl = locks_alloc_lock();
+		new_fl = locks_alloc_lock(0);
 		if (new_fl == NULL)
 			goto out;
 		error = 0;
@@ -788,6 +815,10 @@ find_conflict:
 	}
 	if (request->fl_flags & FL_ACCESS)
 		goto out;
+
+	set_flock_charged(new_fl);
+	unset_flock_charged(request);
+
 	locks_copy_lock(new_fl, request);
 	locks_insert_lock(before, new_fl);
 	new_fl = NULL;
@@ -819,8 +850,11 @@ static int __posix_lock_file(struct inode *inode, struct file_lock *request, str
 	if (!(request->fl_flags & FL_ACCESS) &&
 	    (request->fl_type != F_UNLCK ||
 	     request->fl_start != 0 || request->fl_end != OFFSET_MAX)) {
-		new_fl = locks_alloc_lock();
-		new_fl2 = locks_alloc_lock();
+		if (request->fl_type != F_UNLCK)
+			new_fl = locks_alloc_lock(1);
+		else
+			new_fl = NULL;
+		new_fl2 = locks_alloc_lock(0);
 	}
 
 	lock_kernel();
@@ -960,7 +994,7 @@ static int __posix_lock_file(struct inode *inode, struct file_lock *request, str
 	 * bail out.
 	 */
 	error = -ENOLCK; /* "no luck" */
-	if (right && left == right && !new_fl2)
+	if (right && left == right && !(request->fl_type == F_UNLCK || new_fl2))
 		goto out;
 
 	error = 0;
@@ -971,23 +1005,32 @@ static int __posix_lock_file(struct inode *inode, struct file_lock *request, str
 			goto out;
 		}
 
-		if (!new_fl) {
-			error = -ENOLCK;
+		error = -ENOLCK;
+		if (!new_fl)
 			goto out;
-		}
+		if (right && (left == right) && ub_flock_charge(new_fl, 1))
+			goto out;
 		locks_copy_lock(new_fl, request);
 		locks_insert_lock(before, new_fl);
 		new_fl = NULL;
+		error = 0;
 	}
 	if (right) {
 		if (left == right) {
 			/* The new lock breaks the old one in two pieces,
 			 * so we have to use the second new lock.
 			 */
+			error = -ENOLCK;
+			if (added && ub_flock_charge(new_fl2,
+						request->fl_type != F_UNLCK))
+				goto out;
+			/* FIXME move all fl_charged manipulations in ub code */
+			set_flock_charged(new_fl2);
 			left = new_fl2;
 			new_fl2 = NULL;
 			locks_copy_lock(left, right);
 			locks_insert_lock(before, left);
+			error = 0;
 		}
 		right->fl_start = request->fl_end + 1;
 		locks_wake_up_blocks(right);
@@ -1291,8 +1334,6 @@ void lease_get_mtime(struct inode *inode, struct timespec *time)
 	struct file_lock *flock = inode->i_flock;
 	if (flock && IS_LEASE(flock) && (flock->fl_type & F_WRLCK))
 		*time = current_fs_time(inode->i_sb);
-	else
-		*time = inode->i_mtime;
 }
 
 EXPORT_SYMBOL(lease_get_mtime);
@@ -1373,7 +1414,7 @@ int generic_setlease(struct file *filp, long arg, struct file_lock **flp)
 
 	if (arg != F_UNLCK) {
 		error = -ENOMEM;
-		new_fl = locks_alloc_lock();
+		new_fl = locks_alloc_lock(1);
 		if (new_fl == NULL)
 			goto out;
 
@@ -1617,6 +1658,7 @@ SYSCALL_DEFINE2(flock, unsigned int, fd, unsigned int, cmd)
  out:
 	return error;
 }
+EXPORT_SYMBOL(sys_flock);
 
 /**
  * vfs_test_lock - test file byte range lock
@@ -1777,7 +1819,7 @@ static int do_lock_file_wait(struct file *filp, unsigned int cmd,
 int fcntl_setlk(unsigned int fd, struct file *filp, unsigned int cmd,
 		struct flock __user *l)
 {
-	struct file_lock *file_lock = locks_alloc_lock();
+	struct file_lock *file_lock = locks_alloc_lock(0);
 	struct flock flock;
 	struct inode *inode;
 	struct file *f;
@@ -1895,7 +1937,7 @@ out:
 int fcntl_setlk64(unsigned int fd, struct file *filp, unsigned int cmd,
 		struct flock64 __user *l)
 {
-	struct file_lock *file_lock = locks_alloc_lock();
+	struct file_lock *file_lock = locks_alloc_lock(0);
 	struct flock64 flock;
 	struct inode *inode;
 	struct file *f;
@@ -2178,6 +2220,8 @@ static int locks_show(struct seq_file *f, void *v)
 	struct file_lock *fl, *bfl;
 
 	fl = list_entry(v, struct file_lock, fl_link);
+	if (d_root_check(&fl->fl_file->f_path))
+		return 0;
 
 	lock_get_status(f, fl, *((loff_t *)f->private), "");
 
@@ -2229,7 +2273,7 @@ static const struct file_operations proc_locks_operations = {
 
 static int __init proc_locks_init(void)
 {
-	proc_create("locks", 0, NULL, &proc_locks_operations);
+	proc_create("locks", 0, &glob_proc_root, &proc_locks_operations);
 	return 0;
 }
 module_init(proc_locks_init);
@@ -2316,7 +2360,7 @@ EXPORT_SYMBOL(lock_may_write);
 static int __init filelock_init(void)
 {
 	filelock_cache = kmem_cache_create("file_lock_cache",
-			sizeof(struct file_lock), 0, SLAB_PANIC,
+			sizeof(struct file_lock), 0, SLAB_PANIC|SLAB_UBC,
 			init_once);
 	return 0;
 }

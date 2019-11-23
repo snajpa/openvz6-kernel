@@ -8,6 +8,7 @@
  */
 #include <linux/module.h>
 #include <linux/mm.h>
+#include <linux/rmap.h>
 #include <linux/kernel_stat.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
@@ -18,8 +19,13 @@
 #include <linux/pagevec.h>
 #include <linux/migrate.h>
 #include <linux/page_cgroup.h>
+#include <linux/mmgang.h>
 
 #include <asm/pgtable.h>
+
+#include <bc/vmpages.h>
+#include <bc/io_acct.h>
+#include <bc/kmem.h>
 
 /*
  * swapper_space is a fiction, retained to simplify the path through
@@ -46,15 +52,17 @@ struct address_space swapper_space = {
 	.i_mmap_nonlinear = LIST_HEAD_INIT(swapper_space.i_mmap_nonlinear),
 	.backing_dev_info = &swap_backing_dev_info,
 };
+EXPORT_SYMBOL(swapper_space);
 
 #define INC_CACHE_INFO(x)	do { swap_cache_info.x++; } while (0)
 
-static struct {
+struct {
 	unsigned long add_total;
 	unsigned long del_total;
 	unsigned long find_success;
 	unsigned long find_total;
 } swap_cache_info;
+EXPORT_SYMBOL(swap_cache_info);
 
 void show_swap_cache_info(void)
 {
@@ -71,7 +79,7 @@ void show_swap_cache_info(void)
  * __add_to_swap_cache resembles add_to_page_cache_locked on swapper_space,
  * but sets SwapCache flag and private instead of mapping and index.
  */
-static int __add_to_swap_cache(struct page *page, swp_entry_t entry)
+int __add_to_swap_cache(struct page *page, swp_entry_t entry)
 {
 	int error;
 
@@ -106,7 +114,7 @@ static int __add_to_swap_cache(struct page *page, swp_entry_t entry)
 
 	return error;
 }
-
+EXPORT_SYMBOL(__add_to_swap_cache);
 
 int add_to_swap_cache(struct page *page, swp_entry_t entry, gfp_t gfp_mask)
 {
@@ -119,6 +127,7 @@ int add_to_swap_cache(struct page *page, swp_entry_t entry, gfp_t gfp_mask)
 	}
 	return error;
 }
+EXPORT_SYMBOL(add_to_swap_cache);
 
 /*
  * This must be called only on pages that have
@@ -141,11 +150,12 @@ void __delete_from_swap_cache(struct page *page)
 /**
  * add_to_swap - allocate swap space for a page
  * @page: page we want to move to swap
+ * @ub: user_beancounter to charge swap-entry
  *
  * Allocate swap space for the page and add the page to the
  * swap cache.  Caller needs to hold the page lock. 
  */
-int add_to_swap(struct page *page)
+int add_to_swap(struct page *page, struct user_beancounter *ub)
 {
 	swp_entry_t entry;
 	int err;
@@ -153,7 +163,7 @@ int add_to_swap(struct page *page)
 	VM_BUG_ON(!PageLocked(page));
 	VM_BUG_ON(!PageUptodate(page));
 
-	entry = get_swap_page();
+	entry = get_swap_page(ub);
 	if (!entry.val)
 		return 0;
 
@@ -162,6 +172,11 @@ int add_to_swap(struct page *page)
 			swapcache_free(entry, NULL);
 			return 0;
 		}
+
+	if (PageVSwap(page) && remove_from_vswap(page)) {
+		swapcache_free(entry, NULL);
+		return 0;
+	}
 
 	/*
 	 * Radix-tree node allocations from PF_MEMALLOC contexts could
@@ -189,6 +204,7 @@ int add_to_swap(struct page *page)
 		return 0;
 	}
 }
+EXPORT_SYMBOL(add_to_swap);
 
 /*
  * This must be called only on pages that have
@@ -209,6 +225,7 @@ void delete_from_swap_cache(struct page *page)
 	swapcache_free(entry, page);
 	page_cache_release(page);
 }
+EXPORT_SYMBOL(delete_from_swap_cache);
 
 /* 
  * If we are the only user, then try to free up the swap cache. 
@@ -276,6 +293,34 @@ struct page * lookup_swap_cache(swp_entry_t entry)
 	return page;
 }
 
+static struct user_beancounter *get_swapin_ub(struct page *page,
+					      swp_entry_t entry,
+					      struct vm_area_struct *vma)
+{
+	struct user_beancounter *ub;
+
+#ifdef CONFIG_BC_SWAP_ACCOUNTING
+	rcu_read_lock();
+	ub = get_swap_ub(entry);
+	if (!ub || !get_beancounter_rcu(ub)) {
+		/* speedup unuse pass */
+		if (ub)
+			ub_unuse_swap_page(page);
+		ub = get_beancounter(get_exec_ub());
+	}
+	rcu_read_unlock();
+#else
+	/* can be NULL for shmem, see shmem_swapin() */
+	if (vma && vma->vm_mm)
+		ub = mm_ub(vma->vm_mm);
+	else
+		ub = get_exec_ub();
+	get_beancounter(ub);
+#endif
+
+	return ub;
+}
+
 /* 
  * Locate a page of swap in physical memory, reserving swap cache space
  * and reading the disk if it is not already cached.
@@ -287,6 +332,19 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 {
 	struct page *found_page, *new_page = NULL;
 	int err;
+	struct user_beancounter *ub;
+	gfp_t charge_gfp = gfp_mask;
+
+	/*
+	 * A process performing swapin readahead can try to charge a page to a
+	 * ub different from mm_ub. Generally, it is OK, but if the process is
+	 * responsible for cleaning ub memory (e.g. pstorage) it might get
+	 * stuck in reclaimer waiting for a page to be written back. To avoid
+	 * that, we force charge readahead pages if the current process is in
+	 * ub0.
+	 */
+	if (get_exec_ub() == get_ub0())
+		charge_gfp |= __GFP_NOFAIL;
 
 	do {
 		/*
@@ -305,6 +363,13 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 			new_page = alloc_page_vma(gfp_mask, vma, addr);
 			if (!new_page)
 				break;		/* Out of memory */
+
+			ub = get_swapin_ub(new_page, entry, vma);
+			err = gang_add_user_page(new_page, get_ub_gs(ub),
+						 charge_gfp);
+			put_beancounter(ub);
+			if (err)
+				break;
 		}
 
 		/*
@@ -366,10 +431,14 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
 		swapcache_free(entry, NULL);
 	} while (err != -ENOMEM);
 
-	if (new_page)
+	if (new_page) {
+		if (page_gang(new_page))
+			gang_del_user_page(new_page);
 		page_cache_release(new_page);
+	}
 	return found_page;
 }
+EXPORT_SYMBOL(read_swap_cache_async);
 
 /**
  * swapin_readahead - swap in pages in hope we need them soon
@@ -417,3 +486,121 @@ struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	lru_add_drain();	/* Push any new pages onto the LRU now */
 	return read_swap_cache_async(entry, gfp_mask, vma, addr);
 }
+
+#ifdef CONFIG_MEMORY_VSWAP
+
+static int __add_to_vswap(struct page *page)
+{
+	VM_BUG_ON(!PageLocked(page));
+	VM_BUG_ON(PageSwapCache(page));
+
+	if (PageVSwap(page)) {
+		if (atomic_inc_not_zero(&page->vswap_count))
+			return 1;
+		/*
+		 * wait for put_vswap_page() completion,
+		 * see note in __remove_from_vswap()
+		 */
+		while (PageVSwap(page))
+			cpu_relax();
+	}
+
+	if (unlikely(PageTransHuge(page)) && split_huge_page(page))
+		return 0;
+
+	atomic_set(&page->vswap_count, 1);
+	SetPageVSwap(page);
+	inc_zone_page_state(page, NR_VSWAP);
+	return 1;
+}
+
+int add_to_vswap(struct page *page)
+{
+	int ret = SWAP_FAIL;
+
+	if (__add_to_vswap(page)) {
+		ret = try_to_unmap(page, TTU_VSWAP);
+		put_vswap_page(page);
+	}
+	return ret;
+}
+
+void __remove_from_vswap(struct page *page)
+{
+	/*
+	 * Either in atomic -- under pte-lock
+	 * or in add_to_vswap() under page-lock.
+	 */
+	VM_BUG_ON(!in_atomic() && !PageLocked(page));
+	__dec_zone_page_state(page, NR_VSWAP);
+	ClearPageVSwap(page);
+}
+
+static int remove_vswap_pte(struct page *page, struct vm_area_struct *vma,
+			    unsigned long addr, void *data)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	int ret = SWAP_AGAIN;
+	swp_entry_t entry;
+	pgd_t *pgd;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep, pte;
+	spinlock_t *ptl;
+
+	pgd = pgd_offset(mm, addr);
+	if (!pgd_present(*pgd))
+		goto out;
+
+	pud = pud_offset(pgd, addr);
+	if (!pud_present(*pud))
+		goto out;
+
+	pmd = pmd_offset(pud, addr);
+	if (!pmd_present(*pmd) || pmd_trans_huge(*pmd))
+		goto out;
+
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	pte = *ptep;
+
+	if (!is_swap_pte(pte))
+		goto out_unlock;
+
+	entry = pte_to_swp_entry(pte);
+	if (!is_vswap_entry(entry) || vswap_entry_to_page(entry) != page)
+		goto out_unlock;
+
+	pte = mk_pte(page, vma->vm_page_prot);
+	if (is_write_vswap_entry(entry)) {
+		pte = pte_mkwrite(pte);
+		ClearPageCheckpointed(page);
+	}
+	inc_mm_counter(mm, anon_rss);
+	dec_mm_counter(mm, swap_usage);
+
+	flush_icache_page(vma, page);
+	set_pte_at(mm, addr, ptep, pte);
+	page_add_anon_rmap(page, vma, addr);
+	/* No need to invalidate - it was non-present before */
+	update_mmu_cache(vma, addr, pte);
+	put_vswap_page(page);
+out_unlock:
+	pte_unmap_unlock(ptep, ptl);
+out:
+	return ret;
+}
+
+int remove_from_vswap(struct page *page)
+{
+	struct rmap_walk_control rwc = {
+		.rmap_one = remove_vswap_pte,
+		.arg = NULL,
+	};
+
+	VM_BUG_ON(!PageLocked(page));
+	if (rmap_walk(page, &rwc) != SWAP_AGAIN || PageVSwap(page))
+		return -EBUSY;
+	return 0;
+}
+
+#endif /* CONFIG_MEMORY_VSWAP */

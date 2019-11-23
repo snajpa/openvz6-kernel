@@ -969,7 +969,7 @@ xfs_fs_inode_init_once(
  */
 STATIC void
 xfs_fs_dirty_inode(
-	struct inode	*inode)
+	struct inode	*inode, int flags)
 {
 	struct xfs_inode	*ip = XFS_I(inode);
 	struct xfs_mount	*mp = ip->i_mount;

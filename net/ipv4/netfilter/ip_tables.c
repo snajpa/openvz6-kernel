@@ -321,6 +321,9 @@ ipt_do_table(struct sk_buff *skb,
 	struct xt_match_param mtpar;
 	struct xt_target_param tgpar;
 
+	if (ve_xt_table_forbidden(table))
+		return NF_ACCEPT;
+
 	/* Initialization */
 	ip = ip_hdr(skb);
 	indev = in ? in->name : nulldevname;
@@ -440,6 +443,17 @@ ipt_do_table(struct sk_buff *skb,
 #undef tb_comefrom
 }
 
+static bool next_offset_ok(const struct xt_table_info *t, unsigned int newpos)
+{
+	if (newpos > t->size - sizeof(struct ipt_entry))
+		return false;
+
+	if (newpos % __alignof__(struct ipt_entry) != 0)
+		return false;
+
+	return true;
+}
+
 /* Figures out from what hook each rule can be called: returns 0 if
    there are loops.  Puts hook bitmask in comefrom. */
 static int
@@ -466,8 +480,8 @@ mark_source_chains(struct xt_table_info *newinfo,
 			int visited = e->comefrom & (1 << hook);
 
 			if (e->comefrom & (1 << NF_INET_NUMHOOKS)) {
-				printk("iptables: loop hook %u pos %u %08X.\n",
-				       hook, pos, e->comefrom);
+				ve_printk(VE_LOG, "iptables: loop hook %u pos "
+					"%u %08X.\n", hook, pos, e->comefrom);
 				return 0;
 			}
 			e->comefrom |= ((1 << hook) | (1 << NF_INET_NUMHOOKS));
@@ -516,6 +530,8 @@ mark_source_chains(struct xt_table_info *newinfo,
 
 				/* Move along one */
 				size = e->next_offset;
+				if (!next_offset_ok(newinfo, pos + size))
+					return 0;
 				e = (struct ipt_entry *)
 					(entry0 + pos + size);
 				e->counters.pcnt = pos;
@@ -526,13 +542,6 @@ mark_source_chains(struct xt_table_info *newinfo,
 				if (strcmp(t->target.u.user.name,
 					   IPT_STANDARD_TARGET) == 0
 				    && newpos >= 0) {
-					if (newpos > newinfo->size -
-						sizeof(struct ipt_entry)) {
-						duprintf("mark_source_chains: "
-							"bad verdict (%i)\n",
-								newpos);
-						return 0;
-					}
 					/* This a jump; chase it. */
 					duprintf("Jump rule %u -> %u\n",
 						 pos, newpos);
@@ -540,6 +549,10 @@ mark_source_chains(struct xt_table_info *newinfo,
 					/* ... this is a fallthru */
 					newpos = pos + e->next_offset;
 				}
+
+				if (!next_offset_ok(newinfo, newpos))
+					return 0;
+
 				e = (struct ipt_entry *)
 					(entry0 + newpos);
 				e->counters.pcnt = pos;
@@ -616,9 +629,10 @@ find_check_match(struct ipt_entry_match *m, struct xt_mtchk_param *par,
 	struct xt_match *match;
 	int ret;
 
-	match = try_then_request_module(xt_find_match(AF_INET, m->u.user.name,
-						      m->u.user.revision),
-					"ipt_%s", m->u.user.name);
+	match = ve0_try_then_request_module(xt_find_match(AF_INET,
+							  m->u.user.name,
+							  m->u.user.revision),
+					    "ipt_%s", m->u.user.name);
 	if (IS_ERR(match) || !match) {
 		duprintf("find_check_match: `%s' not found\n", m->u.user.name);
 		return match ? PTR_ERR(match) : -ENOENT;
@@ -678,10 +692,10 @@ find_check_entry(struct ipt_entry *e, const char *name, unsigned int size,
 		goto cleanup_matches;
 
 	t = ipt_get_target(e);
-	target = try_then_request_module(xt_find_target(AF_INET,
-							t->u.user.name,
-							t->u.user.revision),
-					 "ipt_%s", t->u.user.name);
+	target = ve0_try_then_request_module(xt_find_target(AF_INET,
+							    t->u.user.name,
+							    t->u.user.revision),
+					     "ipt_%s", t->u.user.name);
 	if (IS_ERR(target) || !target) {
 		duprintf("find_check_entry: `%s' not found\n", t->u.user.name);
 		ret = target ? PTR_ERR(target) : -ENOENT;
@@ -953,7 +967,7 @@ static struct xt_counters * alloc_counters(struct xt_table *table)
 	   (other than comefrom, which userspace doesn't care
 	   about). */
 	countersize = sizeof(struct xt_counters) * private->number;
-	counters = vmalloc_node(countersize, numa_node_id());
+	counters = ub_vmalloc_node(countersize, numa_node_id());
 
 	if (counters == NULL)
 		return ERR_PTR(-ENOMEM);
@@ -1130,8 +1144,8 @@ static int get_info(struct net *net, void __user *user, int *len, int compat)
 	if (compat)
 		xt_compat_lock(AF_INET);
 #endif
-	t = try_then_request_module(xt_find_table_lock(net, AF_INET, name),
-				    "iptable_%s", name);
+	t = ve0_try_then_request_module(xt_find_table_lock(net, AF_INET, name),
+					"iptable_%s", name);
 	if (t && !IS_ERR(t)) {
 		struct ipt_getinfo info;
 		const struct xt_table_info *private = t->private;
@@ -1220,14 +1234,14 @@ __do_replace(struct net *net, const char *name, unsigned int valid_hooks,
 	void *loc_cpu_old_entry;
 
 	ret = 0;
-	counters = vmalloc(num_counters * sizeof(struct xt_counters));
+	counters = ub_vmalloc_best(num_counters * sizeof(struct xt_counters));
 	if (!counters) {
 		ret = -ENOMEM;
 		goto out;
 	}
 
-	t = try_then_request_module(xt_find_table_lock(net, AF_INET, name),
-				    "iptable_%s", name);
+	t = ve0_try_then_request_module(xt_find_table_lock(net, AF_INET, name),
+					"iptable_%s", name);
 	if (!t || IS_ERR(t)) {
 		ret = t ? PTR_ERR(t) : -ENOENT;
 		goto free_newinfo_counters_untrans;
@@ -1385,7 +1399,7 @@ do_add_counters(struct net *net, void __user *user, unsigned int len, int compat
 	if (len != size + num_counters * sizeof(struct xt_counters))
 		return -EINVAL;
 
-	paddc = vmalloc_node(len - size, numa_node_id());
+	paddc = ub_vmalloc_node(len - size, numa_node_id());
 	if (!paddc)
 		return -ENOMEM;
 
@@ -1494,9 +1508,10 @@ compat_find_calc_match(struct ipt_entry_match *m,
 {
 	struct xt_match *match;
 
-	match = try_then_request_module(xt_find_match(AF_INET, m->u.user.name,
-						      m->u.user.revision),
-					"ipt_%s", m->u.user.name);
+	match = ve0_try_then_request_module(xt_find_match(AF_INET,
+							  m->u.user.name,
+							  m->u.user.revision),
+					    "ipt_%s", m->u.user.name);
 	if (IS_ERR(match) || !match) {
 		duprintf("compat_check_calc_match: `%s' not found\n",
 			 m->u.user.name);
@@ -1583,10 +1598,10 @@ check_compat_entry_size_and_hooks(struct compat_ipt_entry *e,
 		goto release_matches;
 
 	t = compat_ipt_get_target(e);
-	target = try_then_request_module(xt_find_target(AF_INET,
-							t->u.user.name,
-							t->u.user.revision),
-					 "ipt_%s", t->u.user.name);
+	target = ve0_try_then_request_module(xt_find_target(AF_INET,
+							    t->u.user.name,
+							    t->u.user.revision),
+					     "ipt_%s", t->u.user.name);
 	if (IS_ERR(target) || !target) {
 		duprintf("check_compat_entry_size_and_hooks: `%s' not found\n",
 			 t->u.user.name);
@@ -1619,7 +1634,7 @@ check_compat_entry_size_and_hooks(struct compat_ipt_entry *e,
 out:
 	module_put(t->u.kernel.target->me);
 release_matches:
-	IPT_MATCH_ITERATE(e, compat_release_match, &j);
+	COMPAT_IPT_MATCH_ITERATE(e, compat_release_match, &j);
 	return ret;
 }
 
@@ -1864,13 +1879,15 @@ compat_do_replace(struct net *net, void __user *user, unsigned int len)
 	return ret;
 }
 
+static int do_ipt_set_ctl(struct sock *, int, void __user *, unsigned int);
+
 static int
 compat_do_ipt_set_ctl(struct sock *sk,	int cmd, void __user *user,
 		      unsigned int len)
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -1883,8 +1900,7 @@ compat_do_ipt_set_ctl(struct sock *sk,	int cmd, void __user *user,
 		break;
 
 	default:
-		duprintf("do_ipt_set_ctl:  unknown request %i\n", cmd);
-		ret = -EINVAL;
+		ret = do_ipt_set_ctl(sk, cmd, user, len);
 	}
 
 	return ret;
@@ -1981,7 +1997,7 @@ compat_do_ipt_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -2003,7 +2019,7 @@ do_ipt_set_ctl(struct sock *sk, int cmd, void __user *user, unsigned int len)
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -2028,7 +2044,7 @@ do_ipt_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 {
 	int ret;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 		return -EPERM;
 
 	switch (cmd) {
@@ -2060,10 +2076,10 @@ do_ipt_get_ctl(struct sock *sk, int cmd, void __user *user, int *len)
 		else
 			target = 0;
 
-		try_then_request_module(xt_find_revision(AF_INET, rev.name,
-							 rev.revision,
-							 target, &ret),
-					"ipt_%s", rev.name);
+		ve0_try_then_request_module(xt_find_revision(AF_INET, rev.name,
+							     rev.revision,
+							     target, &ret),
+					    "ipt_%s", rev.name);
 		break;
 	}
 
@@ -2082,7 +2098,7 @@ struct xt_table *ipt_register_table(struct net *net,
 	int ret;
 	struct xt_table_info *newinfo;
 	struct xt_table_info bootstrap
-		= { 0, 0, 0, { 0 }, { 0 }, { } };
+		= { 0, 0, 0, 0, { 0 }, { 0 }, { } };
 	void *loc_cpu_entry;
 	struct xt_table *new_table;
 
@@ -2228,12 +2244,25 @@ static struct xt_match icmp_matchstruct __read_mostly = {
 
 static int __net_init ip_tables_net_init(struct net *net)
 {
-	return xt_proto_init(net, NFPROTO_IPV4);
+	int res;
+
+	if (!net_ipt_permitted(net, VE_IP_IPTABLES))
+		return 0;
+
+	res = xt_proto_init(net, NFPROTO_IPV4);
+	if (!res)
+		net_ipt_module_set(net, VE_IP_IPTABLES);
+	return res;
 }
 
 static void __net_exit ip_tables_net_exit(struct net *net)
 {
+	if (!net_is_ipt_module_set(net, VE_IP_IPTABLES))
+		return;
+
 	xt_proto_fini(net, NFPROTO_IPV4);
+
+	net_ipt_module_clear(net, VE_IP_IPTABLES);
 }
 
 static struct pernet_operations ip_tables_net_ops = {

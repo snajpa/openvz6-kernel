@@ -201,10 +201,7 @@ void dccp_destroy_sock(struct sock *sk)
 {
 	struct dccp_sock *dp = dccp_sk(sk);
 
-	/*
-	 * DCCP doesn't use sk_write_queue, just sk_send_head
-	 * for retransmissions
-	 */
+	__skb_queue_purge(&sk->sk_write_queue);
 	if (sk->sk_send_head != NULL) {
 		kfree_skb(sk->sk_send_head);
 		sk->sk_send_head = NULL;
@@ -955,6 +952,10 @@ void dccp_close(struct sock *sk, long timeout)
 		data_was_unread += skb->len;
 		__kfree_skb(skb);
 	}
+
+	/* If socket has been already reset kill it. */
+	if (sk->sk_state == DCCP_CLOSED)
+		goto adjudge_to_death;
 
 	if (data_was_unread) {
 		/* Unread data was tossed, send an appropriate Reset Code */

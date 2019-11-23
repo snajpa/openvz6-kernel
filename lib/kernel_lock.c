@@ -93,6 +93,7 @@ static inline void __lock_kernel(void)
  */
 static inline void __lock_kernel(void)
 {
+	preempt_disable();
 	_raw_spin_lock(&kernel_flag);
 }
 #endif

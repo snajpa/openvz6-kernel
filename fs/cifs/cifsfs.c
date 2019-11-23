@@ -134,6 +134,7 @@ cifs_read_super(struct super_block *sb)
 
 	sb->s_magic = CIFS_MAGIC_NUMBER;
 	sb->s_op = &cifs_super_ops;
+	sb->s_bdi = &cifs_sb->bdi;
 	sb->s_blocksize = CIFS_MAX_MSGSIZE;
 	sb->s_blocksize_bits = 14;	/* default 2**14 = CIFS_MAX_MSGSIZE */
 	inode = cifs_root_iget(sb);
@@ -143,6 +144,7 @@ cifs_read_super(struct super_block *sb)
 		inode = NULL;
 		goto out_no_root;
 	}
+	cifs_sb->bdi.ra_pages = cifs_sb->rsize / PAGE_CACHE_SIZE;
 
 	sb->s_root = d_alloc_root(inode);
 
@@ -172,6 +174,7 @@ static void cifs_kill_sb(struct super_block *sb)
 {
 	struct cifs_sb_info *cifs_sb = CIFS_SB(sb);
 	kill_anon_super(sb);
+	bdi_destroy(&cifs_sb->bdi);
 	cifs_umount(cifs_sb);
 }
 
@@ -582,6 +585,9 @@ cifs_get_sb(struct file_system_type *fs_type,
 		rc = -ENOMEM;
 		goto out_nls;
 	}
+	rc = bdi_setup_and_register(&cifs_sb->bdi, "cifs", BDI_CAP_MAP_COPY);
+	if (rc)
+		goto out_cifs_sb;
 
 	/*
 	 * Copy mount params for use in submounts. Better to do
@@ -591,7 +597,7 @@ cifs_get_sb(struct file_system_type *fs_type,
 	cifs_sb->mountdata = kstrndup(data, PAGE_SIZE, GFP_KERNEL);
 	if (cifs_sb->mountdata == NULL) {
 		rc = -ENOMEM;
-		goto out_cifs_sb;
+		goto out_bdi;
 	}
 
 	cifs_setup_cifs_sb(volume_info, cifs_sb);
@@ -634,6 +640,8 @@ out:
 	return rc;
 out_mountdata:
 	kfree(cifs_sb->mountdata);
+out_bdi:
+	bdi_destroy(&cifs_sb->bdi);
 out_cifs_sb:
 	kfree(cifs_sb);
 out_nls:

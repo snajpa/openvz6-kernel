@@ -39,6 +39,7 @@ static inline void fput_light_pos(struct file *file, int fput_needed)
 	fput_light(file, fput_needed);
 }
 
+extern struct file *get_empty_filp(void);
 extern struct file *fget(unsigned int fd);
 extern struct file *fget_light(unsigned int fd, int *fput_needed);
 extern struct file *fget_light_pos(unsigned int fd, int *fput_needed);
@@ -50,5 +51,8 @@ extern int get_unused_fd_flags(unsigned flags);
 extern void put_unused_fd(unsigned int fd);
 
 extern void fd_install(unsigned int fd, struct file *file);
+
+struct file *get_task_file(pid_t pid, int fd);
+extern struct kmem_cache *filp_cachep;
 
 #endif /* __LINUX_FILE_H */

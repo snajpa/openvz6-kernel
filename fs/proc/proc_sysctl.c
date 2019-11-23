@@ -30,7 +30,7 @@ static struct inode *proc_sys_make_inode(struct super_block *sb,
 
 	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
 	inode->i_flags |= S_PRIVATE; /* tell selinux to ignore this inode */
-	inode->i_mode = table->mode;
+	inode->i_mode = table->mode & ~S_ISVTX;
 	if (!table->child) {
 		inode->i_mode |= S_IFREG;
 		inode->i_op = &proc_sys_inode_operations;
@@ -132,6 +132,7 @@ static ssize_t proc_sys_call_handler(struct file *filp, void __user *buf,
 	struct inode *inode = filp->f_path.dentry->d_inode;
 	struct ctl_table_header *head = grab_header(inode);
 	struct ctl_table *table = PROC_I(inode)->sysctl_entry;
+	struct ctl_table onstack;
 	ssize_t error;
 	size_t res;
 
@@ -150,6 +151,12 @@ static ssize_t proc_sys_call_handler(struct file *filp, void __user *buf,
 	error = -EINVAL;
 	if (!table->proc_handler)
 		goto out;
+
+	table = sysctl_ve_table(table, &onstack, write);
+	if (table == NULL) {
+		error = write;
+		goto out;
+	}
 
 	/* careful: calling conventions are nasty here */
 	res = count;
@@ -358,6 +365,7 @@ static const struct file_operations proc_sys_file_operations = {
 };
 
 static const struct file_operations proc_sys_dir_file_operations = {
+	.read		= generic_read_dir,
 	.readdir	= proc_sys_readdir,
 	.llseek		= generic_file_llseek,
 };
@@ -406,7 +414,7 @@ int __init proc_sys_init(void)
 {
 	struct proc_dir_entry *proc_sys_root;
 
-	proc_sys_root = proc_mkdir("sys", NULL);
+	proc_sys_root = proc_mkdir("sys", &glob_proc_root);
 	proc_sys_root->proc_iops = &proc_sys_dir_operations;
 	proc_sys_root->proc_fops = &proc_sys_dir_file_operations;
 	proc_sys_root->nlink = 0;

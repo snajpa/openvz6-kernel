@@ -2,6 +2,7 @@
 #define LINUX_MM_INLINE_H
 
 #include <linux/huge_mm.h>
+#include <linux/rcupdate.h>
 
 /**
  * page_is_file_cache - should the page be on a file LRU or anon LRU?
@@ -21,22 +22,115 @@ static inline int page_is_file_cache(struct page *page)
 	return !PageSwapBacked(page);
 }
 
-static inline void
-add_page_to_lru_list(struct zone *zone, struct page *page, enum lru_list l)
+static struct zone *lruvec_zone(struct lruvec *lruvec)
 {
-	struct lruvec *lruvec;
+	return lruvec->zone;
+}
 
-	lruvec = mem_cgroup_lru_add_list(zone, page, l);
-	list_add(&page->lru, &lruvec->lists[l]);
-	__mod_zone_page_state(zone, NR_LRU_BASE + l, hpage_nr_pages(page));
+static inline struct lruvec *page_lruvec(struct page *page)
+{
+	return rcu_dereference(page->lruvec);
+}
+
+static inline struct lruvec *__page_lruvec(struct page *page)
+{
+	return rcu_access_pointer(page->lruvec);
+}
+
+static inline void set_page_lruvec(struct page *page, struct lruvec *lruvec)
+{
+	rcu_assign_pointer(page->lruvec, lruvec);
+}
+
+static inline struct lruvec *
+relock_lruvec(struct lruvec *locked, struct lruvec *lruvec)
+{
+	if (unlikely(locked != lruvec)) {
+		if (locked)
+			spin_unlock(&locked->lru_lock);
+		spin_lock(&lruvec->lru_lock);
+	}
+	return lruvec;
 }
 
 static inline void
-del_page_from_lru_list(struct zone *zone, struct page *page, enum lru_list l)
+unlock_lruvec(struct lruvec *lruvec)
 {
-	mem_cgroup_lru_del_list(page, l);
+	if (lruvec)
+		spin_unlock(&lruvec->lru_lock);
+}
+
+static inline struct lruvec *lock_page_lru(struct page *page)
+{
+	struct lruvec *lruvec;
+
+	rcu_read_lock();
+	while (1) {
+		lruvec = page_lruvec(page);
+		spin_lock(&lruvec->lru_lock);
+		if (likely(__page_lruvec(page) == lruvec))
+			break;
+		spin_unlock(&lruvec->lru_lock);
+	}
+	rcu_read_unlock();
+
+	return lruvec;
+}
+
+static inline struct lruvec *
+relock_page_lru(struct lruvec *locked, struct page *page)
+{
+	struct lruvec *lruvec = __page_lruvec(page);
+
+	if (unlikely(locked != lruvec)) {
+		if (locked)
+			spin_unlock(&locked->lru_lock);
+		lruvec = lock_page_lru(page);
+	}
+	return lruvec;
+}
+
+static inline bool
+try_relock_page_lru(struct lruvec **locked, struct page *page)
+{
+	struct lruvec *lruvec;
+
+	while (PageLRU(page)) {
+		rcu_read_lock();
+		lruvec = page_lruvec(page);
+		if (lruvec) {
+			*locked = relock_lruvec(*locked, lruvec);
+			if (__page_lruvec(page) == lruvec) {
+				rcu_read_unlock();
+				return PageLRU(page);
+			}
+		}
+		rcu_read_unlock();
+	}
+
+	return false;
+}
+
+static inline void
+add_page_to_lru_list(struct lruvec *lruvec, struct page *page, enum lru_list l)
+{
+	struct zone *zone = lruvec_zone(lruvec);
+	int numpages = hpage_nr_pages(page);
+
+	list_add(&page->lru, &lruvec->lru_list[l]);
+	lruvec->nr_pages[l] += numpages;
+	__mod_zone_page_state(zone, NR_LRU_BASE + l, numpages);
+}
+
+static inline void
+del_page_from_lru_list(struct lruvec *lruvec, struct page *page, enum lru_list l)
+{
+	struct zone *zone = lruvec_zone(lruvec);
+	int numpages = hpage_nr_pages(page);
+
 	list_del(&page->lru);
-	__mod_zone_page_state(zone, NR_LRU_BASE + l, -hpage_nr_pages(page));
+	lruvec->nr_pages[l] -= numpages;
+	__mod_zone_page_state(zone, NR_LRU_BASE + l, -numpages);
 }
 
 /**
@@ -55,7 +149,7 @@ static inline enum lru_list page_lru_base_type(struct page *page)
 }
 
 static inline void
-del_page_from_lru(struct zone *zone, struct page *page)
+del_page_from_lru(struct lruvec *lruvec, struct page *page)
 {
 	enum lru_list l;
 
@@ -69,9 +163,7 @@ del_page_from_lru(struct zone *zone, struct page *page)
 			l += LRU_ACTIVE;
 		}
 	}
-	mem_cgroup_lru_del_list(page, l);
-	list_del(&page->lru);
-	__mod_zone_page_state(zone, NR_LRU_BASE + l, -hpage_nr_pages(page));
+	del_page_from_lru_list(lruvec, page, l);
 }
 
 /**

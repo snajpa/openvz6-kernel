@@ -95,7 +95,7 @@ struct ip_tunnel_net {
 
 int ip_tunnel_init(struct net_device *dev);
 void ip_tunnel_uninit(struct net_device *dev);
-void  ip_tunnel_dellink(struct net_device *dev);
+void  ip_tunnel_dellink(struct net_device *dev, struct list_head *head);
 int ip_tunnel_init_net(struct net *net, int ip_tnl_net_id,
 		       struct rtnl_link_ops *ops, char *devname);
 
@@ -118,6 +118,10 @@ int ip_tunnel_changelink(struct net_device *dev, struct nlattr *tb[],
 int ip_tunnel_newlink(struct net_device *dev, struct nlattr *tb[],
 		      struct ip_tunnel_parm *p);
 void ip_tunnel_setup(struct net_device *dev, int net_id);
+
+struct cpt_tunnel_image;
+int ip_tunnel_rst(struct net *net, struct ip_tunnel_net *itn,
+		  const struct cpt_tunnel_image *v, const char *name);
 
 /* Extract dsfield from inner protocol */
 static inline u8 ip_tunnel_get_dsfield(const struct iphdr *iph,

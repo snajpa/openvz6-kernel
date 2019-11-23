@@ -105,7 +105,7 @@ static bool limit_mt_check(const struct xt_mtchk_param *par)
 	/* Check for overflow. */
 	if (r->burst == 0
 	    || user2credits(r->avg * r->burst) < user2credits(r->avg)) {
-		printk("Overflow in xt_limit, try lower: %u/%u\n",
+		ve_printk(VE_LOG, "Overflow in xt_limit, try lower: %u/%u\n",
 		       r->avg, r->burst);
 		return false;
 	}

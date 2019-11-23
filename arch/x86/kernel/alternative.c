@@ -65,6 +65,15 @@ static int __init setup_spinlock_type(char *str)
 }
 __setup("spinlock-type=", setup_spinlock_type);
 
+static int __initdata zero_free_pages;
+
+static int __init setup_zero_free_pages(char *str)
+{
+	zero_free_pages = 1;
+	return 1;
+}
+__setup("zero-free-pages", setup_zero_free_pages);
+
 #ifdef CONFIG_PARAVIRT
 static int __initdata_or_module noreplace_paravirt = 0;
 
@@ -547,6 +556,12 @@ void __init alternative_instructions(void)
 		printk(KERN_INFO "alternatives: switching to unfair spinlock\n");
 		setup_force_cpu_cap(X86_FEATURE_UNFAIR_SPINLOCK);
 	}
+
+	if (zero_free_pages) {
+		printk(KERN_INFO "alternatives: enabling zeroing pages on free\n");
+		setup_force_cpu_cap(X86_FEATURE_ZERO_FREE_PAGES);
+	}
+
 	/*
 	 * Don't stop machine check exceptions while patching.
 	 * MCEs only happen when something got corrupted and in this

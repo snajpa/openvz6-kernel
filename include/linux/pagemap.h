@@ -15,6 +15,8 @@
 #include <linux/hardirq.h> /* for in_interrupt() */
 #include <linux/hugetlb_inline.h>
 
+#include <bc/vmpages.h> /* for ub_check_ram_limits() */
+
 /*
  * Bits in mapping->flags.  The lower __GFP_BITS_SHIFT bits are the page
  * allocation mode flags.
@@ -24,6 +26,7 @@ enum mapping_flags {
 	AS_ENOSPC	= __GFP_BITS_SHIFT + 1,	/* ENOSPC on async write */
 	AS_MM_ALL_LOCKS	= __GFP_BITS_SHIFT + 2,	/* under mm_take_all_locks() */
 	AS_UNEVICTABLE	= __GFP_BITS_SHIFT + 3,	/* e.g., ramdisk, SHM_LOCK */
+	AS_CHECKPOINT	= __GFP_BITS_SHIFT + 4,	/* mapping is checkpointed */
 	AS_UNMAPPING	= __GFP_BITS_SHIFT + 6, /* (KABI) unmapping pages */
 };
 
@@ -135,7 +138,7 @@ static inline int page_cache_get_speculative(struct page *page)
 	VM_BUG_ON(in_interrupt());
 
 #if !defined(CONFIG_SMP) && defined(CONFIG_TREE_RCU)
-# ifdef CONFIG_PREEMPT
+# ifdef CONFIG_PREEMPT_COUNT
 	VM_BUG_ON(!in_atomic());
 # endif
 	/*
@@ -173,7 +176,7 @@ static inline int page_cache_add_speculative(struct page *page, int count)
 	VM_BUG_ON(in_interrupt());
 
 #if !defined(CONFIG_SMP) && defined(CONFIG_TREE_RCU)
-# ifdef CONFIG_PREEMPT
+# ifdef CONFIG_PREEMPT_COUNT
 	VM_BUG_ON(!in_atomic());
 # endif
 	VM_BUG_ON(page_count(page) == 0);
@@ -206,6 +209,9 @@ extern struct page *__page_cache_alloc(gfp_t gfp);
 #else
 static inline struct page *__page_cache_alloc(gfp_t gfp)
 {
+	if (unlikely(ub_check_ram_limits(get_exec_ub(), gfp)))
+		return NULL;
+
 	return alloc_pages(gfp, 0);
 }
 #endif
@@ -224,6 +230,12 @@ static inline struct page *page_cache_alloc_readahead(struct address_space *x)
 {
 	return __page_cache_alloc(mapping_gfp_mask(x) |
 				  __GFP_COLD | __GFP_NORETRY | __GFP_NOWARN);
+}
+
+static inline void check_pagecache_limits(struct address_space *mapping,
+					  gfp_t gfp_mask)
+{
+	ub_check_ram_limits(get_exec_ub(), gfp_mask);
 }
 
 typedef int filler_t(void *, struct page *);
@@ -369,18 +381,26 @@ static inline int lock_page_or_retry(struct page *page, struct mm_struct *mm,
 }
 
 /*
- * This is exported only for wait_on_page_locked/wait_on_page_writeback.
- * Never use this directly!
+ * This is exported only for wait_on_page_locked/wait_on_page_writeback,
+ * and for filesystems which need to wait on PG_private.
  */
 extern void wait_on_page_bit(struct page *page, int bit_nr);
 
 extern int wait_on_page_bit_killable(struct page *page, int bit_nr);
+extern int wait_on_page_bit_killable_timeout(struct page *page,
+		int bit_nr, unsigned long timeout);
 
 static inline int wait_on_page_locked_killable(struct page *page)
 {
 	if (PageLocked(page))
 		return wait_on_page_bit_killable(page, PG_locked);
 	return 0;
+}
+
+extern wait_queue_head_t *page_waitqueue(struct page *page);
+static inline void wake_up_page(struct page *page, int bit)
+{
+	__wake_up_bit(page_waitqueue(page), &page->flags, bit);
 }
 
 /* 
@@ -524,6 +544,8 @@ static inline int fault_in_multipages_readable(const char __user *uaddr,
 	return ret;
 }
 
+int add_to_page_cache_nogang(struct page *page, struct address_space *mapping,
+				pgoff_t index, gfp_t gfp_mask);
 int add_to_page_cache_locked(struct page *page, struct address_space *mapping,
 				pgoff_t index, gfp_t gfp_mask);
 int add_to_page_cache_lru(struct page *page, struct address_space *mapping,

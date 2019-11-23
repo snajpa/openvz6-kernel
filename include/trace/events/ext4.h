@@ -15,6 +15,36 @@ struct mpage_da_data;
 
 #define EXT4_I(inode) (container_of(inode, struct ext4_inode_info, vfs_inode))
 
+TRACE_EVENT(ext4_other_inode_update_time,
+	TP_PROTO(struct inode *inode, ino_t orig_ino),
+
+	TP_ARGS(inode, orig_ino),
+
+	TP_STRUCT__entry(
+		__field(	dev_t,	dev			)
+		__field(	ino_t,	ino			)
+		__field(	ino_t,	orig_ino		)
+		__field(	uid_t,	uid			)
+		__field(	gid_t,	gid			)
+		__field(	__u16, mode			)
+	),
+
+	TP_fast_assign(
+		__entry->orig_ino = orig_ino;
+		__entry->dev	= inode->i_sb->s_dev;
+		__entry->ino	= inode->i_ino;
+		__entry->uid	= inode->i_uid;
+		__entry->gid	= inode->i_gid;
+		__entry->mode	= inode->i_mode;
+	),
+
+	TP_printk("dev %d,%d orig_ino %lu ino %lu mode 0%o uid %u gid %u",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  (unsigned long) __entry->orig_ino,
+		  (unsigned long) __entry->ino, __entry->mode,
+		  __entry->uid, __entry->gid)
+);
+
 TRACE_EVENT(ext4_free_inode,
 	TP_PROTO(struct inode *inode),
 
@@ -639,6 +669,61 @@ TRACE_EVENT(ext4_sync_file,
 		  (unsigned long) __entry->parent, __entry->datasync)
 );
 
+TRACE_EVENT(ext4_sync_files_iterate,
+	TP_PROTO(struct dentry *dentry, tid_t tid, int datasync),
+
+	TP_ARGS(dentry, tid, datasync),
+
+	TP_STRUCT__entry(
+		__field(	dev_t,	dev			)
+		__field(	ino_t,	ino			)
+		__field(	ino_t,	parent			)
+		__field(	int,	datasync		)
+		__field(	unsigned int,	tid		)
+	),
+
+	TP_fast_assign(
+		__entry->dev		= dentry->d_inode->i_sb->s_dev;
+		__entry->ino		= dentry->d_inode->i_ino;
+		__entry->datasync	= datasync;
+		__entry->parent		= dentry->d_parent->d_inode->i_ino;
+		__entry->tid		= tid;
+	),
+
+	TP_printk("dev %s ino %ld parent %ld datasync %d tid %u",
+		  jbd2_dev_to_name(__entry->dev), (unsigned long) __entry->ino,
+		  (unsigned long) __entry->parent, __entry->datasync,
+		  __entry->tid)
+);
+
+TRACE_EVENT(ext4_sync_files_exit,
+	TP_PROTO(struct dentry *dentry, tid_t tid, int barrier),
+
+	TP_ARGS(dentry, tid, barrier),
+
+	TP_STRUCT__entry(
+		__field(	dev_t,	dev			)
+		__field(	ino_t,	ino			)
+		__field(	ino_t,	parent			)
+		__field(	int,	barrier			)
+		__field(	unsigned int,	tid		)
+	),
+
+	TP_fast_assign(
+		__entry->dev		= dentry->d_inode->i_sb->s_dev;
+		__entry->ino		= dentry->d_inode->i_ino;
+		__entry->parent		= dentry->d_parent->d_inode->i_ino;
+		__entry->tid		= tid;
+		__entry->barrier	= barrier;
+	),
+
+	TP_printk("dev %s ino %ld parent %ld explicit_barrier %d tid %u",
+		  jbd2_dev_to_name(__entry->dev), (unsigned long) __entry->ino,
+		  (unsigned long) __entry->parent, __entry->barrier,
+		  __entry->tid)
+);
+
+
 TRACE_EVENT(ext4_sync_fs,
 	TP_PROTO(struct super_block *sb, int wait),
 
@@ -922,6 +1007,59 @@ TRACE_EVENT(ext4_update_reserve_space,
 		 "metadata blocks\n",
 		 jbd2_dev_to_name(__entry->dev), __entry->ino,
 		 __entry->allocated, __entry->reserved)
+);
+
+DECLARE_EVENT_CLASS(ext4__data_csum,
+
+	TP_PROTO(struct inode *inode, loff_t pos),
+
+	TP_ARGS(inode, pos),
+
+	TP_STRUCT__entry(
+		__field(	dev_t,	dev			)
+		__field(	ino_t,	ino			)
+		__field(	loff_t,	end			)
+		__field(	loff_t,	pos			)
+	),
+
+	TP_fast_assign(
+		__entry->dev	= inode->i_sb->s_dev;
+		__entry->ino	= inode->i_ino;
+		__entry->end	= EXT4_I(inode)->i_data_csum_end;
+		__entry->pos	= pos;
+	),
+
+	TP_printk("dev %d,%d ino %lu end %lld pos %lld",
+		MAJOR(__entry->dev), MINOR(__entry->dev),
+		(unsigned long) __entry->ino, __entry->end, __entry->pos)
+);
+
+DEFINE_EVENT(ext4__data_csum, ext4_start_data_csum,
+
+	TP_PROTO(struct inode *inode, loff_t pos),
+
+	TP_ARGS(inode, pos)
+);
+
+DEFINE_EVENT(ext4__data_csum, ext4_update_data_csum,
+
+	TP_PROTO(struct inode *inode, loff_t pos),
+
+	TP_ARGS(inode, pos)
+);
+
+DEFINE_EVENT(ext4__data_csum, ext4_save_data_csum,
+
+	TP_PROTO(struct inode *inode, loff_t pos),
+
+	TP_ARGS(inode, pos)
+);
+
+DEFINE_EVENT(ext4__data_csum, ext4_truncate_data_csum,
+
+	TP_PROTO(struct inode *inode, loff_t pos),
+
+	TP_ARGS(inode, pos)
 );
 
 #endif /* _TRACE_EXT4_H */

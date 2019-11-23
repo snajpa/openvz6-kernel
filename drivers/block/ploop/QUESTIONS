@@ -1,0 +1,21 @@
+1. Seems, Axboe's fast loop uses GFP_KERNEL in loop thread. What the fuck?
+
+2. bio_add_page() is buggy. When existing bvec is extended, it passes
+   some crap to merge_bvec_fn
+
+3. BIO_RW_AHEAD. Nobody uses it. Should we implement this?
+
+4. Switching io_context. Dubious. Definitely broken in 2.6.18
+
+5. current->backing_dev_info. Investigate.
+
+6. Waiting for free request. Should not we redo all the checks after waiting?
+
+7. Cached write is used when allocating new index cluster. Should we
+   get rid of this?
+
+8. Investigate *congestion* methods. We should do something, no doubts.
+
+9. Can/should we register_shrinker() to balance our internal caches?
+
+

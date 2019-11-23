@@ -346,18 +346,32 @@
 /* #define __NR_fanotify_init		338 */
 /* #define __NR_fanotify_mark		339 */
 /* #define __NR_prlimit64		340 */
-/* #define __NR_name_to_handle_at	341 */
-/* #define __NR_open_by_handle_at  	342 */
+#define __NR_name_to_handle_at	341
+#define __NR_open_by_handle_at	342
 #define __NR_clock_adjtime	343
 #define __NR_syncfs             344
 #define __NR_sendmmsg		345
 #define __NR_setns		346
 #define __NR_process_vm_readv  347
 #define __NR_process_vm_writev 348
+#define __NR_fairsched_mknod	500	/* FairScheduler syscalls */
+#define __NR_fairsched_rmnod	501
+#define __NR_fairsched_chwt	502
+#define __NR_fairsched_mvpr	503
+#define __NR_fairsched_rate	504
+#define __NR_fairsched_vcpus	505
+#define __NR_fairsched_cpumask	506
+#define __NR_fairsched_nodemask	507
+#define __NR_getluid		510
+#define __NR_setluid		511
+#define __NR_setublimit		512
+#define __NR_ubstat		513
+#define __NR_lchmod		516
+#define __NR_lutime		517
 
 #ifdef __KERNEL__
 
-#define NR_syscalls 349
+#define NR_syscalls 518
 
 #define __ARCH_WANT_IPC_PARSE_VERSION
 #define __ARCH_WANT_OLD_READDIR

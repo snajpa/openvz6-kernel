@@ -37,6 +37,8 @@ int __ptrace_may_access(struct task_struct *task, unsigned int mode)
 	 * or halting the specified task is impossible.
 	 */
 	int dumpable = 0;
+	int vps_dumpable = 0;
+
 	/* Don't let security modules deny introspection */
 	if (same_thread_group(task, current))
 		return 0;
@@ -54,10 +56,17 @@ int __ptrace_may_access(struct task_struct *task, unsigned int mode)
 	}
 	rcu_read_unlock();
 	smp_rmb();
-	if (task->mm)
+	if (task->mm) {
 		dumpable = get_dumpable(task->mm);
+		vps_dumpable = (task->mm->vps_dumpable == VD_PTRACE_COREDUMP);
+	}
+
 	if (dumpable != SUID_DUMP_USER &&
 	   (mode & PTRACE_MODE_SKIP_AUDIT || !capable(CAP_SYS_PTRACE)))
+		return -EPERM;
+	if (!vps_dumpable && !ve_is_super(get_exec_env()))
+		return -EPERM;
+	if (!ve_accessible(VE_TASK_INFO(task)->owner_env, get_exec_env()))
 		return -EPERM;
 
 	if (!(mode & PTRACE_MODE_NOACCESS_CHK))
@@ -179,6 +188,10 @@ int ptrace_writedata(struct task_struct *tsk, char __user *src, unsigned long ds
 static struct task_struct *ptrace_get_task_struct(pid_t pid)
 {
 	struct task_struct *child;
+
+	/* ptracing of init from inside CT is dangerous */
+	if (pid == 1 && !capable(CAP_SYS_ADMIN))
+		return ERR_PTR(-EPERM);
 
 	rcu_read_lock();
 	child = find_task_by_vpid(pid);
@@ -459,7 +472,12 @@ int ptrace_attach(struct task_struct *task)
 
 	task_lock(task);
 	retval = __ptrace_may_access(task, PTRACE_MODE_ATTACH);
+	if (!retval) {
+		if (!task->mm || task->mm->vps_dumpable == VD_LICDATA_ACCESS)
+			retval = -EACCES;
+	}
 	task_unlock(task);
+
 	if (retval)
 		goto unlock_creds;
 

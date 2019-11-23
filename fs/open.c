@@ -512,15 +512,21 @@ out:
 	return err;
 }
 
-SYSCALL_DEFINE3(fchmodat, int, dfd, const char __user *, filename, mode_t, mode)
+static int do_fchmodat(int dfd, const char __user *filename, mode_t mode, int flag)
 {
 	struct path path;
 	struct inode *inode;
 	int error;
 	struct iattr newattrs;
 	unsigned int lookup_flags = LOOKUP_FOLLOW;
+	int follow;
 retry:
-	error = user_path_at(dfd, filename, lookup_flags, &path);
+	error = -EINVAL;
+	if ((flag & ~AT_SYMLINK_NOFOLLOW) != 0)
+		goto out;
+
+	follow = (flag & AT_SYMLINK_NOFOLLOW) ? 0 : lookup_flags;
+	error = user_path_at(dfd, filename, follow, &path);
 	if (error)
 		goto out;
 	inode = path.dentry->d_inode;
@@ -546,9 +552,20 @@ out:
 	return error;
 }
 
+SYSCALL_DEFINE3(fchmodat, int, dfd, const char __user *, filename, mode_t, mode)
+{
+	return do_fchmodat(dfd, filename, mode, 0);
+}
+
 SYSCALL_DEFINE2(chmod, const char __user *, filename, mode_t, mode)
 {
-	return sys_fchmodat(AT_FDCWD, filename, mode);
+	return do_fchmodat(AT_FDCWD, filename, mode, 0);
+}
+EXPORT_SYMBOL_GPL(sys_chmod);
+
+SYSCALL_DEFINE2(lchmod, const char __user *, filename, mode_t, mode)
+{
+	return do_fchmodat(AT_FDCWD, filename, mode, AT_SYMLINK_NOFOLLOW);
 }
 
 static int chown_common(struct dentry * dentry, uid_t user, gid_t group)
@@ -583,10 +600,12 @@ SYSCALL_DEFINE5(fchownat, int, dfd, const char __user *, filename, uid_t, user,
 	int error = -EINVAL;
 	unsigned int lookup_flags;
 
-	if ((flag & ~AT_SYMLINK_NOFOLLOW) != 0)
+	if ((flag & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0)
 		goto out;
 
 	lookup_flags = (flag & AT_SYMLINK_NOFOLLOW) ? 0 : LOOKUP_FOLLOW;
+	if (flag & AT_EMPTY_PATH)
+		lookup_flags |= LOOKUP_EMPTY;
 retry:
 	error = user_path_at(dfd, filename, lookup_flags, &path);
 	if (error)
@@ -610,6 +629,7 @@ SYSCALL_DEFINE3(chown, const char __user *, filename, uid_t, user, gid_t, group)
 {
 	return sys_fchownat(AT_FDCWD, filename, user, group, 0);
 }
+EXPORT_SYMBOL(sys_chown);
 
 SYSCALL_DEFINE3(lchown, const char __user *, filename, uid_t, user, gid_t, group)
 {
@@ -677,6 +697,11 @@ static struct file *__dentry_open(struct dentry *dentry, struct vfsmount *mnt,
 	struct inode *inode;
 	int error;
 
+	if (!may_use_odirect())
+		f->f_flags &= ~O_DIRECT;
+	if (ve_fsync_behavior() == FSYNC_NEVER)
+		f->f_flags &= ~O_SYNC;
+
 	f->f_mode = (__force fmode_t)((f->f_flags+1) & O_ACCMODE) | FMODE_LSEEK |
 				FMODE_PREAD | FMODE_PWRITE;
 	inode = dentry->d_inode;
@@ -697,7 +722,7 @@ static struct file *__dentry_open(struct dentry *dentry, struct vfsmount *mnt,
 	f->f_path.mnt = mnt;
 	f->f_pos = 0;
 	f->f_op = fops_get(inode->i_fop);
-	file_move(f, &inode->i_sb->s_files);
+	file_sb_list_add(f, inode->i_sb);
 
 	error = security_dentry_open(f, cred);
 	if (error)
@@ -743,7 +768,7 @@ cleanup_all:
 			__mnt_drop_write(mnt);
 		}
 	}
-	file_kill(f);
+	file_sb_list_del(f);
 	f->f_path.dentry = NULL;
 	f->f_path.mnt = NULL;
 cleanup_file:
@@ -815,6 +840,7 @@ struct file *nameidata_to_filp(struct nameidata *nd)
 		path_put(&nd->path);
 	return filp;
 }
+EXPORT_SYMBOL_GPL(nameidata_to_filp);
 
 /*
  * dentry_open() will have done dput(dentry) and mntput(mnt) if it returns an
@@ -932,6 +958,7 @@ SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, int, mode)
 	asmlinkage_protect(3, ret, filename, flags, mode);
 	return ret;
 }
+EXPORT_SYMBOL(sys_open);
 
 SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
 		int, mode)
@@ -1065,3 +1092,181 @@ int nonseekable_open(struct inode *inode, struct file *filp)
 }
 
 EXPORT_SYMBOL(nonseekable_open);
+
+/*
+ * require inode->i_mutex or unreachable inode
+ */
+int open_inode_peer(struct inode *inode, struct path *path,
+		    const struct cred *cred)
+{
+	struct inode *peer = path->dentry->d_inode;
+	struct address_space *mapping;
+	struct file *file;
+	struct user_beancounter *cur_ub;
+	const struct cred *cur_cred;
+	int err;
+
+	/*
+	 * We cannot open peers in the middle of transaction,
+	 * this shouldn't happens at all.
+	 */
+	err = -EDEADLK;
+	if (WARN_ON_ONCE(current->journal_info))
+		goto out_err;
+
+	err = -EBUSY;
+	if (inode->i_peer_file)
+		goto out_err;
+
+	err = -EINVAL;
+	if (!S_ISREG(inode->i_mode) || !S_ISREG(peer->i_mode) ||
+	    peer == inode || i_size_read(peer) != i_size_read(inode))
+		goto out_err;
+
+restart:
+	rcu_read_lock();
+	file = rcu_dereference(peer->i_peer_file);
+	if (file && file->f_mapping != peer->i_mapping) {
+		rcu_read_unlock();
+		err = -EMLINK;
+		goto out_err;
+	}
+	if (file && atomic_long_inc_not_zero(&file->f_count)) {
+		rcu_read_unlock();
+		path_put(path);
+		goto install;
+	}
+	rcu_read_unlock();
+
+	cur_ub = set_exec_ub(&ub0);
+	cur_cred = override_creds(cred);
+	file = dentry_open(path->dentry, path->mnt,
+			   O_RDONLY|O_LARGEFILE, cred);
+	revert_creds(cur_cred);
+	set_exec_ub(cur_ub);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	spin_lock(&peer->i_lock);
+	if (atomic_read(&peer->i_writecount) > 0) {
+		spin_unlock(&peer->i_lock);
+		fput(file);
+		return -ETXTBSY;
+	}
+	if (peer->i_size != inode->i_size) {
+		spin_unlock(&peer->i_lock);
+		fput(file);
+		return -EINVAL;
+	}
+	if (peer->i_peer_file && file_count(peer->i_peer_file)) {
+		spin_unlock(&peer->i_lock);
+		*path = file->f_path;
+		path_get(path);
+		fput(file);
+		goto restart;
+	}
+	atomic_dec(&peer->i_writecount);
+	rcu_assign_pointer(peer->i_peer_file, file);
+	spin_unlock(&peer->i_lock);
+
+install:
+	spin_lock(&inode->i_lock);
+	if (inode->i_peer_file)
+		goto undo;
+	rcu_assign_pointer(inode->i_peer_file, file);
+	spin_unlock(&inode->i_lock);
+
+	mapping = file->f_mapping;
+	spin_lock(&mapping->i_mmap_lock);
+	list_add(&inode->i_mapping->i_peer_list, &mapping->i_peer_list);
+	spin_unlock(&mapping->i_mmap_lock);
+
+	/* update peer atime */
+	file_accessed(file);
+
+	/* prune unused pages */
+	invalidate_mapping_pages(inode->i_mapping, 0, -1);
+
+	return 0;
+
+undo:
+	spin_unlock(&inode->i_lock);
+	peer_fput(file);
+
+	return -EBUSY;
+
+out_err:
+	path_put(path);
+	return err;
+}
+EXPORT_SYMBOL(open_inode_peer);
+
+static void __peer_fput(struct work_struct *work)
+{
+	struct file *file = container_of(work, struct file, f_work);
+
+	/* update peer atime */
+	file_accessed(file);
+
+	__fput(file);
+}
+
+void peer_fput(struct file *file)
+{
+	if (atomic_long_dec_and_test(&file->f_count)) {
+		struct inode *peer = file->f_mapping->host;
+
+		spin_lock(&peer->i_lock);
+		if (peer->i_peer_file == file)
+			rcu_assign_pointer(peer->i_peer_file, NULL);
+		atomic_inc(&peer->i_writecount);
+		spin_unlock(&peer->i_lock);
+
+		/*
+		 * We cannot fput file if we are in the middle of
+		 * fs-transaction, so schedule this fput to keventd.
+		 */
+		if (current->journal_info) {
+			INIT_WORK(&file->f_work, __peer_fput);
+			schedule_work(&file->f_work);
+		} else
+			__peer_fput(&file->f_work);
+	}
+}
+
+/*
+ * require inode->i_mutex or unreachable inode
+ */
+void close_inode_peer(struct inode *inode)
+{
+	struct address_space *mapping = inode->i_mapping;
+	struct file *file = inode->i_peer_file;
+
+	if (!file)
+		return;
+
+	spin_lock(&inode->i_lock);
+	BUG_ON(inode->i_peer_file != file);
+	BUG_ON(file->f_mapping == mapping);
+	rcu_assign_pointer(inode->i_peer_file, NULL);
+	spin_unlock(&inode->i_lock);
+
+	if (mapping_mapped(mapping)) {
+		struct zap_details details = {
+			.check_mapping = file->f_mapping,
+			.first_index = 0,
+			.last_index = ULONG_MAX,
+		};
+
+		synchronize_mapping_faults(mapping);
+		zap_mapping_range(mapping, &details);
+	}
+
+	mapping = file->f_mapping;
+	spin_lock(&mapping->i_mmap_lock);
+	list_del_init(&inode->i_mapping->i_peer_list);
+	spin_unlock(&mapping->i_mmap_lock);
+
+	peer_fput(file);
+}
+EXPORT_SYMBOL(close_inode_peer);

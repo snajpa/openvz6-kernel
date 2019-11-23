@@ -14,6 +14,40 @@
 #include <linux/ipv6.h>
 #include <linux/netfilter/x_tables.h>
 #include <linux/netfilter/xt_iprange.h>
+#include <linux/netfilter_ipv4/ipt_iprange.h>
+
+static bool
+iprange_mt_v0(const struct sk_buff *skb, const struct xt_match_param *par)
+{
+	const struct ipt_iprange_info *info = par->matchinfo;
+	const struct iphdr *iph = ip_hdr(skb);
+
+	if (info->flags & IPRANGE_SRC) {
+		if ((ntohl(iph->saddr) < ntohl(info->src.min_ip)
+			  || ntohl(iph->saddr) > ntohl(info->src.max_ip))
+			 ^ !!(info->flags & IPRANGE_SRC_INV)) {
+			pr_debug("src IP %pI4 NOT in range %s%pI4-%pI4\n",
+				 &iph->saddr,
+				 info->flags & IPRANGE_SRC_INV ? "(INV) " : "",
+				 &info->src.min_ip,
+				 &info->src.max_ip);
+			return false;
+		}
+	}
+	if (info->flags & IPRANGE_DST) {
+		if ((ntohl(iph->daddr) < ntohl(info->dst.min_ip)
+			  || ntohl(iph->daddr) > ntohl(info->dst.max_ip))
+			 ^ !!(info->flags & IPRANGE_DST_INV)) {
+			pr_debug("dst IP %pI4 NOT in range %s%pI4-%pI4\n",
+				 &iph->daddr,
+				 info->flags & IPRANGE_DST_INV ? "(INV) " : "",
+				 &info->dst.min_ip,
+				 &info->dst.max_ip);
+			return false;
+		}
+	}
+	return true;
+}
 
 static bool
 iprange_mt4(const struct sk_buff *skb, const struct xt_match_param *par)
@@ -91,6 +125,14 @@ iprange_mt6(const struct sk_buff *skb, const struct xt_match_param *par)
 }
 
 static struct xt_match iprange_mt_reg[] __read_mostly = {
+	{
+		.name      = "iprange",
+		.revision  = 0,
+		.family    = NFPROTO_IPV4,
+		.match     = iprange_mt_v0,
+		.matchsize = sizeof(struct ipt_iprange_info),
+		.me        = THIS_MODULE,
+	},
 	{
 		.name      = "iprange",
 		.revision  = 1,

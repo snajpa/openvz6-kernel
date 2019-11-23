@@ -219,14 +219,16 @@ static inline void mem_cgroup_uncharge_cache_page(struct page *page)
 static inline struct lruvec *mem_cgroup_zone_lruvec(struct zone *zone,
 						    struct mem_cgroup *memcg)
 {
-	return &zone->lruvec;
+	return NULL;
+//	return &zone->lruvec;
 }
 
 static inline struct lruvec *mem_cgroup_lru_add_list(struct zone *zone,
 						     struct page *page,
 						     enum lru_list lru)
 {
-	return &zone->lruvec;
+	return NULL;
+//	return &zone->lruvec;
 }
 
 static inline void mem_cgroup_lru_del_list(struct page *page, enum lru_list lru)
@@ -242,7 +244,8 @@ static inline struct lruvec *mem_cgroup_lru_move_lists(struct zone *zone,
 						       enum lru_list from,
 						       enum lru_list to)
 {
-	return &zone->lruvec;
+	return NULL;
+	//return &zone->lruvec;
 }
 
 static inline struct mem_cgroup *try_get_mem_cgroup_from_page(struct page *page)
@@ -378,6 +381,7 @@ unsigned long mem_cgroup_soft_limit_reclaim(struct zone *zone, int order,
 	return 0;
 }
 
+static inline
 void mem_cgroup_split_hugepage_commit(struct page *page, struct page *head)
 {
 }

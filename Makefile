@@ -2,6 +2,7 @@ VERSION = 2
 PATCHLEVEL = 6
 SUBLEVEL = 32
 EXTRAVERSION =
+VZVERSION = 042stab141_3
 NAME = Man-Eating Seals of Antiquity
 RHEL_MAJOR = 6
 RHEL_MINOR = 10
@@ -375,8 +376,8 @@ CPP_VERS        := $(shell expr $(CPP_MAJOR) \* 1000000 + $(CPP_MINOR) \* 1000 \
 ifeq ($(KBUILD_EXTMOD),)
 KBUILD_CFLAGS   += $(shell if [ $(CPP_VERS) -ge 4004004 ]; then \
 		   echo "-Wno-array-bounds"; else echo ""; fi)
-KBUILD_CFLAGS   += $(shell if [ $(CPP_MAJOR) -eq 4 -a $(CPP_MINOR) -eq 4  ] ; then \
-		   echo "-Werror"; else echo ""; fi)
+#KBUILD_CFLAGS   += $(shell if [ $(CPP_MAJOR) -eq 4 -a $(CPP_MINOR) -eq 4  ] ; then \
+#		   echo "-Werror"; else echo ""; fi)
 endif ##($(KBUILD_EXTMOD),)
 endif #(,$(filter $(ARCH), i386 x86_64))
 
@@ -386,7 +387,7 @@ KBUILD_AFLAGS   := -D__ASSEMBLY__
 KERNELRELEASE = $(shell cat include/config/kernel.release 2> /dev/null)
 KERNELVERSION = $(VERSION).$(PATCHLEVEL).$(SUBLEVEL)$(EXTRAVERSION)
 
-export VERSION PATCHLEVEL SUBLEVEL KERNELRELEASE KERNELVERSION
+export VERSION PATCHLEVEL SUBLEVEL KERNELRELEASE KERNELVERSION VZVERSION
 export ARCH SRCARCH CONFIG_SHELL HOSTCC HOSTCFLAGS CROSS_COMPILE AS LD CC
 export CPP AR NM STRIP OBJCOPY OBJDUMP
 export MAKE AWK GENKSYMS INSTALLKERNEL PERL UTS_MACHINE
@@ -1081,7 +1082,8 @@ define filechk_utsrelease.h
 	  echo '"$(KERNELRELEASE)" exceeds $(uts_len) characters' >&2;    \
 	  exit 1;                                                         \
 	fi;                                                               \
-	(echo \#define UTS_RELEASE \"$(KERNELRELEASE)\";)
+	(echo \#define UTS_RELEASE \"$(KERNELRELEASE)\"; 		  \
+		echo \#define VZVERSION \"$(VZVERSION)\";)
 endef
 
 define filechk_version.h

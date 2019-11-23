@@ -30,6 +30,8 @@
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
 
+#include <bc/vmpages.h>
+
 #ifndef arch_remove_exec_range
 #define arch_remove_exec_range(mm, limit)      do { ; } while (0)
 #endif
@@ -218,6 +220,12 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 			return error;
 	}
 
+	error = -ENOMEM;
+       if (!VM_UB_PRIVATE(oldflags, vma->vm_file) &&
+            VM_UB_PRIVATE(newflags, vma->vm_file) &&
+            charge_beancounter_fast(mm_ub_top(mm), UB_PRIVVMPAGES, nrpages, UB_SOFT))
+		goto fail_ch;
+
 	/*
 	 * If we make a private mapping writable we increase our commit;
 	 * but (without finer accounting) cannot reduce our commit if we
@@ -229,7 +237,7 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 						VM_SHARED|VM_NORESERVE))) {
 			charged = nrpages;
 			if (security_vm_enough_memory(charged))
-				return -ENOMEM;
+				goto fail_sec;
 			newflags |= VM_ACCOUNT;
 		}
 	}
@@ -270,7 +278,9 @@ success:
 
 	if (vma_wants_writenotify(vma)) {
 		vma->vm_page_prot = vm_get_page_prot(newflags & ~VM_SHARED);
-		dirty_accountable = 1;
+		if (!vma->vm_file ||
+		    !test_bit(AS_CHECKPOINT, &vma->vm_file->f_mapping->flags))
+			dirty_accountable = 1;
 	}
 
 	if (oldflags & VM_EXEC)
@@ -284,11 +294,21 @@ success:
 	mmu_notifier_invalidate_range_end(mm, start, end);
 	vm_stat_account(mm, oldflags, vma->vm_file, -nrpages);
 	vm_stat_account(mm, newflags, vma->vm_file, nrpages);
+
+       if (VM_UB_PRIVATE(oldflags, vma->vm_file) &&
+                       !VM_UB_PRIVATE(newflags, vma->vm_file))
+               uncharge_beancounter_fast(mm_ub_top(mm), UB_PRIVVMPAGES, nrpages);
+
 	perf_event_mmap(vma);
 	return 0;
 
 fail:
 	vm_unacct_memory(charged);
+fail_sec:
+       if (!VM_UB_PRIVATE(oldflags, vma->vm_file) &&
+                       VM_UB_PRIVATE(newflags, vma->vm_file))
+               uncharge_beancounter_fast(mm_ub_top(mm), UB_PRIVVMPAGES, nrpages);
+fail_ch:
 	return error;
 }
 
@@ -390,3 +410,4 @@ out:
 	up_write(&current->mm->mmap_sem);
 	return error;
 }
+EXPORT_SYMBOL(sys_mprotect);

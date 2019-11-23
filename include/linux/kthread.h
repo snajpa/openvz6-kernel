@@ -10,11 +10,19 @@ struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),
 					   const char namefmt[], ...)
 	__attribute__((format(printf, 4, 5)));
 
-struct task_struct *kthread_create(int (*threadfn)(void *data),
+struct task_struct *kthread_create_ve(struct ve_struct *ve,
+				   int (*threadfn)(void *data),
 				   void *data,
 				   const char namefmt[], ...)
-	__attribute__((format(printf, 3, 4)));
+	__attribute__((format(printf, 4, 5)));
 
+#define kthread_create(threadfn, data, namefmt, ...)			\
+({									\
+	struct task_struct *__k						\
+		= kthread_create_ve(get_ve0(), threadfn, data, namefmt,	\
+				 ## __VA_ARGS__);			\
+	__k;								\
+})
 
 /**
  * kthread_run - create and wake a thread.
@@ -34,12 +42,29 @@ struct task_struct *kthread_create(int (*threadfn)(void *data),
 	__k;								   \
 })
 
+/* Like kthread_run() but run a thread in VE context */
+#define kthread_run_ve(ve, threadfn, data, namefmt, ...)		   \
+({									   \
+	struct task_struct *__k						   \
+		= kthread_create_ve(ve, threadfn, data, namefmt,	   \
+				    ## __VA_ARGS__);			   \
+	if (!IS_ERR(__k))						   \
+		wake_up_process(__k);					   \
+	__k;								   \
+})
+
 void kthread_bind(struct task_struct *k, unsigned int cpu);
 int kthread_stop(struct task_struct *k);
 int kthread_should_stop(void);
+int kthreadd_create(void);
+void kthreadd_stop(struct ve_struct *ve);
 
 int kthreadd(void *unused);
+#ifdef CONFIG_VE
+#define kthreadd_task get_exec_env()->_kthreadd_task
+#else
 extern struct task_struct *kthreadd_task;
+#endif
 extern int tsk_fork_get_node(struct task_struct *tsk);
 
 /*

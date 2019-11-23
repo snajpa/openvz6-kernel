@@ -268,6 +268,13 @@ static inline void ext4_update_inode_fsync_trans(handle_t *handle,
 		ei->i_sync_tid = handle->h_transaction->t_tid;
 		if (datasync)
 			ei->i_datasync_tid = handle->h_transaction->t_tid;
+	} else {
+		struct request_queue *q = bdev_get_queue(inode->i_sb->s_bdev);
+		if (q)
+			atomic_set(&EXT4_I(inode)->i_flush_tag,
+				   atomic_read(&q->flush_tag));
+		else
+			atomic_set(&EXT4_I(inode)->i_flush_tag, UINT_MAX);
 	}
 }
 

@@ -136,7 +136,7 @@ static int ipoib_new_child_link(struct net_device *dev,
 	return err;
 }
 
-static void ipoib_unregister_child_dev(struct net_device *dev)
+static void ipoib_unregister_child_dev(struct net_device *dev, struct list_head *head)
 {
 	struct ipoib_dev_priv *priv, *ppriv;
 
@@ -144,7 +144,7 @@ static void ipoib_unregister_child_dev(struct net_device *dev)
 	ppriv = netdev_priv(priv->parent);
 
 	down_write(&ppriv->vlan_rwsem);
-	unregister_netdevice_queue(dev, NULL);
+	unregister_netdevice_queue(dev, head);
 	list_del(&priv->list);
 	up_write(&ppriv->vlan_rwsem);
 }

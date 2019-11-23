@@ -26,6 +26,14 @@ static void *get_uts(ctl_table *table, int write)
 		down_read(&uts_sem);
 	else
 		down_write(&uts_sem);
+
+	if (table->data == &virt_utsname.release) {
+		if (uts_ns == &init_uts_ns)
+			return virt_utsname.release;
+		else
+			return uts_ns->name.release;
+	}
+
 	return which;
 }
 
@@ -126,19 +134,27 @@ static struct ctl_table uts_kern_table[] = {
 	{}
 };
 
-static struct ctl_table uts_root_table[] = {
+static struct ctl_table uts_virt_osrelease_table[] = {
 	{
-		.ctl_name	= CTL_KERN,
-		.procname	= "kernel",
-		.mode		= 0555,
-		.child		= uts_kern_table,
+		.procname	= "virt_osrelease",
+		.data		= virt_utsname.release,
+		.maxlen		= sizeof(virt_utsname.release),
+		.mode		= 0644,
+		.proc_handler	= &proc_do_uts_string,
+		.strategy	= sysctl_uts_string,
 	},
 	{}
 };
 
+static struct ctl_path uts_path[] = {
+	{ .ctl_name = CTL_KERN, .procname = "kernel", },
+	{ }
+};
+
 static int __init utsname_sysctl_init(void)
 {
-	register_sysctl_table(uts_root_table);
+	register_sysctl_glob_paths(uts_path, uts_kern_table, 1);
+	register_sysctl_paths(uts_path, uts_virt_osrelease_table);
 	return 0;
 }
 

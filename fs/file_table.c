@@ -20,10 +20,18 @@
 #include <linux/cdev.h>
 #include <linux/fsnotify.h>
 #include <linux/sysctl.h>
+#include <linux/lglock.h>
 #include <linux/percpu_counter.h>
+#include <linux/percpu.h>
 #include <linux/ima.h>
+#include <linux/ve.h>
+#include <linux/nsproxy.h>
 
 #include <asm/atomic.h>
+
+#include <bc/beancounter.h>
+#include <bc/kmem.h>
+#include <bc/misc.h>
 
 #include "internal.h"
 
@@ -32,11 +40,11 @@ struct files_stat_struct files_stat = {
 	.max_files = NR_FILE
 };
 
-/* public. Not pretty! */
-__cacheline_aligned_in_smp DEFINE_SPINLOCK(files_lock);
+DECLARE_LGLOCK(files_lglock);
+DEFINE_LGLOCK(files_lglock);
 
 /* SLAB cache for file structures */
-static struct kmem_cache *filp_cachep __read_mostly;
+struct kmem_cache *filp_cachep __read_mostly;
 
 static struct percpu_counter nr_files __cacheline_aligned_in_smp;
 
@@ -50,8 +58,10 @@ static inline void file_free_rcu(struct rcu_head *head)
 
 static inline void file_free(struct file *f)
 {
-	percpu_counter_dec(&nr_files);
 	file_check_state(f);
+	if (f->f_ub == get_ub0())
+		percpu_counter_dec(&nr_files);
+	ub_file_uncharge(f);
 	call_rcu(&f->f_u.fu_rcuhead, file_free_rcu);
 }
 
@@ -105,11 +115,14 @@ struct file *get_empty_filp(void)
 	const struct cred *cred = current_cred();
 	static long old_max;
 	struct file * f;
+	int acct;
 
+	acct = (get_exec_ub_top() == get_ub0());
 	/*
 	 * Privileged users can go above max_files
 	 */
-	if (get_nr_files() >= files_stat.max_files && !capable(CAP_SYS_ADMIN)) {
+	if (acct && get_nr_files() >= files_stat.max_files &&
+			!capable(CAP_SYS_ADMIN)) {
 		/*
 		 * percpu_counters are inaccurate.  Do an expensive check before
 		 * we go and fail.
@@ -122,7 +135,11 @@ struct file *get_empty_filp(void)
 	if (f == NULL)
 		goto fail;
 
-	percpu_counter_inc(&nr_files);
+	if (ub_file_charge(f))
+		goto fail_ch;
+	if (acct)
+		percpu_counter_inc(&nr_files);
+
 	if (security_file_alloc(f))
 		goto fail_sec;
 
@@ -148,7 +165,12 @@ fail_sec:
 	file_free(f);
 fail:
 	return NULL;
+
+fail_ch:
+	kmem_cache_free(filp_cachep, f);
+	return NULL;
 }
+EXPORT_SYMBOL_GPL(get_empty_filp);
 
 /**
  * alloc_file - allocate and initialize a 'struct file'
@@ -258,7 +280,7 @@ void __fput(struct file *file)
 		cdev_put(inode->i_cdev);
 	fops_put(file->f_op);
 	put_pid(file->f_owner.pid);
-	file_kill(file);
+	file_sb_list_del(file);
 	if (file->f_mode & FMODE_WRITE)
 		drop_file_write_access(file);
 	file->f_path.dentry = NULL;
@@ -304,7 +326,10 @@ struct file *fget_light(unsigned int fd, int *fput_needed)
 	*fput_needed = 0;
 	if (likely((atomic_read(&files->count) == 1))) {
 		file = fcheck_files(files, fd);
+		if (unlikely(file && file->f_heavy))
+			goto slow;
 	} else {
+slow:
 		rcu_read_lock();
 		file = fcheck_files(files, fd);
 		if (file) {
@@ -348,36 +373,103 @@ void put_filp(struct file *file)
 {
 	if (atomic_long_dec_and_test(&file->f_count)) {
 		security_file_free(file);
-		file_kill(file);
+		file_sb_list_del(file);
 		file_free(file);
 	}
 }
 
-void file_move(struct file *file, struct list_head *list)
+static inline int file_list_cpu(struct file *file)
 {
-	if (!list)
-		return;
-	file_list_lock();
-	list_move(&file->f_u.fu_list, list);
-	file_list_unlock();
+#ifdef CONFIG_SMP
+	return file->f_sb_list_cpu;
+#else
+	return smp_processor_id();
+#endif
 }
 
-void file_kill(struct file *file)
+/* helper for file_sb_list_add to reduce ifdefs */
+static inline void __file_sb_list_add(struct file *file, struct super_block *sb)
+{
+	struct list_head *list;
+#ifdef CONFIG_SMP
+	int cpu;
+	cpu = smp_processor_id();
+	file->f_sb_list_cpu = cpu;
+	list = per_cpu_ptr(sb->s_files, cpu);
+#else
+	list = &sb->s_files;
+#endif
+	list_add(&file->f_u.fu_list, list);
+}
+
+/**
+ * file_sb_list_add - add a file to the sb's file list
+ * @file: file to add
+ * @sb: sb to add it to
+ *
+ * Use this function to associate a file with the superblock of the inode it
+ * refers to.
+ */
+void file_sb_list_add(struct file *file, struct super_block *sb)
+{
+	lg_local_lock(files_lglock);
+	__file_sb_list_add(file, sb);
+	lg_local_unlock(files_lglock);
+}
+
+/**
+ * file_sb_list_del - remove a file from the sb's file list
+ * @file: file to remove
+ * @sb: sb to remove it from
+ *
+ * Use this function to remove a file from its superblock.
+ */
+void file_sb_list_del(struct file *file)
 {
 	if (!list_empty(&file->f_u.fu_list)) {
-		file_list_lock();
+		lg_local_lock_cpu(files_lglock, file_list_cpu(file));
 		list_del_init(&file->f_u.fu_list);
-		file_list_unlock();
+		lg_local_unlock_cpu(files_lglock, file_list_cpu(file));
 	}
 }
+
+#ifdef CONFIG_SMP
+
+/*
+ * These macros iterate all files on all CPUs for a given superblock.
+ * files_lglock must be held globally.
+ */
+#define do_file_list_for_each_entry(__sb, __file)		\
+{								\
+	int i;							\
+	for_each_possible_cpu(i) {				\
+		struct list_head *list;				\
+		list = per_cpu_ptr((__sb)->s_files, i);		\
+		list_for_each_entry((__file), list, f_u.fu_list)
+
+#define while_file_list_for_each_entry				\
+	}							\
+}
+
+#else
+
+#define do_file_list_for_each_entry(__sb, __file)		\
+{								\
+	struct list_head *list;					\
+	list = &(sb)->s_files;					\
+	list_for_each_entry((__file), list, f_u.fu_list)
+
+#define while_file_list_for_each_entry				\
+}
+
+#endif
 
 int fs_may_remount_ro(struct super_block *sb)
 {
 	struct file *file;
-
 	/* Check that no files are currently opened for writing. */
-	file_list_lock();
-	list_for_each_entry(file, &sb->s_files, f_u.fu_list) {
+	lg_global_lock(files_lglock);
+	do_file_list_for_each_entry(sb, file) {
 		struct inode *inode = file->f_path.dentry->d_inode;
 
 		/* File with pending delete? */
@@ -387,11 +479,11 @@ int fs_may_remount_ro(struct super_block *sb)
 		/* Writeable file? */
 		if (S_ISREG(inode->i_mode) && (file->f_mode & FMODE_WRITE))
 			goto too_bad;
-	}
-	file_list_unlock();
+	} while_file_list_for_each_entry;
+	lg_global_unlock(files_lglock);
 	return 1; /* Tis' cool bro. */
 too_bad:
-	file_list_unlock();
+	lg_global_unlock(files_lglock);
 	return 0;
 }
 
@@ -407,8 +499,8 @@ void mark_files_ro(struct super_block *sb)
 	struct file *f;
 
 retry:
-	file_list_lock();
-	list_for_each_entry(f, &sb->s_files, f_u.fu_list) {
+	lg_global_lock(files_lglock);
+	do_file_list_for_each_entry(sb, f) {
 		struct vfsmount *mnt;
 		if (!S_ISREG(f->f_path.dentry->d_inode->i_mode))
 		       continue;
@@ -423,17 +515,56 @@ retry:
 			continue;
 		file_release_write(f);
 		mnt = mntget(f->f_path.mnt);
-		file_list_unlock();
-		/*
-		 * This can sleep, so we can't hold
-		 * the file_list_lock() spinlock.
-		 */
+		/* This can sleep, so we can't hold the spinlock. */
+		lg_global_unlock(files_lglock);
 		mnt_drop_write(mnt);
 		mntput(mnt);
 		goto retry;
-	}
-	file_list_unlock();
+	} while_file_list_for_each_entry;
+	lg_global_unlock(files_lglock);
 }
+
+struct file *get_task_file(pid_t pid, int fd)
+{
+	int err;
+	struct task_struct *tsk;
+	struct files_struct *fs;
+	struct file *file = NULL;
+
+	err = -ESRCH;
+	read_lock(&tasklist_lock);
+	tsk = find_task_by_pid_ns(pid, get_exec_env()->ve_ns->pid_ns);
+	if (tsk == NULL) {
+		read_unlock(&tasklist_lock);
+		goto out;
+	}
+
+	get_task_struct(tsk);
+	read_unlock(&tasklist_lock);
+
+	err = -EINVAL;
+	fs = get_files_struct(tsk);
+	if (fs == NULL)
+		goto out_put;
+
+	rcu_read_lock();
+	err = -EBADF;
+	file = fcheck_files(fs, fd);
+	if (file == NULL)
+		goto out_unlock;
+
+	err = 0;
+	get_file(file);
+
+out_unlock:
+	rcu_read_unlock();
+	put_files_struct(fs);
+out_put:
+	put_task_struct(tsk);
+out:
+	return err ? ERR_PTR(err) : file;
+}
+EXPORT_SYMBOL(get_task_file);
 
 void __init files_init(unsigned long mempages)
 { 
@@ -450,5 +581,6 @@ void __init files_init(unsigned long mempages)
 	n = (mempages * (PAGE_SIZE / 1024)) / 10;
 	files_stat.max_files = max_t(unsigned long, n, NR_FILE);
 	files_defer_init();
+	lg_lock_init(files_lglock);
 	percpu_counter_init(&nr_files, 0);
 } 

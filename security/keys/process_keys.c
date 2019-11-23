@@ -132,6 +132,9 @@ int install_thread_keyring_to_cred(struct cred *new)
 {
 	struct key *keyring;
 
+	if (new->thread_keyring)
+		return 0;
+
 	keyring = keyring_alloc("_tid", new->uid, new->gid, new,
 				KEY_POS_ALL | KEY_USR_VIEW,
 				KEY_ALLOC_QUOTA_OVERRUN, NULL);
@@ -226,8 +229,7 @@ static int install_process_keyring(void)
 /*
  * Install a session keyring directly to a credentials struct.
  */
-static int install_session_keyring_to_cred(struct cred *cred,
-					   struct key *keyring)
+int install_session_keyring_to_cred(struct cred *cred, struct key *keyring)
 {
 	unsigned long flags;
 	struct key *old;

@@ -21,6 +21,18 @@
 #include <asm/bootinfo.h>
 #endif
 
+#ifdef CONFIG_LOGO_PSBM_CLUT224
+
+static int logo_psbm = 0;
+static int __init psbm(char *arg)
+{
+	logo_psbm = 1;
+	return 0;
+}
+__setup("psbm", psbm);
+
+#endif
+
 static int nologo;
 module_param(nologo, bool, 0);
 MODULE_PARM_DESC(nologo, "Disables startup logo");
@@ -99,6 +111,11 @@ const struct linux_logo * __init_refok fb_find_logo(int depth)
 #ifdef CONFIG_LOGO_M32R_CLUT224
 		/* M32R Linux logo */
 		logo = &logo_m32r_clut224;
+#endif
+#ifdef CONFIG_LOGO_PSBM_CLUT224
+		/* PSBM logo */
+		if (logo_psbm)
+			logo = &logo_psbm_clut224;
 #endif
 	}
 	return logo;

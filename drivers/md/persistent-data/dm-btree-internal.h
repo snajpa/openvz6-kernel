@@ -63,15 +63,28 @@ void unlock_block(struct dm_btree_info *info, struct dm_block *b);
 struct ro_spine {
 	struct dm_btree_info *info;
 
+	int length;
 	int count;
 	struct dm_block *nodes[2];
 };
 
+#define RO_SPINE_LONG_LEN 16
+struct ro_spine_long {
+	struct ro_spine ro_spine;
+	struct dm_block *nodes[RO_SPINE_LONG_LEN - 2];
+	int idxs[RO_SPINE_LONG_LEN];
+};
+
 void init_ro_spine(struct ro_spine *s, struct dm_btree_info *info);
+void init_ro_spine_long(struct ro_spine_long *s, struct dm_btree_info *info);
 int exit_ro_spine(struct ro_spine *s);
+int exit_ro_spine_long(struct ro_spine_long *s);
 int ro_step(struct ro_spine *s, dm_block_t new_child);
+int ro_step_long(struct ro_spine_long *s, dm_block_t new_child, int idx);
 void ro_pop(struct ro_spine *s);
+int ro_pop_long(struct ro_spine_long *s, int *idx);
 struct btree_node *ro_node(struct ro_spine *s);
+struct btree_node *ro_node_long(struct ro_spine_long *s);
 
 struct shadow_spine {
 	struct dm_btree_info *info;

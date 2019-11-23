@@ -270,6 +270,7 @@ enum fuse_notify_code {
 	FUSE_NOTIFY_POLL   = 1,
 	FUSE_NOTIFY_INVAL_INODE = 2,
 	FUSE_NOTIFY_INVAL_ENTRY = 3,
+	FUSE_NOTIFY_INVAL_FILES = 4,
 	FUSE_NOTIFY_CODE_MAX,
 };
 
@@ -594,6 +595,10 @@ struct fuse_notify_inval_entry_out {
 	__u64	parent;
 	__u32	namelen;
 	__u32	padding;
+};
+
+struct fuse_notify_inval_files_out {
+	__u64	ino;
 };
 
 #endif /* _LINUX_FUSE_H */

@@ -29,6 +29,12 @@
 #define FOR_ALL_ZONES(xx) DMA_ZONE(xx) DMA32_ZONE(xx) xx##_NORMAL HIGHMEM_ZONE(xx) , xx##_MOVABLE
 
 enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+#ifdef CONFIG_MEMORY_VSWAP
+		VSWPIN, VSWPOUT,
+#else
+# define	VSWPIN -1
+# define	VSWPOUT -1
+#endif
 		FOR_ALL_ZONES(PGALLOC),
 		PGFREE, PGACTIVATE, PGDEACTIVATE,
 		PGFAULT, PGMAJFAULT,
@@ -118,6 +124,7 @@ static inline void vm_events_fold_cpu(int cpu)
 }
 #endif
 
+extern unsigned long vm_events(enum vm_event_item i);
 #else
 
 /* Disable counters */
@@ -140,6 +147,7 @@ static inline void vm_events_fold_cpu(int cpu)
 {
 }
 
+static inline unsigned long vm_events(enum vm_event_item i) { return 0; }
 #endif /* CONFIG_VM_EVENT_COUNTERS */
 
 #define __count_zone_vm_events(item, zone, delta) \

@@ -17,6 +17,9 @@
 #include <net/busy_poll.h>
 #include <net/pkt_sched.h>
 
+int sysctl_ve_netns_nr = 1024;
+EXPORT_SYMBOL(sysctl_ve_netns_nr);
+
 static int rps_sock_flow_sysctl(ctl_table *table, int write,
 				void __user *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -234,6 +237,13 @@ static struct ctl_table net_core_table[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec
+	},
+	{
+		.procname	= "ve-netns-nr",
+		.data		= &sysctl_ve_netns_nr,
+		.maxlen		= sizeof(sysctl_ve_netns_nr),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
 	},
 	{ .ctl_name = 0 }
 };

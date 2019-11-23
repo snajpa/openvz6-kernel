@@ -323,3 +323,26 @@ config TRANSPARENT_HUGEPAGE
 	  up the pagetable walking.
 
 	  If memory constrained on embedded, you may want to say N.
+
+config MEMORY_GANGS
+	bool
+
+config MEMORY_GANGS_MIGRATION
+	bool
+	depends on MEMORY_GANGS && MIGRATION
+	default MEMORY_GANGS
+
+config MEMORY_VSWAP
+	bool
+
+config PRAM
+	bool "Persistent over-kexec memory storage"
+	depends on X86_64
+	select CRYPTO_CRC32C
+	select CRYPTO_CRC32C_INTEL
+	select CRC32
+	select LIBCRC32C
+
+config PSWAP
+	bool "Persistent swap"
+	depends on SWAP && PRAM

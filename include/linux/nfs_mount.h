@@ -12,6 +12,7 @@
 #include <linux/nfs.h>
 #include <linux/nfs2.h>
 #include <linux/nfs3.h>
+#include <linux/nfs4.h>
 
 /*
  * WARNING!  Do not delete or change the order of these fields.  If
@@ -45,6 +46,42 @@ struct nfs_mount_data {
 	char		context[NFS_MAX_CONTEXT_LEN + 1];	/* 6 */
 };
 
+struct nfs_mount_data_dump {
+	int			version;
+	int			flags;
+	int			rsize, wsize;
+	int			timeo, retrans;
+	int			acregmin, acregmax,
+				acdirmin, acdirmax;
+	int			namlen;
+	unsigned int		options;
+	unsigned int		bsize;
+	unsigned int		auth_flavors;
+	char			client_address[48];
+	unsigned int		minorversion;
+	char			fscache_uniq[256];
+
+	struct {
+		struct sockaddr_storage	address;
+		size_t			addrlen;
+		char			hostname[NFS4_MAXNAMLEN];
+		u32			version;
+		int			port;
+		unsigned short		protocol;
+	} mount_server;
+
+	struct {
+		struct sockaddr_storage	address;
+		size_t			addrlen;
+		char			hostname[NFS4_MAXNAMLEN];
+		char			export_path[NFS4_MAXPATHLEN];
+		int			port;
+		unsigned short		protocol;
+	} nfs_server;
+
+	struct nfs3_fh		root;
+};
+
 /* bits in the flags field visible to user space */
 
 #define NFS_MOUNT_SOFT		0x0001	/* 1 */
@@ -65,6 +102,8 @@ struct nfs_mount_data {
 #define NFS_MOUNT_UNSHARED	0x8000	/* 5 */
 #define NFS_MOUNT_FLAGMASK	0xFFFF
 
+#define NFS_MOUNT_RESTORE	0x80000000
+
 /* The following are for internal use only */
 #define NFS_MOUNT_LOOKUP_CACHE_NONEG	0x10000
 #define NFS_MOUNT_LOOKUP_CACHE_NONE	0x20000
@@ -72,5 +111,8 @@ struct nfs_mount_data {
 
 #define NFS_MOUNT_LOCAL_FLOCK	0x100000
 #define NFS_MOUNT_LOCAL_FCNTL	0x200000
+
+/* Special mount options version, used only for migration support */
+#define NFS_MOUNT_MIGRATED	0x80000000
 
 #endif

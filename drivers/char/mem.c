@@ -834,6 +834,9 @@ static ssize_t kmsg_write(struct file * file, const char __user * buf,
 	char *tmp;
 	ssize_t ret;
 
+	if (!ve_is_super(get_exec_env()))
+		return count;
+
 	tmp = kmalloc(count + 1, GFP_KERNEL);
 	if (tmp == NULL)
 		return -ENOMEM;
@@ -911,7 +914,7 @@ static const struct file_operations memory_fops = {
 	.open		= memory_open,
 };
 
-static char *mem_devnode(struct device *dev, mode_t *mode)
+char *mem_devnode(struct device *dev, mode_t *mode)
 {
 	unsigned int minor = array_index_nospec(MINOR(dev->devt),
 						ARRAY_SIZE(devlist));
@@ -920,6 +923,7 @@ static char *mem_devnode(struct device *dev, mode_t *mode)
 		*mode = devlist[minor].mode;
 	return NULL;
 }
+EXPORT_SYMBOL(mem_devnode);
 
 static struct class *mem_class;
 

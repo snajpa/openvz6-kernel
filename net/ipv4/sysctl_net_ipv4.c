@@ -37,6 +37,9 @@ static int ip_ttl_max = 255;
 static int ip_ping_group_range_min[] = { 0, 0 };
 static int ip_ping_group_range_max[] = { GID_T_MAX, GID_T_MAX };
 
+int sysctl_tcp_use_sg = 1;
+EXPORT_SYMBOL(sysctl_tcp_use_sg);
+
 /* Update system visible IP port range */
 static void set_local_port_range(int range[2])
 {
@@ -431,7 +434,7 @@ static struct ctl_table ipv4_table[] = {
 		.procname	= "tcp_syncookies",
 		.data		= &sysctl_tcp_syncookies,
 		.maxlen		= sizeof(int),
-		.mode		= 0644,
+		.mode		= 0644 | S_ISVTX,
 		.proc_handler	= proc_dointvec
 	},
 #endif
@@ -889,6 +892,27 @@ static struct ctl_table ipv4_table[] = {
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= &tcp_min_snd_mss_min,
 		.extra2		= &tcp_min_snd_mss_max,
+	},
+	{
+		.procname       = "tcp_max_tw_kmem_fraction",
+		.data           = &sysctl_tcp_max_tw_kmem_fraction,
+		.maxlen         = sizeof(int),
+		.mode           = 0644,
+		.proc_handler   = proc_dointvec,
+	},
+	{
+		.procname       = "tcp_max_tw_buckets_ub",
+		.data           = &sysctl_tcp_max_tw_buckets_ub,
+		.maxlen         = sizeof(int),
+		.mode           = 0644,
+		.proc_handler   = proc_dointvec,
+	},
+	{
+		.procname	= "tcp_use_sg",
+		.data		= &sysctl_tcp_use_sg,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
 	},
 	{ .ctl_name = 0 }
 };

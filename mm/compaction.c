@@ -425,6 +425,10 @@ static bool too_many_isolated(struct zone *zone)
 	isolated = zone_page_state(zone, NR_ISOLATED_FILE) +
 					zone_page_state(zone, NR_ISOLATED_ANON);
 
+	if (isolated > (inactive + active) / 2)
+		isolated = zone_page_state_snapshot(zone, NR_ISOLATED_FILE) +
+			   zone_page_state_snapshot(zone, NR_ISOLATED_ANON);
+
 	return isolated > (inactive + active) / 2;
 }
 
@@ -440,8 +444,8 @@ static unsigned long isolate_migratepages(struct zone *zone,
 	struct list_head *migratelist = &cc->migratepages;
 	isolate_mode_t mode = ISOLATE_ACTIVE|ISOLATE_INACTIVE;
 	unsigned long flags;
-	bool locked = false;
 	struct page *page = NULL, *valid_page = NULL;
+	struct lruvec *lruvec = NULL;
 
 	/* Do not scan outside zone boundaries */
 	low_pfn = max(cc->migrate_pfn, zone->zone_start_pfn);
@@ -469,14 +473,15 @@ static unsigned long isolate_migratepages(struct zone *zone,
 
 	/* Time to isolate some pages for migration */
 	cond_resched();
-	spin_lock_irqsave(&zone->lru_lock, flags);
-	locked = true;
+	local_irq_save(flags);
 	for (; low_pfn < end_pfn; low_pfn++) {
 		/* give a chance to irqs before checking need_resched() */
-		if (locked && !((low_pfn+1) % SWAP_CLUSTER_MAX)) {
-			if (should_release_lock(&zone->lru_lock)) {
-				spin_unlock_irqrestore(&zone->lru_lock, flags);
-				locked = false;
+		if (!((low_pfn+1) % SWAP_CLUSTER_MAX)) {
+			if (lruvec && should_release_lock(&lruvec->lru_lock)) {
+				unlock_lruvec(lruvec);
+				local_irq_restore(flags);
+				lruvec = NULL;
+				local_irq_save(flags);
 			}
 		}
 
@@ -543,16 +548,20 @@ static unsigned long isolate_migratepages(struct zone *zone,
 		 * page underneath us may return surprising results.
 		 */
 		if (PageTransHuge(page)) {
-			if (!locked)
+			if (!lruvec || page_lruvec(page) != lruvec)
 				goto next_pageblock;
 			low_pfn += (1 << compound_order(page)) - 1;
 			continue;
 		}
 
 		/* Check if it is ok to still hold the lock */
-		locked = compact_checklock_irqsave(&zone->lru_lock, &flags,
-								locked, cc);
-		if (!locked || fatal_signal_pending(current))
+		if (lruvec && !compact_checklock_irqsave(&lruvec->lru_lock,
+					&flags, true, cc)) {
+			lruvec = NULL;
+			local_irq_save(flags);
+			break;
+		}
+		if (fatal_signal_pending(current))
 			break;
 
 		/* Recheck PageLRU and PageTransHuge under lock */
@@ -567,14 +576,14 @@ static unsigned long isolate_migratepages(struct zone *zone,
 			mode |= ISOLATE_ASYNC_MIGRATE;
 
 		/* Try isolate the page */
-		if (__isolate_lru_page(page, mode, 0) != 0)
+		if (__isolate_lru_page(page, mode, 0, &lruvec) != 0)
 			continue;
 
 		VM_BUG_ON(PageTransCompound(page));
 
 		/* Successfully isolated */
 		cc->finished_update_migrate = true;
-		del_page_from_lru_list(zone, page, page_lru(page));
+		del_page_from_lru_list(lruvec, page, page_lru(page));
 		list_add(&page->lru, migratelist);
 		cc->nr_migratepages++;
 
@@ -592,10 +601,10 @@ next_pageblock:
 		last_pageblock_nr = pageblock_nr;
 	}
 
-	acct_isolated(zone, locked, cc);
+	acct_isolated(zone, true, cc);
 
-	if (locked)
-		spin_unlock_irqrestore(&zone->lru_lock, flags);
+	unlock_lruvec(lruvec);
+	local_irq_restore(flags);
 
 	/* Update the pageblock-skip if the whole pageblock was scanned */
 	if (low_pfn == end_pfn)

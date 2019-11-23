@@ -55,6 +55,7 @@
 
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/quotaops.h>
 #include <linux/buffer_head.h>
 #include <linux/sort.h>
 #include <linux/gfs2_ondisk.h>
@@ -913,23 +914,26 @@ got_dent:
 	return dent;
 }
 
-static struct gfs2_leaf *new_leaf(struct inode *inode, struct buffer_head **pbh, u16 depth)
+static struct gfs2_leaf *new_leaf(struct inode *inode, struct buffer_head **pbh, u16 depth,
+				  int *error_p)
 {
 	struct gfs2_inode *ip = GFS2_I(inode);
 	unsigned int n = 1;
 	u64 bn;
-	int error;
 	struct buffer_head *bh;
 	struct gfs2_leaf *leaf;
 	struct gfs2_dirent *dent;
 	struct qstr name = { .name = "", .len = 0, .hash = 0 };
 
-	error = gfs2_alloc_blocks(ip, &bn, &n, 0, NULL);
-	if (error)
+	*error_p = gfs2_alloc_blocks(ip, &bn, &n, 0, NULL, 1);
+	if (*error_p)
 		return NULL;
 	bh = gfs2_meta_new(ip->i_gl, bn);
-	if (!bh)
+	if (!bh) {
+		vfs_dq_release_reservation_block(inode, 1);
+		*error_p = -ENOSPC;
 		return NULL;
+	}
 
 	gfs2_trans_add_unrevoke(GFS2_SB(inode), bn, 1);
 	gfs2_trans_add_meta(ip->i_gl, bh);
@@ -973,9 +977,11 @@ static int dir_make_exhash(struct inode *inode)
 
 	/*  Turn over a new leaf  */
 
-	leaf = new_leaf(inode, &bh, 0);
-	if (!leaf)
-		return -ENOSPC;
+	leaf = new_leaf(inode, &bh, 0, &error);
+	if (!leaf) {
+		brelse(dibh);
+		return error;
+	}
 	bn = bh->b_blocknr;
 
 	gfs2_assert(sdp, dip->i_entries < (1 << 16));
@@ -995,11 +1001,13 @@ static int dir_make_exhash(struct inode *inode)
 	dent = gfs2_dirent_scan(&dip->i_inode, bh->b_data, bh->b_size,
 				gfs2_dirent_last, &args, NULL);
 	if (!dent) {
+		vfs_dq_release_reservation_block(inode, 1);
 		brelse(bh);
 		brelse(dibh);
 		return -EIO;
 	}
 	if (IS_ERR(dent)) {
+		vfs_dq_release_reservation_block(inode, 1);
 		brelse(bh);
 		brelse(dibh);
 		return PTR_ERR(dent);
@@ -1026,7 +1034,7 @@ static int dir_make_exhash(struct inode *inode)
 		*lp = cpu_to_be64(bn);
 
 	i_size_write(inode, sdp->sd_sb.sb_bsize / 2);
-	gfs2_add_inode_blocks(&dip->i_inode, 1);
+	vfs_dq_claim_block(&dip->i_inode, 1);
 	dip->i_diskflags |= GFS2_DIF_EXHASH;
 
 	for (x = sdp->sd_hash_ptrs, y = -1; x; x >>= 1, y++) ;
@@ -1079,10 +1087,11 @@ static int dir_split_leaf(struct inode *inode, const struct qstr *name)
 
 	gfs2_trans_add_meta(dip->i_gl, obh);
 
-	nleaf = new_leaf(inode, &nbh, be16_to_cpu(oleaf->lf_depth) + 1);
+	nleaf = new_leaf(inode, &nbh, be16_to_cpu(oleaf->lf_depth) + 1,
+			 &error);
 	if (!nleaf) {
 		brelse(obh);
-		return -ENOSPC;
+		return error;
 	}
 	bn = nbh->b_blocknr;
 
@@ -1167,9 +1176,11 @@ static int dir_split_leaf(struct inode *inode, const struct qstr *name)
 	error = gfs2_meta_inode_buffer(dip, &dibh);
 	if (!gfs2_assert_withdraw(GFS2_SB(&dip->i_inode), !error)) {
 		gfs2_trans_add_meta(dip->i_gl, dibh);
-		gfs2_add_inode_blocks(&dip->i_inode, 1);
+		vfs_dq_claim_block(&dip->i_inode, 1);
 		gfs2_dinode_out(dip, dibh->b_data);
 		brelse(dibh);
+	} else {
+		vfs_dq_release_reservation_block(&dip->i_inode, 1);
 	}
 
 	brelse(obh);
@@ -1181,6 +1192,7 @@ fail_lpfree:
 	kfree(lp);
 
 fail_brelse:
+	vfs_dq_release_reservation_block(&dip->i_inode, 1);
 	brelse(obh);
 	brelse(nbh);
 	return error;
@@ -1773,20 +1785,22 @@ static int dir_new_leaf(struct inode *inode, const struct qstr *name)
 
 	gfs2_trans_add_meta(ip->i_gl, obh);
 
-	leaf = new_leaf(inode, &bh, be16_to_cpu(oleaf->lf_depth));
+	leaf = new_leaf(inode, &bh, be16_to_cpu(oleaf->lf_depth), &error);
 	if (!leaf) {
 		brelse(obh);
-		return -ENOSPC;
+		return error;
 	}
 	oleaf->lf_next = cpu_to_be64(bh->b_blocknr);
 	brelse(bh);
 	brelse(obh);
 
 	error = gfs2_meta_inode_buffer(ip, &bh);
-	if (error)
+	if (error) {
+		vfs_dq_release_reservation_block(&ip->i_inode, 1);
 		return error;
+	}
 	gfs2_trans_add_meta(ip->i_gl, bh);
-	gfs2_add_inode_blocks(&ip->i_inode, 1);
+	vfs_dq_claim_block(&ip->i_inode, 1);
 	gfs2_dinode_out(ip, bh->b_data);
 	brelse(bh);
 	return 0;
@@ -2047,7 +2061,7 @@ static int leaf_dealloc(struct gfs2_inode *dip, u32 index, u32 len,
 		brelse(bh);
 
 		gfs2_free_meta(dip, blk, 1);
-		gfs2_add_inode_blocks(&dip->i_inode, -1);
+		vfs_dq_free_block(&dip->i_inode, 1);
 	}
 
 	error = gfs2_dir_write_data(dip, ht, index * sizeof(u64), size);

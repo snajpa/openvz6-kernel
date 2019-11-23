@@ -1,0 +1,23 @@
+1. When mapping is not available (still not allocated or just
+   not read from disk), bio preparation stage allows to
+   virtual block boundary. In this case bulk writeback self-synchronizes
+   to sending bios spanning the whole block and we do not have
+   to waste time/io to pad those bios to block size, when
+   creating new block, or reading original block, when making delta.
+
+2. That block size is calculated from block size of top delta.
+
+   It would be useful to have f.e. base image with block=128K
+   and deltas with block=4K. In this case we quantize everything
+   to 4K.
+
+   Here is the assumption: successive deltas cannot increase block
+   size. NB: raw image has infinite block size.
+
+   BUT! When we start new delta, some bios can be already prepared
+   and in this case we can see bio spanning several blocks.
+   Right now we do not support this, therefore all the deltas
+   and base image must have the same block size. What's about
+   raw image, we just assign a default block size to base image
+   and all the deltas must inherit it.
+

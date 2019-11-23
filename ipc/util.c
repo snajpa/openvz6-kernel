@@ -38,6 +38,8 @@
 
 #include <asm/unistd.h>
 
+#include <bc/kmem.h>
+
 #include "util.h"
 
 struct ipc_proc_iface {
@@ -157,8 +159,8 @@ void __init ipc_init_proc_interface(const char *path, const char *header,
 	iface->show	= show;
 
 	pde = proc_create_data(path,
-			       S_IRUGO,        /* world readable */
-			       NULL,           /* parent dir */
+			       S_IRUGO,		/* world readable */
+			       &glob_proc_root,	/* parent dir */
 			       &sysvipc_proc_fops,
 			       iface);
 	if (!pde) {
@@ -238,6 +240,7 @@ int ipc_get_maxid(struct ipc_ids *ids)
  *	@ids: IPC identifier set
  *	@new: new IPC permission set
  *	@size: limit for the number of used ids
+ *	@reqid: if >= 0, get this id exactly. If -1 -- don't care.
  *
  *	Add an entry 'new' to the IPC ids idr. The permissions object is
  *	initialised and the first free entry is set up and the id assigned
@@ -247,7 +250,7 @@ int ipc_get_maxid(struct ipc_ids *ids)
  *	Called with ipc_ids.rw_mutex held as a writer.
  */
  
-int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
+int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size, int reqid)
 {
 	uid_t euid;
 	gid_t egid;
@@ -268,7 +271,16 @@ int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
 	new->cuid = new->uid = euid;
 	new->gid = new->cgid = egid;
 
-	err = idr_get_new(&ids->ipcs_idr, new, &id);
+	if (reqid >= 0) {
+		id = reqid % SEQ_MULTIPLIER;
+		err = idr_get_new_above(&ids->ipcs_idr, new, id, &id);
+		if (!err && id != (reqid % SEQ_MULTIPLIER)) {
+			idr_remove(&ids->ipcs_idr, id);
+			err = -EEXIST;
+		}
+	} else
+		err = idr_get_new(&ids->ipcs_idr, new, &id);
+
 	if (err) {
 		spin_unlock(&new->lock);
 		rcu_read_unlock();
@@ -277,9 +289,13 @@ int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
 
 	ids->in_use++;
 
-	new->seq = ids->seq++;
-	if(ids->seq > ids->seq_max)
-		ids->seq = 0;
+	if (reqid >= 0) {
+		new->seq = reqid/SEQ_MULTIPLIER;
+	} else {
+		new->seq = ids->seq++;
+		if(ids->seq > ids->seq_max)
+			ids->seq = 0;
+	}
 
 	new->id = ipc_buildid(id, new->seq);
 	return id;
@@ -443,9 +459,9 @@ void *ipc_alloc(int size)
 {
 	void *out;
 	if(size > PAGE_SIZE)
-		out = vmalloc(size);
+		out = ub_vmalloc(size);
 	else
-		out = kmalloc(size, GFP_KERNEL);
+		out = kmalloc(size, GFP_KERNEL_UBC);
 	return out;
 }
 
@@ -642,6 +658,7 @@ err1:
 	rcu_read_unlock();
 	return out;
 }
+EXPORT_SYMBOL(ipc_lock);
 
 /**
  * ipc_obtain_object_check
@@ -769,7 +786,7 @@ struct kern_ipc_perm *ipcctl_pre_down_nolock(struct ipc_ids *ids, int id,
 
 	euid = current_euid();
 	if (euid == ipcp->cuid ||
-	    euid == ipcp->uid  || capable(CAP_SYS_ADMIN))
+	    euid == ipcp->uid  || capable(CAP_VE_SYS_ADMIN))
 		return ipcp;
 
 out_up:

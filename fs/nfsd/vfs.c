@@ -26,6 +26,7 @@
 #include <linux/xattr.h>
 #include <linux/jhash.h>
 #include <linux/ima.h>
+#include <linux/vzquota.h>
 #include <asm/uaccess.h>
 #include <linux/exportfs.h>
 #include <linux/writeback.h>
@@ -70,7 +71,10 @@ struct raparm_hbucket {
 #define RAPARM_HASH_BITS	4
 #define RAPARM_HASH_SIZE	(1<<RAPARM_HASH_BITS)
 #define RAPARM_HASH_MASK	(RAPARM_HASH_SIZE-1)
-static struct raparm_hbucket	raparm_hash[RAPARM_HASH_SIZE];
+
+#ifndef CONFIG_VE
+static struct raparm_hbucket	_raparm_hash[RAPARM_HASH_SIZE];
+#endif
 
 /* 
  * Called from nfsd_lookup and encode_dirent. Check if we have crossed 
@@ -414,6 +418,7 @@ nfsd_setattr(struct svc_rqst *rqstp, struct svc_fh *fhp, struct iattr *iap,
 			put_write_access(inode);
 			goto out_nfserr;
 		}
+		vzquota_cur_qmblk_set(fhp->fh_export->ex_path.dentry->d_inode);
 		vfs_dq_init(inode);
 	}
 
@@ -813,6 +818,7 @@ nfsd_open(struct svc_rqst *rqstp, struct svc_fh *fhp, int type,
 		else
 			flags = O_WRONLY|O_LARGEFILE;
 
+		vzquota_cur_qmblk_set(fhp->fh_export->ex_path.dentry->d_inode);
 		vfs_dq_init(inode);
 	}
 	*filp = dentry_open(dget(dentry), mntget(fhp->fh_export->ex_path.mnt),
@@ -827,6 +833,13 @@ nfsd_open(struct svc_rqst *rqstp, struct svc_fh *fhp, int type,
 			(*filp)->f_mode |= FMODE_64BITHASH;
 		else
 			(*filp)->f_mode |= FMODE_32BITHASH;
+
+		/* Update fmode for underlying file */
+		if ((*filp)->f_op->get_host) {
+			struct file *host = (*filp)->f_op->get_host(*filp);
+
+			host->f_mode |= (*filp)->f_mode & (FMODE_32BITHASH | FMODE_64BITHASH);
+		}
 	}
 
 out_nfserr:
@@ -869,7 +882,7 @@ nfsd_get_raparms(dev_t dev, ino_t ino)
 		if (ra->p_count == 0)
 			frap = rap;
 	}
-	depth = nfsdstats.ra_size*11/10;
+	depth = nfsdstats.ra_size;
 	if (!frap) {	
 		spin_unlock(&rab->pb_lock);
 		return NULL;
@@ -1015,15 +1028,18 @@ static void kill_suid(struct dentry *dentry)
  * better tool (separate unstable writes and commits) for solving this
  * problem.
  */
-static int wait_for_concurrent_writes(struct file *file)
+static int wait_for_concurrent_writes(struct file *file, struct svc_export *exp)
 {
 	struct inode *inode = file->f_path.dentry->d_inode;
 	static ino_t last_ino;
 	static dev_t last_dev;
 	int err = 0;
+	dev_t		ex_dev;
 
+	BUG_ON(file->f_vfsmnt != exp->ex_path.mnt);
+	ex_dev = exp_get_dev(exp);
 	if (atomic_read(&inode->i_writecount) > 1
-	    || (last_ino == inode->i_ino && last_dev == inode->i_sb->s_dev)) {
+	    || (last_ino == inode->i_ino && last_dev == ex_dev)) {
 		dprintk("nfsd: write defer %d\n", task_pid_nr(current));
 		msleep(10);
 		dprintk("nfsd: write resume %d\n", task_pid_nr(current));
@@ -1034,7 +1050,7 @@ static int wait_for_concurrent_writes(struct file *file)
 		err = vfs_fsync(file, file->f_path.dentry, 0);
 	}
 	last_ino = inode->i_ino;
-	last_dev = inode->i_sb->s_dev;
+	last_dev = ex_dev;
 	return err;
 }
 
@@ -1102,7 +1118,7 @@ nfsd_vfs_write(struct svc_rqst *rqstp, struct svc_fh *fhp, struct file *file,
 		kill_suid(dentry);
 
 	if (stable && use_wgather)
-		host_err = wait_for_concurrent_writes(file);
+		host_err = wait_for_concurrent_writes(file, exp);
 
 out_nfserr:
 	dprintk("nfsd: write complete host_err=%d\n", host_err);
@@ -1126,6 +1142,7 @@ __be32 nfsd_read(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	struct inode *inode;
 	struct raparms	*ra;
 	__be32 err;
+	dev_t		ex_dev;
 
 	err = nfsd_open(rqstp, fhp, S_IFREG, NFSD_MAY_READ, &file);
 	if (err)
@@ -1134,7 +1151,9 @@ __be32 nfsd_read(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	inode = file->f_path.dentry->d_inode;
 
 	/* Get readahead parameters */
-	ra = nfsd_get_raparms(inode->i_sb->s_dev, inode->i_ino);
+	BUG_ON(file->f_vfsmnt != fhp->fh_export->ex_path.mnt);
+	ex_dev = exp_get_dev(fhp->fh_export);
+	ra = nfsd_get_raparms(ex_dev, inode->i_ino);
 
 	if (ra && ra->p_set)
 		file->f_ra = ra->p_ra;
@@ -2238,6 +2257,7 @@ nfsd_racache_init(int cache_size)
 	int	nperbucket;
 	struct raparms **raparm = NULL;
 
+	BUILD_BUG_ON(sizeof(struct raparm_hbucket) * RAPARM_HASH_SIZE > VE_RAPARM_SIZE);
 
 	if (raparm_hash[0].pb_head)
 		return 0;
@@ -2253,7 +2273,7 @@ nfsd_racache_init(int cache_size)
 
 		raparm = &raparm_hash[i].pb_head;
 		for (j = 0; j < nperbucket; j++) {
-			*raparm = kzalloc(sizeof(struct raparms), GFP_KERNEL);
+			*raparm = kzalloc(sizeof(struct raparms), GFP_KERNEL_UBC);
 			if (!*raparm)
 				goto out_nomem;
 			raparm = &(*raparm)->p_next;

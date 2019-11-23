@@ -322,6 +322,11 @@ enum netdev_state_t
 	__LINK_STATE_DORMANT,
 };
 
+struct netdev_bc {
+	struct user_beancounter *exec_ub, *owner_ub;
+};
+
+#define netdev_bc(dev)		(&(dev)->dev_bc)
 
 /*
  * This structure holds at boot time configured netdevice settings. They
@@ -729,6 +734,11 @@ struct netdev_tc_txq {
 	u16 offset;
 };
 
+struct cpt_context;
+struct cpt_ops;
+struct rst_ops;
+struct cpt_netdev_image;
+
 #if defined(CONFIG_FCOE) || defined(CONFIG_FCOE_MODULE)
 /*
  * This structure is to hold information about the device
@@ -904,6 +914,14 @@ struct netdev_phys_port_id {
  *	Called to get ID of physical port of this device. If driver does
  *	not implement this, it is assumed that the hw is not able to have
  *	multiple net devices on single physical port.
+ *
+ *	Slave management functions (for bridge, bonding, etc). User should
+ *	call netdev_set_master() to set dev->master properly.
+ * int (*ndo_add_slave)(struct net_device *dev, struct net_device *slave_dev);
+ *	Called to make another netdev an underling.
+ *
+ * int (*ndo_del_slave)(struct net_device *dev, struct net_device *slave_dev);
+ *	Called to release previously enslaved netdev.
  */
 #define HAVE_NET_DEVICE_OPS
 struct net_device_ops {
@@ -982,6 +1000,13 @@ struct net_device_ops {
 	int			(*ndo_fcoe_get_wwn)(struct net_device *dev,
 						    u64 *wwn, int type);
 #endif
+	void			(*ndo_cpt)(struct net_device *dev,
+						struct cpt_ops *,
+						struct cpt_context *);
+	int			(*ndo_add_slave)(struct net_device *dev,
+						 struct net_device *slave_dev);
+	int			(*ndo_del_slave)(struct net_device *dev,
+						 struct net_device *slave_dev);
 };
 
 /**
@@ -1009,6 +1034,18 @@ struct net_device_ops_ext {
 };
 
 typedef u64 netdev_features_t;
+
+struct netdev_rst {
+	int			cpt_object;
+	int			(*ndo_rst)(loff_t, struct cpt_netdev_image *,
+						struct rst_ops *,
+						struct cpt_context *);
+	struct list_head	list;
+};
+
+void register_netdev_rst(struct netdev_rst *ops);
+void unregister_netdev_rst(struct netdev_rst *ops);
+struct netdev_rst *netdev_find_rst(int cpt_object, struct netdev_rst *ops);
 
 /*
  *	The DEVICE structure.
@@ -1138,11 +1175,20 @@ struct net_device
 	/* changeable features with no special hardware requirements */
 #define NETIF_F_SOFT_FEATURES	(NETIF_F_GSO | NETIF_F_GRO)
 
+	unsigned long		vz_features;
+/* The field features doesn't have free flags */
+#define NETIF_F_VENET		(1 << 0) /* device is venet device */
+#define NETIF_F_VIRTUAL		(1 << 1) /* can be registered inside VE */
+
 	/* Interface index. Unique device identifier	*/
 	int			ifindex;
 	int			iflink;
 
 	struct net_device_stats	stats;
+	/* Statistics from CT start to last suspend */
+	struct net_device_stats	s_stats;
+	/* Buffer to store summary in dev_get_stats() */
+	struct net_device_stats	b_stats;
 
 #ifdef CONFIG_WIRELESS_EXT
 	/* List of functions to handle Wireless Extensions (instead of ioctl).
@@ -1226,6 +1272,7 @@ struct net_device
 						      hw addresses */
 
 	unsigned char		broadcast[MAX_ADDR_LEN];	/* hw bcast add	*/
+	unsigned char		is_leaked;
 
 	struct netdev_queue	rx_queue;
 
@@ -1264,7 +1311,7 @@ struct net_device
 	/* device index hash chain */
 	struct hlist_node	index_hlist;
 
-	struct net_device	*link_watch_next;
+	struct list_head	link_watch_list;
 
 	/* register/unregister state machine */
 	enum { NETREG_UNINITIALIZED=0,
@@ -1297,6 +1344,9 @@ struct net_device
 	/* GARP */
 	struct garp_port	*garp_port;
 
+	struct ve_struct	*owner_env; /* Owner VE of the interface */
+	struct netdev_bc	dev_bc;
+
 	/* class/net/name entry */
 	struct device		dev;
 	/* space for optional statistics and wireless sysfs groups */
@@ -1323,6 +1373,17 @@ struct net_device
 #endif
 };
 #define to_net_dev(d) container_of(d, struct net_device, dev)
+
+static inline struct hlist_head *dev_name_hash(struct net *net, const char *name)
+{
+	unsigned hash = full_name_hash(name, strnlen(name, IFNAMSIZ));
+	return &net->dev_name_head[hash & ((1 << NETDEV_HASHBITS) - 1)];
+}
+
+static inline struct hlist_head *dev_index_hash(struct net *net, int ifindex)
+{
+	return &net->dev_index_head[ifindex & ((1 << NETDEV_HASHBITS) - 1)];
+}
 
 #define	NETDEV_ALIGN		32
 #define NET_DEVICE_SIZE \
@@ -1762,6 +1823,8 @@ extern rwlock_t				dev_base_lock;		/* Device list lock */
 
 #define for_each_netdev(net, d)		\
 		list_for_each_entry(d, &(net)->dev_base_head, dev_list)
+#define for_each_netdev_reverse(net, d)	\
+		list_for_each_entry_reverse(d, &(net)->dev_base_head, dev_list)
 #define for_each_netdev_safe(net, d, n)	\
 		list_for_each_entry_safe(d, n, &(net)->dev_base_head, dev_list)
 #define for_each_netdev_continue(net, d)		\
@@ -2269,6 +2332,8 @@ extern int		dev_ethtool(struct net *net, struct ifreq *);
 extern unsigned		dev_get_flags(const struct net_device *);
 extern int		dev_change_flags(struct net_device *, unsigned);
 extern int		dev_change_name(struct net_device *, const char *);
+int __dev_change_net_namespace(struct net_device *, struct net *, const char *,
+			struct user_beancounter *exec_ub);
 extern int		dev_set_alias(struct net_device *, const char *, size_t);
 extern int		dev_change_net_namespace(struct net_device *,
 						 struct net *, const char *);
@@ -2321,6 +2386,7 @@ static inline void dev_hold(struct net_device *dev)
 
 extern int linkwatch_init(void);
 extern void linkwatch_fire_event(struct net_device *dev);
+extern void linkwatch_forget_dev(struct net_device *dev);
 
 /**
  *	netif_carrier_ok - test if carrier present
@@ -2766,6 +2832,19 @@ void netif_stacked_transfer_operstate(const struct net_device *rootdev,
 					struct net_device *dev);
 
 int netif_skb_features(struct sk_buff *skb);
+
+#if defined(CONFIG_VE) && defined(CONFIG_NET)
+static inline int ve_is_dev_movable(struct net_device *dev)
+{
+	return !((dev->vz_features & NETIF_F_VIRTUAL) ||
+		 (dev->features & NETIF_F_NETNS_LOCAL));
+}
+#else
+static inline int ve_is_dev_movable(struct net_device *dev)
+{
+	return 0;
+}
+#endif
 
 static inline int net_gso_ok(int features, int gso_type)
 {

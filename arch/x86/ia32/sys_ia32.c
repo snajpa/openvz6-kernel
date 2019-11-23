@@ -623,20 +623,6 @@ long sys32_fadvise64_64(int fd, __u32 offset_low, __u32 offset_high,
 				advice);
 }
 
-long sys32_vm86_warning(void)
-{
-	struct task_struct *me = current;
-	static char lastcomm[sizeof(me->comm)];
-
-	if (strncmp(lastcomm, me->comm, sizeof(lastcomm))) {
-		compat_printk(KERN_INFO
-			      "%s: vm86 mode not supported on 64 bit kernel\n",
-			      me->comm);
-		strncpy(lastcomm, me->comm, sizeof(lastcomm));
-	}
-	return -ENOSYS;
-}
-
 long sys32_lookup_dcookie(u32 addr_low, u32 addr_high,
 			  char __user *buf, size_t len)
 {

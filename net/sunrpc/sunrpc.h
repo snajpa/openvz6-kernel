@@ -29,6 +29,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <linux/net.h>
 
+#include "ve.h"
+
 /*
  * Header for dynamically allocated rpc buffers.
  */

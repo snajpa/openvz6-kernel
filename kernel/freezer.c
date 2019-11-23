@@ -113,6 +113,7 @@ bool freeze_task(struct task_struct *p, bool sig_only)
 
 	return true;
 }
+EXPORT_SYMBOL(freeze_task);
 
 void cancel_freezing(struct task_struct *p)
 {

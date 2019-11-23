@@ -96,6 +96,8 @@
 #include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/seq_file.h>
+#include <linux/nsproxy.h>
+#include <linux/ve.h>
 
 #include <linux/uaccess.h>
 #include <asm/system.h>
@@ -106,6 +108,7 @@
 
 #include <linux/kmod.h>
 #include <linux/nsproxy.h>
+#include <bc/kmem.h>
 
 #undef TTY_DEBUG_HANGUP
 
@@ -130,11 +133,15 @@ EXPORT_SYMBOL(tty_std_termios);
    into this file */
 
 LIST_HEAD(tty_drivers);			/* linked list of tty drivers */
+EXPORT_SYMBOL(tty_drivers);
 
 /* Mutex to protect creating and releasing a tty. This is shared with
    vt.c for deeply disgusting hack reasons */
 DEFINE_MUTEX(tty_mutex);
 EXPORT_SYMBOL(tty_mutex);
+
+/* Spinlock to protect the tty->tty_files list */
+DEFINE_SPINLOCK(tty_files_lock);
 
 static ssize_t tty_read(struct file *, char __user *, size_t, loff_t *);
 static ssize_t tty_write(struct file *, const char __user *, size_t, loff_t *);
@@ -166,7 +173,7 @@ static void proc_set_tty(struct task_struct *tsk, struct tty_struct *tty);
 
 struct tty_struct *alloc_tty_struct(void)
 {
-	return kzalloc(sizeof(struct tty_struct), GFP_KERNEL);
+	return kzalloc(sizeof(struct tty_struct), GFP_KERNEL_UBC);
 }
 
 /**
@@ -184,6 +191,36 @@ void free_tty_struct(struct tty_struct *tty)
 	tty_buffer_free_all(tty);
 	kfree(tty);
 }
+
+/* Associate a new file with the tty structure */
+void tty_add_file(struct tty_struct *tty, struct file *file)
+{
+	struct tty_file_private *priv;
+
+	/* XXX: must implement proper error handling in callers */
+	priv = kmalloc(sizeof(*priv), GFP_KERNEL|__GFP_NOFAIL);
+
+	priv->tty = tty;
+	priv->file = file;
+	file->private_data = priv;
+
+	spin_lock(&tty_files_lock);
+	list_add(&priv->list, &tty->tty_files);
+	spin_unlock(&tty_files_lock);
+}
+
+/* Delete file from its tty */
+void tty_del_file(struct file *file)
+{
+	struct tty_file_private *priv = file->private_data;
+
+	spin_lock(&tty_files_lock);
+	list_del(&priv->list);
+	spin_unlock(&tty_files_lock);
+	file->private_data = NULL;
+	kfree(priv);
+}
+
 
 #define TTY_NUMBER(tty) ((tty)->index + (tty)->driver->name_base)
 
@@ -235,14 +272,16 @@ static int check_tty_count(struct tty_struct *tty, const char *routine)
 	struct list_head *p;
 	int count = 0;
 
-	file_list_lock();
+	spin_lock(&tty_files_lock);
 	list_for_each(p, &tty->tty_files) {
 		count++;
 	}
-	file_list_unlock();
+	spin_unlock(&tty_files_lock);
 	if (tty->driver->type == TTY_DRIVER_TYPE_PTY &&
 	    tty->driver->subtype == PTY_TYPE_SLAVE &&
 	    tty->link && tty->link->count)
+		count++;
+	if (test_bit(TTY_EXTRA_REFERENCE, &tty->flags))
 		count++;
 	if (tty->count != count) {
 		printk(KERN_WARNING "Warning: dev (%s) tty->count(%d) "
@@ -274,9 +313,22 @@ static struct tty_driver *get_tty_driver(dev_t device, int *index)
 		if (device < base || device >= base + p->num)
 			continue;
 		*index = device - base;
-		return tty_driver_kref_get(p);
+#ifdef CONFIG_VE
+		if (in_interrupt())
+			goto found;
+		if (p->major!=PTY_MASTER_MAJOR && p->major!=PTY_SLAVE_MAJOR)
+			goto found;
+		if (ve_is_super(p->owner_env) && ve_is_super(get_exec_env()))
+			goto found;
+		if (!ve_accessible_strict(p->owner_env, get_exec_env()))
+			continue;
+#endif
+		goto found;
 	}
 	return NULL;
+
+found:
+	return tty_driver_kref_get(p);
 }
 
 #ifdef CONFIG_CONSOLE_POLL
@@ -499,6 +551,7 @@ static void do_tty_hangup(struct work_struct *work)
 	struct file *cons_filp = NULL;
 	struct file *filp, *f = NULL;
 	struct task_struct *p;
+	struct tty_file_private *priv;
 	int    closecount = 0, n;
 	unsigned long flags;
 	int refs = 0;
@@ -510,7 +563,7 @@ static void do_tty_hangup(struct work_struct *work)
 	lock_kernel();
 
 	spin_lock(&redirect_lock);
-	if (redirect && redirect->private_data == tty) {
+	if (redirect && file_tty(redirect) == tty) {
 		f = redirect;
 		redirect = NULL;
 	}
@@ -523,9 +576,10 @@ static void do_tty_hangup(struct work_struct *work)
 	set_bit(TTY_HUPPING, &tty->flags);
 
 	check_tty_count(tty, "do_tty_hangup");
-	file_list_lock();
+	spin_lock(&tty_files_lock);
 	/* This breaks for file handles being sent over AF_UNIX sockets ? */
-	list_for_each_entry(filp, &tty->tty_files, f_u.fu_list) {
+	list_for_each_entry(priv, &tty->tty_files, list) {
+		filp = priv->file;
 		if (filp->f_op->write == redirected_tty_write)
 			cons_filp = filp;
 		if (filp->f_op->write != tty_write)
@@ -534,7 +588,7 @@ static void do_tty_hangup(struct work_struct *work)
 		tty_fasync(-1, filp, 0);	/* can't block */
 		filp->f_op = &hung_up_tty_fops;
 	}
-	file_list_unlock();
+	spin_unlock(&tty_files_lock);
 
 	/*
 	 * it drops BKL and thus races with reopen
@@ -884,12 +938,10 @@ static ssize_t tty_read(struct file *file, char __user *buf, size_t count,
 			loff_t *ppos)
 {
 	int i;
-	struct tty_struct *tty;
-	struct inode *inode;
+	struct inode *inode = file->f_path.dentry->d_inode;
+	struct tty_struct *tty = file_tty(file);
 	struct tty_ldisc *ld;
 
-	tty = (struct tty_struct *)file->private_data;
-	inode = file->f_path.dentry->d_inode;
 	if (tty_paranoia_check(tty, inode, "tty_read"))
 		return -EIO;
 	if (!tty || (test_bit(TTY_IO_ERROR, &tty->flags)))
@@ -1058,12 +1110,11 @@ void tty_write_message(struct tty_struct *tty, char *msg)
 static ssize_t tty_write(struct file *file, const char __user *buf,
 						size_t count, loff_t *ppos)
 {
-	struct tty_struct *tty;
 	struct inode *inode = file->f_path.dentry->d_inode;
+	struct tty_struct *tty = file_tty(file);
+ 	struct tty_ldisc *ld;
 	ssize_t ret;
-	struct tty_ldisc *ld;
 
-	tty = (struct tty_struct *)file->private_data;
 	if (tty_paranoia_check(tty, inode, "tty_write"))
 		return -EIO;
 	if (!tty || !tty->ops->write ||
@@ -1179,7 +1230,7 @@ int tty_init_termios(struct tty_struct *tty)
 
 	tp = tty->driver->termios[idx];
 	if (tp == NULL) {
-		tp = kzalloc(sizeof(struct ktermios[2]), GFP_KERNEL);
+		tp = kzalloc(sizeof(struct ktermios[2]), GFP_KERNEL_UBC);
 		if (tp == NULL)
 			return -ENOMEM;
 		memcpy(tp, &tty->driver->init_termios,
@@ -1307,7 +1358,7 @@ static int tty_reopen(struct tty_struct *tty)
  */
 
 struct tty_struct *tty_init_dev(struct tty_driver *driver, int idx,
-								int first_ok)
+					struct tty_struct *i_tty, int first_ok)
 {
 	struct tty_struct *tty;
 	int retval;
@@ -1414,9 +1465,9 @@ static void release_one_tty(struct work_struct *work)
 	tty_driver_kref_put(driver);
 	module_put(driver->owner);
 
-	file_list_lock();
+	spin_lock(&tty_files_lock);
 	list_del_init(&tty->tty_files);
-	file_list_unlock();
+	spin_unlock(&tty_files_lock);
 
 	put_pid(tty->pgrp);
 	put_pid(tty->session);
@@ -1486,7 +1537,8 @@ static void release_tty(struct tty_struct *tty, int idx)
  */
 void tty_release_dev(struct file *filp)
 {
-	struct tty_struct *tty, *o_tty;
+	struct tty_struct *tty = file_tty(filp);
+	struct tty_struct *o_tty;
 	int	pty_master, tty_closing, o_tty_closing, do_sleep;
 	int	devpts;
 	int	idx;
@@ -1494,7 +1546,6 @@ void tty_release_dev(struct file *filp)
 	struct 	inode *inode;
 
 	inode = filp->f_path.dentry->d_inode;
-	tty = (struct tty_struct *)filp->private_data;
 	if (tty_paranoia_check(tty, inode, "tty_release_dev"))
 		return;
 
@@ -1505,7 +1556,8 @@ void tty_release_dev(struct file *filp)
 	idx = tty->index;
 	pty_master = (tty->driver->type == TTY_DRIVER_TYPE_PTY &&
 		      tty->driver->subtype == PTY_TYPE_MASTER);
-	devpts = (tty->driver->flags & TTY_DRIVER_DEVPTS_MEM) != 0;
+	devpts = tty->driver->major == UNIX98_PTY_SLAVE_MAJOR ||
+		 tty->driver->major == UNIX98_PTY_MASTER_MAJOR;
 	o_tty = tty->link;
 
 #ifdef TTY_PARANOIA_CHECK
@@ -1514,7 +1566,7 @@ void tty_release_dev(struct file *filp)
 				  "free (%s)\n", tty->name);
 		return;
 	}
-	if (!devpts) {
+	if ((tty->driver->flags & TTY_DRIVER_DEVPTS_MEM) == 0) {
 		if (tty != tty->driver->ttys[idx]) {
 			printk(KERN_DEBUG "tty_release_dev: driver.table[%d] not tty "
 			       "for (%s)\n", idx, tty->name);
@@ -1642,8 +1694,7 @@ void tty_release_dev(struct file *filp)
 	 *  - do_tty_hangup no longer sees this file descriptor as
 	 *    something that needs to be handled for hangups.
 	 */
-	file_kill(filp);
-	filp->private_data = NULL;
+	tty_del_file(filp);
 
 	/*
 	 * Perform some housekeeping before deciding whether to return.
@@ -1717,7 +1768,7 @@ void tty_release_dev(struct file *filp)
 
 static int __tty_open(struct inode *inode, struct file *filp)
 {
-	struct tty_struct *tty = NULL;
+	struct tty_struct *tty = NULL, *c_tty = NULL;
 	int noctty, retval;
 	struct tty_driver *driver;
 	int index;
@@ -1741,15 +1792,36 @@ retry_open:
 		}
 		driver = tty_driver_kref_get(tty->driver);
 		index = tty->index;
+		c_tty = tty;
 		filp->f_flags |= O_NONBLOCK; /* Don't let /dev/tty block */
 		/* noctty = 1; */
 		/* FIXME: Should we take a driver reference ? */
 		tty_kref_put(tty);
 		goto got_driver;
 	}
+#ifdef CONFIG_VTTYS
+	if (!ve_is_super(get_exec_env()) &&
+		MAJOR(device) == TTY_MAJOR &&
+		MINOR(device) <= MAX_NR_VTTY) {
+		driver = tty_driver_kref_get(vtty_driver);
+		if (MINOR(device)) {
+			index = MINOR(device) - 1;
+		} else {
+			index = 0;
+			noctty = 1;
+		}
+		goto got_driver;
+	}
+#endif
 #ifdef CONFIG_VT
 	if (device == MKDEV(TTY_MAJOR, 0)) {
 		extern struct tty_driver *console_driver;
+#ifdef CONFIG_VE
+		if (!ve_is_super(get_exec_env())) {
+			mutex_unlock(&tty_mutex);
+			return -ENODEV;
+		}
+#endif
 		driver = tty_driver_kref_get(console_driver);
 		index = fg_console;
 		noctty = 1;
@@ -1757,7 +1829,20 @@ retry_open:
 	}
 #endif
 	if (device == MKDEV(TTYAUX_MAJOR, 1)) {
-		struct tty_driver *console_driver = console_device(&index);
+		struct tty_driver *console_driver = NULL;
+#ifdef CONFIG_VE
+		if (!ve_is_super(get_exec_env())) {
+# ifdef CONFIG_VTTYS
+			console_driver = vtty_driver;
+			index = 0;
+			/* reset fops, sometimes there might be console_fops
+			 * picked from inode->i_cdev in chrdev_open() */
+			filp->f_op = &tty_fops;
+# endif
+		} else
+#endif
+			console_driver = console_device(&index);
+
 		if (console_driver) {
 			driver = tty_driver_kref_get(console_driver);
 			if (driver) {
@@ -1793,15 +1878,15 @@ got_driver:
 		if (retval)
 			tty = ERR_PTR(retval);
 	} else
-		tty = tty_init_dev(driver, index, 0);
+		tty = tty_init_dev(driver, index, c_tty, 0);
 
 	mutex_unlock(&tty_mutex);
 	tty_driver_kref_put(driver);
 	if (IS_ERR(tty))
 		return PTR_ERR(tty);
 
-	filp->private_data = tty;
-	file_move(filp, &tty->tty_files);
+	tty_add_file(tty, filp);
+
 	check_tty_count(tty, "tty_open");
 	if (tty->driver->type == TTY_DRIVER_TYPE_PTY &&
 	    tty->driver->subtype == PTY_TYPE_MASTER)
@@ -1900,11 +1985,10 @@ static int tty_release(struct inode *inode, struct file *filp)
 
 static unsigned int tty_poll(struct file *filp, poll_table *wait)
 {
-	struct tty_struct *tty;
+	struct tty_struct *tty = file_tty(filp);
 	struct tty_ldisc *ld;
 	int ret = 0;
 
-	tty = (struct tty_struct *)filp->private_data;
 	if (tty_paranoia_check(tty, filp->f_path.dentry->d_inode, "tty_poll"))
 		return 0;
 
@@ -1917,12 +2001,11 @@ static unsigned int tty_poll(struct file *filp, poll_table *wait)
 
 static int tty_fasync(int fd, struct file *filp, int on)
 {
-	struct tty_struct *tty;
+	struct tty_struct *tty = file_tty(filp);
 	unsigned long flags;
 	int retval = 0;
 
 	lock_kernel();
-	tty = (struct tty_struct *)filp->private_data;
 	if (tty_paranoia_check(tty, filp->f_path.dentry->d_inode, "tty_fasync"))
 		goto out;
 
@@ -2089,6 +2172,8 @@ static int tioccons(struct file *file)
 {
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
+	if (!ve_is_super(get_exec_env()))
+		return -EACCES;
 	if (file->f_op->write == redirected_tty_write) {
 		struct file *f;
 		spin_lock(&redirect_lock);
@@ -2470,13 +2555,13 @@ EXPORT_SYMBOL(tty_pair_get_pty);
  */
 long tty_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	struct tty_struct *tty, *real_tty;
+	struct tty_struct *tty = file_tty(file);
+	struct tty_struct *real_tty;
 	void __user *p = (void __user *)arg;
 	int retval;
 	struct tty_ldisc *ld;
 	struct inode *inode = file->f_dentry->d_inode;
 
-	tty = (struct tty_struct *)file->private_data;
 	if (tty_paranoia_check(tty, inode, "tty_ioctl"))
 		return -EINVAL;
 
@@ -2576,6 +2661,11 @@ long tty_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 		}
 		break;
+	case TIOSAK:
+		if (real_tty == tty && !capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		__do_SAK(real_tty);
+		return 0;
 	}
 	if (tty->ops->ioctl) {
 		retval = (tty->ops->ioctl)(tty, file, cmd, arg);
@@ -2598,7 +2688,7 @@ static long tty_compat_ioctl(struct file *file, unsigned int cmd,
 				unsigned long arg)
 {
 	struct inode *inode = file->f_dentry->d_inode;
-	struct tty_struct *tty = file->private_data;
+	struct tty_struct *tty = file_tty(file);
 	struct tty_ldisc *ld;
 	int retval = -ENOIOCTLCMD;
 
@@ -2669,7 +2759,7 @@ void __do_SAK(struct tty_struct *tty)
 	/* Now kill any processes that happen to have the
 	 * tty open.
 	 */
-	do_each_thread(g, p) {
+	do_each_thread_all(g, p) {
 		if (p->signal->tty == tty) {
 			printk(KERN_NOTICE "SAK: killed process %d"
 			    " (%s): task_session(p)==tty->session\n",
@@ -2690,7 +2780,7 @@ void __do_SAK(struct tty_struct *tty)
 				if (!filp)
 					continue;
 				if (filp->f_op->read == tty_read &&
-				    filp->private_data == tty) {
+				    file_tty(filp) == tty) {
 					printk(KERN_NOTICE "SAK: killed process %d"
 					    " (%s): fd#%d opened to the tty\n",
 					    task_pid_nr(p), p->comm, i);
@@ -2701,7 +2791,7 @@ void __do_SAK(struct tty_struct *tty)
 			spin_unlock(&p->files->file_lock);
 		}
 		task_unlock(p);
-	} while_each_thread(g, p);
+	} while_each_thread_all(g, p);
 	read_unlock(&tasklist_lock);
 #endif
 }
@@ -2768,6 +2858,7 @@ void initialize_tty_struct(struct tty_struct *tty,
 	tty->ops = driver->ops;
 	tty->index = idx;
 	tty_line_name(driver, idx, tty->name);
+	tty->owner_env = driver->owner_env;
 }
 
 /**
@@ -2860,6 +2951,7 @@ struct tty_driver *alloc_tty_driver(int lines)
 		driver->magic = TTY_DRIVER_MAGIC;
 		driver->num = lines;
 		/* later we'll move allocation of tables here */
+		driver->owner_env = get_ve(get_exec_env());
 	}
 	return driver;
 }
@@ -2894,6 +2986,7 @@ static void destruct_tty_driver(struct kref *kref)
 		kfree(p);
 		cdev_del(&driver->cdev);
 	}
+	put_ve(driver->owner_env);
 	kfree(driver);
 }
 
@@ -2968,6 +3061,7 @@ int tty_register_driver(struct tty_driver *driver)
 	}
 
 	mutex_lock(&tty_mutex);
+	driver->owner_env = get_exec_env();
 	list_add(&driver->tty_drivers, &tty_drivers);
 	mutex_unlock(&tty_mutex);
 
@@ -3141,3 +3235,61 @@ static int __init tty_init(void)
 	return 0;
 }
 module_init(tty_init);
+
+#ifdef CONFIG_UNIX98_PTYS
+int init_ve_tty_class(void)
+{
+	struct class * ve_tty_class;
+	struct device * res;
+
+	ve_tty_class = class_create(THIS_MODULE, "tty");
+	if (IS_ERR(ve_tty_class))
+		return -ENOMEM;
+
+	res = device_create(ve_tty_class, NULL,
+				MKDEV(TTYAUX_MAJOR, 0), NULL, "tty");
+	if (IS_ERR(res))
+		goto err_class;
+
+	res = device_create(ve_tty_class, NULL,
+				MKDEV(TTYAUX_MAJOR, 1), NULL, "console");
+	if (IS_ERR(res))
+		goto err_tty;
+
+	res = device_create(ve_tty_class, NULL,
+				MKDEV(TTYAUX_MAJOR, 2), NULL, "ptmx");
+	if (IS_ERR(res))
+		goto err_console;
+
+	get_exec_env()->tty_class = ve_tty_class;
+	return 0;
+
+err_console:
+	device_destroy(ve_tty_class, MKDEV(TTYAUX_MAJOR, 1));
+err_tty:
+	device_destroy(ve_tty_class, MKDEV(TTYAUX_MAJOR, 0));
+err_class:
+	class_destroy(ve_tty_class);
+	return PTR_ERR(res);
+}
+
+void fini_ve_tty_class(void)
+{
+	struct class *ve_tty_class = get_exec_env()->tty_class;
+
+	device_destroy(ve_tty_class, MKDEV(TTYAUX_MAJOR, 0));
+	device_destroy(ve_tty_class, MKDEV(TTYAUX_MAJOR, 1));
+	device_destroy(ve_tty_class, MKDEV(TTYAUX_MAJOR, 2));
+	class_destroy(ve_tty_class);
+}
+#else
+int init_ve_tty_class(void)
+{
+	return 0;
+}
+void fini_ve_tty_class(void)
+{
+}
+#endif
+EXPORT_SYMBOL(init_ve_tty_class);
+EXPORT_SYMBOL(fini_ve_tty_class);

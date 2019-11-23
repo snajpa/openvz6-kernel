@@ -137,7 +137,12 @@ extern char *make_class_name(const char *name, struct kobject *kobj);
 
 extern int devres_release_all(struct device *dev);
 
+#ifndef CONFIG_VE
 extern struct kset *devices_kset;
+#define ve_devices_kset devices_kset
+#else
+#define ve_devices_kset (get_exec_env()->devices_kset)
+#endif
 
 #if defined(CONFIG_MODULES) && defined(CONFIG_SYSFS)
 extern void module_add_driver(struct module *mod, struct device_driver *drv);
@@ -153,3 +158,17 @@ extern int devtmpfs_init(void);
 #else
 static inline int devtmpfs_init(void) { return 0; }
 #endif
+
+extern struct device_type part_type;
+#ifdef CONFIG_BLOCK
+static inline int device_is_not_partition(struct device *dev)
+{
+	return !(dev->type == &part_type);
+}
+#else
+static inline int device_is_not_partition(struct device *dev)
+{
+	return 1;
+}
+#endif
+

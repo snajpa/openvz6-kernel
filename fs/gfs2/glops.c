@@ -341,7 +341,7 @@ static int inode_go_lock(struct gfs2_holder *gh)
 		return 0;
 
 	if (test_bit(GIF_INVALID, &ip->i_flags)) {
-		error = gfs2_inode_refresh(ip);
+		error = gfs2_inode_refresh(ip, 0);
 		if (error)
 			return error;
 	}

@@ -48,6 +48,10 @@ ucc_geth_driver-objs := ucc_geth.o ucc_geth_ethtool.o
 
 obj-$(CONFIG_FSL_PQ_MDIO) += fsl_pq_mdio.o
 
+obj-$(CONFIG_VE_NETDEV) += vznetdev.o
+vznetdev-objs := venetdev.o veip_mgmt.o
+obj-$(CONFIG_VE_ETHDEV) += vzethdev.o
+
 #
 # link order important here
 #

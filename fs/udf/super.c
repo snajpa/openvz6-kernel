@@ -2135,6 +2135,8 @@ static void udf_put_super(struct super_block *sb)
 
 	sbi = UDF_SB(sb);
 
+	vfs_dq_off(sb, 0);
+
 	lock_kernel();
 
 	if (sbi->s_vat_inode)

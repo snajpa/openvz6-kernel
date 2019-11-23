@@ -61,6 +61,13 @@
 #include "vport-internal_dev.h"
 #include "vport-netdev.h"
 
+
+#if defined(CONFIG_OVS_BRCOMPAT) || defined(CONFIG_OVS_BRCOMPAT_MODULE)
+/* Allow brcompat module be loaded and hooked to bridge */
+int (*ovs_dp_ioctl_hook)(struct net_device *dev, struct ifreq *rq, int cmd);
+EXPORT_SYMBOL_GPL(ovs_dp_ioctl_hook);
+#endif
+
 int ovs_net_id __read_mostly;
 
 static void ovs_notify(struct sk_buff *skb, struct genl_info *info,
@@ -1843,18 +1850,7 @@ error:
 
 static int __net_init ovs_init_net(struct net *net)
 {
-	struct ovs_net *ovs_net;
-	int err;
-
-	ovs_net = kzalloc(sizeof(struct ovs_net), GFP_KERNEL);
-	if (ovs_net == NULL)
-		return -ENOMEM;
-
-	err = net_assign_generic(net, ovs_net_id, ovs_net);
-	if (err < 0) {
-		kfree(ovs_net);
-		return err;
-	}
+	struct ovs_net *ovs_net = net_generic(net, ovs_net_id);
 
 	INIT_LIST_HEAD(&ovs_net->dps);
 	INIT_WORK(&ovs_net->dp_notify_work, ovs_dp_notify_wq);
@@ -1872,12 +1868,13 @@ static void __net_exit ovs_exit_net(struct net *net)
 	ovs_unlock();
 
 	cancel_work_sync(&ovs_net->dp_notify_work);
-	kfree(ovs_net);
 }
 
 static struct pernet_operations ovs_net_ops = {
 	.init = ovs_init_net,
 	.exit = ovs_exit_net,
+	.id   = &ovs_net_id,
+	.size = sizeof(struct ovs_net),
 };
 
 static int __init dp_init(void)
@@ -1896,7 +1893,7 @@ static int __init dp_init(void)
 	if (err)
 		goto error_flow_exit;
 
-	err = register_pernet_gen_device(&ovs_net_id, &ovs_net_ops);
+	err = register_pernet_device(&ovs_net_ops);
 	if (err)
 		goto error_vport_exit;
 
@@ -1913,7 +1910,7 @@ static int __init dp_init(void)
 error_unreg_notifier:
 	unregister_netdevice_notifier(&ovs_dp_device_notifier);
 error_netns_exit:
-	unregister_pernet_gen_device(ovs_net_id, &ovs_net_ops);
+	unregister_pernet_device(&ovs_net_ops);
 error_vport_exit:
 	ovs_vport_exit();
 error_flow_exit:
@@ -1926,7 +1923,7 @@ static void dp_cleanup(void)
 {
 	dp_unregister_genl(ARRAY_SIZE(dp_genl_families));
 	unregister_netdevice_notifier(&ovs_dp_device_notifier);
-	unregister_pernet_gen_device(ovs_net_id, &ovs_net_ops);
+	unregister_pernet_device(&ovs_net_ops);
 	rcu_barrier();
 	ovs_vport_exit();
 	ovs_flow_exit();

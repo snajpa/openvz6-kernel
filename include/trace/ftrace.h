@@ -65,7 +65,8 @@
 	};
 #undef DEFINE_EVENT
 #define DEFINE_EVENT(template, name, proto, args)	\
-	static struct ftrace_event_call event_##name
+	static struct ftrace_event_call			\
+	__attribute__((__aligned__(4))) event_##name
 
 #undef DEFINE_EVENT_FN
 #define DEFINE_EVENT_FN(template, name, proto, args, reg, unreg)	\
@@ -803,6 +804,9 @@ __attribute__((section("_ftrace_events_ptrs"))) *__event_##call = &event_##call
 
 #undef __perf_count
 #define __perf_count(c) __count = (c)
+
+#undef TP_perf_assign
+#define TP_perf_assign(args...) args
 
 #undef DECLARE_EVENT_CLASS
 #define DECLARE_EVENT_CLASS(call, proto, args, tstruct, assign, print)	\

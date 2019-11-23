@@ -1545,6 +1545,21 @@ config KEXEC_AUTO_RESERVE
 	  On x86_32, 128M is reserved, on x86_64 1/32 of your memory is
 	  reserved, but it will not exceed 4G.
 
+config KEXEC_REUSE_CRASH
+	bool "try to reuse crashkernel when booting via kexec"
+	depends on KEXEC && PRAM
+	default y
+	---help---
+	  Reuse crashkernel left from the previous kernel if booting via
+	  kexec, so that early init bugs can be debugged.
+
+	  The option is actually enabled by writing 1 to
+	  /proc/sys/kernel/kexec_reuse_crash before calling kexec.
+
+	  Note that crashkernel areas (specified by the crashkernel boot
+	  option) of the new and the previous kernels must coincide for
+	  the crashkernel to be reused.
+
 config CRASH_DUMP
 	bool "kernel crash dumps"
 	depends on X86_64 || (X86_32 && HIGHMEM)
@@ -2173,6 +2188,8 @@ config HAVE_ATOMIC_IOMAP
 	def_bool y
 	depends on X86_32
 
+source "kernel/Kconfig.openvz"
+
 source "net/Kconfig"
 
 source "drivers/Kconfig"
@@ -2190,3 +2207,5 @@ source "crypto/Kconfig"
 source "arch/x86/kvm/Kconfig"
 
 source "lib/Kconfig"
+
+source "kernel/bc/Kconfig"

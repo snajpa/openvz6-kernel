@@ -49,6 +49,7 @@ struct dst_entry
 #define DST_NOPOLICY		4
 #define DST_NOHASH		8
 #define DST_NOCOUNT		16
+#define DST_FREE		32
 #define DST_FAKE_RTABLE		0x0080
 	unsigned long		expires;
 
@@ -117,6 +118,8 @@ struct dst_entry
 	atomic_t		__refcnt;	/* client references	*/
 	int			__use;
 	unsigned long		lastuse;
+	unsigned int		privnet_mark;
+
 	union {
 		struct dst_entry *next;
 		struct rtable    *rt_next;
@@ -126,6 +129,10 @@ struct dst_entry
 };
 
 #ifdef __KERNEL__
+void dst_dump_one(struct dst_entry *d);
+void ip_rt_dump_dsts(void);
+void dst_cache_dump(void);
+extern void (*ip6_rt_dump_dsts)(void);
 
 static inline u32
 dst_metric(const struct dst_entry *dst, int metric)

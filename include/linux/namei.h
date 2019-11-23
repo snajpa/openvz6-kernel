@@ -59,8 +59,13 @@ enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT, LAST_BIND};
 #define LOOKUP_CREATE		0x0200
 #define LOOKUP_EXCL		0x0400
 #define LOOKUP_RENAME_TARGET	0x0800
+#define LOOKUP_STRICT		0x2000	/* no symlinks or other filesystems */
+#define LOOKUP_EMPTY		0x4000
+#define LOOKUP_DIVE		0x8000	/* no follow mount */
+#define LOOKUP_OPATH		0x80000000
 
 extern int user_path_at(int, const char __user *, unsigned, struct path *);
+extern int user_path_at_empty(int, const char __user *, unsigned, struct path *, int *empty);
 
 #define user_path(name, path) user_path_at(AT_FDCWD, name, LOOKUP_FOLLOW, path)
 #define user_lpath(name, path) user_path_at(AT_FDCWD, name, 0, path)
@@ -87,6 +92,8 @@ extern int follow_up(struct path *);
 
 extern struct dentry *lock_rename(struct dentry *, struct dentry *);
 extern void unlock_rename(struct dentry *, struct dentry *);
+
+extern int lookup_flags(unsigned int f);
 
 static inline void nd_set_link(struct nameidata *nd, char *path)
 {

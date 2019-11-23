@@ -880,17 +880,22 @@ out:
 
 static void xs_reset_transport(struct sock_xprt *transport)
 {
-	struct socket *sock = transport->sock;
-	struct sock *sk = transport->inet;
 	struct rpc_xprt *xprt = &transport->xprt;
-
-	if (sk == NULL)
+	struct socket *sock;
+	struct sock *sk;
+ 
+	spin_lock_bh(&xprt->transport_lock);
+	if (transport->sock == NULL) {
+		spin_unlock_bh(&xprt->transport_lock);
 		return;
-
-	write_lock_bh(&sk->sk_callback_lock);
+	}
+	sock = transport->sock;
+	sk = transport->inet;
 	transport->inet = NULL;
 	transport->sock = NULL;
+	spin_unlock_bh(&xprt->transport_lock);
 
+	write_lock_bh(&sk->sk_callback_lock);
 	sk->sk_user_data = NULL;
 
 	xs_restore_old_callbacks(transport, sk);
@@ -1888,6 +1893,7 @@ static struct socket *xs_create_sock(struct rpc_xprt *xprt,
 				protocol, -err);
 		goto out;
 	}
+	sk_change_net_get(sock->sk, xprt->owner_env->ve_netns);
 	xs_reclassify_socket(family, sock);
 
 	if (reuseport)
@@ -1954,8 +1960,6 @@ static void xs_local_setup_socket(struct work_struct *work)
 	struct socket *sock;
 	int status = -EIO;
 
-	current->flags |= PF_FSTRANS;
-
 	status = __sock_create(xprt->xprt_net, AF_LOCAL,
 					SOCK_STREAM, 0, &sock, 1);
 	if (status < 0) {
@@ -1990,7 +1994,6 @@ out:
 	xprt_unlock_connect(xprt, transport);
 	xprt_clear_connecting(xprt);
 	xprt_wake_pending_tasks(xprt, status);
-	current->flags &= ~PF_FSTRANS;
 }
 
 static void xs_udp_finish_connecting(struct rpc_xprt *xprt, struct socket *sock)
@@ -2029,8 +2032,6 @@ static void xs_udp_setup_socket(struct work_struct *work)
 	struct socket *sock = transport->sock;
 	int status = -EIO;
 
-	current->flags |= PF_FSTRANS;
-
 	sock = xs_create_sock(xprt, transport,
 			xs_addr(xprt)->sa_family, SOCK_DGRAM,
 			IPPROTO_UDP, false);
@@ -2049,7 +2050,6 @@ out:
 	xprt_unlock_connect(xprt, transport);
 	xprt_clear_connecting(xprt);
 	xprt_wake_pending_tasks(xprt, status);
-	current->flags &= ~PF_FSTRANS;
 }
 
 static int xs_tcp_finish_connecting(struct rpc_xprt *xprt, struct socket *sock)
@@ -2138,8 +2138,6 @@ static void xs_tcp_setup_socket(struct work_struct *work)
 	struct rpc_xprt *xprt = &transport->xprt;
 	int status = -EIO;
 
-	current->flags |= PF_FSTRANS;
-
 	if (!sock) {
 		sock = xs_create_sock(xprt, transport,
 				xs_addr(xprt)->sa_family, SOCK_STREAM,
@@ -2174,7 +2172,6 @@ static void xs_tcp_setup_socket(struct work_struct *work)
 	case -EINPROGRESS:
 	case -EALREADY:
 		xprt_unlock_connect(xprt, transport);
-		current->flags &= ~PF_FSTRANS;
 		return;
 	case -EINVAL:
 		/* Happens, for instance, if the user specified a link
@@ -2194,7 +2191,6 @@ out:
 	xprt_unlock_connect(xprt, transport);
 	xprt_clear_connecting(xprt);
 	xprt_wake_pending_tasks(xprt, status);
-	current->flags &= ~PF_FSTRANS;
 }
 
 /**
@@ -2220,6 +2216,7 @@ static void xs_connect(struct rpc_xprt *xprt, struct rpc_task *task)
 	/* Start by resetting any existing state */
 	xs_reset_transport(transport);
 
+	BUG_ON(xprt->owner_env != get_exec_env());
 	if (transport->sock != NULL && !RPC_IS_SOFTCONN(task)) {
 		dprintk("RPC:       xs_connect delayed xprt %p for %lu "
 				"seconds\n",
@@ -2575,8 +2572,10 @@ static struct rpc_xprt *xs_setup_xprt(struct xprt_create *args,
 		int err;
 		err = xs_init_anyaddr(args->dstaddr->sa_family,
 					(struct sockaddr *)&new->srcaddr);
-		if (err != 0)
+		if (err != 0) {
+			xprt_free(xprt);
 			return ERR_PTR(err);
+		}
 	}
 
 	return xprt;

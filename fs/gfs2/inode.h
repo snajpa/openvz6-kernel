@@ -123,7 +123,7 @@ extern struct inode *gfs2_lookup_by_inum(struct gfs2_sbd *sdp, u64 no_addr,
 					 u64 *no_formal_ino,
 					 unsigned int blktype);
 
-extern int gfs2_inode_refresh(struct gfs2_inode *ip);
+extern int gfs2_inode_refresh(struct gfs2_inode *ip, int create);
 
 extern struct inode *gfs2_lookupi(struct inode *dir, const struct qstr *name,
 				  int is_root);

@@ -18,6 +18,7 @@ extern const char VDSO64_PRELINK[];
 #if defined CONFIG_X86_32 || defined CONFIG_COMPAT
 extern const char VDSO32_PRELINK[];
 
+extern const char VDSO32_SYSENTER_RETURN[];
 /*
  * Given a pointer to the vDSO image, find the pointer to VDSO32_name
  * as that symbol is defined in the vDSO sources or linker script.

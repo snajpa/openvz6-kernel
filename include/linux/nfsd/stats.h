@@ -40,11 +40,7 @@ struct nfsd_stats {
 
 };
 
-
-extern struct nfsd_stats	nfsdstats;
-extern struct svc_stat		nfsd_svcstats;
-
-void	nfsd_stat_init(void);
+int	nfsd_stat_init(void);
 void	nfsd_stat_shutdown(void);
 
 #endif /* __KERNEL__ */

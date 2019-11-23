@@ -24,6 +24,34 @@
 
 #define	DM_MSG_PREFIX	"thin"
 
+static struct kmem_cache *_discard_cache;
+
+struct discard_io {
+	unsigned long magic;
+	struct bio *orig_bio;
+	struct thin_c *tc;
+	sector_t sector;
+	unsigned int size;
+	bool requeued;
+
+	struct page *page_provisioned;
+	int n_provisioned;
+	int idx_provisioned;
+};
+
+#define THIN_DISCARD_MAGIC 0xbaabdeed
+
+static union map_info *thin_get_mapinfo(struct bio *bio)
+{
+	if (bio->bi_rw & BIO_DISCARD) {
+		struct discard_io *dio = bio->bi_private;
+		BUG_ON(!dio->orig_bio);
+		bio = dio->orig_bio;
+	}
+
+	return dm_get_mapinfo(bio);
+}
+
 /*
  * Tunable constants
  */
@@ -310,6 +338,9 @@ struct thin_c {
 	 */
 	atomic_t refcount;
 	struct completion can_destroy;
+
+	struct bio_set *discard_bs;
+	mempool_t *discard_pool;
 };
 
 /*----------------------------------------------------------------*/
@@ -554,17 +585,33 @@ static bool block_size_is_power_of_two(struct pool *pool)
 	return pool->sectors_per_block_shift >= 0;
 }
 
-static dm_block_t get_bio_block(struct thin_c *tc, struct bio *bio)
+static dm_block_t get_block_by_sector(struct thin_c *tc, sector_t nr)
 {
 	struct pool *pool = tc->pool;
-	sector_t block_nr = bio->bi_sector;
 
 	if (block_size_is_power_of_two(pool))
-		block_nr >>= pool->sectors_per_block_shift;
+		nr >>= pool->sectors_per_block_shift;
 	else
-		(void) sector_div(block_nr, pool->sectors_per_block);
+		(void) sector_div(nr, pool->sectors_per_block);
 
-	return block_nr;
+	return nr;
+}
+
+static sector_t get_sector_by_block(struct thin_c *tc, dm_block_t nr)
+{
+	struct pool *pool = tc->pool;
+
+	if (block_size_is_power_of_two(pool))
+		nr <<= pool->sectors_per_block_shift;
+	else
+		nr *= pool->sectors_per_block;
+
+	return nr;
+}
+
+static dm_block_t get_bio_block(struct thin_c *tc, struct bio *bio)
+{
+	return get_block_by_sector(tc, bio->bi_sector);
 }
 
 static void remap(struct thin_c *tc, struct bio *bio, dm_block_t block)
@@ -574,11 +621,11 @@ static void remap(struct thin_c *tc, struct bio *bio, dm_block_t block)
 
 	bio->bi_bdev = tc->pool_dev->bdev;
 	if (block_size_is_power_of_two(pool))
-		bio->bi_sector = (block << pool->sectors_per_block_shift) |
-				(bi_sector & (pool->sectors_per_block - 1));
+		bio->bi_sector = get_sector_by_block(tc, block) |
+			        (bi_sector & (pool->sectors_per_block - 1));
 	else
-		bio->bi_sector = (block * pool->sectors_per_block) +
-				 sector_div(bi_sector, pool->sectors_per_block);
+		bio->bi_sector = get_sector_by_block(tc, block) +
+			         sector_div(bi_sector, pool->sectors_per_block);
 }
 
 static void remap_to_origin(struct thin_c *tc, struct bio *bio)
@@ -599,7 +646,7 @@ static void inc_all_io_entry(struct pool *pool, struct bio *bio)
 	if (bio->bi_rw & BIO_DISCARD)
 		return;
 
-	h = dm_get_mapinfo(bio)->ptr;
+	h = thin_get_mapinfo(bio)->ptr;
 	h->all_io_entry = dm_deferred_entry_inc(pool->all_io_ds);
 }
 
@@ -709,7 +756,7 @@ static void copy_complete(int read_err, unsigned long write_err, void *context)
 
 static void overwrite_endio(struct bio *bio, int err)
 {
-	struct dm_thin_endio_hook *h = dm_get_mapinfo(bio)->ptr;
+	struct dm_thin_endio_hook *h = thin_get_mapinfo(bio)->ptr;
 	struct dm_thin_new_mapping *m = h->overwrite_mapping;
 
 	bio->bi_end_io = m->saved_bi_end_io;
@@ -981,7 +1028,7 @@ static void remap_and_issue_overwrite(struct thin_c *tc, struct bio *bio,
 				      struct dm_thin_new_mapping *m)
 {
 	struct pool *pool = tc->pool;
-	struct dm_thin_endio_hook *h = dm_get_mapinfo(bio)->ptr;
+	struct dm_thin_endio_hook *h = thin_get_mapinfo(bio)->ptr;
 
 	h->overwrite_mapping = m;
 	m->bio = bio;
@@ -1229,7 +1276,7 @@ static int alloc_data_block(struct thin_c *tc, dm_block_t *result)
  */
 static void retry_on_resume(struct bio *bio)
 {
-	struct dm_thin_endio_hook *h = dm_get_mapinfo(bio)->ptr;
+	struct dm_thin_endio_hook *h = thin_get_mapinfo(bio)->ptr;
 	struct thin_c *tc = h->tc;
 	unsigned long flags;
 
@@ -1372,11 +1419,135 @@ static void process_discard_cell(struct thin_c *tc, struct dm_bio_prison_cell *c
 	}
 }
 
+static int find_provisioned_blocks(struct thin_c *tc, struct bio *bio)
+{
+	struct discard_io *dio = bio->bi_private;
+	unsigned int dio_size = dio->size;
+	sector_t bi_sec = bio->bi_sector;
+
+	dm_block_t block = get_bio_block(tc, bio);
+	dm_block_t end_block = get_block_by_sector(tc,
+				bi_sec + (dio_size >> SECTOR_SHIFT) - 1);
+	int rc, n = 0;
+
+	struct page *page = alloc_page(GFP_NOIO);
+	dm_block_t *blks;
+	int max_blks;
+
+	if (!page)
+		return -ENOMEM;
+
+	BUG_ON(end_block < block);
+	blks = (dm_block_t *)page_address(page);
+	max_blks = PAGE_SIZE / sizeof(dm_block_t);
+
+	rc = dm_thin_find_blocks(tc->td, block, end_block, blks, max_blks, &n);
+
+	if (rc && !n) {
+		put_page(page);
+		return rc;
+	}
+
+	WARN_ONCE(rc && rc != -ENOSPC,
+		  "Unknown error from dm_thin_find_blocks: %d\n", rc);
+
+	dio->page_provisioned = page;
+	dio->n_provisioned = n;
+	dio->idx_provisioned = 0;
+	return 0;
+}
+
+static sector_t bio_last_sector(struct bio *bio)
+{
+	return bio->bi_sector + (bio->bi_size >> SECTOR_SHIFT) - 1;
+}
+
 static void process_discard_bio(struct thin_c *tc, struct bio *bio)
 {
 	struct dm_bio_prison_cell *cell;
 	struct dm_cell_key key;
 	dm_block_t block = get_bio_block(tc, bio);
+	dm_block_t *blocks;
+
+	struct discard_io *dio = bio->bi_private;
+	BUG_ON(!dio || dio->magic != THIN_DISCARD_MAGIC);
+	BUG_ON(!dio->orig_bio);
+
+	/* dm might re-queue us for deferred processing */
+	if (dio->requeued)
+		goto queue;
+
+	/* optimization: batch searching for provisioned blocks */
+	if (!dio->page_provisioned) {
+		int rc  = find_provisioned_blocks(tc, bio);
+		if (!rc && !dio->n_provisioned) { /* no more provisioned blocks found */
+			put_page(dio->page_provisioned);
+			dio->page_provisioned = NULL;
+			dio->size = 0;
+			bio_endio(bio, 0);
+			return;
+		}
+	}
+
+	if (dio->page_provisioned) { /* optimization succeeded */
+		blocks = (dm_block_t *)page_address(dio->page_provisioned);
+		block = blocks[dio->idx_provisioned++];
+		if (dio->idx_provisioned == dio->n_provisioned) {
+			put_page(dio->page_provisioned);
+			dio->page_provisioned = NULL;
+		}
+
+		/* skip not provisioned blocks */
+		if (get_sector_by_block(tc, block) > bio->bi_sector) {
+			int l = get_sector_by_block(tc, block) - bio->bi_sector;
+			BUG_ON((l << SECTOR_SHIFT) >= dio->size);
+
+			bio->bi_sector += l;
+			dio->size -= (l << SECTOR_SHIFT);
+		}
+	} else { /* fall back to "find first provisioned block" loop */
+		for (;;) {
+			struct dm_thin_lookup_result lookup_result;
+			int r, l;
+
+			r = dm_thin_find_block(tc->td, block, 1, &lookup_result);
+			if (!r)
+				break;
+
+			if (r != -ENODATA)
+				DMERR_LIMIT("%s: dm_thin_find_block() failed:"
+					    " error = %d", __func__, r);
+
+			l = get_sector_by_block(tc, block + 1) - bio->bi_sector;
+			if ((l << SECTOR_SHIFT) >= dio->size) {
+				dio->size = 0;
+				bio_endio(bio, 0);
+				return;
+			}
+
+			block++;
+			bio->bi_sector += l;
+			BUG_ON(dio->size < (l << SECTOR_SHIFT));
+			dio->size -= (l << SECTOR_SHIFT);
+		}
+	}
+
+	/* deal with the case when remaining dio->size < dm_block_size */
+	bio->bi_size = min(tc->pool->sectors_per_block << SECTOR_SHIFT,
+			   dio->size);
+
+	/* do not jump onto next block */
+	if (block != get_block_by_sector(tc, bio_last_sector(bio))) {
+		int l = get_sector_by_block(tc, block + 1) - bio->bi_sector;
+		bio->bi_size = (l << SECTOR_SHIFT);
+	}
+
+	/* prepare dio for next round (see last clause in discard_endio) */
+	dio->requeued = true;
+	BUG_ON(dio->size < bio->bi_size);
+	dio->size -= bio->bi_size;
+	dio->sector = bio->bi_sector;
+queue:
 
 	build_virtual_key(tc->td, block, &key);
 	if (bio_detain(tc->pool, &key, bio, &cell))
@@ -1424,7 +1595,7 @@ static void __remap_and_issue_shared_cell(void *context,
 		    (bio->bi_rw & (BIO_DISCARD | BIO_FLUSH | BIO_FUA)))
 			bio_list_add(&info->defer_bios, bio);
 		else {
-			struct dm_thin_endio_hook *h = dm_get_mapinfo(bio)->ptr;
+			struct dm_thin_endio_hook *h = thin_get_mapinfo(bio)->ptr;
 
 			h->shared_read_entry = dm_deferred_entry_inc(info->tc->pool->shared_read_ds);
 			inc_all_io_entry(info->tc->pool, bio);
@@ -1477,7 +1648,7 @@ static void process_shared_bio(struct thin_c *tc, struct bio *bio,
 		break_sharing(tc, bio, block, &key, lookup_result, data_cell);
 		cell_defer_no_holder(tc, virt_cell);
 	} else {
-		struct dm_thin_endio_hook *h = dm_get_mapinfo(bio)->ptr;
+		struct dm_thin_endio_hook *h = thin_get_mapinfo(bio)->ptr;
 
 		h->shared_read_entry = dm_deferred_entry_inc(pool->shared_read_ds);
 		inc_all_io_entry(pool, bio);
@@ -1722,7 +1893,7 @@ static void __thin_bio_rb_add(struct thin_c *tc, struct bio *bio)
 			rbp = &(*rbp)->rb_right;
 	}
 
-	pbd = dm_get_mapinfo(bio)->ptr;
+	pbd = thin_get_mapinfo(bio)->ptr;
 	rb_link_node(&pbd->rb_node, parent, rbp);
 	rb_insert_color(&pbd->rb_node, &tc->sort_bio_list);
 }
@@ -2254,9 +2425,79 @@ static void thin_defer_bio(struct thin_c *tc, struct bio *bio)
 	wake_worker(pool);
 }
 
-static void thin_defer_bio_with_throttle(struct thin_c *tc, struct bio *bio)
+static void discard_bio_destructor(struct bio *bio)
+{
+	struct discard_io *dio = bio->bi_private;
+	struct thin_c *tc;
+	BUG_ON(!dio || dio->magic != THIN_DISCARD_MAGIC);
+	BUG_ON(dio->orig_bio || !dio->tc);
+	tc = dio->tc;
+
+	dio->magic = 0;
+	bio_free(bio, tc->discard_bs);
+	mempool_free(dio, tc->discard_pool);
+}
+
+static void discard_endio(struct bio *bio, int error)
+{
+	struct discard_io *dio = bio->bi_private;
+	struct bio *orig_bio;
+	BUG_ON(!dio || dio->magic != THIN_DISCARD_MAGIC);
+	BUG_ON(!dio->orig_bio || !dio->tc);
+	orig_bio = dio->orig_bio;
+
+	if (!bio_flagged(bio, BIO_UPTODATE) && !error) {
+		put_page(dio->page_provisioned);
+		dio->page_provisioned = NULL;
+		error = -EIO;
+	}
+
+	if (!dio->size) {
+		BUG_ON(dio->page_provisioned);
+		dio->orig_bio = NULL;
+		bio_put(bio);
+		bio_endio(orig_bio, error);
+	} else {
+		bio->bi_sector = dio->sector;
+		bio->bi_sector += (bio->bi_size >> SECTOR_SHIFT);
+		dio->requeued = false;
+		thin_defer_bio(dio->tc, bio);
+	}
+}
+
+static void thin_defer_bio_with_throttle(struct thin_c *tc, struct bio *bio, union map_info *map_context)
 {
 	struct pool *pool = tc->pool;
+
+	if (bio->bi_rw & BIO_DISCARD) {
+		struct dm_thin_endio_hook *h = map_context->ptr;
+		int block_size = tc->pool->sectors_per_block << SECTOR_SHIFT;
+		struct bio *clone = bio_alloc_bioset(GFP_NOIO, bio->bi_max_vecs, tc->discard_bs);
+		struct discard_io *dio = mempool_alloc(tc->discard_pool, GFP_NOIO);
+		BUG_ON(!clone || !dio);
+
+		BUG_ON(!h);
+		h->bio = clone;
+
+		dio->tc = tc;
+		dio->orig_bio = bio;
+		dio->magic = THIN_DISCARD_MAGIC;
+		dio->sector = 0;
+		dio->size = bio->bi_size;
+
+		dio->page_provisioned = NULL;
+		dio->requeued = false;
+		__bio_clone(clone, bio);
+		clone->bi_destructor = discard_bio_destructor;
+
+		if (clone->bi_size > block_size)
+			clone->bi_size = block_size;
+
+		clone->bi_end_io = discard_endio;
+		clone->bi_private = dio;
+
+		bio = clone;
+	}
 
 	throttle_lock(&pool->throttle);
 	thin_defer_bio(tc, bio);
@@ -2318,7 +2559,7 @@ static int thin_bio_map(struct dm_target *ti, struct bio *bio,
 	}
 
 	if (bio->bi_rw & (BIO_DISCARD | BIO_FLUSH | BIO_FUA)) {
-		thin_defer_bio_with_throttle(tc, bio);
+		thin_defer_bio_with_throttle(tc, bio, map_context);
 		return DM_MAPIO_SUBMITTED;
 	}
 
@@ -3723,7 +3964,7 @@ static void thin_dtr(struct dm_target *ti)
 	spin_lock_irqsave(&tc->pool->lock, flags);
 	list_del_rcu(&tc->list);
 	spin_unlock_irqrestore(&tc->pool->lock, flags);
-	synchronize_rcu();
+	synchronize_rcu_expedited();
 
 	thin_put(tc);
 	wait_for_completion(&tc->can_destroy);
@@ -3735,6 +3976,10 @@ static void thin_dtr(struct dm_target *ti)
 	dm_put_device(ti, tc->pool_dev);
 	if (tc->origin_dev)
 		dm_put_device(ti, tc->origin_dev);
+	if (tc->discard_bs)
+		bioset_free(tc->discard_bs);
+	if (tc->discard_pool)
+		mempool_destroy(tc->discard_pool);
 	kfree(tc);
 
 	mutex_unlock(&dm_thin_pool_table.mutex);
@@ -3759,6 +4004,7 @@ static int thin_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	struct dm_dev *pool_dev, *origin_dev;
 	struct mapped_device *pool_md;
 	unsigned long flags;
+	unsigned int pool_size = dm_get_reserved_bio_based_ios();
 
 	mutex_lock(&dm_thin_pool_table.mutex);
 
@@ -3780,6 +4026,14 @@ static int thin_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	bio_list_init(&tc->deferred_bio_list);
 	bio_list_init(&tc->retry_on_resume_list);
 	tc->sort_bio_list = RB_ROOT;
+
+	tc->discard_bs = bioset_create(pool_size, 0);
+	tc->discard_pool = mempool_create_slab_pool(pool_size, _discard_cache);
+	if (!tc->discard_bs || !tc->discard_pool) {
+		ti->error = "Out of memory";
+		r = -ENOMEM;
+		goto out_unlock;
+	}
 
 	if (argc == 3) {
 		r = dm_get_device(ti, argv[2], FMODE_READ, &origin_dev);
@@ -3842,8 +4096,8 @@ static int thin_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	if (tc->pool->pf.discard_enabled) {
 		ti->discards_supported = 1;
 		ti->num_discard_requests = 1;
-		/* Discard requests must be split on a block boundary */
-		ti->split_discard_requests = 1;
+		/* Discard requests must not be split on a block boundary */
+		ti->split_discard_requests = 0;
 	}
 
 	mutex_unlock(&dm_thin_pool_table.mutex);
@@ -3866,7 +4120,7 @@ static int thin_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	 * added tc isn't yet visible).  So this reduces latency since we
 	 * aren't then dependent on the periodic commit to wake_worker().
 	 */
-	synchronize_rcu();
+	synchronize_rcu_expedited();
 
 	dm_put(pool_md);
 
@@ -3884,6 +4138,10 @@ bad_pool_dev:
 	if (tc->origin_dev)
 		dm_put_device(ti, tc->origin_dev);
 bad_origin_dev:
+	if (tc->discard_bs)
+		bioset_free(tc->discard_bs);
+	if (tc->discard_pool)
+		mempool_destroy(tc->discard_pool);
 	kfree(tc);
 out_unlock:
 	mutex_unlock(&dm_thin_pool_table.mutex);
@@ -4118,8 +4376,14 @@ static int __init dm_thin_init(void)
 	if (!_endio_hook_cache)
 		goto bad_endio_hook_cache;
 
+	_discard_cache = KMEM_CACHE(discard_io, 0);
+	if (!_discard_cache)
+		goto bad_discard_cache;
+
 	return 0;
 
+bad_discard_cache:
+	kmem_cache_destroy(_endio_hook_cache);
 bad_endio_hook_cache:
 	kmem_cache_destroy(_new_mapping_cache);
 bad_new_mapping_cache:
@@ -4137,6 +4401,7 @@ static void dm_thin_exit(void)
 
 	kmem_cache_destroy(_new_mapping_cache);
 	kmem_cache_destroy(_endio_hook_cache);
+	kmem_cache_destroy(_discard_cache);
 }
 
 module_init(dm_thin_init);

@@ -17,7 +17,9 @@
 #include <linux/module.h>
 #include <linux/rmap.h>
 #include <linux/mmzone.h>
+#include <linux/mmgang.h>
 #include <linux/hugetlb.h>
+#include <bc/vmpages.h>
 
 #include "internal.h"
 
@@ -76,7 +78,7 @@ void __clear_page_mlock(struct page *page)
  * Mark page as mlocked if not already.
  * If page on LRU, isolate and putback to move to unevictable list.
  */
-void mlock_vma_page(struct page *page)
+void mlock_vma_page(struct vm_area_struct *vma, struct page *page)
 {
 	/* Serialize with page migration */
 	BUG_ON(!PageLocked(page));
@@ -84,10 +86,18 @@ void mlock_vma_page(struct page *page)
 	if (!TestSetPageMlocked(page)) {
 		inc_zone_page_state(page, NR_MLOCK);
 		count_vm_event(UNEVICTABLE_PGMLOCKED);
-		if (!isolate_lru_page(page))
+		if (!isolate_lru_page(page)) {
+			struct gang_set *gs = get_mm_gang(vma->vm_mm);
+
+			if (!page_in_gang(page, gs))
+				gang_mod_user_page(page, gs,
+						GFP_ATOMIC|__GFP_NOFAIL);
+
 			putback_lru_page(page);
+		}
 	}
 }
+EXPORT_SYMBOL(mlock_vma_page);
 
 /*
  * called from munlock()/munmap() path with page supposedly on the LRU.
@@ -139,6 +149,7 @@ void munlock_vma_page(struct page *page)
 		}
 	}
 }
+EXPORT_SYMBOL(munlock_vma_page);
 
 /**
  * __mlock_vma_pages_range() -  mlock a range of pages in the vma.
@@ -229,7 +240,7 @@ static long __mlock_vma_pages_range(struct vm_area_struct *vma,
 				 * only check for file-cache page truncation.
 				 */
 				if (page->mapping)
-					mlock_vma_page(page);
+					mlock_vma_page(vma, page);
 				unlock_page(page);
 			}
 			put_page(page);	/* ref from get_user_pages() */
@@ -323,12 +334,14 @@ no_mlock:
  * and re-mlocked by try_to_{munlock|unmap} before we unmap and
  * free them.  This will result in freeing mlocked pages.
  */
-void munlock_vma_pages_range(struct vm_area_struct *vma,
-			     unsigned long start, unsigned long end)
+void __munlock_vma_pages_range(struct vm_area_struct *vma,
+			     unsigned long start, unsigned long end, int acct)
 {
 	unsigned long addr;
 
 	lru_add_drain();
+	if (acct)
+		ub_locked_uncharge(vma->vm_mm, end - start);
 	vma->vm_flags &= ~VM_LOCKED;
 
 	for (addr = start; addr < end; addr += PAGE_SIZE) {
@@ -368,13 +381,14 @@ void munlock_vma_pages_range(struct vm_area_struct *vma,
  * For vmas that pass the filters, merge/split as appropriate.
  */
 static int mlock_fixup(struct vm_area_struct *vma, struct vm_area_struct **prev,
-	unsigned long start, unsigned long end, unsigned int newflags)
+	unsigned long start, unsigned long end, vm_flags_t newflags,
+	bool convert_error)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	pgoff_t pgoff;
 	int nr_pages;
 	int ret = 0;
-	int lock = newflags & VM_LOCKED;
+	int lock = !!(newflags & VM_LOCKED);
 
 	if (newflags == vma->vm_flags ||
 			(vma->vm_flags & (VM_IO | VM_PFNMAP)))
@@ -388,6 +402,12 @@ static int mlock_fixup(struct vm_area_struct *vma, struct vm_area_struct **prev,
 		goto out;	/* don't set VM_LOCKED,  don't count */
 	}
 
+	if (newflags & VM_LOCKED) {
+		ret = ub_locked_charge(mm, end - start);
+		if (ret < 0)
+			goto out;
+	}
+
 	pgoff = vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT);
 	*prev = vma_merge(mm, *prev, start, end, newflags, vma->anon_vma,
 			  vma->vm_file, pgoff, vma_policy(vma));
@@ -399,13 +419,13 @@ static int mlock_fixup(struct vm_area_struct *vma, struct vm_area_struct **prev,
 	if (start != vma->vm_start) {
 		ret = split_vma(mm, vma, start, 1);
 		if (ret)
-			goto out;
+			goto out_uncharge;
 	}
 
 	if (end != vma->vm_end) {
 		ret = split_vma(mm, vma, end, 0);
 		if (ret)
-			goto out;
+			goto out_uncharge;
 	}
 
 success:
@@ -426,7 +446,7 @@ success:
 	if (lock) {
 		vma->vm_flags = newflags;
 		ret = __mlock_vma_pages_range(vma, start, end);
-		if (ret < 0)
+		if ((ret < 0) && (convert_error == true))
 			ret = __mlock_posix_error_return(ret);
 	} else {
 		munlock_vma_pages_range(vma, start, end);
@@ -435,9 +455,14 @@ success:
 out:
 	*prev = vma;
 	return ret;
+
+out_uncharge:
+	if (newflags & VM_LOCKED)
+		ub_locked_uncharge(mm, end - start);
+	goto out;
 }
 
-static int do_mlock(unsigned long start, size_t len, int on)
+static int do_mlock(unsigned long start, size_t len, int on, bool convert_error)
 {
 	unsigned long nstart, end, tmp;
 	struct vm_area_struct * vma, * prev;
@@ -457,7 +482,7 @@ static int do_mlock(unsigned long start, size_t len, int on)
 		prev = vma;
 
 	for (nstart = start ; ; ) {
-		unsigned int newflags;
+		vm_flags_t newflags;
 
 		/* Here we know that  vma->vm_start <= nstart < vma->vm_end. */
 
@@ -468,7 +493,7 @@ static int do_mlock(unsigned long start, size_t len, int on)
 		tmp = vma->vm_end;
 		if (tmp > end)
 			tmp = end;
-		error = mlock_fixup(vma, &prev, nstart, tmp, newflags);
+		error = mlock_fixup(vma, &prev, nstart, tmp, newflags, convert_error);
 		if (error)
 			break;
 		nstart = tmp;
@@ -486,7 +511,7 @@ static int do_mlock(unsigned long start, size_t len, int on)
 	return error;
 }
 
-SYSCALL_DEFINE2(mlock, unsigned long, start, size_t, len)
+int __mlock(unsigned long start, size_t len, bool convert_error)
 {
 	unsigned long locked;
 	unsigned long lock_limit;
@@ -509,21 +534,33 @@ SYSCALL_DEFINE2(mlock, unsigned long, start, size_t, len)
 
 	/* check against resource limits */
 	if ((locked <= lock_limit) || capable(CAP_IPC_LOCK))
-		error = do_mlock(start, len, 1);
+		error = do_mlock(start, len, 1, convert_error);
 	up_write(&current->mm->mmap_sem);
 	return error;
 }
+EXPORT_SYMBOL_GPL(__mlock);
 
-SYSCALL_DEFINE2(munlock, unsigned long, start, size_t, len)
+SYSCALL_DEFINE2(mlock, unsigned long, start, size_t, len)
+{
+	return __mlock(start, len, true);
+}
+
+int __munlock(unsigned long start, size_t len, bool convert_error)
 {
 	int ret;
 
 	down_write(&current->mm->mmap_sem);
 	len = PAGE_ALIGN(len + (start & ~PAGE_MASK));
 	start &= PAGE_MASK;
-	ret = do_mlock(start, len, 0);
+	ret = do_mlock(start, len, 0, convert_error);
 	up_write(&current->mm->mmap_sem);
 	return ret;
+}
+EXPORT_SYMBOL_GPL(__munlock);
+
+SYSCALL_DEFINE2(munlock, unsigned long, start, size_t, len)
+{
+	return __munlock(start, len, true);
 }
 
 static int do_mlockall(int flags)
@@ -538,14 +575,14 @@ static int do_mlockall(int flags)
 		goto out;
 
 	for (vma = current->mm->mmap; vma ; vma = prev->vm_next) {
-		unsigned int newflags;
+		vm_flags_t newflags;
 
 		newflags = vma->vm_flags | VM_LOCKED;
 		if (!(flags & MCL_CURRENT))
 			newflags &= ~VM_LOCKED;
 
 		/* Ignore errors */
-		mlock_fixup(vma, &prev, vma->vm_start, vma->vm_end, newflags);
+		mlock_fixup(vma, &prev, vma->vm_start, vma->vm_end, newflags, true);
 	}
 out:
 	return 0;

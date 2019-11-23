@@ -41,6 +41,7 @@ struct wait_bit_key {
 	void *flags;
 	int bit_nr;
 #define WAIT_ATOMIC_T_BIT_NR -1
+	unsigned long timeout;
 };
 
 struct wait_bit_queue {
@@ -143,6 +144,10 @@ static inline void __remove_wait_queue(wait_queue_head_t *head,
 	list_del(&old->task_list);
 }
 
+typedef int wait_bit_action_f(struct wait_bit_key *, int mode);
+int __wait_on_bit_2(wait_queue_head_t *, struct wait_bit_queue *,
+		      wait_bit_action_f *action, unsigned mode);
+
 void __wake_up(wait_queue_head_t *q, unsigned int mode, int nr, void *key);
 void __wake_up_locked_key(wait_queue_head_t *q, unsigned int mode, void *key);
 void __wake_up_sync_key(wait_queue_head_t *q, unsigned int mode, int nr,
@@ -158,6 +163,8 @@ int out_of_line_wait_on_bit(void *, int, int (*)(void *), unsigned);
 int out_of_line_wait_on_bit_lock(void *, int, int (*)(void *), unsigned);
 int out_of_line_wait_on_atomic_t(atomic_t *, int (*)(atomic_t *), unsigned);
 wait_queue_head_t *bit_waitqueue(void *, int);
+
+int bit_wait_io_timeout(struct wait_bit_key *word, int mode);
 
 #define wake_up(x)			__wake_up(x, TASK_NORMAL, 1, NULL)
 #define wake_up_nr(x, nr)		__wake_up(x, TASK_NORMAL, nr, NULL)

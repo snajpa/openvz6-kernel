@@ -167,6 +167,9 @@ char *		rpc_sockaddr2uaddr(const struct sockaddr *);
 size_t		rpc_uaddr2sockaddr(const char *, const size_t,
 				   struct sockaddr *, const size_t);
 
+extern int ve_ip_map_init(void);
+extern void ve_ip_map_exit(void);
+
 static inline unsigned short rpc_get_port(const struct sockaddr *sap)
 {
 	switch (sap->sa_family) {

@@ -144,7 +144,7 @@ static __be32 *encode_fsid(__be32 *p, struct svc_fh *fhp)
 	default:
 	case FSIDSOURCE_DEV:
 		p = xdr_encode_hyper(p, (u64)huge_encode_dev
-				     (fhp->fh_dentry->d_inode->i_sb->s_dev));
+				     (exp_get_dev(fhp->fh_export)));
 		break;
 	case FSIDSOURCE_FSID:
 		p = xdr_encode_hyper(p, (u64) fhp->fh_export->ex_fsid);
@@ -1060,8 +1060,13 @@ nfs3svc_encode_fsinfores(struct svc_rqst *rqstp, __be32 *p,
 		*p++ = htonl(resp->f_wtmult);
 		*p++ = htonl(resp->f_dtpref);
 		p = xdr_encode_hyper(p, resp->f_maxfilesize);
-		*p++ = xdr_one;
-		*p++ = xdr_zero;
+		if (resp->f_time_gran) {
+			*p++ = xdr_zero;
+			*p++ = htonl(resp->f_time_gran);
+		} else {
+			*p++ = xdr_one;
+			*p++ = xdr_zero;
+		}
 		*p++ = htonl(resp->f_properties);
 	}
 

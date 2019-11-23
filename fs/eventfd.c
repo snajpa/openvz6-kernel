@@ -19,21 +19,6 @@
 #include <linux/kref.h>
 #include <linux/eventfd.h>
 
-struct eventfd_ctx {
-	struct kref kref;
-	wait_queue_head_t wqh;
-	/*
-	 * Every time that a write(2) is performed on an eventfd, the
-	 * value of the __u64 being written is added to "count" and a
-	 * wakeup is performed on "wqh". A read(2) will return the "count"
-	 * value to userspace, and will reset "count" to zero. The kernel
-	 * side eventfd_signal() also, adds to the "count" counter and
-	 * issue a wakeup.
-	 */
-	__u64 count;
-	unsigned int flags;
-};
-
 /**
  * eventfd_signal - Adds @n to the eventfd counter.
  * @ctx: [in] Pointer to the eventfd context.
@@ -263,12 +248,13 @@ static ssize_t eventfd_write(struct file *file, const char __user *buf, size_t c
 	return res;
 }
 
-static const struct file_operations eventfd_fops = {
+const struct file_operations eventfd_fops = {
 	.release	= eventfd_release,
 	.poll		= eventfd_poll,
 	.read		= eventfd_read,
 	.write		= eventfd_write,
 };
+EXPORT_SYMBOL(eventfd_fops);
 
 /**
  * eventfd_fget - Acquire a reference of an eventfd file descriptor.
@@ -405,6 +391,7 @@ err_put_unused_fd:
 
 	return error;
 }
+EXPORT_SYMBOL_GPL(sys_eventfd2);
 
 SYSCALL_DEFINE1(eventfd, unsigned int, count)
 {

@@ -177,7 +177,9 @@ static inline struct vport *ovs_vport_ovsl(const struct datapath *dp, int port_n
 
 extern struct notifier_block ovs_dp_device_notifier;
 extern struct genl_multicast_group ovs_dp_vport_multicast_group;
-
+#if defined(CONFIG_OVS_BRCOMPAT) || defined(CONFIG_OVS_BRCOMPAT_MODULE)
+extern int (*ovs_dp_ioctl_hook)(struct net_device *dev, struct ifreq *rq, int cmd);
+#endif
 void ovs_dp_process_received_packet(struct vport *, struct sk_buff *);
 void ovs_dp_detach_port(struct vport *);
 int ovs_dp_upcall(struct datapath *, struct sk_buff *,

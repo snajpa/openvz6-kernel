@@ -67,8 +67,13 @@ redirect_tg(struct sk_buff *skb, const struct xt_target_param *par)
 
 		rcu_read_lock();
 		indev = __in_dev_get_rcu(skb->dev);
-		if (indev && (ifa = indev->ifa_list))
+		if (indev && (ifa = indev->ifa_list)) {
+			/* because of venet device specific, we should use
+			 * second ifa in the list */
+			if (IN_LOOPBACK(ntohl(ifa->ifa_local)) && ifa->ifa_next)
+				ifa = ifa->ifa_next;
 			newdst = ifa->ifa_local;
+		}
 		rcu_read_unlock();
 
 		if (!newdst)

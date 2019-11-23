@@ -175,6 +175,10 @@ enum {
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 
+#include <linux/spinlock.h>
+
+extern spinlock_t dq_data_lock;
+
 #include <linux/dqblk_xfs.h>
 #include <linux/dqblk_v1.h>
 #include <linux/dqblk_v2.h>
@@ -293,6 +297,8 @@ struct quota_format_ops {
 	int (*release_dqblk)(struct dquot *dquot);	/* Called when last reference to dquot is being dropped */
 };
 
+struct inode;
+struct iattr;
 /* Operations working with dquots */
 struct dquot_operations {
 	int (*initialize) (struct inode *, int);
@@ -318,9 +324,15 @@ struct dquot_operations {
 	/* get reserved quota for delayed alloc, value returned is managed by
 	 * quota code only */
 	qsize_t *(*get_reserved_space) (struct inode *);
+	int (*rename) (struct inode *, struct inode *, struct inode *);
+
+	void (*swap_inode) (struct inode *, struct inode *);
+	void (*shutdown) (struct super_block *);
+	unsigned int (*orphan_cookie) (struct inode *i);
 };
 
 /* Operations handling requests from userspace */
+struct v2_disk_dqblk;
 struct quotactl_ops {
 	int (*quota_on)(struct super_block *, int, int, char *, int);
 	int (*quota_off)(struct super_block *, int, int);
@@ -333,6 +345,10 @@ struct quotactl_ops {
 	int (*set_xstate)(struct super_block *, unsigned int, int);
 	int (*get_xquota)(struct super_block *, int, qid_t, struct fs_disk_quota *);
 	int (*set_xquota)(struct super_block *, int, qid_t, struct fs_disk_quota *);
+#ifdef CONFIG_QUOTA_COMPAT
+	int (*get_quoti)(struct super_block *, int, unsigned int,
+			struct v2_disk_dqblk __user *);
+#endif
 };
 
 struct quota_format_type {
@@ -398,6 +414,12 @@ struct quota_info {
 	struct inode *files[MAXQUOTAS];		/* inodes of quotafiles */
 	struct mem_dqinfo info[MAXQUOTAS];	/* Information for each quota type */
 	struct quota_format_ops *ops[MAXQUOTAS];	/* Operations for each type */
+#if defined(CONFIG_VZ_QUOTA) || defined(CONFIG_VZ_QUOTA_MODULE)
+	struct vz_quota_master *vzdq_master;
+	const struct dquot_operations	*dq_op_orig;
+	const struct quotactl_ops	*qcop_orig;
+	int vzdq_count;
+#endif
 };
 
 int register_quota_format(struct quota_format_type *fmt);

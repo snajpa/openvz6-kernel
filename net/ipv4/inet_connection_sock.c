@@ -24,6 +24,9 @@
 #include <net/tcp_states.h>
 #include <net/xfrm.h>
 
+#include <bc/net.h>
+#include <bc/sock_orphan.h>
+
 #ifdef INET_CSK_DEBUG
 const char inet_csk_timer_bug_msg[] = "inet_csk BUG: unknown timer value\n";
 EXPORT_SYMBOL(inet_csk_timer_bug_msg);
@@ -218,6 +221,8 @@ have_snum:
 	goto tb_not_found;
 tb_found:
 	if (!hlist_empty(&tb->owners)) {
+		if (sk->sk_reuse > 1)
+			goto success;
 		if (((tb->fastreuse > 0 &&
 		      sk->sk_reuse && sk->sk_state != TCP_LISTEN) ||
 		     (tb->fastreuseport > 0 &&
@@ -690,7 +695,7 @@ void inet_csk_destroy_sock(struct sock *sk)
 
 	sk_refcnt_debug_release(sk);
 
-	percpu_counter_dec(sk->sk_prot->orphan_count);
+	ub_dec_orphan_count(sk);
 	sock_put(sk);
 }
 
@@ -770,7 +775,7 @@ void inet_csk_listen_stop(struct sock *sk)
 
 		sock_orphan(child);
 
-		percpu_counter_inc(sk->sk_prot->orphan_count);
+		ub_inc_orphan_count(sk);
 
 		inet_csk_destroy_sock(child);
 

@@ -116,6 +116,12 @@ enum pageflags {
 	/* Filesystems */
 	PG_checked = PG_owner_priv_1,
 
+	/* VZ checkpointing */
+	PG_checkpointed = PG_owner_priv_1,
+
+	/* Page has vswap ptes */
+	PG_vswap = PG_private_2,
+
 	/* Two page bits are conscripted by FS-Cache to maintain local caching
 	 * state.  These bits are set on pages belonging to the netfs's inodes
 	 * when those inodes are being locally cached.
@@ -212,6 +218,7 @@ __PAGEFLAG(Slab, slab)
 PAGEFLAG(Checked, checked)		/* Used by some filesystems */
 PAGEFLAG(Pinned, pinned) TESTSCFLAG(Pinned, pinned)	/* Xen */
 PAGEFLAG(SavePinned, savepinned);			/* Xen */
+PAGEFLAG(Checkpointed, checkpointed)			/* VZ checkpointing */
 PAGEFLAG(Reserved, reserved) __CLEARPAGEFLAG(Reserved, reserved)
 PAGEFLAG(SwapBacked, swapbacked) __CLEARPAGEFLAG(SwapBacked, swapbacked)
 
@@ -229,6 +236,12 @@ PAGEFLAG(Private, private) __SETPAGEFLAG(Private, private)
 	__CLEARPAGEFLAG(Private, private)
 PAGEFLAG(Private2, private_2) TESTSCFLAG(Private2, private_2)
 PAGEFLAG(OwnerPriv1, owner_priv_1) TESTCLEARFLAG(OwnerPriv1, owner_priv_1)
+
+#ifdef CONFIG_MEMORY_VSWAP
+PAGEFLAG(VSwap, vswap)
+#else
+PAGEFLAG_FALSE(VSwap)
+#endif
 
 /*
  * Only test-and-set exist for PG_writeback.  The unconditional operators are
@@ -450,7 +463,7 @@ static inline void ClearPageCompound(struct page *page)
 	 1 << PG_private | 1 << PG_private_2 | \
 	 1 << PG_buddy	 | 1 << PG_writeback | 1 << PG_reserved | \
 	 1 << PG_slab	 | 1 << PG_swapcache | 1 << PG_active | \
-	 1 << PG_unevictable | __PG_MLOCKED | __PG_HWPOISON | \
+	 1 << PG_unevictable | __PG_MLOCKED  | __PG_HWPOISON | \
 	 __PG_COMPOUND_LOCK)
 
 /*

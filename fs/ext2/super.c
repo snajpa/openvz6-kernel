@@ -117,6 +117,8 @@ static void ext2_put_super (struct super_block * sb)
 	int i;
 	struct ext2_sb_info *sbi = EXT2_SB(sb);
 
+	vfs_dq_off(sb, 0);
+
 	lock_kernel();
 
 	if (sb->s_dirt)
@@ -1484,7 +1486,8 @@ static struct file_system_type ext2_fs_type = {
 	.name		= "ext2",
 	.get_sb		= ext2_get_sb,
 	.kill_sb	= kill_block_super,
-	.fs_flags	= FS_REQUIRES_DEV | FS_HAS_NEW_FREEZE | FS_HANDLE_QUOTA,
+	.fs_flags	= FS_REQUIRES_DEV | FS_HAS_NEW_FREEZE |
+			  FS_HANDLE_QUOTA | FS_VIRTUALIZED,
 };
 
 static int __init init_ext2_fs(void)

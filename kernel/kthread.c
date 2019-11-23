@@ -16,11 +16,18 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/freezer.h>
+#include <linux/nsproxy.h>
+#include <linux/syscalls.h>
 #include <trace/events/sched.h>
+#include <asm/uaccess.h>
 
 static DEFINE_SPINLOCK(kthread_create_lock);
+#ifdef CONFIG_VE
+#define kthread_create_list get_exec_env()->_kthread_create_list
+#else
 static LIST_HEAD(kthread_create_list);
 struct task_struct *kthreadd_task;
+#endif
 
 struct kthread_create_info
 {
@@ -34,6 +41,12 @@ struct kthread_create_info
 	struct completion *done;
 
 	struct list_head list;
+};
+
+struct kthreadd_create_info
+{
+	struct completion done;
+	struct task_struct *result;
 };
 
 struct kthread {
@@ -77,6 +90,7 @@ static int kthread(void *_create)
 		kfree(create);
 		do_exit(-EINTR);
 	}
+
 	/* OK, tell user we're spawned, wait for stop or wakeup */
 	__set_current_state(TASK_UNINTERRUPTIBLE);
 	create->result = current;
@@ -86,7 +100,6 @@ static int kthread(void *_create)
 	ret = -EINTR;
 	if (!self.should_stop)
 		ret = threadfn(data);
-
 	/* we can't just return, we must preserve "self" on stack */
 	do_exit(ret);
 }
@@ -146,17 +159,23 @@ static void create_kthread(struct kthread_create_info *create)
  *
  * Returns a task_struct or ERR_PTR(-ENOMEM).
  */
-struct task_struct *va_kthread_create_on_node(int (*threadfn)(void *data),
+struct task_struct *va_kthread_create_on_node(struct ve_struct *ve,
+					      int (*threadfn)(void *data),
 					      void *data, int node,
 					      const char *fmt, va_list args)
 {
 	DECLARE_COMPLETION_ONSTACK(done);
 	struct task_struct *task;
-	struct kthread_create_info *create = kmalloc(sizeof(*create),
-						     GFP_KERNEL);
+	struct kthread_create_info *create;
+	struct ve_struct *old_ve;
 
-	if (!create)
+	old_ve = set_exec_env(ve);
+
+	create = kmalloc(sizeof(*create), GFP_KERNEL);
+	if (!create) {
+		set_exec_env(old_ve);
 		return ERR_PTR(-ENOMEM);
+	}
 	create->threadfn = threadfn;
 	create->data = data;
 	create->node = node;
@@ -178,8 +197,10 @@ struct task_struct *va_kthread_create_on_node(int (*threadfn)(void *data),
 		 * calls complete(), leave the cleanup of this structure to
 		 * that thread.
 		 */
-		if (xchg(&create->done, NULL))
+		if (xchg(&create->done, NULL)) {
+			set_exec_env(old_ve);
 			return ERR_PTR(-ENOMEM);
+		}
 		/*
 		 * kthreadd (or new kernel thread) will call complete()
 		 * shortly.
@@ -199,6 +220,8 @@ struct task_struct *va_kthread_create_on_node(int (*threadfn)(void *data),
 		set_cpus_allowed_ptr(task, cpu_all_mask);
 	}
 	kfree(create);
+	set_exec_env(old_ve);
+
 	return task;
 }
 
@@ -234,7 +257,7 @@ struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),
 	struct task_struct *result;
 
 	va_start(args, namefmt);
-	result = va_kthread_create_on_node(threadfn, data,
+	result = va_kthread_create_on_node(get_ve0(), threadfn, data,
 					   node, namefmt, args);
 	va_end(args);
 	return result;
@@ -242,7 +265,7 @@ struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),
 EXPORT_SYMBOL(kthread_create_on_node);
 
 /**
- * kthread_create - create a kthread.
+ * kthread_create_ve - create a kthread.
  * @threadfn: the function to run until signal_pending(current).
  * @data: data ptr for @threadfn.
  * @namefmt: printf-style name for the thread.
@@ -260,7 +283,8 @@ EXPORT_SYMBOL(kthread_create_on_node);
  *
  * Returns a task_struct or ERR_PTR(-ENOMEM).
  */
-struct task_struct *kthread_create(int (*threadfn)(void *data),
+struct task_struct *kthread_create_ve(struct ve_struct *ve,
+				   int (*threadfn)(void *data),
 				   void *data,
 				   const char namefmt[],
 				   ...)
@@ -269,11 +293,11 @@ struct task_struct *kthread_create(int (*threadfn)(void *data),
 	struct task_struct *result;
 
 	va_start(args, namefmt);
-	result = va_kthread_create_on_node(threadfn, data, -1, namefmt, args);
+	result = va_kthread_create_on_node(ve, threadfn, data, -1, namefmt, args);
 	va_end(args);
 	return result;
 }
-EXPORT_SYMBOL(kthread_create);
+EXPORT_SYMBOL(kthread_create_ve);
 
 /**
  * kthread_stop - stop a thread created by kthread_create().
@@ -314,22 +338,44 @@ int kthread_stop(struct task_struct *k)
 }
 EXPORT_SYMBOL(kthread_stop);
 
-int kthreadd(void *unused)
+int kthreadd(void *data)
 {
 	struct task_struct *tsk = current;
+	struct kthreadd_create_info *kcreate;
+	struct kthread self;
+	int rc;
+
+	self.should_stop = 0;
+
+	kcreate = (struct kthreadd_create_info *) data;
+
+	if (kcreate) {
+		daemonize("kthreadd/%d", get_exec_env()->veid);
+		kcreate->result = current;
+		set_fs(KERNEL_DS);
+		init_completion(&self.exited);
+		current->vfork_done = &self.exited;
+	} else
+		set_task_comm(tsk, "kthreadd");
 
 	/* Setup a clean context for our children to inherit. */
-	set_task_comm(tsk, "kthreadd");
 	ignore_signals(tsk);
 	set_cpus_allowed_ptr(tsk, cpu_all_mask);
 	set_mems_allowed(node_states[N_HIGH_MEMORY]);
 
 	current->flags |= PF_NOFREEZE | PF_FREEZER_NOSIG;
 
+	if (kcreate)
+		complete(&kcreate->done);
+
 	for (;;) {
 		set_current_state(TASK_INTERRUPTIBLE);
-		if (list_empty(&kthread_create_list))
-			schedule();
+		if (list_empty(&kthread_create_list)) {
+			if (self.should_stop)
+				break;
+			else
+				schedule();
+		}
 		__set_current_state(TASK_RUNNING);
 
 		spin_lock(&kthread_create_lock);
@@ -348,8 +394,59 @@ int kthreadd(void *unused)
 		spin_unlock(&kthread_create_lock);
 	}
 
+	do {
+		clear_thread_flag(TIF_SIGPENDING);
+		rc = sys_wait4(-1, NULL, __WALL, NULL);
+	} while (rc != -ECHILD);
+
+	do_exit(0);
+}
+
+int kthreadd_create()
+{
+	struct kthreadd_create_info create;
+	int ret;
+	struct ve_struct *ve = get_exec_env();
+
+	BUG_ON(ve->_kthreadd_task);
+
+	INIT_LIST_HEAD(&ve->_kthread_create_list);
+	init_completion(&create.done);
+	ret = kernel_thread(kthreadd, (void *) &create, CLONE_FS);
+	if (ret < 0) {
+		return ret;
+	}
+	wait_for_completion(&create.done);
+	ve->_kthreadd_task = create.result;
 	return 0;
 }
+EXPORT_SYMBOL(kthreadd_create);
+
+void kthreadd_stop(struct ve_struct *ve)
+{
+	struct kthread *kthread;
+	int ret;
+	struct task_struct *k;
+
+	if (!ve->_kthreadd_task)
+		return;
+
+	k = ve->_kthreadd_task;
+	trace_sched_kthread_stop(k);
+	get_task_struct(k);
+
+	BUG_ON(!k->vfork_done);
+
+	kthread = container_of(k->vfork_done, struct kthread, exited);
+	kthread->should_stop = 1;
+	wake_up_process(k);
+	wait_for_completion(&kthread->exited);
+	ret = k->exit_code;
+
+	put_task_struct(k);
+	trace_sched_kthread_stop_ret(ret);
+}
+EXPORT_SYMBOL(kthreadd_stop);
 
 void __init_kthread_worker(struct kthread_worker *worker,
 				const char *name,

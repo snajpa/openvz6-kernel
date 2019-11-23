@@ -21,6 +21,12 @@ SECTIONS
 	.eh_frame_hdr	: { *(.eh_frame_hdr) }		:text	:eh_frame_hdr
 	.eh_frame	: { KEEP (*(.eh_frame)) }	:text
 
+#ifdef VDSO_RHEL5
+	.gettimeofday 0xffffffffff7006f0 : { *(GETTIMEOFDAY) } :text   =0x90909090
+	.clockgettime 0xffffffffff700780 : { *(CLOCKGETTIME) } :text   =0x90909090
+	.getcpu 0xffffffffff7007c0 : { *(GETCPU) } :text   =0x90909090
+#endif
+
 	.dynamic	: { *(.dynamic) }		:text	:dynamic
 
 	.rodata		: { *(.rodata*) }		:text
@@ -43,6 +49,15 @@ SECTIONS
 	 */
 	. = ALIGN(0x100);
 
+#ifndef VDSO_RHEL5
+	/*
+	 * All global symbols have fixed adresses to be able migrate between
+	 * different versions.
+	 */
+	.gettimeofday 0xffffffffff700800 : { *(GETTIMEOFDAY) } :text   =0x90909090
+	.clockgettime 0xffffffffff700820 : { *(CLOCKGETTIME) } :text   =0x90909090
+	.getcpu 0xffffffffff700840 : { *(GETCPU) } :text   =0x90909090
+#endif
 	.text		: { *(.text*) }			:text	=0x90909090
 }
 

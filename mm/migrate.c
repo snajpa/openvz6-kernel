@@ -31,6 +31,7 @@
 #include <linux/vmalloc.h>
 #include <linux/security.h>
 #include <linux/memcontrol.h>
+#include <linux/mmgang.h>
 #include <linux/syscalls.h>
 #include <linux/hugetlb.h>
 
@@ -160,7 +161,7 @@ static int remove_migration_pte(struct page *new, struct vm_area_struct *vma,
 	} else if (PageAnon(new))
 		page_add_anon_rmap(new, vma, addr);
 	else
-		page_add_file_rmap(new);
+		page_add_file_rmap(new, mm);
 
 	/* No need to invalidate - it was non-present before */
 	update_mmu_cache(vma, addr, pte);
@@ -793,6 +794,11 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 	}
 	BUG_ON(charge);
 
+	if (gang_add_user_page(newpage, page_gang(page)->set, GFP_KERNEL)) {
+		rc = -ENOMEM;
+		goto uncharge;
+	}
+
 	if (PageWriteback(page)) {
 		/*
 		 * Only in the case of a full syncronous migration is it
@@ -817,6 +823,10 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
 	 * just care Anon page here.
 	 */
 	if (PageAnon(page) && !PageKsm(page)) {
+
+		if (PageVSwap(page) && remove_from_vswap(page))
+			goto uncharge;
+
 		/*
 		 * Only page_lock_anon_vma() understands the subtleties of
 		 * getting a hold on an anon_vma from outside one of its mms.
@@ -932,6 +942,11 @@ out:
 				page_is_file_cache(page));
 		putback_lru_page(page);
 	}
+
+	if (unlikely(!page_gang(newpage)))
+		gang_add_user_page(newpage, &init_gang_set,
+				GFP_KERNEL|__GFP_NOFAIL);
+
 	/*
 	 * Move the new page to the LRU. If migration was not successful
 	 * then this will free the page.

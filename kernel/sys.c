@@ -10,6 +10,7 @@
 #include <linux/mman.h>
 #include <linux/smp_lock.h>
 #include <linux/notifier.h>
+#include <linux/virtinfo.h>
 #include <linux/reboot.h>
 #include <linux/prctl.h>
 #include <linux/highuid.h>
@@ -123,6 +124,125 @@ EXPORT_SYMBOL(cad_pid);
 
 void (*pm_power_off_prepare)(void);
 
+DECLARE_MUTEX(virtinfo_sem);
+EXPORT_SYMBOL(virtinfo_sem);
+static struct vnotifier_block *virtinfo_chain[VIRT_TYPES];
+
+void __virtinfo_notifier_register(int type, struct vnotifier_block *nb)
+{
+	struct vnotifier_block **p;
+
+	for (p = &virtinfo_chain[type];
+	     *p != NULL && nb->priority < (*p)->priority;
+	     p = &(*p)->next);
+	nb->next = *p;
+	smp_wmb();
+	*p = nb;
+}
+
+EXPORT_SYMBOL(__virtinfo_notifier_register);
+
+void virtinfo_notifier_register(int type, struct vnotifier_block *nb)
+{
+	down(&virtinfo_sem);
+	__virtinfo_notifier_register(type, nb);
+	up(&virtinfo_sem);
+}
+
+EXPORT_SYMBOL(virtinfo_notifier_register);
+
+struct virtinfo_cnt_struct {
+	volatile unsigned long exit[NR_CPUS];
+	volatile unsigned long entry;
+};
+static DEFINE_PER_CPU(struct virtinfo_cnt_struct, virtcnt);
+
+void virtinfo_notifier_unregister(int type, struct vnotifier_block *nb)
+{
+	struct vnotifier_block **p;
+	int entry_cpu, exit_cpu;
+	unsigned long cnt, ent;
+	struct rcu_synchronize rcu;
+
+	down(&virtinfo_sem);
+	for (p = &virtinfo_chain[type]; *p != nb; p = &(*p)->next);
+	*p = nb->next;
+	smp_mb();
+
+	init_completion(&rcu.completion);
+	call_rcu_sched(&rcu.head, wakeme_after_rcu);
+
+	for_each_cpu_mask(entry_cpu, cpu_possible_map) {
+		while (1) {
+			cnt = 0;
+			for_each_cpu_mask(exit_cpu, cpu_possible_map)
+				cnt +=
+				    per_cpu(virtcnt, entry_cpu).exit[exit_cpu];
+			smp_rmb();
+			ent = per_cpu(virtcnt, entry_cpu).entry;
+			if (cnt == ent)
+				break;
+			__set_current_state(TASK_UNINTERRUPTIBLE);
+			schedule_timeout(HZ / 100);
+		}
+	}
+
+	wait_for_completion(&rcu.completion);
+
+	up(&virtinfo_sem);
+}
+
+EXPORT_SYMBOL(virtinfo_notifier_unregister);
+
+static int do_virtinfo_notifier_call(int type, unsigned long n, void *data)
+{
+	int ret;
+	struct vnotifier_block *nb;
+
+	nb = virtinfo_chain[type];
+	ret = NOTIFY_DONE;
+	while (nb)
+	{
+		ret = nb->notifier_call(nb, n, data, ret);
+		if(ret & NOTIFY_STOP_MASK) {
+			ret &= ~NOTIFY_STOP_MASK;
+			break;
+		}
+		nb = nb->next;
+	}
+
+	return ret;
+}
+
+int virtinfo_notifier_call(int type, unsigned long n, void *data)
+{
+	int ret;
+	int entry_cpu, exit_cpu;
+
+	entry_cpu = get_cpu();
+	per_cpu(virtcnt, entry_cpu).entry++;
+	smp_wmb();
+	put_cpu();
+
+	ret = do_virtinfo_notifier_call(type, n, data);
+
+	exit_cpu = get_cpu();
+	smp_wmb();
+	per_cpu(virtcnt, entry_cpu).exit[exit_cpu]++;
+	put_cpu();
+
+	return ret;
+}
+EXPORT_SYMBOL(virtinfo_notifier_call);
+
+int virtinfo_notifier_call_irq(int type, unsigned long n, void *data)
+{
+	if (!in_interrupt())
+		return virtinfo_notifier_call(type, n, data);
+	return do_virtinfo_notifier_call(type, n, data);
+}
+EXPORT_SYMBOL(virtinfo_notifier_call_irq);
+
 /*
  * set the priority of a task
  * - the caller must hold the RCU read lock
@@ -198,10 +318,10 @@ SYSCALL_DEFINE3(setpriority, int, which, int, who, int, niceval)
 				 !(user = find_user(who)))
 				goto out_unlock;	/* No processes for this user */
 
-			do_each_thread(g, p)
+			do_each_thread_ve(g, p) {
 				if (__task_cred(p)->uid == who)
 					error = set_one_prio(p, niceval, error);
-			while_each_thread(g, p);
+			} while_each_thread_ve(g, p);
 			if (who != cred->uid)
 				free_uid(user);		/* For find_user() */
 			break;
@@ -261,13 +381,13 @@ SYSCALL_DEFINE2(getpriority, int, which, int, who)
 				 !(user = find_user(who)))
 				goto out_unlock;	/* No processes for this user */
 
-			do_each_thread(g, p)
+			do_each_thread_ve(g, p)
 				if (__task_cred(p)->uid == who) {
 					niceval = 20 - task_nice(p);
 					if (niceval > retval)
 						retval = niceval;
 				}
-			while_each_thread(g, p);
+			while_each_thread_ve(g, p);
 			if (who != cred->uid)
 				free_uid(user);		/* for find_user() */
 			break;
@@ -386,6 +506,26 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 			magic2 != LINUX_REBOOT_MAGIC2B &&
 	                magic2 != LINUX_REBOOT_MAGIC2C))
 		return -EINVAL;
+
+#ifdef CONFIG_VE
+	if (!ve_is_super(get_exec_env()))
+		switch (cmd) {
+		case LINUX_REBOOT_CMD_RESTART:
+		case LINUX_REBOOT_CMD_RESTART2:
+			set_bit(VE_REBOOT, &get_exec_env()->flags);
+
+		case LINUX_REBOOT_CMD_HALT:
+		case LINUX_REBOOT_CMD_POWER_OFF:
+			force_sig(SIGKILL, get_exec_env_init());
+
+		case LINUX_REBOOT_CMD_CAD_ON:
+		case LINUX_REBOOT_CMD_CAD_OFF:
+			return 0;
+
+		default:
+			return -EINVAL;
+		}
+#endif
 
 	/*
 	 * If pid namespaces are enabled and the current task is in a child
@@ -945,8 +1085,27 @@ void do_sys_times(struct tms *tms)
 	tms->tms_cstime = cputime_to_clock_t(cstime);
 }
 
+#ifdef CONFIG_VE
+unsigned long long ve_relative_clock(struct timespec * ts)
+{
+	unsigned long long offset = 0;
+
+	if (ts->tv_sec > get_exec_env()->start_timespec.tv_sec ||
+	    (ts->tv_sec == get_exec_env()->start_timespec.tv_sec &&
+	     ts->tv_nsec >= get_exec_env()->start_timespec.tv_nsec))
+		offset = (unsigned long long)(ts->tv_sec -
+			get_exec_env()->start_timespec.tv_sec) * NSEC_PER_SEC
+			+ ts->tv_nsec -	get_exec_env()->start_timespec.tv_nsec;
+	return nsec_to_clock_t(offset);
+}
+#endif
+
 SYSCALL_DEFINE1(times, struct tms __user *, tbuf)
 {
+#ifdef CONFIG_VE
+	struct timespec now;
+#endif
+
 	if (tbuf) {
 		struct tms tmp;
 
@@ -954,8 +1113,15 @@ SYSCALL_DEFINE1(times, struct tms __user *, tbuf)
 		if (copy_to_user(tbuf, &tmp, sizeof(struct tms)))
 			return -EFAULT;
 	}
+#ifndef CONFIG_VE
 	force_successful_syscall_return();
 	return (long) jiffies_64_to_clock_t(get_jiffies_64());
+#else
+	/* Compare to calculation in fs/proc/array.c */
+	do_posix_clock_monotonic_gettime(&now);
+	force_successful_syscall_return();
+	return ve_relative_clock(&now);
+#endif
 }
 
 /*
@@ -1138,6 +1304,7 @@ out:
 }
 
 DECLARE_RWSEM(uts_sem);
+EXPORT_SYMBOL_GPL(uts_sem);
 
 SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 {
@@ -1155,7 +1322,7 @@ SYSCALL_DEFINE2(sethostname, char __user *, name, int, len)
 	int errno;
 	char tmp[__NEW_UTS_LEN];
 
-	if (!capable(CAP_SYS_ADMIN))
+	if (!capable(CAP_VE_SYS_ADMIN))
 		return -EPERM;
 	if (len < 0 || len > __NEW_UTS_LEN)
 		return -EINVAL;
@@ -1204,7 +1371,7 @@ SYSCALL_DEFINE2(setdomainname, char __user *, name, int, len)
 	int errno;
 	char tmp[__NEW_UTS_LEN];
 
-	if (!capable(CAP_SYS_ADMIN))
+	if (!capable(CAP_VE_SYS_ADMIN))
 		return -EPERM;
 	if (len < 0 || len > __NEW_UTS_LEN)
 		return -EINVAL;
@@ -1655,6 +1822,24 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			if (arg4 || arg5)
 				return -EINVAL;
 			error = arch_prctl_spec_ctrl_set(me, arg2, arg3);
+			break;
+		case PR_SET_DATA_CSUM:
+			switch (arg2) {
+			case PR_DATA_CSUM_OFF:
+			case PR_DATA_CSUM_ON:
+				current->data_csum_enabled = arg2;
+				break;
+			default:
+				error = -EINVAL;
+				break;
+			}
+			break;
+		case PR_SET_CHILD_SUBREAPER:
+			me->signal->is_child_subreaper = !!arg2;
+			break;
+		case PR_GET_CHILD_SUBREAPER:
+			error = put_user(me->signal->is_child_subreaper,
+					 (int __user *) arg2);
 			break;
 		default:
 			error = -EINVAL;

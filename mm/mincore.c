@@ -132,6 +132,11 @@ static void mincore_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 			if (is_migration_entry(entry)) {
 				/* migration entries are always uptodate */
 				*vec = 1;
+			} else if (is_vswap_entry(entry)) {
+				struct page *page = vswap_entry_to_page(entry);
+
+				/* vswap present if already mapped somewhere */
+				*vec = page_mapped(page);
 			} else {
 #ifdef CONFIG_SWAP
 				pgoff = entry.val;

@@ -24,7 +24,7 @@ static inline cycles_t get_cycles(void)
 	unsigned long long ret = 0;
 
 #ifndef CONFIG_X86_TSC
-	if (!cpu_has_tsc)
+	if (WARN_ON_ONCE(!cpu_has_tsc))
 		return 0;
 #endif
 	rdtscll(ret);

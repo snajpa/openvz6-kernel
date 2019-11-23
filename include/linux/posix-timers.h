@@ -116,6 +116,7 @@ void posix_cpu_timer_schedule(struct k_itimer *timer);
 void run_posix_cpu_timers(struct task_struct *task);
 void posix_cpu_timers_exit(struct task_struct *task);
 void posix_cpu_timers_exit_group(struct task_struct *task);
+long posix_cpu_nsleep_restart(struct restart_block *restart_block);
 
 void set_process_cpu_timer(struct task_struct *task, unsigned int clock_idx,
 			   cputime_t *newval, cputime_t *oldval);
@@ -124,4 +125,10 @@ long clock_nanosleep_restart(struct restart_block *restart_block);
 
 void update_rlimit_cpu(struct task_struct *task, unsigned long rlim_new);
 
+int timer_create_id(const clockid_t which_clock,
+		    struct sigevent *timer_event_spec, timer_t *timer_id);
+int timer_setup(timer_t timer_id, struct itimerspec *setting,
+		int overrun, int overrun_last, int signal_pending);
+void get_timer_setting(struct k_itimer *timr, struct itimerspec *setting,
+		       int *overrun, int *overrun_last, int *signal_pending);
 #endif

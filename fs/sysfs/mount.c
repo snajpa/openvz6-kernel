@@ -22,9 +22,24 @@
 #include "sysfs.h"
 
 
-static struct vfsmount *sysfs_mount;
+#ifndef CONFIG_VE
+struct vfsmount *sysfs_mount;
 struct super_block * sysfs_sb = NULL;
+#endif
+
 struct kmem_cache *sysfs_dir_cachep;
+
+#ifdef CONFIG_SYSFS_DEPRECATED_DYN
+unsigned _sysfs_deprecated __read_mostly;
+EXPORT_SYMBOL(_sysfs_deprecated);
+
+static int __init sysfs_init_deprecated(char *str)
+{
+	_sysfs_deprecated = simple_strtoul(str, NULL, 10);
+	return 1;
+}
+early_param("sysfs.deprecated", sysfs_init_deprecated);
+#endif
 
 static const struct super_operations sysfs_ops = {
 	.statfs		= simple_statfs,
@@ -38,7 +53,15 @@ struct sysfs_dirent sysfs_root = {
 	.s_flags	= SYSFS_DIR,
 	.s_mode		= S_IFDIR | S_IRWXU | S_IRUGO | S_IXUGO,
 	.s_ino		= 1,
+	.owner_env	= &ve0,
 };
+
+static void init_ve0_sysfs_root(void)
+{
+#ifdef CONFIG_VE
+	get_ve0()->_sysfs_root = &sysfs_root;
+#endif
+}
 
 static int sysfs_fill_super(struct super_block *sb, void *data, int silent)
 {
@@ -54,7 +77,7 @@ static int sysfs_fill_super(struct super_block *sb, void *data, int silent)
 
 	/* get root inode, initialize and unlock it */
 	mutex_lock(&sysfs_mutex);
-	inode = sysfs_get_inode(&sysfs_root);
+	inode = sysfs_get_inode(ve_sysfs_root);
 	mutex_unlock(&sysfs_mutex);
 	if (!inode) {
 		pr_debug("sysfs: could not get root inode\n");
@@ -68,7 +91,7 @@ static int sysfs_fill_super(struct super_block *sb, void *data, int silent)
 		iput(inode);
 		return -ENOMEM;
 	}
-	root->d_fsdata = &sysfs_root;
+	root->d_fsdata = ve_sysfs_root;
 	sb->s_root = root;
 	return 0;
 }
@@ -79,16 +102,19 @@ static int sysfs_get_sb(struct file_system_type *fs_type,
 	return get_sb_single(fs_type, flags, data, sysfs_fill_super, mnt);
 }
 
-static struct file_system_type sysfs_fs_type = {
+struct file_system_type sysfs_fs_type = {
 	.name		= "sysfs",
 	.get_sb		= sysfs_get_sb,
 	.kill_sb	= kill_anon_super,
 };
 
+EXPORT_SYMBOL(sysfs_fs_type);
+
 int __init sysfs_init(void)
 {
 	int err = -ENOMEM;
 
+	init_ve0_sysfs_root();
 	sysfs_dir_cachep = kmem_cache_create("sysfs_dir_cache",
 					      sizeof(struct sysfs_dirent),
 					      0, 0, NULL);

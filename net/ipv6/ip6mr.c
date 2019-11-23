@@ -478,7 +478,7 @@ failure:
  *	Delete a VIF entry
  */
 
-static int mif6_delete(struct net *net, int vifi)
+static int mif6_delete(struct net *net, int vifi, struct list_head *head)
 {
 	struct mif_device *v;
 	struct net_device *dev;
@@ -521,7 +521,7 @@ static int mif6_delete(struct net *net, int vifi)
 		in6_dev->cnf.mc_forwarding--;
 
 	if (v->flags & MIFF_REGISTER)
-		unregister_netdevice(dev);
+		unregister_netdevice_queue(dev, head);
 
 	dev_put(dev);
 	return 0;
@@ -978,6 +978,7 @@ static int ip6mr_device_event(struct notifier_block *this,
 	struct net *net = dev_net(dev);
 	struct mif_device *v;
 	int ct;
+	LIST_HEAD(list);
 
 	if (event != NETDEV_UNREGISTER)
 		return NOTIFY_DONE;
@@ -985,8 +986,10 @@ static int ip6mr_device_event(struct notifier_block *this,
 	v = &net->ipv6.vif6_table[0];
 	for (ct = 0; ct < net->ipv6.maxvif; ct++, v++) {
 		if (v->dev == dev)
-			mif6_delete(net, ct);
+			mif6_delete(net, ct, &list);
 	}
+	unregister_netdevice_many(&list);
+
 	return NOTIFY_DONE;
 }
 
@@ -1194,14 +1197,16 @@ static int ip6mr_mfc_add(struct net *net, struct mf6cctl *mfc, int mrtsock)
 static void mroute_clean_tables(struct net *net)
 {
 	int i;
+	LIST_HEAD(list);
 
 	/*
 	 *	Shut down all active vif entries
 	 */
 	for (i = 0; i < net->ipv6.maxvif; i++) {
 		if (!(net->ipv6.vif6_table[i].flags & VIFF_STATIC))
-			mif6_delete(net, i);
+			mif6_delete(net, i, &list);
 	}
+	unregister_netdevice_many(&list);
 
 	/*
 	 *	Wipe the cache
@@ -1333,7 +1338,7 @@ int ip6_mroute_setsockopt(struct sock *sk, int optname, char __user *optval, uns
 		if (copy_from_user(&mifi, optval, sizeof(mifi_t)))
 			return -EFAULT;
 		rtnl_lock();
-		ret = mif6_delete(net, mifi);
+		ret = mif6_delete(net, mifi, NULL);
 		rtnl_unlock();
 		return ret;
 

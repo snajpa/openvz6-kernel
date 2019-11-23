@@ -94,9 +94,10 @@ static int nf_ip6_reroute(struct sk_buff *skb,
 	return 0;
 }
 
-static int nf_ip6_route(struct dst_entry **dst, struct flowi *fl)
+static int nf_ip6_route(struct net *net, struct dst_entry **dst,
+			struct flowi *fl)
 {
-	*dst = ip6_route_output(&init_net, NULL, fl);
+	*dst = ip6_route_output(net, NULL, fl);
 	return (*dst)->error;
 }
 

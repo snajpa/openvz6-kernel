@@ -197,12 +197,9 @@ struct cpu_vfs_cap_data {
 
 #define CAP_NET_BROADCAST    11
 
-/* Allow interface configuration */
 /* Allow administration of IP firewall, masquerading and accounting */
 /* Allow setting debug option on sockets */
 /* Allow modification of routing tables */
-/* Allow setting arbitrary process / process group ownership on
-   sockets */
 /* Allow binding to any address for transparent proxying */
 /* Allow setting TOS (type of service) */
 /* Allow setting promiscuous mode */
@@ -232,6 +229,7 @@ struct cpu_vfs_cap_data {
 #define CAP_SYS_MODULE       16
 
 /* Allow ioperm/iopl access */
+/* Allow O_DIRECT access */
 /* Allow sending USB messages to any device via /proc/bus/usb */
 
 #define CAP_SYS_RAWIO        17
@@ -250,24 +248,19 @@ struct cpu_vfs_cap_data {
 
 /* Allow configuration of the secure attention key */
 /* Allow administration of the random device */
-/* Allow examination and configuration of disk quotas */
 /* Allow configuring the kernel's syslog (printk behaviour) */
 /* Allow setting the domainname */
 /* Allow setting the hostname */
 /* Allow calling bdflush() */
-/* Allow mount() and umount(), setting up new smb connection */
+/* Allow setting up new smb connection */
 /* Allow some autofs root ioctls */
 /* Allow nfsservctl */
 /* Allow VM86_REQUEST_IRQ */
 /* Allow to read/write pci config on alpha */
 /* Allow irix_prctl on mips (setstacksize) */
 /* Allow flushing all cache on m68k (sys_cacheflush) */
-/* Allow removing semaphores */
-/* Used instead of CAP_CHOWN to "chown" IPC message queues, semaphores
-   and shared memory */
 /* Allow locking/unlocking of shared memory segment */
 /* Allow turning swap on/off */
-/* Allow forged pids on socket credentials passing */
 /* Allow setting readahead and flushing buffers on block devices */
 /* Allow setting geometry in floppy driver */
 /* Allow turning DMA on/off in xd driver */
@@ -339,6 +332,61 @@ struct cpu_vfs_cap_data {
 #define CAP_AUDIT_CONTROL    30
 
 #define CAP_SETFCAP	     31
+
+#ifdef __KERNEL__
+/*
+ * Important note: VZ capabilities do intersect with CAP_AUDIT
+ * this is due to compatibility reasons. Nothing bad.
+ * Both VZ and Audit/SELinux caps are disabled in VPSs.
+ */
+
+/* Allow access to all information. In the other case some structures will be
+ * hiding to ensure different Virtual Environment non-interaction on the same
+ * node (NOW OBSOLETED)
+ */
+#define CAP_SETVEID	     29
+
+#define capable_setveid()	({			\
+		ve_is_super(get_exec_env()) &&		\
+			(capable(CAP_SYS_ADMIN) ||	\
+			 capable(CAP_VE_ADMIN));	\
+	})
+
+/*
+ * coinsides with CAP_AUDIT_CONTROL but we don't care, since
+ * audit is disabled in Virtuozzo
+ */
+#define CAP_VE_ADMIN	     30
+
+#ifdef CONFIG_VE
+
+/* Replacement for CAP_NET_ADMIN:
+   delegated rights to the Virtual environment of its network administration.
+   For now the following rights have been delegated:
+
+   Allow setting arbitrary process / process group ownership on sockets
+   Allow interface configuration
+ */
+#define CAP_VE_NET_ADMIN     CAP_VE_ADMIN
+
+/* Replacement for CAP_SYS_ADMIN:
+   delegated rights to the Virtual environment of its administration.
+   For now the following rights have been delegated:
+ */
+/* Allow mount/umount/remount */
+/* Allow examination and configuration of disk quotas */
+/* Allow removing semaphores */
+/* Used instead of CAP_CHOWN to "chown" IPC message queues, semaphores
+   and shared memory */
+/* Allow locking/unlocking of shared memory segment */
+/* Allow forged pids on socket credentials passing */
+
+#define CAP_VE_SYS_ADMIN     CAP_VE_ADMIN
+#else
+#define CAP_VE_NET_ADMIN     CAP_NET_ADMIN
+#define CAP_VE_SYS_ADMIN     CAP_SYS_ADMIN
+#endif
+#endif
 
 /* Override MAC access.
    The base kernel enforces no MAC policy.
@@ -420,7 +468,16 @@ struct file;
 #define CAP_INIT_INH_SET    CAP_EMPTY_SET
 
 # define cap_clear(c)         do { (c) = __cap_empty_set; } while (0)
+#ifndef CONFIG_VE
 # define cap_set_full(c)      do { (c) = __cap_full_set; } while (0)
+#else
+# define cap_set_full(c)      do {			\
+		if (ve_is_super(get_exec_env()))	\
+			(c) = __cap_full_set;		\
+		else					\
+			(c) = get_exec_env()->ve_cap_bset;\
+	} while (0)
+#endif
 # define cap_set_init_eff(c)  do { (c) = __cap_init_eff_set; } while (0)
 
 #define cap_raise(c, flag)  ((c).cap[CAP_TO_INDEX(flag)] |= CAP_TO_MASK(flag))
@@ -537,6 +594,10 @@ static inline kernel_cap_t cap_raise_nfsd_set(const kernel_cap_t a,
 extern const kernel_cap_t __cap_empty_set;
 extern const kernel_cap_t __cap_full_set;
 extern const kernel_cap_t __cap_init_eff_set;
+
+#include <linux/spinlock_types.h>
+
+extern spinlock_t task_capability_lock;
 
 /**
  * has_capability - Determine if a task has a superior capability available

@@ -124,12 +124,36 @@ void unlock_block(struct dm_btree_info *info, struct dm_block *b)
 
 /*----------------------------------------------------------------*/
 
+static void __init_ro_spine(struct ro_spine *s, struct dm_btree_info *info, int len)
+{
+	int i;
+	int *idxs = NULL;
+
+	if (len == RO_SPINE_LONG_LEN) {
+		struct ro_spine_long *sl =
+			container_of(s, struct ro_spine_long, ro_spine);
+		idxs = sl->idxs;
+	}
+
+	s->info = info;
+	s->length = len;
+	s->count = 0;
+	for (i = 0; i < len; i++) {
+		s->nodes[i] = NULL;
+		if (idxs)
+			idxs[i] = 0;
+	}
+
+}
+
 void init_ro_spine(struct ro_spine *s, struct dm_btree_info *info)
 {
-	s->info = info;
-	s->count = 0;
-	s->nodes[0] = NULL;
-	s->nodes[1] = NULL;
+	__init_ro_spine(s, info, 2);
+}
+
+void init_ro_spine_long(struct ro_spine_long *s, struct dm_btree_info *info)
+{
+	__init_ro_spine(&s->ro_spine, info, RO_SPINE_LONG_LEN);
 }
 
 int exit_ro_spine(struct ro_spine *s)
@@ -143,28 +167,76 @@ int exit_ro_spine(struct ro_spine *s)
 	return r;
 }
 
-int ro_step(struct ro_spine *s, dm_block_t new_child)
+int exit_ro_spine_long(struct ro_spine_long *s)
+{
+	return exit_ro_spine(&s->ro_spine);
+}
+
+int __ro_step(struct ro_spine *s, dm_block_t new_child, int idx, int *idxs)
 {
 	int r;
 
-	if (s->count == 2) {
+	if (s->count == s->length) {
+		int i;
 		unlock_block(s->info, s->nodes[0]);
-		s->nodes[0] = s->nodes[1];
+
+		for (i = 0; i < s->length - 1; i++) {
+			s->nodes[i] = s->nodes[i+1];
+			if (idxs)
+				idxs[i] = idxs[i+1];
+		}
 		s->count--;
 	}
 
 	r = bn_read_lock(s->info, new_child, s->nodes + s->count);
-	if (!r)
+	if (!r) {
+		if (idxs)
+			idxs[s->count] = idx;
 		s->count++;
 
+	}
 	return r;
+}
+
+int ro_step(struct ro_spine *s, dm_block_t new_child)
+{
+	return __ro_step(s, new_child, 0, NULL);
+}
+
+int ro_step_long(struct ro_spine_long *s, dm_block_t new_child, int idx)
+{
+	return __ro_step(&s->ro_spine, new_child, idx, s->idxs);
+}
+
+int __ro_pop(struct ro_spine *s, int *idxs, int *idx)
+{
+	BUG_ON(!s->count);
+
+	if (idxs) {
+		if (idxs[s->count - 1] < 0)
+			return -ENODATA;
+
+		if (s->count == 1)
+			return -ENOSPC;
+	}
+
+	--s->count;
+
+	if (idxs)
+		*idx = idxs[s->count];
+
+	unlock_block(s->info, s->nodes[s->count]);
+	return 0;
 }
 
 void ro_pop(struct ro_spine *s)
 {
-	BUG_ON(!s->count);
-	--s->count;
-	unlock_block(s->info, s->nodes[s->count]);
+	(void)__ro_pop(s, NULL, NULL);
+}
+
+int ro_pop_long(struct ro_spine_long *s, int *idx)
+{
+	return __ro_pop(&s->ro_spine, s->idxs, idx);
 }
 
 struct btree_node *ro_node(struct ro_spine *s)
@@ -177,6 +249,10 @@ struct btree_node *ro_node(struct ro_spine *s)
 	return dm_block_data(block);
 }
 
+struct btree_node *ro_node_long(struct ro_spine_long *s)
+{
+	return ro_node(&s->ro_spine);
+}
 /*----------------------------------------------------------------*/
 
 void init_shadow_spine(struct shadow_spine *s, struct dm_btree_info *info)

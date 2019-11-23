@@ -141,6 +141,12 @@ static u32 crc32c(u32 crc, const u8 *data, unsigned int length)
 	return crc;
 }
 
+u32 crc32c_generic(u32 crc, const void *address, unsigned int length)
+{
+	return crc32c(crc, address, length);
+}
+EXPORT_SYMBOL(crc32c_generic);
+
 /*
  * Steps through buffer one byte at at time, calculates reflected 
  * crc using table.

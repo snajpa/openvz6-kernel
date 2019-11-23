@@ -155,7 +155,7 @@ static void __init reserve_crashkernel(void)
 	free_mem = ((unsigned long long)max_low_pfn - min_low_pfn) << PAGE_SHIFT;
 
 	ret = parse_crashkernel(boot_command_line, free_mem,
-			&crash_size, &crash_base);
+			&crash_size, &crash_base, NULL);
 	if (ret == 0 && crash_size) {
 		if (crash_base <= 0) {
 			vp = alloc_bootmem_nopanic(crash_size);

@@ -77,6 +77,13 @@ static netdev_tx_t loopback_xmit(struct sk_buff *skb,
 	struct pcpu_lstats *lb_stats;
 	int len;
 
+#ifdef CONFIG_VE
+	if (unlikely(get_exec_env()->disable_net)) {
+		kfree_skb(skb);
+		return 0;
+	}
+#endif
+
 	skb_orphan(skb);
 
 	skb->protocol = eth_type_trans(skb, dev);
@@ -152,9 +159,15 @@ static void loopback_dev_free(struct net_device *dev)
 	free_netdev(dev);
 }
 
+static void loopback_cpt(struct net_device *dev,
+		struct cpt_ops *ops, struct cpt_context *ctx)
+{
+}
+
 static const struct net_device_ops loopback_ops = {
 	.ndo_init      = loopback_dev_init,
 	.ndo_start_xmit= loopback_xmit,
+	.ndo_cpt = loopback_cpt,
 };
 
 static const struct net_device_ops_ext loopback_ops_ext = {
@@ -186,6 +199,7 @@ static void loopback_setup(struct net_device *dev)
 		| NETIF_F_NETNS_LOCAL
 		| NETIF_F_VLAN_CHALLENGED
 		| NETIF_F_LOOPBACK;
+	dev->vz_features |= NETIF_F_VIRTUAL;
 	dev->ethtool_ops	= &loopback_ethtool_ops;
 	dev->header_ops		= &eth_header_ops;
 	dev->netdev_ops		= &loopback_ops;
@@ -221,15 +235,7 @@ out:
 	return err;
 }
 
-static __net_exit void loopback_net_exit(struct net *net)
-{
-	struct net_device *dev = net->loopback_dev;
-
-	unregister_netdev(dev);
-}
-
 /* Registered in net/core/dev.c */
 struct pernet_operations __net_initdata loopback_net_ops = {
        .init = loopback_net_init,
-       .exit = loopback_net_exit,
 };

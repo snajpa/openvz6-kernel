@@ -708,6 +708,7 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 	q->orderr = q->ordcolor = 0;
 	q->orig_bar_rq = NULL;
 
+	atomic_set(&q->flush_tag, 0);
 	/*
 	 * By default initialize queue_lock to internal lock and driver can
 	 * override it later if need be.
@@ -1038,16 +1039,15 @@ static struct request *get_request(struct request_queue *q, int rw_flags,
 			if (!blk_queue_full(q, is_sync)) {
 				ioc_set_batching(q, ioc);
 				blk_set_queue_full(q, is_sync);
-			} else {
-				if (may_queue != ELV_MQUEUE_MUST
-						&& !ioc_batching(q, ioc)) {
-					/*
-					 * The queue is full and the allocating
-					 * process is not a "batcher", and not
-					 * exempted by the IO scheduler
-					 */
-					goto out;
-				}
+			} else if (may_queue == ELV_MQUEUE_MUST) {
+				ioc_set_batching(q, ioc);
+			} else if (!ioc_batching(q, ioc)) {
+				/*
+				 * The queue is full and the allocating
+				 * process is not a "batcher", and not
+				 * exempted by the IO scheduler
+				 */
+				goto out;
 			}
 		}
 		blk_set_queue_congested(q, is_sync);
@@ -1792,10 +1792,9 @@ static inline void __generic_make_request(struct bio *bio)
 	old_sector = -1;
 	old_dev = 0;
 	do {
-		char b[BDEVNAME_SIZE];
-
 		q = bdev_get_queue(bio->bi_bdev);
 		if (unlikely(!q)) {
+			char b[BDEVNAME_SIZE];
 			printk(KERN_ERR
 			       "generic_make_request: Trying to access "
 				"nonexistent block-device %s (%Lu)\n",
@@ -1806,6 +1805,7 @@ static inline void __generic_make_request(struct bio *bio)
 
 		if (likely(bio_is_rw(bio) &&
 			   nr_sectors > queue_max_hw_sectors(q))) {
+			char b[BDEVNAME_SIZE];
 			printk(KERN_ERR "bio too big device %s (%u > %u)\n",
 			       bdevname(bio->bi_bdev, b),
 			       bio_sectors(bio),
@@ -1854,6 +1854,7 @@ static inline void __generic_make_request(struct bio *bio)
 			break;  /* throttled, will be resubmitted later */
 
 		trace_block_bio_queue(q, bio);
+		blk_cbt_bio_queue(q, bio);
 
 		ret = q->make_request_fn(q, bio);
 	} while (ret);

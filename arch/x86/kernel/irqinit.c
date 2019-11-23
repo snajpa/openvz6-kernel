@@ -204,6 +204,8 @@ static void __init apic_intr_init(void)
 # endif
 
 #endif
+	alloc_intr_gate(MONITOR_IPI_VECTOR, monitor_ipi);
+	alloc_intr_gate(MONITOR_POSTED_INTERRUPT_VECTOR, monitor_posted_interrupt);
 }
 
 void __init native_init_IRQ(void)

@@ -167,6 +167,7 @@ struct fib6_table {
 	u32			tb6_id;
 	rwlock_t		tb6_lock;
 	struct fib6_node	tb6_root;
+	struct ve_struct	*owner_env;
 };
 
 #define RT6_TABLE_UNSPEC	RT_TABLE_UNSPEC

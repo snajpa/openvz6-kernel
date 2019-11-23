@@ -11,6 +11,7 @@ void unix_notinflight(struct user_struct *user, struct file *fp);
 extern void unix_gc(void);
 extern void wait_for_unix_gc(void);
 extern struct sock *unix_get_socket(struct file *filp);
+extern void unix_destruct_scm(struct sk_buff *skb);
 
 #define UNIX_HASH_SIZE	256
 
@@ -23,6 +24,9 @@ struct unix_address {
 	struct sockaddr_un name[0];
 };
 
+int unix_bind_path(struct sock *, struct dentry *, struct vfsmount *);
+int unix_attach_addr(struct sock *, struct sockaddr_un *, int);
+
 struct unix_skb_parms {
 	struct pid		*pid;		/* Skb credentials	*/
 	const struct cred	*cred;
@@ -30,6 +34,7 @@ struct unix_skb_parms {
 #ifdef CONFIG_SECURITY_NETWORK
 	u32			secid;		/* Security ID		*/
 #endif
+	u32			consumed;
 };
 
 #define UNIXCB(skb) 	(*(struct unix_skb_parms*)&((skb)->cb))

@@ -224,7 +224,7 @@ int arp_mc_map(__be32 addr, u8 *haddr, struct net_device *dev, int dir)
 
 static u32 arp_hash(const void *pkey, const struct net_device *dev)
 {
-	return jhash_2words(*(u32 *)pkey, dev->ifindex, arp_tbl.hash_rnd);
+	return jhash_2words(*(u32 *)pkey, hash32_ptr(dev), arp_tbl.hash_rnd[0]);
 }
 
 static int arp_constructor(struct neighbour *neigh)
@@ -1181,7 +1181,8 @@ int arp_ioctl(struct net *net, unsigned int cmd, void __user *arg)
 	switch (cmd) {
 		case SIOCDARP:
 		case SIOCSARP:
-			if (!capable(CAP_NET_ADMIN))
+			if (!capable(CAP_NET_ADMIN) &&
+					!capable(CAP_VE_NET_ADMIN))
 				return -EPERM;
 		case SIOCGARP:
 			err = copy_from_user(&r, arg, sizeof(struct arpreq));

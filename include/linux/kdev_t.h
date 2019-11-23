@@ -87,6 +87,57 @@ static inline unsigned sysv_minor(u32 dev)
 	return dev & 0x3ffff;
 }
 
+#define UNNAMED_MAJOR_COUNT	16
+
+#if UNNAMED_MAJOR_COUNT > 1
+
+extern int unnamed_dev_majors[UNNAMED_MAJOR_COUNT];
+
+static inline dev_t make_unnamed_dev(int idx)
+{
+	/*
+	 * Here we transfer bits from 8 to 8+log2(UNNAMED_MAJOR_COUNT) of the
+	 * unnamed device index into major number.
+	 */
+	return MKDEV(unnamed_dev_majors[(idx >> 8) & (UNNAMED_MAJOR_COUNT - 1)],
+		     idx & ~((UNNAMED_MAJOR_COUNT - 1) << 8));
+}
+
+static inline int unnamed_dev_idx(dev_t dev)
+{
+	int i;
+	for (i = 0; i < UNNAMED_MAJOR_COUNT &&
+				MAJOR(dev) != unnamed_dev_majors[i]; i++);
+	return MINOR(dev) | (i << 8);
+}
+
+static inline int is_unnamed_dev(dev_t dev)
+{
+	int i;
+	for (i = 0; i < UNNAMED_MAJOR_COUNT &&
+				MAJOR(dev) != unnamed_dev_majors[i]; i++);
+	return i < UNNAMED_MAJOR_COUNT;
+}
+
+#else /* UNNAMED_MAJOR_COUNT */
+
+static inline dev_t make_unnamed_dev(int idx)
+{
+	return MKDEV(0, idx);
+}
+
+static inline int unnamed_dev_idx(dev_t dev)
+{
+	return MINOR(dev);
+}
+
+static inline int is_unnamed_dev(dev_t dev)
+{
+	return MAJOR(dev) == 0;
+}
+
+#endif /* UNNAMED_MAJOR_COUNT */
+
 #else /* __KERNEL__ */
 
 /*

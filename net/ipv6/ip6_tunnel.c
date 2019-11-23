@@ -1221,7 +1221,7 @@ ip6_tnl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	case SIOCADDTUNNEL:
 	case SIOCCHGTUNNEL:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			break;
 		err = -EFAULT;
 		if (copy_from_user(&p, ifr->ifr_ifru.ifru_data, sizeof (p)))
@@ -1255,7 +1255,7 @@ ip6_tnl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 		break;
 	case SIOCDELTUNNEL:
 		err = -EPERM;
-		if (!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN) && !capable(CAP_VE_NET_ADMIN))
 			break;
 
 		if (dev == ip6n->fb_tnl_dev) {
@@ -1389,29 +1389,25 @@ static void ip6_tnl_destroy_tunnels(struct ip6_tnl_net *ip6n)
 {
 	int h;
 	struct ip6_tnl *t;
+	LIST_HEAD(list);
 
 	for (h = 0; h < HASH_SIZE; h++) {
-		while ((t = ip6n->tnls_r_l[h]) != NULL)
-			unregister_netdevice(t->dev);
+		t = ip6n->tnls_r_l[h];
+		while (t != NULL) {
+			unregister_netdevice_queue(t->dev, &list);
+			t = t->next;
+		}
 	}
 
 	t = ip6n->tnls_wc[0];
-	unregister_netdevice(t->dev);
+	unregister_netdevice_queue(t->dev, &list);
+	unregister_netdevice_many(&list);
 }
 
 static int ip6_tnl_init_net(struct net *net)
 {
+	struct ip6_tnl_net *ip6n = net_generic(net, ip6_tnl_net_id);
 	int err;
-	struct ip6_tnl_net *ip6n;
-
-	err = -ENOMEM;
-	ip6n = kzalloc(sizeof(struct ip6_tnl_net), GFP_KERNEL);
-	if (ip6n == NULL)
-		goto err_alloc;
-
-	err = net_assign_generic(net, ip6_tnl_net_id, ip6n);
-	if (err < 0)
-		goto err_assign;
 
 	ip6n->tnls[0] = ip6n->tnls_wc;
 	ip6n->tnls[1] = ip6n->tnls_r_l;
@@ -1434,27 +1430,23 @@ static int ip6_tnl_init_net(struct net *net)
 err_register:
 	free_netdev(ip6n->fb_tnl_dev);
 err_alloc_dev:
-	/* nothing */
-err_assign:
-	kfree(ip6n);
-err_alloc:
 	return err;
 }
 
 static void ip6_tnl_exit_net(struct net *net)
 {
-	struct ip6_tnl_net *ip6n;
+	struct ip6_tnl_net *ip6n = net_generic(net, ip6_tnl_net_id);
 
-	ip6n = net_generic(net, ip6_tnl_net_id);
 	rtnl_lock();
 	ip6_tnl_destroy_tunnels(ip6n);
 	rtnl_unlock();
-	kfree(ip6n);
 }
 
 static struct pernet_operations ip6_tnl_net_ops = {
 	.init = ip6_tnl_init_net,
 	.exit = ip6_tnl_exit_net,
+	.id   = &ip6_tnl_net_id,
+	.size = sizeof(struct ip6_tnl_net),
 };
 
 /**
@@ -1467,7 +1459,7 @@ static int __init ip6_tunnel_init(void)
 {
 	int  err;
 
-	err = register_pernet_gen_device(&ip6_tnl_net_id, &ip6_tnl_net_ops);
+	err = register_pernet_device(&ip6_tnl_net_ops);
 	if (err < 0)
 		goto out;
 
@@ -1488,7 +1480,7 @@ static int __init ip6_tunnel_init(void)
 unreg_ip4ip6:
 	xfrm6_tunnel_deregister(&ip4ip6_handler, AF_INET);
 unreg_pernet_dev:
-	unregister_pernet_gen_device(ip6_tnl_net_id, &ip6_tnl_net_ops);
+	unregister_pernet_device(&ip6_tnl_net_ops);
 out:
 	return err;
 }
@@ -1505,7 +1497,7 @@ static void __exit ip6_tunnel_cleanup(void)
 	if (xfrm6_tunnel_deregister(&ip6ip6_handler, AF_INET6))
 		printk(KERN_INFO "ip6_tunnel close: can't deregister ip6ip6\n");
 
-	unregister_pernet_gen_device(ip6_tnl_net_id, &ip6_tnl_net_ops);
+	unregister_pernet_device(&ip6_tnl_net_ops);
 }
 
 module_init(ip6_tunnel_init);

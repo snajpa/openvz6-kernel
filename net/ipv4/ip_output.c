@@ -309,6 +309,7 @@ int ip_output(struct sk_buff *skb)
 			    ip_finish_output,
 			    !(IPCB(skb)->flags & IPSKB_REROUTED));
 }
+EXPORT_SYMBOL(ip_output);
 
 int ip_queue_xmit(struct sk_buff *skb, int ipfragok)
 {
@@ -451,6 +452,7 @@ int ip_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *))
 	__be16 not_last_frag;
 	struct rtable *rt = skb_rtable(skb);
 	int err = 0;
+	u8 brmark = skb_get_brmark(skb);
 
 	dev = rt->u.dst.dev;
 
@@ -551,6 +553,7 @@ int ip_fragment(struct sk_buff *skb, int (*output)(struct sk_buff *))
 				ip_send_check(iph);
 			}
 
+			skb_set_brmark(skb, brmark);
 			err = output(skb);
 
 			if (!err)
@@ -685,6 +688,7 @@ slow_path:
 
 		ip_send_check(iph);
 
+		skb_set_brmark(skb2, brmark);
 		err = output(skb2);
 		if (err)
 			goto fail;
@@ -1473,13 +1477,14 @@ void ip_send_reply(struct sock *sk, struct sk_buff *skb, struct ip_reply_arg *ar
 		char			data[40];
 	} replyopts;
 	struct ipcm_cookie ipc;
-	__be32 daddr;
+	__be32 saddr, daddr;
 	struct rtable *rt = skb_rtable(skb);
 	int err;
 
 	if (ip_options_echo(&replyopts.opt, skb))
 		return;
 
+	saddr = ip_hdr(skb)->daddr;
 	daddr = ipc.addr = rt->rt_src;
 	ipc.opt = NULL;
 	ipc.shtx.flags = 0;
@@ -1497,7 +1502,7 @@ void ip_send_reply(struct sock *sk, struct sk_buff *skb, struct ip_reply_arg *ar
 		struct flowi fl = { .oif = arg->bound_dev_if,
 				    .nl_u = { .ip4_u =
 					      { .daddr = daddr,
-						.saddr = rt->rt_spec_dst,
+						.saddr = saddr,
 						.tos = RT_TOS(ip_hdr(skb)->tos) } },
 				    /* Not quite clean, but right. */
 				    .uli_u = { .ports =

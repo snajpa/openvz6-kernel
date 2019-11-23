@@ -36,10 +36,11 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/crc32c.h>
 
 static struct crypto_shash *tfm;
 
-u32 crc32c(u32 crc, const void *address, unsigned int length)
+static u32 __crc32c(u32 crc, const void *address, unsigned int length)
 {
 	struct {
 		struct shash_desc shash;
@@ -55,6 +56,13 @@ u32 crc32c(u32 crc, const void *address, unsigned int length)
 	BUG_ON(err);
 
 	return *(u32 *)desc.ctx;
+}
+
+u32 crc32c(u32 crc, const void *address, unsigned int length)
+{
+	if (unlikely(!tfm))
+		return crc32c_generic(crc, address, length);
+	return __crc32c(crc, address, length);
 }
 
 EXPORT_SYMBOL(crc32c);

@@ -14,6 +14,19 @@
 #include <net/addrconf.h>
 #include <net/inet_frag.h>
 
+static struct ctl_table empty[1];
+
+static ctl_table ipv6_static_skeleton[] = {
+	{
+		.ctl_name	= NET_IPV6_NEIGH,
+		.procname	= "neigh",
+		.maxlen		= 0,
+		.mode		= 0555,
+		.child		= empty,
+	},
+	{ }
+};
+
 static ctl_table ipv6_table_template[] = {
 	{
 		.ctl_name	= NET_IPV6_ROUTE,
@@ -155,8 +168,7 @@ static struct ctl_table_header *ip6_base;
 
 int ipv6_static_sysctl_register(void)
 {
-	static struct ctl_table empty[1];
-	ip6_base = register_sysctl_paths(net_ipv6_ctl_path, empty);
+	ip6_base = register_sysctl_paths(net_ipv6_ctl_path, ipv6_static_skeleton);
 	if (ip6_base == NULL)
 		return -ENOMEM;
 	return 0;

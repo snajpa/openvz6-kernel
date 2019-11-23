@@ -209,9 +209,12 @@ extern void *nf_ct_alloc_hashtable(unsigned int *sizep, int *vmalloced, int null
 
 extern void nf_ct_free_hashtable(void *hash, int vmalloced, unsigned int size);
 
+extern void death_by_timeout(unsigned long ul_conntrack);
 extern struct nf_conntrack_tuple_hash *
 __nf_conntrack_find(struct net *net, const struct nf_conntrack_tuple *tuple);
 
+extern int
+__nf_conntrack_hash_check_insert(struct nf_conn *ct, struct nf_conn **cd);
 extern int nf_conntrack_hash_check_insert(struct nf_conn *ct);
 extern void nf_ct_delete_from_lists(struct nf_conn *ct);
 extern void nf_ct_insert_dying_list(struct nf_conn *ct);
@@ -282,6 +285,7 @@ extern struct nf_conn *
 nf_conntrack_alloc(struct net *net,
 		   const struct nf_conntrack_tuple *orig,
 		   const struct nf_conntrack_tuple *repl,
+		   struct user_beancounter *,
 		   gfp_t gfp);
 
 /* It's confirmed if it is, or has been in the hash table. */
@@ -302,7 +306,7 @@ static inline int nf_ct_is_untracked(const struct sk_buff *skb)
 
 extern int nf_conntrack_set_hashsize(const char *val, struct kernel_param *kp);
 extern unsigned int nf_conntrack_htable_size;
-extern unsigned int nf_conntrack_max;
+extern int ip_conntrack_disable_ve0 /* XXX: unused */;
 
 #define NF_CT_STAT_INC(net, count)	\
 	(per_cpu_ptr((net)->ct.stat, raw_smp_processor_id())->count++)

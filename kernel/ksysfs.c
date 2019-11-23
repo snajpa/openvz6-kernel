@@ -16,6 +16,7 @@
 #include <linux/kexec.h>
 #include <linux/profile.h>
 #include <linux/sched.h>
+#include <linux/capability.h>
 
 #define KERNEL_ATTR_RO(_name) \
 static struct kobj_attribute _name##_attr = __ATTR_RO(_name)
@@ -29,7 +30,7 @@ static struct kobj_attribute _name##_attr = \
 static ssize_t uevent_seqnum_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%llu\n", (unsigned long long)uevent_seqnum);
+	return sprintf(buf, "%llu\n", (unsigned long long)ve_uevent_seqnum);
 }
 KERNEL_ATTR_RO(uevent_seqnum);
 
@@ -66,6 +67,13 @@ static ssize_t profiling_store(struct kobject *kobj,
 {
 	int ret;
 
+	/*
+	 * We show /sys/kernel/profiling in CT for docker's sake but profiling
+	 * is system wide, so we don't allow to turn it on/off and do not
+	 * allow to create /proc/profile to get profiling info
+	 */
+	if (!ve_is_super(get_exec_env()))
+		return -ENOTSUPP;
 	if (prof_on)
 		return -EEXIST;
 	/*
@@ -131,6 +139,14 @@ KERNEL_ATTR_RO(vmcoreinfo);
 
 #endif /* CONFIG_KEXEC */
 
+/* whether file capabilities are enabled */
+static ssize_t fscaps_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", file_caps_enabled);
+}
+KERNEL_ATTR_RO(fscaps);
+
 /*
  * Make /sys/kernel/notes give the raw contents of our kernel .notes section.
  */
@@ -158,6 +174,7 @@ struct kobject *kernel_kobj;
 EXPORT_SYMBOL_GPL(kernel_kobj);
 
 static struct attribute * kernel_attrs[] = {
+	&fscaps_attr.attr,
 #if defined(CONFIG_HOTPLUG)
 	&uevent_seqnum_attr.attr,
 	&uevent_helper_attr.attr,
@@ -174,22 +191,64 @@ static struct attribute * kernel_attrs[] = {
 	NULL
 };
 
+static struct attribute * kernel_ve_attrs[] = {
+	&fscaps_attr.attr,
+#if defined(CONFIG_HOTPLUG)
+	&uevent_seqnum_attr.attr,
+#endif
+#ifdef CONFIG_PROFILING
+	&profiling_attr.attr,
+#endif
+	NULL
+};
+
 static struct attribute_group kernel_attr_group = {
 	.attrs = kernel_attrs,
 };
 
+static struct attribute_group kernel_ve_attr_group = {
+	.attrs = kernel_ve_attrs,
+};
+
+int ksysfs_init_ve(struct ve_struct *ve, struct kobject **kernel_obj)
+{
+	struct attribute_group *k_grp;
+	int err;
+
+	if (!ve || ve_is_super(ve))
+		k_grp = &kernel_attr_group;
+	else
+		k_grp = &kernel_ve_attr_group;
+
+	*kernel_obj = kobject_create_and_add("kernel", NULL);
+	if (!*kernel_obj)
+		return -ENOMEM;
+
+	err = sysfs_create_group(*kernel_obj, k_grp);
+
+	if (err) {
+		kobject_put(*kernel_obj);
+		*kernel_obj = NULL;
+	}
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(ksysfs_init_ve);
+
+void ksysfs_fini_ve(struct ve_struct *ve, struct kobject **kernel_obj)
+{
+	sysfs_remove_group(*kernel_obj, &kernel_ve_attr_group);
+	kobject_put(*kernel_obj);
+	*kernel_obj = NULL;
+}
+EXPORT_SYMBOL_GPL(ksysfs_fini_ve);
+
 static int __init ksysfs_init(void)
 {
-	int error;
+	int error = ksysfs_init_ve(NULL, &kernel_kobj);
 
-	kernel_kobj = kobject_create_and_add("kernel", NULL);
-	if (!kernel_kobj) {
-		error = -ENOMEM;
-		goto exit;
-	}
-	error = sysfs_create_group(kernel_kobj, &kernel_attr_group);
 	if (error)
-		goto kset_exit;
+		return error;
 
 	if (notes_size > 0) {
 		notes_attr.size = notes_size;
@@ -209,10 +268,7 @@ notes_exit:
 	if (notes_size > 0)
 		sysfs_remove_bin_file(kernel_kobj, &notes_attr);
 group_exit:
-	sysfs_remove_group(kernel_kobj, &kernel_attr_group);
-kset_exit:
-	kobject_put(kernel_kobj);
-exit:
+	ksysfs_fini_ve(NULL, &kernel_kobj);
 	return error;
 }
 

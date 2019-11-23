@@ -632,8 +632,6 @@ static void module_unload_init(struct module *mod)
 		local_set(__module_ref_addr(mod, cpu), 0);
 	/* Hold reference count during initialization. */
 	local_set(__module_ref_addr(mod, raw_smp_processor_id()), 1);
-	/* Backwards compatibility macros put refcount during init. */
-	mod->waiter = current;
 }
 
 /* modules using other modules */
@@ -756,16 +754,9 @@ static int __try_stop_module(void *_sref)
 
 static int try_stop_module(struct module *mod, int flags, int *forced)
 {
-	if (flags & O_NONBLOCK) {
-		struct stopref sref = { mod, flags, forced };
+	struct stopref sref = { mod, flags, forced };
 
-		return stop_machine(__try_stop_module, &sref, NULL);
-	} else {
-		/* We don't need to stop the machine for this. */
-		mod->state = MODULE_STATE_GOING;
-		synchronize_sched();
-		return 0;
-	}
+	return stop_machine(__try_stop_module, &sref, NULL);
 }
 
 unsigned int module_refcount(struct module *mod)
@@ -781,21 +772,6 @@ EXPORT_SYMBOL(module_refcount);
 
 /* This exists whether we can unload or not */
 static void free_module(struct module *mod);
-
-static void wait_for_zero_refcount(struct module *mod)
-{
-	/* Since we might sleep for some time, release the mutex first */
-	mutex_unlock(&module_mutex);
-	for (;;) {
-		DEBUGP("Looking at refcount...\n");
-		set_current_state(TASK_UNINTERRUPTIBLE);
-		if (module_refcount(mod) == 0)
-			break;
-		schedule();
-	}
-	current->state = TASK_RUNNING;
-	mutex_lock(&module_mutex);
-}
 
 SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 		unsigned int, flags)
@@ -828,8 +804,7 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 
 	/* Doing init or already dying? */
 	if (mod->state != MODULE_STATE_LIVE) {
-		/* FIXME: if (force), slam module count and wake up
-                   waiter --RR */
+		/* FIXME: if (force), slam module count damn the torpedoes */
 		DEBUGP("%s already dying\n", mod->name);
 		ret = -EBUSY;
 		goto out;
@@ -845,17 +820,10 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
 		}
 	}
 
-	/* Set this up before setting mod->state */
-	mod->waiter = current;
-
 	/* Stop the machine so refcounts can't move and disable module. */
 	ret = try_stop_module(mod, flags, &forced);
 	if (ret != 0)
 		goto out;
-
-	/* Never wait if forced. */
-	if (!forced && module_refcount(mod) != 0)
-		wait_for_zero_refcount(mod);
 
 	mutex_unlock(&module_mutex);
 	/* Final destruction now noone is using it. */
@@ -944,9 +912,6 @@ void module_put(struct module *module)
 		local_dec(__module_ref_addr(module, cpu));
 		trace_module_put(module, _RET_IP_,
 				 local_read(__module_ref_addr(module, cpu)));
-		/* Maybe they're waiting for us to drop reference? */
-		if (unlikely(!module_is_live(module)))
-			wake_up_process(module->waiter);
 		put_cpu();
 	}
 }
@@ -2069,9 +2034,7 @@ static void kmemleak_load_module(struct module *mod, Elf_Ehdr *hdr,
 	unsigned int i;
 
 	/* only scan the sections containing data */
-	kmemleak_scan_area(mod->module_core, (unsigned long)mod -
-			   (unsigned long)mod->module_core,
-			   sizeof(struct module), GFP_KERNEL);
+	kmemleak_scan_area(mod, sizeof(struct module), GFP_KERNEL);
 
 	for (i = 1; i < hdr->e_shnum; i++) {
 		if (!(sechdrs[i].sh_flags & SHF_ALLOC))
@@ -2080,8 +2043,7 @@ static void kmemleak_load_module(struct module *mod, Elf_Ehdr *hdr,
 		    && strncmp(secstrings + sechdrs[i].sh_name, ".bss", 4) != 0)
 			continue;
 
-		kmemleak_scan_area(mod->module_core, sechdrs[i].sh_addr -
-				   (unsigned long)mod->module_core,
+		kmemleak_scan_area((void *)sechdrs[i].sh_addr,
 				   sechdrs[i].sh_size, GFP_KERNEL);
 	}
 }
@@ -2438,6 +2400,12 @@ static noinline struct module *load_module(void __user *umod,
 		mod->trace_events.ptrs = ftrace_events_ptrs_mask(trace_events_ptrs);
 		mod->num_trace_events = num_trace_events_ptrs;
 	}
+	/*
+	 * This section contains pointers to allocated objects in the trace
+	 * code and not scanning it leads to false positives.
+	 */
+	kmemleak_scan_area(mod->trace_events.events, sizeof(*mod->trace_events.events) *
+			   mod->num_trace_events, GFP_KERNEL);
 #endif
 #ifdef CONFIG_FTRACE_MCOUNT_RECORD
 	/* sechdrs[0].sh_size is always zero */
@@ -2961,6 +2929,8 @@ static char *module_flags(struct module *mod, char *buf)
 static void *m_start(struct seq_file *m, loff_t *pos)
 {
 	mutex_lock(&module_mutex);
+	if (!ve_is_super(get_exec_env()))
+		return NULL;
 	return seq_list_start(&modules, *pos);
 }
 
@@ -3025,7 +2995,7 @@ static const struct file_operations proc_modules_operations = {
 
 static int __init proc_modules_init(void)
 {
-	proc_create("modules", 0, NULL, &proc_modules_operations);
+	proc_create("modules", 0, &glob_proc_root, &proc_modules_operations);
 	return 0;
 }
 module_init(proc_modules_init);

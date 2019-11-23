@@ -1230,7 +1230,7 @@ static int try_to_merge_one_page(struct vm_area_struct *vma,
 		if (!PageMlocked(kpage)) {
 			unlock_page(page);
 			lock_page(kpage);
-			mlock_vma_page(kpage);
+			mlock_vma_page(vma, kpage);
 			page = kpage;		/* for final unlock */
 		}
 	}

@@ -363,6 +363,17 @@ static s32 e1000_get_variants_82571(struct e1000_adapter *adapter)
 		if (global_quad_port_a == 4)
 			global_quad_port_a = 0;
 		break;
+	case E1000_DEV_ID_82574L:
+	case E1000_DEV_ID_82574LA:
+		/*
+		 * 82574 family can hang when switching PCIe power on.
+		 * Intel will not fix it, so need to disable PCIe power
+		 * management for this family.
+		 */
+		pci_disable_link_state(pdev, PCIE_LINK_STATE_L0S |
+					     PCIE_LINK_STATE_L1 |
+					     PCIE_LINK_STATE_CLKPM);
+
 	default:
 		break;
 	}

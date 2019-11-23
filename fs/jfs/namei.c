@@ -802,9 +802,6 @@ static int jfs_link(struct dentry *old_dentry,
 	if (ip->i_nlink == JFS_LINK_MAX)
 		return -EMLINK;
 
-	if (ip->i_nlink == 0)
-		return -ENOENT;
-
 	tid = txBegin(ip->i_sb, 0);
 
 	mutex_lock_nested(&JFS_IP(dir)->commit_mutex, COMMIT_MUTEX_PARENT);

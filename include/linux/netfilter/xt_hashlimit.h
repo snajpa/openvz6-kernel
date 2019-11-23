@@ -65,4 +65,11 @@ struct xt_hashlimit_mtinfo1 {
 	struct xt_hashlimit_htable *hinfo __attribute__((aligned(8)));
 };
 
+#ifdef __KERNEL__
+struct ve_xt_hashlimit {
+	struct hlist_head	hashlimit_htables;
+	struct proc_dir_entry	*hashlimit_procdir4;
+	struct proc_dir_entry	*hashlimit_procdir6;
+};
+#endif
 #endif /*_XT_HASHLIMIT_H*/

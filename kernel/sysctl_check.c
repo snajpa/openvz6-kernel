@@ -1507,7 +1507,8 @@ int sysctl_check_table(struct nsproxy *namespaces, struct ctl_table *table)
 			    (table->proc_handler == proc_dointvec_ms_jiffies) ||
 			    (table->proc_handler == proc_doulongvec_minmax) ||
 			    (table->proc_handler == proc_doulongvec_ms_jiffies_minmax)) {
-				if (!table->data)
+				if (!table->data &&
+				    !((table->mode & S_ISVTX) && table->extra1))
 					set_fail(&fail, table, "No data");
 				if (!table->maxlen)
 					set_fail(&fail, table, "No maxlen");
@@ -1531,7 +1532,7 @@ int sysctl_check_table(struct nsproxy *namespaces, struct ctl_table *table)
 			sysctl_check_leaf(namespaces, table, &fail);
 		}
 		sysctl_check_bin_path(table, &fail);
-		if (table->mode > 0777)
+		if (table->mode & ~(0777 | S_ISVTX))
 			set_fail(&fail, table, "bogus .mode");
 		if (fail) {
 			set_fail(&fail, table, NULL);

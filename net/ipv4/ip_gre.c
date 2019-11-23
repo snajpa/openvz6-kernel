@@ -51,6 +51,9 @@
 #include <net/ip6_route.h>
 #endif
 
+#include <linux/cpt_image.h>
+#include <linux/cpt_export.h>
+
 /*
    Problems & solutions
    --------------------
@@ -109,6 +112,7 @@
  */
 
 static struct rtnl_link_ops ipgre_link_ops __read_mostly;
+static struct rtnl_link_ops ipgre_tap_ops __read_mostly;
 static int ipgre_tunnel_init(struct net_device *dev);
 
 static int ipgre_net_id __read_mostly;
@@ -445,6 +449,47 @@ static const struct ethtool_ops gre_dev_ethtool_ops = {
 	.get_tso	= ethtool_op_get_tso,
 };
 
+static void ipgre_cpt(struct net_device *dev,
+		struct cpt_ops *ops, struct cpt_context *ctx)
+{
+	struct cpt_tunnel_image v;
+	struct ip_tunnel *t;
+	struct ip_tunnel_net *itn;
+	int net_id;
+
+	v.cpt_next = CPT_NULL;
+	v.cpt_object = CPT_OBJ_NET_IPIP_TUNNEL;
+	v.cpt_hdrlen = sizeof(v);
+	v.cpt_content = CPT_CONTENT_VOID;
+
+	if (dev->rtnl_link_ops == &ipgre_link_ops) {
+		net_id = ipgre_net_id;
+		v.cpt_tnl_flags = CPT_TUNNEL_GRE;
+	} else if (dev->rtnl_link_ops == &ipgre_tap_ops) {
+		net_id = gre_tap_net_id;
+		v.cpt_tnl_flags = CPT_TUNNEL_GRE_TAP;
+	} else BUG();
+
+	/* mark fb dev */
+	itn = net_generic(get_exec_env()->ve_netns, net_id);
+	if (dev == itn->fb_tunnel_dev)
+		v.cpt_tnl_flags |= CPT_TUNNEL_FBDEV;
+
+	t = netdev_priv(dev);
+	v.cpt_i_flags = t->parms.i_flags;
+	v.cpt_o_flags = t->parms.o_flags;
+	v.cpt_i_key = t->parms.i_key;
+	v.cpt_o_key = t->parms.o_key;
+	v.cpt_i_seqno = t->i_seqno;
+	v.cpt_o_seqno = t->o_seqno;
+	v.cpt_link = dev->iflink;
+
+	BUILD_BUG_ON(sizeof(v.cpt_iphdr) != sizeof(t->parms.iph));
+	memcpy(&v.cpt_iphdr, &t->parms.iph, sizeof(t->parms.iph));
+
+	ops->write(&v, sizeof(v), ctx);
+}
+
 static const struct net_device_ops ipgre_netdev_ops = {
 	.ndo_init		= ipgre_tunnel_init,
 	.ndo_uninit		= ip_tunnel_uninit,
@@ -455,6 +500,7 @@ static const struct net_device_ops ipgre_netdev_ops = {
 	.ndo_start_xmit		= ipgre_xmit,
 	.ndo_do_ioctl		= ipgre_tunnel_ioctl,
 	.ndo_change_mtu		= ip_tunnel_change_mtu,
+	.ndo_cpt		= ipgre_cpt,
 };
 
 #define GRE_FEATURES (NETIF_F_SG |		\
@@ -466,7 +512,45 @@ static void ipgre_tunnel_setup(struct net_device *dev)
 {
 	dev->netdev_ops		= &ipgre_netdev_ops;
 	ip_tunnel_setup(dev, ipgre_net_id);
+	dev->vz_features |= NETIF_F_VIRTUAL;
 }
+
+static int ipgre_rst(loff_t start, struct cpt_netdev_image *di,
+		struct rst_ops *ops, struct cpt_context *ctx)
+{
+	int err;
+	struct cpt_tunnel_image v;
+	loff_t pos;
+	struct net *net = get_exec_env()->ve_netns;
+	struct ip_tunnel_net *itn;
+
+	pos = start + di->cpt_hdrlen;
+	err = ops->get_object(CPT_OBJ_NET_IPIP_TUNNEL,
+			pos, &v, sizeof(v), ctx);
+	if (err)
+		return err;
+
+	/* some sanity */
+	if (v.cpt_content != CPT_CONTENT_VOID)
+		return -EINVAL;
+
+	if (v.cpt_tnl_flags & CPT_TUNNEL_GRE)
+		itn = net_generic(net, ipgre_net_id);
+	else if (v.cpt_tnl_flags & CPT_TUNNEL_GRE_TAP)
+		itn = net_generic(net, gre_tap_net_id);
+	else
+		return 1;
+
+	if (itn == NULL)
+		return -EOPNOTSUPP;
+
+	return ip_tunnel_rst(net, itn, &v, di->cpt_name);
+}
+
+static struct netdev_rst ipgre_netdev_rst = {
+	.cpt_object = CPT_OBJ_NET_IPIP_TUNNEL,
+	.ndo_rst = ipgre_rst,
+};
 
 static void __gre_tunnel_init(struct net_device *dev)
 {
@@ -550,16 +634,19 @@ free:
 	return err;
 }
 
-static void ipgre_exit_net(struct net *net)
+static void __net_exit ipgre_exit_net(struct net *net)
 {
 	struct ip_tunnel_net *itn = net_generic(net, ipgre_net_id);
 	ip_tunnel_delete_net(itn);
+	net_assign_generic(net, ipgre_net_id, NULL);
 	kfree(itn);
 }
 
 static struct pernet_operations ipgre_net_ops = {
 	.init = ipgre_init_net,
 	.exit = ipgre_exit_net,
+	.id   = &ipgre_net_id,
+	.size = sizeof(struct ip_tunnel_net),
 };
 
 static int ipgre_tunnel_validate(struct nlattr *tb[], struct nlattr *data[])
@@ -659,6 +746,7 @@ static const struct net_device_ops gre_tap_netdev_ops = {
 	.ndo_set_mac_address 	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_change_mtu		= ip_tunnel_change_mtu,
+	.ndo_cpt		= ipgre_cpt,
 };
 
 static void ipgre_tap_setup(struct net_device *dev)
@@ -666,6 +754,7 @@ static void ipgre_tap_setup(struct net_device *dev)
 	ether_setup(dev);
 	dev->netdev_ops		= &gre_tap_netdev_ops;
 	ip_tunnel_setup(dev, gre_tap_net_id);
+	dev->vz_features |= NETIF_F_VIRTUAL;
 }
 
 static int ipgre_newlink(struct net_device *dev,
@@ -802,12 +891,15 @@ static void __net_exit ipgre_tap_exit_net(struct net *net)
 {
 	struct ip_tunnel_net *itn = net_generic(net, gre_tap_net_id);
 	ip_tunnel_delete_net(itn);
+	net_assign_generic(net, gre_tap_net_id, NULL);
 	kfree(itn);
 }
 
 static struct pernet_operations ipgre_tap_net_ops = {
 	.init = ipgre_tap_init_net,
 	.exit = ipgre_tap_exit_net,
+	.id   = &gre_tap_net_id,
+	.size = sizeof(struct ip_tunnel_net),
 };
 
 static int __init ipgre_init(void)
@@ -816,11 +908,11 @@ static int __init ipgre_init(void)
 
 	printk(KERN_INFO "GRE over IPv4 tunneling driver\n");
 
-	err = register_pernet_gen_device(&ipgre_net_id, &ipgre_net_ops);
+	err = register_pernet_device(&ipgre_net_ops);
 	if (err < 0)
 		goto out;
 
-	err = register_pernet_gen_device(&gre_tap_net_id, &ipgre_tap_net_ops);
+	err = register_pernet_device(&ipgre_tap_net_ops);
 	if (err < 0)
 		goto pnet_tap_faied;
 
@@ -839,6 +931,8 @@ static int __init ipgre_init(void)
 	if (err < 0)
 		goto tap_ops_failed;
 
+	register_netdev_rst(&ipgre_netdev_rst);
+
 	return 0;
 
 tap_ops_failed:
@@ -846,18 +940,19 @@ tap_ops_failed:
 rtnl_link_failed:
 	gre_cisco_unregister(&ipgre_protocol);
 add_proto_failed:
-	unregister_pernet_gen_device(gre_tap_net_id, &ipgre_tap_net_ops);
+	unregister_pernet_device(&ipgre_tap_net_ops);
 pnet_tap_faied:
-	unregister_pernet_gen_device(ipgre_net_id, &ipgre_net_ops);
+	unregister_pernet_device(&ipgre_net_ops);
 out:
 	return err;
 }
 
 static void __exit ipgre_fini(void)
 {
+	unregister_netdev_rst(&ipgre_netdev_rst);
 	gre_cisco_unregister(&ipgre_protocol);
-	unregister_pernet_gen_device(gre_tap_net_id, &ipgre_tap_net_ops);
-	unregister_pernet_gen_device(ipgre_net_id, &ipgre_net_ops);
+	unregister_pernet_device(&ipgre_tap_net_ops);
+	unregister_pernet_device(&ipgre_net_ops);
 	rtnl_link_unregister(&ipgre_tap_ops);
 	rtnl_link_unregister(&ipgre_link_ops);
 }

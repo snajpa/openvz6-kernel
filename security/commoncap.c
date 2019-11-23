@@ -27,6 +27,7 @@
 #include <linux/sched.h>
 #include <linux/prctl.h>
 #include <linux/securebits.h>
+#include <linux/syslog.h>
 #include <linux/personality.h>
 #include <linux/nospec.h>
 
@@ -150,6 +151,7 @@ int cap_capget(struct task_struct *target, kernel_cap_t *effective,
 	       kernel_cap_t *inheritable, kernel_cap_t *permitted)
 {
 	const struct cred *cred;
+	struct ve_struct *ve = get_exec_env();
 
 	/* Derived from kernel/capability.c:sys_capget. */
 	rcu_read_lock();
@@ -158,6 +160,27 @@ int cap_capget(struct task_struct *target, kernel_cap_t *effective,
 	*inheritable = cred->cap_inheritable;
 	*permitted   = cred->cap_permitted;
 	rcu_read_unlock();
+
+	if (!ve_is_super(ve)) {
+		if (!cap_raised(ve->ve_cap_bset, CAP_NET_ADMIN))
+			cap_swap_all(CAP_VE_NET_ADMIN, CAP_NET_ADMIN,
+				      effective,
+				      inheritable,
+				      permitted,
+				      &cred->cap_effective,
+				      &cred->cap_inheritable,
+				      &cred->cap_permitted);
+
+		if (!cap_raised(ve->ve_cap_bset, CAP_SYS_ADMIN))
+			cap_swap_all(CAP_VE_SYS_ADMIN, CAP_SYS_ADMIN,
+				      effective,
+				      inheritable,
+				      permitted,
+				      &cred->cap_effective,
+				      &cred->cap_inheritable,
+				      &cred->cap_permitted);
+	}
+
 	return 0;
 }
 
@@ -179,6 +202,28 @@ static inline int cap_inh_is_capped(void)
 	return 1;
 }
 
+void cap_swap_all(int old, int new,
+	          kernel_cap_t *effective,
+	          kernel_cap_t *inheritable,
+	          kernel_cap_t *permitted,
+		  const kernel_cap_t *effective_old,
+	          const kernel_cap_t *inheritable_old,
+	          const kernel_cap_t *permitted_old)
+{
+	if (cap_raised(*effective_old, old)) {
+		cap_lower(*effective, old);
+		cap_raise(*effective, new);
+	}
+	if (cap_raised(*inheritable_old, old)) {
+		cap_lower(*inheritable, old);
+		cap_raise(*inheritable, new);
+	}
+	if (cap_raised(*permitted_old, old)) {
+		cap_lower(*permitted, old);
+		cap_raise(*permitted, new);
+	}
+}
+
 /**
  * cap_capset - Validate and apply proposed changes to current's capabilities
  * @new: The proposed new credentials; alterations should be made here
@@ -197,30 +242,69 @@ int cap_capset(struct cred *new,
 	       const kernel_cap_t *inheritable,
 	       const kernel_cap_t *permitted)
 {
+	kernel_cap_t ve_effective = *effective;
+	kernel_cap_t ve_inheritable = *inheritable;
+	kernel_cap_t ve_permitted = *permitted;
+	struct ve_struct *ve = get_exec_env();
+
+	if (!ve_is_super(ve)) {
+		/*
+		 * In container replace:
+		 * 	CAP_NET_ADMIN -> CAP_VE_NET_ADMIN,
+		 * 	CAP_SYS_ADMIN -> CAP_VE_SYS_ADMIN
+		 */
+		if (!cap_raised(ve->ve_cap_bset, CAP_NET_ADMIN))
+			cap_swap_all(CAP_NET_ADMIN, CAP_VE_NET_ADMIN,
+				      &ve_effective,
+				      &ve_inheritable,
+				      &ve_permitted,
+				      effective,
+				      inheritable,
+				      permitted);
+
+		if (!cap_raised(ve->ve_cap_bset, CAP_SYS_ADMIN))
+			cap_swap_all(CAP_SYS_ADMIN, CAP_VE_SYS_ADMIN,
+				      &ve_effective,
+				      &ve_inheritable,
+				      &ve_permitted,
+				      effective,
+				      inheritable,
+				      permitted);
+
+		if (cap_raised(old->cap_effective, CAP_SETPCAP)) {
+			/*
+			 * Ignore not known caps or caps not enabled in container
+			 */
+			ve_effective = cap_intersect(ve_effective, ve->ve_cap_bset);
+			ve_inheritable = cap_intersect(ve_inheritable, ve->ve_cap_bset);
+			ve_permitted = cap_intersect(ve_permitted, ve->ve_cap_bset);
+		}
+	}
+
 	if (cap_inh_is_capped() &&
-	    !cap_issubset(*inheritable,
+	    !cap_issubset(ve_inheritable,
 			  cap_combine(old->cap_inheritable,
 				      old->cap_permitted)))
 		/* incapable of using this inheritable set */
 		return -EPERM;
 
-	if (!cap_issubset(*inheritable,
+	if (!cap_issubset(ve_inheritable,
 			  cap_combine(old->cap_inheritable,
 				      old->cap_bset)))
 		/* no new pI capabilities outside bounding set */
 		return -EPERM;
 
 	/* verify restrictions on target's new Permitted set */
-	if (!cap_issubset(*permitted, old->cap_permitted))
+	if (!cap_issubset(ve_permitted, old->cap_permitted))
 		return -EPERM;
 
 	/* verify the _new_Effective_ is a subset of the _new_Permitted_ */
-	if (!cap_issubset(*effective, *permitted))
+	if (!cap_issubset(ve_effective, ve_permitted))
 		return -EPERM;
 
-	new->cap_effective   = *effective;
-	new->cap_inheritable = *inheritable;
-	new->cap_permitted   = *permitted;
+	new->cap_effective   = ve_effective;
+	new->cap_inheritable = ve_inheritable;
+	new->cap_permitted   = ve_permitted;
 	return 0;
 }
 
@@ -629,7 +713,7 @@ int cap_inode_setxattr(struct dentry *dentry, const char *name,
 
 	if (!strncmp(name, XATTR_SECURITY_PREFIX,
 		     sizeof(XATTR_SECURITY_PREFIX) - 1)  &&
-	    !capable(CAP_SYS_ADMIN))
+	    !capable(CAP_SYS_ADMIN) && !capable(CAP_VE_ADMIN))
 		return -EPERM;
 	return 0;
 }
@@ -655,7 +739,7 @@ int cap_inode_removexattr(struct dentry *dentry, const char *name)
 
 	if (!strncmp(name, XATTR_SECURITY_PREFIX,
 		     sizeof(XATTR_SECURITY_PREFIX) - 1)  &&
-	    !capable(CAP_SYS_ADMIN))
+	    !capable(CAP_SYS_ADMIN) && !capable(CAP_VE_ADMIN))
 		return -EPERM;
 	return 0;
 }
@@ -970,17 +1054,23 @@ error:
 /**
  * cap_syslog - Determine whether syslog function is permitted
  * @type: Function requested
+ * @from_file: Whether this request came from an open file (i.e. /proc)
  *
  * Determine whether the current process is permitted to use a particular
  * syslog function, returning 0 if permission is granted, -ve if not.
  */
-int cap_syslog(int type)
+int cap_syslog(int type, bool from_file)
 {
-	if (dmesg_restrict && !capable(CAP_SYS_ADMIN))
-		return -EPERM;
+	if (dmesg_restrict && !capable(CAP_SYS_ADMIN) &&
+		 ve_is_super(get_exec_env()))
+			return -EPERM;
 
-	if ((type != 3 && type != 10) && !capable(CAP_SYS_ADMIN))
-		return -EPERM;
+	/* /proc/kmsg can open be opened by CAP_SYS_ADMIN */
+	if (type != 1 && from_file)
+		return 0;
+	if ((type != 3 && type != 10) &&
+		!capable(CAP_VE_SYS_ADMIN) && !capable(CAP_SYS_ADMIN))
+			return -EPERM;
 	return 0;
 }
 

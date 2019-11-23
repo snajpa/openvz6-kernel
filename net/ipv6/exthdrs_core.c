@@ -162,7 +162,7 @@ int ipv6_find_tlv(struct sk_buff *skb, int offset, int type)
 EXPORT_SYMBOL_GPL(ipv6_find_tlv);
 EXPORT_SYMBOL(ipv6_ext_hdr);
 EXPORT_SYMBOL(ipv6_skip_exthdr);
-EXPORT_SYMBOL_GPL(ipv6_skip_exthdr_fragoff);
+EXPORT_SYMBOL(ipv6_skip_exthdr_fragoff);
 
 /*
  * find the offset to specified header or the protocol number of last header

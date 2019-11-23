@@ -63,9 +63,20 @@ static inline int try_to_freeze(void)
 extern bool freeze_task(struct task_struct *p, bool sig_only);
 extern void cancel_freezing(struct task_struct *p);
 
+enum freezer_state {
+	CGROUP_THAWED = 0,
+	CGROUP_FREEZING,
+	CGROUP_FROZEN,
+};
+
 #ifdef CONFIG_CGROUP_FREEZER
+extern int freezer_change_state(struct cgroup *, enum freezer_state);
 extern int cgroup_freezing_or_frozen(struct task_struct *task);
 #else /* !CONFIG_CGROUP_FREEZER */
+static inline int freezer_change_state(struct cgroup *c, enum freezer_state s)
+{
+	return -ENOSYS;
+}
 static inline int cgroup_freezing_or_frozen(struct task_struct *task)
 {
 	return 0;
@@ -139,7 +150,7 @@ static inline void set_freezable_with_signal(void)
  * if it ends up racing with the freezer. Callers must be able to deal with
  * spurious wakeups.
  */
-#define freezable_schedule()						\
+#define __freezable_schedule()						\
 ({									\
 	freezer_do_not_count();						\
 	if (!try_to_freeze())						\
@@ -228,7 +239,7 @@ static inline int freezer_should_skip(struct task_struct *p) { return 0; }
 static inline void set_freezable(void) {}
 static inline void set_freezable_with_signal(void) {}
 
-#define freezable_schedule()  schedule()
+#define __freezable_schedule()  schedule()
 
 #define freezable_schedule_timeout_killable(timeout)			\
 	schedule_timeout_killable(timeout)

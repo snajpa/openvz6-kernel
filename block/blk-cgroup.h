@@ -33,6 +33,8 @@ enum stat_type {
 	BLKIO_STAT_SERVICE_TIME = 0,
 	/* Total time spent waiting in scheduler queue in ns */
 	BLKIO_STAT_WAIT_TIME,
+	/* Maximum time spent waiting in scheduler queue in ns */
+	BLKIO_STAT_WAIT_MAX,
 	/* Number of IOs merged */
 	BLKIO_STAT_MERGED,
 	/* Number of IOs queued up */
@@ -83,6 +85,7 @@ enum blkcg_file_name_prop {
 	BLKIO_PROP_sectors,
 	BLKIO_PROP_io_service_time,
 	BLKIO_PROP_io_wait_time,
+	BLKIO_PROP_io_wait_max,
 	BLKIO_PROP_io_merged,
 	BLKIO_PROP_io_queued,
 	BLKIO_PROP_avg_queue_size,
@@ -108,6 +111,7 @@ struct blkio_cgroup {
 	spinlock_t lock;
 	struct hlist_head blkg_list;
 	struct list_head policy_list; /* list of blkio_policy_node */
+	struct user_beancounter *blk_ub;
 };
 
 struct blkio_group_stats {
@@ -155,6 +159,9 @@ struct blkio_group {
 	char path[128];
 	/* The device MKDEV(major, minor), this group has been created for */
 	dev_t dev;
+	char *dev_name;
+	struct user_beancounter *blk_ub;
+
 	/* policy which owns this blk group */
 	enum blkio_policy_id plid;
 
@@ -163,6 +170,8 @@ struct blkio_group {
 	struct blkio_group_stats stats;
 	/* Per cpu stats pointer */
 	struct blkio_group_stats_cpu __percpu *stats_cpu;
+
+	struct list_head stats_alloc_list;
 };
 
 struct blkio_policy_node {
@@ -208,6 +217,8 @@ typedef void (blkio_update_group_read_iops_fn) (void *key,
 			struct blkio_group *blkg, unsigned int read_iops);
 typedef void (blkio_update_group_write_iops_fn) (void *key,
 			struct blkio_group *blkg, unsigned int write_iops);
+uint64_t blkio_read_stat_cpu(struct blkio_group *blkg,
+			enum stat_type_cpu type, enum stat_sub_type sub_type);
 
 struct blkio_policy_ops {
 	blkio_unlink_group_fn *blkio_unlink_group_fn;
@@ -299,6 +310,7 @@ extern void blkiocg_add_blkio_group(struct blkio_cgroup *blkcg,
 	struct blkio_group *blkg, void *key, dev_t dev,
 	enum blkio_policy_id plid);
 extern int blkio_alloc_blkg_stats(struct blkio_group *blkg);
+extern void blkio_free_blkg_stats(struct blkio_group *blkg);
 extern int blkiocg_del_blkio_group(struct blkio_group *blkg);
 extern struct blkio_group *blkiocg_lookup_group(struct blkio_cgroup *blkcg,
 						void *key);
@@ -314,6 +326,8 @@ void blkiocg_update_io_add_stats(struct blkio_group *blkg,
 		struct blkio_group *curr_blkg, bool direction, bool sync);
 void blkiocg_update_io_remove_stats(struct blkio_group *blkg,
 					bool direction, bool sync);
+int blkio_cgroup_set_weight(struct cgroup *cgroup, u64 weight);
+void blkio_cgroup_set_ub(struct cgroup *cgroup, struct user_beancounter *ub);
 #else
 struct cgroup;
 static inline struct blkio_cgroup *
@@ -326,6 +340,7 @@ static inline void blkiocg_add_blkio_group(struct blkio_cgroup *blkcg,
 		enum blkio_policy_id plid) {}
 
 static inline int blkio_alloc_blkg_stats(struct blkio_group *blkg) { return 0; }
+static inline void blkio_free_blkg_stats(struct blkio_group *blkg) { }
 
 static inline int
 blkiocg_del_blkio_group(struct blkio_group *blkg) { return 0; }
@@ -345,5 +360,11 @@ static inline void blkiocg_update_io_add_stats(struct blkio_group *blkg,
 		struct blkio_group *curr_blkg, bool direction, bool sync) {}
 static inline void blkiocg_update_io_remove_stats(struct blkio_group *blkg,
 						bool direction, bool sync) {}
+static inline int blkio_cgroup_set_weight(struct cgroup *cgroup, u64 weight)
+{
+	return -EINVAL;
+}
+static inline void blkio_cgroup_set_ub(struct cgroup *cgroup,
+		struct user_beancounter *ub) { }
 #endif
 #endif /* _BLK_CGROUP_H */

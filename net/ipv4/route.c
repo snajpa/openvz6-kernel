@@ -69,6 +69,7 @@
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/nsproxy.h>
 #include <linux/bootmem.h>
 #include <linux/string.h>
 #include <linux/socket.h>
@@ -114,6 +115,7 @@
 
 #define RT_GC_TIMEOUT (300*HZ)
 
+int ip_rt_src_check		= 1;
 static int ip_rt_max_size;
 static int ip_rt_gc_timeout __read_mostly	= RT_GC_TIMEOUT;
 static int ip_rt_gc_interval __read_mostly	= 60 * HZ;
@@ -912,6 +914,7 @@ void rt_cache_flush(struct net *net, int delay)
 	if (delay >= 0)
 		rt_do_flush(!in_softirq());
 }
+EXPORT_SYMBOL(rt_cache_flush);
 
 /* Flush previous cache invalidated entries from the cache */
 void rt_cache_flush_batch(void)
@@ -1475,6 +1478,9 @@ void ip_rt_redirect(__be32 old_gw, __be32 daddr, __be32 new_gw,
 				rt->u.dst.xfrm		= NULL;
 #endif
 				rt->rt_genid		= rt_genid(net);
+#ifdef CONFIG_VE
+				rt->fl.owner_env = get_exec_env();
+#endif
 				rt->rt_flags		|= RTCF_REDIRECTED;
 
 				/* Gateway is different ... */
@@ -1948,9 +1954,12 @@ static int ip_route_input_mc(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 #ifdef CONFIG_NET_CLS_ROUTE
 	rth->u.dst.tclassid = itag;
 #endif
+#ifdef CONFIG_VE
+	rth->fl.owner_env = get_exec_env();
+#endif
 	rth->rt_iif	=
 	rth->fl.iif	= dev->ifindex;
-	rth->u.dst.dev	= init_net.loopback_dev;
+	rth->u.dst.dev	= get_exec_env()->ve_netns->loopback_dev;
 	dev_hold(rth->u.dst.dev);
 	rth->idev	= in_dev_get(rth->u.dst.dev);
 	rth->fl.oif	= 0;
@@ -2091,6 +2100,9 @@ static int __mkroute_input(struct sk_buff *skb,
 	rth->fl.fl4_src	= saddr;
 	rth->rt_src	= saddr;
 	rth->rt_gateway	= daddr;
+#ifdef CONFIG_VE
+	rth->fl.owner_env = get_exec_env();
+#endif
 	rth->rt_iif 	=
 		rth->fl.iif	= in_dev->dev->ifindex;
 	rth->u.dst.dev	= (out_dev)->dev;
@@ -2293,6 +2305,9 @@ local_input:
 	rth->idev	= in_dev_get(rth->u.dst.dev);
 	rth->rt_gateway	= daddr;
 	rth->rt_spec_dst= spec_dst;
+#ifdef CONFIG_VE
+	rth->fl.owner_env = get_exec_env();
+#endif
 	rth->u.dst.input= ip_local_deliver;
 	rth->rt_flags 	= flags|RTCF_LOCAL;
 	if (res.type == RTN_UNREACHABLE) {
@@ -2490,6 +2505,9 @@ static int __mkroute_output(struct rtable **result,
 	rth->fl.mark    = oldflp->mark;
 	rth->rt_dst	= fl->fl4_dst;
 	rth->rt_src	= fl->fl4_src;
+#ifdef CONFIG_VE
+	rth->fl.owner_env = get_exec_env();
+#endif
 	rth->rt_iif	= oldflp->oif ? : dev_out->ifindex;
 	/* get references to the devices that are to be hold by the routing
 	   cache entry */
@@ -2631,7 +2649,7 @@ static int ip_route_output_slow(struct net *net, struct rtable **rp,
 			goto make_route;
 		}
 
-		if (!(oldflp->flags & FLOWI_FLAG_ANYSRC)) {
+		if (!(oldflp->flags & FLOWI_FLAG_ANYSRC) && ip_rt_src_check) {
 			/* It is equivalent to inet_addr_type(saddr) == RTN_LOCAL */
 			dev_out = ip_dev_find(net, oldflp->fl4_src);
 			if (dev_out == NULL)
@@ -3363,6 +3381,15 @@ static ctl_table ipv4_route_table[] = {
 		.proc_handler	= ipv4_sysctl_rt_secret_interval,
 		.strategy	= ipv4_sysctl_rt_secret_interval_strategy,
 	},
+#ifdef CONFIG_VE
+	{
+		.procname	= "src_check",
+		.data		= &ip_rt_src_check,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+#endif
 	{ .ctl_name = 0 }
 };
 
@@ -3567,3 +3594,25 @@ void __init ip_static_sysctl_init(void)
 EXPORT_SYMBOL(__ip_select_ident);
 EXPORT_SYMBOL(ip_route_input);
 EXPORT_SYMBOL(ip_route_output_key);
+
+static void ip_rt_dump_dst(void *o)
+{
+	struct rtable *rt = (struct rtable *)o;
+
+	if (rt->u.dst.flags & DST_FREE)
+		return;
+
+	printk("=== %p\n", o);
+	dst_dump_one(&rt->u.dst);
+	printk("\tidev %p gen %x flags %x type %d\n", rt->idev,
+			rt->rt_genid, rt->rt_flags, (int)rt->rt_type);
+}
+
+void ip_rt_dump_dsts(void)
+{
+	printk("IPv4 dst cache (%d entries):\n", atomic_read(&ipv4_dst_ops.entries));
+	slab_obj_walk(ipv4_dst_ops.kmem_cachep, ip_rt_dump_dst);
+}
+
+void (*ip6_rt_dump_dsts)(void);
+EXPORT_SYMBOL_GPL(ip6_rt_dump_dsts);

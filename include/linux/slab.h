@@ -88,6 +88,26 @@
 				(unsigned long)ZERO_SIZE_PTR)
 
 /*
+ * allocation rules:                            __GFP_UBC       0
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *  cache (SLAB_UBC)				charge		charge
+ *				      (usual caches: mm, vma, task_struct, ...)
+ *
+ *  cache (SLAB_UBC | SLAB_NO_CHARGE)		charge		---
+ *					     (ub_kmalloc)    (kmalloc)
+ *
+ *  cache (no UB flags)				BUG()		---
+ *							(nonub caches, mempools)
+ *
+ *  pages					charge		---
+ *					   (ub_vmalloc,	      (vmalloc,
+ *				        poll, fdsets, ...)  non-ub allocs)
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ */
+#define SLAB_UBC		0x10000000UL	/* alloc space for ubs ... */
+#define SLAB_NO_CHARGE		0x20000000UL	/* ... but don't charge */
+
+/*
  * struct kmem_cache related prototypes
  */
 void __init kmem_cache_init(void);
@@ -102,7 +122,28 @@ void kmem_cache_free(struct kmem_cache *, void *);
 unsigned int kmem_cache_size(struct kmem_cache *);
 const char *kmem_cache_name(struct kmem_cache *);
 int kmem_ptr_validate(struct kmem_cache *cachep, const void *ptr);
+#ifdef CONFIG_SLABINFO
+extern void show_slab_info(void);
+#else
+#define show_slab_info()	do { } while (0)
+#endif
+int kmem_cache_objuse(struct kmem_cache *cachep);
+int kmem_obj_objuse(void *obj);
+int kmem_dname_objuse(void *obj);
+unsigned long ub_cache_growth(struct kmem_cache *cachep);
 
+struct user_beancounter;
+extern void slab_walk_ub(struct user_beancounter *ub,
+		void (*show)(const char *name, int count, void *v), void *v);
+
+#ifdef CONFIG_BEANCOUNTERS
+void kmem_mark_nocharge(struct kmem_cache *cachep);
+struct user_beancounter **ub_slab_ptr(struct kmem_cache *cachep, void *obj);
+struct user_beancounter *slab_ub(void *obj);
+#else
+static inline void kmem_mark_nocharge(struct kmem_cache *cachep) { }
+static inline struct user_beancounter *slab_ub(void *obj) { return NULL; }
+#endif
 /*
  * Please use this macro to create slab caches. Simply specify the
  * name of the structure and maybe some flags that are listed above.
@@ -338,5 +379,6 @@ static inline void *kzalloc_node(size_t size, gfp_t flags, int node)
 }
 
 void __init kmem_cache_init_late(void);
+void slab_obj_walk(struct kmem_cache *c, void (*f)(void *));
 
 #endif	/* _LINUX_SLAB_H */

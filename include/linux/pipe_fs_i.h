@@ -145,6 +145,8 @@ void pipe_wait(struct pipe_inode_info *pipe);
 struct pipe_inode_info * alloc_pipe_info(struct inode * inode);
 void free_pipe_info(struct inode * inode);
 void __free_pipe_info(struct pipe_inode_info *);
+int pipe_release(struct inode *inode, int decr, int decw);
+void swap_pipe_info(struct inode *, struct inode *);
 
 /* Generic pipe buffer ops functions */
 void *generic_pipe_buf_map(struct pipe_inode_info *, struct pipe_buffer *, int);

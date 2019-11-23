@@ -268,6 +268,7 @@ static void veth_setup(struct net_device *dev)
 	dev->ethtool_ops = &veth_ethtool_ops;
 	dev->features |= NETIF_F_LLTX;
 	dev->features |= VETH_FEATURES;
+	dev->vz_features |= NETIF_F_VIRTUAL;
 	dev->vlan_features = dev->features;
 	dev->destructor = veth_dev_free;
 
@@ -406,7 +407,7 @@ err_register_peer:
 	return err;
 }
 
-static void veth_dellink(struct net_device *dev)
+static void veth_dellink(struct net_device *dev, struct list_head *head)
 {
 	struct veth_priv *priv;
 	struct net_device *peer;
@@ -419,12 +420,12 @@ static void veth_dellink(struct net_device *dev)
 	 * not being freed before one RCU grace period.
 	 */
 	RCU_INIT_POINTER(priv->peer, NULL);
-	unregister_netdevice(dev);
+	unregister_netdevice_queue(dev, head);
 
 	if (peer) {
 		priv = netdev_priv(peer);
 		RCU_INIT_POINTER(priv->peer, NULL);
-		unregister_netdevice(peer);
+		unregister_netdevice_queue(peer, head);
 	}
 }
 

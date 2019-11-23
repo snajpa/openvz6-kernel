@@ -19,6 +19,8 @@
 #include <linux/slab.h>
 #include "internal.h"
 
+#include <keys/user-type.h>
+
 #define key_negative_timeout	60	/* default timeout on a negative key's existence */
 
 /*
@@ -63,6 +65,44 @@ void complete_request_key(struct key_construction *cons, int error)
 	kfree(cons);
 }
 EXPORT_SYMBOL(complete_request_key);
+
+/*
+ * Initialise a usermode helper that is going to have a specific session
+ * keyring.
+ *
+ * This is called in context of freshly forked kthread before kernel_execve(),
+ * so we can simply install the desired session_keyring at this point.
+ */
+static int umh_keys_init(struct subprocess_info *info, struct cred *cred)
+{
+	struct key *keyring = info->data;
+	/*
+	 * This is called in context of freshly forked kthread before
+	 * kernel_execve(), we can just change our ->session_keyring.
+	 */
+	return install_session_keyring_to_cred(cred, keyring);
+}
+
+static void umh_keys_cleanup(struct subprocess_info *info)
+{
+	struct key *keyring = info->data;
+	key_put(keyring);
+}
+
+static int call_usermodehelper_keys(char *path, char **argv, char **envp,
+			 struct key *session_keyring, enum umh_wait wait)
+{
+	gfp_t gfp_mask = (wait == UMH_NO_WAIT) ? GFP_ATOMIC : GFP_KERNEL;
+	struct subprocess_info *info =
+		call_usermodehelper_setup(path, argv, envp, gfp_mask);
+
+	if (!info)
+		return -ENOMEM;
+
+	call_usermodehelper_setfns(info, umh_keys_init, umh_keys_cleanup,
+					key_get(session_keyring));
+	return call_usermodehelper_exec(info, wait);
+}
 
 /*
  * Request userspace finish the construction of a key
@@ -227,11 +267,12 @@ static int construct_key(struct key *key, const void *callout_info,
  * The keyring selected is returned with an extra reference upon it which the
  * caller must release.
  */
-static void construct_get_dest_keyring(struct key **_dest_keyring)
+static int construct_get_dest_keyring(struct key **_dest_keyring)
 {
 	struct request_key_auth *rka;
 	const struct cred *cred = current_cred();
 	struct key *dest_keyring = *_dest_keyring, *authkey;
+	int ret;
 
 	kenter("%p", dest_keyring);
 
@@ -240,6 +281,8 @@ static void construct_get_dest_keyring(struct key **_dest_keyring)
 		/* the caller supplied one */
 		key_get(dest_keyring);
 	} else {
+		bool do_perm_check = true;
+
 		/* use a default keyring; falling through the cases until we
 		 * find one that we actually have */
 		switch (cred->jit_keyring) {
@@ -254,8 +297,10 @@ static void construct_get_dest_keyring(struct key **_dest_keyring)
 					dest_keyring =
 						key_get(rka->dest_keyring);
 				up_read(&authkey->sem);
-				if (dest_keyring)
+				if (dest_keyring) {
+					do_perm_check = false;
 					break;
+				}
 			}
 
 		case KEY_REQKEY_DEFL_THREAD_KEYRING:
@@ -290,11 +335,29 @@ static void construct_get_dest_keyring(struct key **_dest_keyring)
 		default:
 			BUG();
 		}
+
+		/*
+		 * Require Write permission on the keyring.  This is essential
+		 * because the default keyring may be the session keyring, and
+		 * joining a keyring only requires Search permission.
+		 *
+		 * However, this check is skipped for the "requestor keyring" so
+		 * that /sbin/request-key can itself use request_key() to add
+		 * keys to the original requestor's destination keyring.
+		 */
+		if (dest_keyring && do_perm_check) {
+			ret = key_permission(make_key_ref(dest_keyring, 1),
+					     KEY_WRITE);
+			if (ret) {
+				key_put(dest_keyring);
+				return ret;
+			}
+		}
 	}
 
 	*_dest_keyring = dest_keyring;
 	kleave(" [dk %d]", key_serial(dest_keyring));
-	return;
+	return 0;
 }
 
 /*
@@ -420,11 +483,15 @@ static struct key *construct_key_and_link(struct key_type *type,
 	if (type == &key_type_keyring)
 		return ERR_PTR(-EPERM);
 
-	user = key_user_lookup(current_fsuid(), current_user_ns());
-	if (!user)
-		return ERR_PTR(-ENOMEM);
+	ret = construct_get_dest_keyring(&dest_keyring);
+	if (ret)
+		goto error;
 
-	construct_get_dest_keyring(&dest_keyring);
+	user = key_user_lookup(current_fsuid(), current_user_ns());
+	if (!user) {
+		ret = -ENOMEM;
+		goto error_put_dest_keyring;
+	}
 
 	ret = construct_alloc_key(type, description, dest_keyring, flags, user,
 				  &key);
@@ -440,7 +507,7 @@ static struct key *construct_key_and_link(struct key_type *type,
 	} else if (ret == -EINPROGRESS) {
 		ret = 0;
 	} else {
-		goto couldnt_alloc_key;
+		goto error_put_dest_keyring;
 	}
 
 	key_put(dest_keyring);
@@ -450,8 +517,9 @@ static struct key *construct_key_and_link(struct key_type *type,
 construction_failed:
 	key_negate_and_link(key, key_negative_timeout, NULL, NULL);
 	key_put(key);
-couldnt_alloc_key:
+error_put_dest_keyring:
 	key_put(dest_keyring);
+error:
 	kleave(" = %d", ret);
 	return ERR_PTR(ret);
 }
@@ -498,6 +566,9 @@ struct key *request_key_and_link(struct key_type *type,
 	kenter("%s,%s,%p,%zu,%p,%p,%lx",
 	       type->name, description, callout_info, callout_len, aux,
 	       dest_keyring, flags);
+
+	if (type->match == NULL)
+		type->match = user_match;
 
 	/* search all the process keyrings for a key */
 	key_ref = search_process_keyrings(type, description, type->match,

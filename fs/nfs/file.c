@@ -78,7 +78,7 @@ const struct file_operations nfs_file_operations = {
 	.flock		= nfs_flock,
 	.splice_read	= nfs_file_splice_read,
 	.splice_write	= nfs_file_splice_write,
-	.check_flags	= nfs_check_flags,
+	.set_flags	= nfs_set_flags,
 	.setlease	= nfs_setlease,
 };
 
@@ -113,6 +113,17 @@ int nfs_check_flags(int flags)
 	return 0;
 }
 
+int nfs_set_flags(struct file * filp, int flags)
+{
+	int err;
+
+	err = nfs_check_flags(flags);
+	if (!err)
+		err = generic_set_file_flags(filp, flags);
+
+	return err;
+}
+
 /*
  * Open file
  */
@@ -125,7 +136,7 @@ nfs_file_open(struct inode *inode, struct file *filp)
 			filp->f_path.dentry->d_parent->d_name.name,
 			filp->f_path.dentry->d_name.name);
 
-	res = nfs_check_flags(filp->f_flags);
+	res = nfs_set_flags(filp, filp->f_flags);
 	if (res)
 		return res;
 
@@ -495,17 +506,26 @@ static int nfs_release_page(struct page *page, gfp_t gfp)
 
 	dfprintk(PAGECACHE, "NFS: release_page(%p)\n", page);
 
-	/* Only do I/O if gfp is a superset of GFP_KERNEL, and we're not
-	 * doing this memory reclaim for a fs-related allocation.
+	/* Always try to initiate a 'commit' if relevant, but only
+	 * wait for it if __GFP_WAIT is set.  Even then, only wait 1
+	 * second and only if the 'bdi' is not congested.
+	 * Waiting indefinitely can cause deadlocks when the NFS
+	 * server is on this machine, when a new TCP connection is
+	 * needed and in other rare cases.  There is no particular
+	 * need to wait extensively here.  A short wait has the
+	 * benefit that someone else can worry about the freezer.
 	 */
-	if (mapping && (gfp & GFP_KERNEL) == GFP_KERNEL &&
-	    !(current->flags & PF_FSTRANS)) {
-		int how = FLUSH_SYNC;
-
-		/* Don't let kswapd deadlock waiting for OOM RPC calls */
-		if (current_is_kswapd())
-			how = 0;
-		nfs_commit_inode(mapping->host, how);
+	if (mapping) {
+		struct nfs_server *nfss = NFS_SERVER(mapping->host);
+		nfs_commit_inode(mapping->host, 0);
+		if ((gfp & __GFP_WAIT) &&
+		    !bdi_write_congested(&nfss->backing_dev_info)) {
+			wait_on_page_bit_killable_timeout(page, PG_private,
+							  HZ);
+			if (PagePrivate(page))
+				set_bdi_congested(&nfss->backing_dev_info,
+						  BLK_RW_ASYNC);
+		}
 	}
 	/* If PagePrivate() is set, then the page is not freeable */
 	if (PagePrivate(page))
@@ -563,6 +583,11 @@ static int nfs_vm_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
 	int ret = VM_FAULT_NOPAGE;
 	struct address_space *mapping;
 
+	if (filp->f_op->get_host) {
+		filp = filp->f_op->get_host(filp);
+		dentry = filp->f_path.dentry;
+	}
+
 	dfprintk(PAGECACHE, "NFS: vm_page_mkwrite(%s/%s(%ld), offset %lld)\n",
 		dentry->d_parent->d_name.name, dentry->d_name.name,
 		filp->f_mapping->host->i_ino,
@@ -617,6 +642,7 @@ static ssize_t nfs_file_write(struct kiocb *iocb, const struct iovec *iov,
 	struct inode * inode = dentry->d_inode;
 	ssize_t result;
 	size_t count = iov_length(iov, nr_segs);
+	long prealloc_blocks;
 
 	result = nfs_key_timeout_notify(iocb->ki_filp, inode);
 	if (result)
@@ -645,6 +671,10 @@ static ssize_t nfs_file_write(struct kiocb *iocb, const struct iovec *iov,
 	if (!count)
 		goto out;
 
+	prealloc_blocks = nfs_dq_prealloc_space(inode, pos, count);
+	if (prealloc_blocks < 0)
+		return prealloc_blocks;
+
 	nfs_add_stats(inode, NFSIOS_NORMALWRITTENBYTES, count);
 	result = generic_file_aio_write(iocb, iov, nr_segs, pos);
 	/* Return error values for O_SYNC and IS_SYNC() */
@@ -653,6 +683,9 @@ static ssize_t nfs_file_write(struct kiocb *iocb, const struct iovec *iov,
 		if (err < 0)
 			result = err;
 	}
+
+	if (result < 0)
+		nfs_dq_release_preallocated_blocks(inode, prealloc_blocks);
 out:
 	return result;
 
@@ -762,7 +795,7 @@ do_unlk(struct file *filp, int cmd, struct file_lock *fl, int is_local)
 	 * Use local locking if mounted with "-onolock" or with appropriate
 	 * "-olocal_lock="
 	 */
-	if (!is_local)
+	if (!is_local && !(fl->fl_flags & FL_LOCAL))
 		status = NFS_PROTO(inode)->lock(filp, cmd, fl);
 	else
 		status = do_vfs_lock(filp, fl);
@@ -792,7 +825,7 @@ do_setlk(struct file *filp, int cmd, struct file_lock *fl, int is_local)
 	 * Use local locking if mounted with "-onolock" or with appropriate
 	 * "-olocal_lock="
 	 */
-	if (!is_local)
+	if (!is_local && !(fl->fl_flags & FL_LOCAL))
 		status = NFS_PROTO(inode)->lock(filp, cmd, fl);
 	else
 		status = do_vfs_lock(filp, fl);
@@ -926,7 +959,7 @@ const struct file_operations nfs4_file_operations = {
 	.flock		= nfs_flock,
 	.splice_read	= nfs_file_splice_read,
 	.splice_write	= nfs_file_splice_write,
-	.check_flags	= nfs_check_flags,
+	.set_flags	= nfs_set_flags,
 	.setlease	= nfs_setlease,
 };
 #endif /* CONFIG_NFS_V4 */

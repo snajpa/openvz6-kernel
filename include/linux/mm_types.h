@@ -21,6 +21,7 @@
 #define AT_VECTOR_SIZE (2*(AT_VECTOR_SIZE_ARCH + AT_VECTOR_SIZE_BASE + 1))
 
 struct address_space;
+struct lruvec;
 
 #define USE_SPLIT_PTLOCKS	(NR_CPUS >= CONFIG_SPLIT_PTLOCK_CPUS)
 
@@ -52,28 +53,27 @@ struct page {
 		};
 	};
 	union {
-	    struct {
 		unsigned long private;		/* Mapping-private opaque data:
-					 	 * usually used for buffer_heads
+						 * usually used for buffer_heads
 						 * if PagePrivate set; used for
 						 * swp_entry_t if PageSwapCache;
 						 * indicates order in the buddy
 						 * system if PG_buddy is set.
 						 */
-		struct address_space *mapping;	/* If low bit clear, points to
-						 * inode address_space, or NULL.
-						 * If page mapped as anonymous
-						 * memory, low bit is set, and
-						 * it points to anon_vma object:
-						 * see PAGE_MAPPING_ANON below.
-						 */
-	    };
+		atomic_t vswap_count;		/* if PageVSwap() set */
 #if USE_SPLIT_PTLOCKS
-	    spinlock_t ptl;
+		spinlock_t ptl;
 #endif
-	    struct kmem_cache *slab;	/* SLUB: Pointer to slab */
-	    struct page *first_page;	/* Compound tail pages */
+		struct kmem_cache *slab;	/* SLUB: Pointer to slab */
+		struct page *first_page;	/* Compound tail pages */
 	};
+	struct address_space *mapping;	/* If low bit clear, points to
+					 * inode address_space, or NULL.
+					 * If page mapped as anonymous
+					 * memory, low bit is set, and
+					 * it points to anon_vma object:
+					 * see PAGE_MAPPING_ANON below.
+					 */
 	union {
 		pgoff_t index;		/* Our offset within mapping. */
 		void *freelist;		/* SLUB: freelist req. slab lock */
@@ -106,7 +106,16 @@ struct page {
 	 */
 	void *shadow;
 #endif
+	union {
+		struct lruvec *lruvec;
+#ifdef CONFIG_BEANCOUNTERS
+		struct user_beancounter *kmem_ub;
+		struct user_beancounter **slub_ubs;
+#endif
+	};
 };
+
+typedef unsigned long __nocast vm_flags_t;
 
 /*
  * A region containing a mapping of a non-memory backed file under NOMMU
@@ -115,7 +124,7 @@ struct page {
  */
 struct vm_region {
 	struct rb_node	vm_rb;		/* link in global region tree */
-	unsigned long	vm_flags;	/* VMA vm_flags */
+	vm_flags_t	vm_flags;	/* VMA vm_flags */
 	unsigned long	vm_start;	/* start address of region */
 	unsigned long	vm_end;		/* region initialised to here */
 	unsigned long	vm_top;		/* region allocated to here */
@@ -202,6 +211,8 @@ struct core_state {
 	struct completion startup;
 };
 
+struct oom_control;
+
 struct mm_struct {
 	struct vm_area_struct * mmap;		/* list of VMAs */
 	struct rb_root mm_rb;
@@ -245,11 +256,13 @@ struct mm_struct {
 	mm_counter_t _anon_rss;
 	mm_counter_t _swap_usage;
 
+	long page_table_precharge;	/* protected by mmap_sem and page_table_lock */
+
 	unsigned long hiwater_rss;	/* High-watermark of RSS usage */
 	unsigned long hiwater_vm;	/* High-water virtual memory usage */
 
 	unsigned long total_vm, locked_vm, shared_vm, exec_vm;
-	unsigned long stack_vm, reserved_vm, def_flags, nr_ptes;
+	unsigned long stack_vm, reserved_vm, def_flags, nr_ptes, nr_ptds;
 	unsigned long start_code, end_code, start_data, end_data;
 	unsigned long start_brk, brk, start_stack;
 	unsigned long arg_start, arg_end, env_start, env_end;
@@ -276,6 +289,13 @@ struct mm_struct {
 
 	unsigned long flags; /* Must use atomic bitops to access the bits */
 
+	unsigned int vps_dumpable:2;
+
+	struct oom_control *oom_ctrl;
+
+#ifdef CONFIG_BEANCOUNTERS
+	struct user_beancounter *mm_ub;
+#endif
 	struct core_state *core_state; /* coredumping support */
 #ifdef CONFIG_AIO
 	spinlock_t		ioctx_lock;
@@ -310,16 +330,21 @@ struct mm_struct {
 #ifdef __GENKSYMS__
 	unsigned long rh_reserved[2];
 #else
-	/* How many tasks sharing this mm are OOM_DISABLE */
-	union {
-		unsigned long rh_reserved_aux;
-		atomic_t oom_disable_count;
-	};
-
 	/* base of lib map area (ASCII armour) */
 	unsigned long shlib_base;
 #endif
 };
+
+/* tasks entered to VE from host, no ptrace,
+ * or coredump or licdata access allowed
+ */
+#define VD_VE_ENTER_TASK	0
+/* tasks with ptrace and coredump allowed */
+#define VD_PTRACE_COREDUMP	1
+/* tasks accessed containers license data,
+ *  no ptrace and no coredump allowed
+ */
+#define VD_LICDATA_ACCESS	2
 
 /* Future-safe accessor for struct mm_struct's cpu_vm_mask. */
 #define mm_cpumask(mm) (&(mm)->cpu_vm_mask)

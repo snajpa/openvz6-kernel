@@ -12,6 +12,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/nsproxy.h>
 #include <linux/netdevice.h>
 #include <linux/netpoll.h>
 #include <linux/ethtool.h>
@@ -166,10 +167,15 @@ static void del_nbp(struct net_bridge_port *p)
 }
 
 /* Delete bridge device */
-void br_dev_delete(struct net_device *dev)
+void br_dev_delete(struct net_device *dev, struct list_head *head)
 {
 	struct net_bridge *br = netdev_priv(dev);
 	struct net_bridge_port *p, *n;
+
+	if (br->master_dev) {
+		dev_put(br->master_dev);
+		rcu_assign_pointer(br->master_dev, NULL);
+	}
 
 	list_for_each_entry_safe(p, n, &br->port_list, list) {
 		del_nbp(p);
@@ -178,7 +184,7 @@ void br_dev_delete(struct net_device *dev)
 	del_timer_sync(&br->gc_timer);
 
 	br_sysfs_delbr(br->dev);
-	unregister_netdevice(br->dev);
+	unregister_netdevice_queue(br->dev, head);
 }
 
 /* find an available port number */
@@ -274,7 +280,7 @@ int br_del_bridge(struct net *net, const char *name)
 	}
 
 	else
-		br_dev_delete(dev);
+		br_dev_delete(dev, NULL);
 
 	rtnl_unlock();
 	return ret;
@@ -391,6 +397,10 @@ int br_add_if(struct net_bridge *br, struct net_device *dev)
 	if ((dev->flags & IFF_UP) && netif_carrier_ok(dev) &&
 	    (br->dev->flags & IFF_UP))
 		br_stp_enable_port(p);
+	if (!(dev->vz_features & NETIF_F_VIRTUAL) && !br->master_dev) {
+		dev_hold(dev);
+		rcu_assign_pointer(br->master_dev, dev);
+	}
 	spin_unlock_bh(&br->lock);
 
 	if (br->vlgrp && dev->netdev_ops->ndo_vlan_rx_register)
@@ -436,6 +446,16 @@ int br_del_if(struct net_bridge *br, struct net_device *dev)
 
 	spin_lock_bh(&br->lock);
 	changed_addr = br_stp_recalculate_bridge_id(br);
+	if (br->master_dev == dev) {
+		rcu_assign_pointer(br->master_dev, NULL);
+		dev_put(dev);
+		list_for_each_entry(p, &br->port_list, list)
+			if (!(p->dev->vz_features & NETIF_F_VIRTUAL)) {
+				dev_hold(p->dev);
+				rcu_assign_pointer(br->master_dev, p->dev);
+				break;
+			}
+	}
 	spin_unlock_bh(&br->lock);
 
 	if (changed_addr)
@@ -449,15 +469,15 @@ int br_del_if(struct net_bridge *br, struct net_device *dev)
 void br_net_exit(struct net *net)
 {
 	struct net_device *dev;
+	LIST_HEAD(list);
 
 	rtnl_lock();
-restart:
+
 	for_each_netdev(net, dev) {
-		if (dev->priv_flags & IFF_EBRIDGE) {
-			br_dev_delete(dev);
-			goto restart;
-		}
+		if (dev->priv_flags & IFF_EBRIDGE)
+			br_dev_delete(dev, &list);
 	}
+	unregister_netdevice_many(&list);
 	rtnl_unlock();
 
 }

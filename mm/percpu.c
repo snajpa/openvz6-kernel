@@ -834,7 +834,7 @@ void __percpu *__alloc_percpu(size_t size, size_t align)
 {
 	return pcpu_alloc(size, align, false);
 }
-EXPORT_SYMBOL_GPL(__alloc_percpu);
+EXPORT_SYMBOL(__alloc_percpu);
 
 /**
  * __alloc_reserved_percpu - allocate reserved percpu area
@@ -935,7 +935,7 @@ void free_percpu(void __percpu *ptr)
 
 	spin_unlock_irqrestore(&pcpu_lock, flags);
 }
-EXPORT_SYMBOL_GPL(free_percpu);
+EXPORT_SYMBOL(free_percpu);
 
 /**
  * per_cpu_ptr_to_phys - convert translated percpu address to physical address

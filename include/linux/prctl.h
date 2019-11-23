@@ -131,4 +131,11 @@
 #define PR_SPEC_DISABLE			(1UL << 2)
 #define PR_SPEC_FORCE_DISABLE		(1UL << 3)
 
+#define PR_SET_DATA_CSUM	100500
+# define PR_DATA_CSUM_OFF	0
+# define PR_DATA_CSUM_ON	1
+
+#define PR_SET_CHILD_SUBREAPER 36
+#define PR_GET_CHILD_SUBREAPER 37
+
 #endif /* _LINUX_PRCTL_H */

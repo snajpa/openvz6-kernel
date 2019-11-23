@@ -28,10 +28,9 @@
 
 #include "nfsd.h"
 
-struct nfsd_stats	nfsdstats;
-struct svc_stat		nfsd_svcstats = {
-	.program	= &nfsd_program,
-};
+#ifndef CONFIG_VE
+struct nfsd_stats	_nfsdstats;
+#endif
 
 static int nfsd_proc_show(struct seq_file *seq, void *v)
 {
@@ -63,7 +62,7 @@ static int nfsd_proc_show(struct seq_file *seq, void *v)
 	seq_putc(seq, '\n');
 	
 	/* show my rpc info */
-	svc_seq_show(seq, &nfsd_svcstats);
+	svc_seq_show(seq, get_exec_env()->nfsd_data->svc_stat);
 
 #ifdef CONFIG_NFSD_V4
 	/* Show count for individual nfsv4 operations */
@@ -91,14 +90,27 @@ static const struct file_operations nfsd_proc_fops = {
 	.release = single_release,
 };
 
-void
+int
 nfsd_stat_init(void)
 {
-	svc_proc_register(&nfsd_svcstats, &nfsd_proc_fops);
+	struct ve_nfsd_data *d;
+
+	d = get_exec_env()->nfsd_data;
+	d->svc_stat = kzalloc(sizeof(struct svc_stat), GFP_KERNEL);
+	if (d->svc_stat == NULL)
+		return -ENOMEM;
+
+	d->svc_stat->program = &nfsd_program;
+	svc_proc_register(d->svc_stat, &nfsd_proc_fops);
+	return 0;
 }
 
 void
 nfsd_stat_shutdown(void)
 {
+	struct ve_nfsd_data *d;
+
+	d = get_exec_env()->nfsd_data;
 	svc_proc_unregister("nfsd");
+	kfree(d->svc_stat);
 }

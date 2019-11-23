@@ -312,6 +312,27 @@ dotraplinkage void do_double_fault(struct pt_regs *regs, long error_code)
 }
 #endif
 
+static int check_cpuid_fault(struct pt_regs *regs, long error_code)
+{
+	unsigned long addr;
+	unsigned short opcode;
+
+	if (error_code != 0)
+		return 0;
+
+	addr = convert_ip_to_linear(current, regs);
+	if (get_user(opcode, (unsigned short __user *)addr))
+		return 0;
+
+	if (opcode != 0xa20f)
+		return 0;
+
+	do_cpuid_fault(regs);
+
+	regs->ip += 2;
+	return 1;
+}
+
 dotraplinkage void __kprobes
 do_general_protection(struct pt_regs *regs, long error_code)
 {
@@ -327,6 +348,9 @@ do_general_protection(struct pt_regs *regs, long error_code)
 	tsk = current;
 	if (!user_mode(regs))
 		goto gp_in_kernel;
+
+	if (check_cpuid_fault(regs, error_code))
+		return;
 
 #ifdef CONFIG_X86_32
 {
@@ -509,12 +533,16 @@ static notrace __kprobes void default_do_nmi(struct pt_regs *regs)
 		 * Ok, so this is none of the documented NMI sources,
 		 * so it must be the NMI watchdog.
 		 */
-		if (nmi_watchdog_tick(regs, reason))
+		if (nmi_watchdog_tick(regs, reason) +
+				do_nmi_show_regs(regs, cpu))
 			return;
 		if (!do_nmi_callback(regs, cpu))
 #endif /* !CONFIG_LOCKUP_DETECTOR */
+		if (!do_nmi_show_regs(regs, cpu))
 			unknown_nmi_error(reason, regs);
 #else
+		if (do_nmi_show_regs(regs, cpu))
+			return;
 		unknown_nmi_error(reason, regs);
 #endif
 

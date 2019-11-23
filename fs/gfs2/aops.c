@@ -191,6 +191,7 @@ int gfs2_write_full_page(struct page *page, get_block_t *get_block,
 		zero_user_segment(page, offset, PAGE_SIZE);
 
 	return __block_write_full_page(inode, page, get_block, wbc,
+				       generic_submit_bh_handler,
 				       end_buffer_async_write);
 }
 

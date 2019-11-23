@@ -826,6 +826,9 @@ static int reiserfs_rmdir(struct inode *dir, struct dentry *dentry)
 	INITIALIZE_PATH(path);
 	struct reiserfs_dir_entry de;
 
+	inode = dentry->d_inode;
+	vfs_dq_init(inode);
+
 	/* we will be doing 2 balancings and update 2 stat data, we change quotas
 	 * of the owner of the directory and of the owner of the parent directory.
 	 * The quota structure is possibly deleted only on last iput => outside
@@ -849,8 +852,6 @@ static int reiserfs_rmdir(struct inode *dir, struct dentry *dentry)
 		retval = -EIO;
 		goto end_rmdir;
 	}
-
-	inode = dentry->d_inode;
 
 	reiserfs_update_inode_transaction(inode);
 	reiserfs_update_inode_transaction(dir);
@@ -915,6 +916,7 @@ static int reiserfs_unlink(struct inode *dir, struct dentry *dentry)
 	unsigned long savelink;
 
 	inode = dentry->d_inode;
+	vfs_dq_init(inode);
 
 	/* in this transaction we can be doing at max two balancings and update
 	 * two stat datas, we change quotas of the owner of the directory and of
@@ -1108,10 +1110,6 @@ static int reiserfs_link(struct dentry *old_dentry, struct inode *dir,
 		reiserfs_write_unlock(dir->i_sb);
 		return -EMLINK;
 	}
-	if (inode->i_nlink == 0) {
-		reiserfs_write_unlock(dir->i_sb);
-		return -ENOENT;
-	}
 
 	/* inc before scheduling so reiserfs_unlink knows we are here */
 	inc_nlink(inode);
@@ -1228,6 +1226,8 @@ static int reiserfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 	old_inode = old_dentry->d_inode;
 	new_dentry_inode = new_dentry->d_inode;
+	if (new_dentry_inode)
+		vfs_dq_init(new_dentry_inode);
 
 	// make sure, that oldname still exists and points to an object we
 	// are going to rename

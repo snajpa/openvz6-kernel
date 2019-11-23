@@ -142,6 +142,7 @@ static int udp_lib_lport_inuse(struct net *net, __u16 num,
 		    sk2 != sk					&&
 		    (bitmap || sk2->sk_hash == num)		&&
 		    (!sk2->sk_reuse || !sk->sk_reuse)		&&
+		    sk->sk_reuse != 2 &&
 		    (!sk2->sk_bound_dev_if || !sk->sk_bound_dev_if
 			|| sk2->sk_bound_dev_if == sk->sk_bound_dev_if) &&
 		    (!sk2->sk_reuseport || !sk->sk_reuseport ||
@@ -1697,7 +1698,7 @@ static struct sock *udp_get_first(struct seq_file *seq, int start)
 		struct udp_hslot *hslot = &state->udp_table->hash[state->bucket];
 		spin_lock_bh(&hslot->lock);
 		sk_nulls_for_each(sk, node, &hslot->head) {
-			if (!net_eq(sock_net(sk), net))
+			if (!net_access_allowed(sock_net(sk), net))
 				continue;
 			if (sk->sk_family == state->family)
 				goto found;
@@ -1716,7 +1717,7 @@ static struct sock *udp_get_next(struct seq_file *seq, struct sock *sk)
 
 	do {
 		sk = sk_nulls_next(sk);
-	} while (sk && (!net_eq(sock_net(sk), net) || sk->sk_family != state->family));
+	} while (sk && (!net_access_allowed(sock_net(sk), net) || sk->sk_family != state->family));
 
 	if (!sk) {
 		if (state->bucket < UDP_HTABLE_SIZE)

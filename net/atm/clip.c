@@ -312,7 +312,7 @@ static int clip_constructor(struct neighbour *neigh)
 
 static u32 clip_hash(const void *pkey, const struct net_device *dev)
 {
-	return jhash_2words(*(u32 *) pkey, dev->ifindex, clip_tbl.hash_rnd);
+	return jhash_2words(*(u32 *) pkey, dev->ifindex, clip_tbl.hash_rnd[0]);
 }
 
 static struct neigh_table clip_tbl = {

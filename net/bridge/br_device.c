@@ -17,12 +17,19 @@
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
 #include <linux/list.h>
+#include <linux/nsproxy.h>
+#include <linux/cpt_image.h>
+#include <linux/cpt_export.h>
 
 #include <asm/uaccess.h>
 #include "br_private.h"
 
 #define COMMON_FEATURES (NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_HIGHDMA | \
 			 NETIF_F_GSO_MASK | NETIF_F_HW_CSUM)
+
+static struct device_type br_type = {
+	.name	= "bridge",
+};
 
 /* net device transmit always called with no BH (preempt_disabled) */
 netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -43,6 +50,8 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 	skb_reset_mac_header(skb);
 	skb_pull(skb, ETH_HLEN);
 
+	skb->brmark = BR_ALREADY_SEEN;
+
 	if (is_broadcast_ether_addr(dest))
 		br_flood_deliver(br, skb);
 	else if (is_multicast_ether_addr(dest)) {
@@ -62,7 +71,7 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 		else
 			br_flood_deliver(br, skb);
 	} else if ((dst = __br_fdb_get(br, dest)) != NULL)
-		br_deliver(dst->dst, skb);
+		br_deliver(dst->dst, skb, 1);
 	else
 		br_flood_deliver(br, skb);
 
@@ -73,6 +82,10 @@ out:
 static int br_dev_init(struct net_device *dev)
 {
 	struct net_bridge *br = netdev_priv(dev);
+	struct net *net = dev_net(dev);
+
+	if (!(net->owner_ve->features & VE_FEATURE_BRIDGE))
+		return -EACCES;
 
 	br->stats = alloc_percpu(struct br_cpu_netstats);
 	if (!br->stats)
@@ -164,9 +177,12 @@ static int br_set_mac_address(struct net_device *dev, void *p)
 		return -EINVAL;
 
 	spin_lock_bh(&br->lock);
-	memcpy(dev->dev_addr, addr->sa_data, ETH_ALEN);
-	dev->addr_assign_type = NET_ADDR_PERM;
-	br_stp_change_bridge_id(br, addr->sa_data);
+	if (compare_ether_addr(dev->dev_addr, addr->sa_data)) {
+		memcpy(dev->dev_addr, addr->sa_data, ETH_ALEN);
+		dev->addr_assign_type = NET_ADDR_PERM;
+		br_fdb_change_mac_address(br, addr->sa_data);
+		br_stp_change_bridge_id(br, addr->sa_data);
+	}
 	br->flags |= BR_SET_MAC_ADDR;
 	spin_unlock_bh(&br->lock);
 
@@ -292,6 +308,149 @@ static void br_vlan_rx_register(struct net_device *br_dev, struct vlan_group *gr
 	}
 }
 
+static int br_rst_nested_dev(loff_t start, struct cpt_br_image *bri,
+			 struct net_bridge *br, struct rst_ops *ops,
+			 struct cpt_context *ctx)
+{
+	struct net_device *dev;
+	int ret = 0;
+	loff_t pos;
+
+	pos = start + bri->cpt_hdrlen;
+
+	while (pos < start + bri->cpt_next) {
+		struct cpt_br_nested_dev o;
+
+		ret = ops->get_object(CPT_OBJ_NET_BR_DEV, pos, &o, sizeof(o), ctx);
+		if (ret)
+			break;
+
+		dev = dev_get_by_name(dev_net(br->dev), o.name);
+		if (!dev) {
+			printk(KERN_ERR "%s: restore '%s' nested dev\n", __func__, o.name);
+			WARN_ON(1);
+			ret = -ENODEV;
+			break;
+		}
+
+		ret = br_add_if(br, dev);
+		dev_put(dev);
+		if (ret)
+			break;
+
+		pos += o.cpt_next;
+	}
+	return ret;
+}
+
+int br_rst(loff_t start, struct cpt_netdev_image *di,
+		struct rst_ops *ops, struct cpt_context *ctx)
+{
+	struct net *net = current->nsproxy->net_ns;
+	struct cpt_br_image bri;
+	struct net_device *dev;
+	struct net_bridge *br;
+	loff_t pos;
+	int ret;
+
+	pos = start + di->cpt_hdrlen;
+	ret = ops->get_object(CPT_OBJ_NET_BR, pos,
+			&bri, sizeof(bri), ctx);
+	if (ret)
+		goto out;
+
+	dev = alloc_netdev(sizeof(struct net_bridge), di->cpt_name,
+			   br_dev_setup);
+	if (!dev)
+		return -ENOMEM;
+
+	dev_net_set(dev, net);
+	br = netdev_priv(dev);
+
+	memcpy(&br->designated_root, &bri.designated_root, 8);
+	memcpy(&br->bridge_id, &bri.bridge_id, 8);
+	br->root_path_cost = bri.root_path_cost;
+	br->max_age = clock_t_to_jiffies(bri.max_age);
+	br->hello_time = clock_t_to_jiffies(bri.hello_time);
+	br->forward_delay = bri.forward_delay;
+	br->bridge_max_age = bri.bridge_max_age;
+	br->bridge_hello_time = bri.bridge_hello_time;
+	br->bridge_forward_delay = clock_t_to_jiffies(bri.bridge_forward_delay);
+	br->ageing_time = clock_t_to_jiffies(bri.ageing_time);
+	br->root_port = bri.root_port;
+	br->stp_enabled = bri.stp_enabled;
+	br->via_phys_dev = bri.via_phys_dev;
+
+	SET_NETDEV_DEVTYPE(dev, &br_type);
+
+	ret = register_netdevice(dev);
+	if (ret)
+		goto out_free;
+
+	ret = br_rst_nested_dev(pos, &bri, br, ops, ctx);
+out:
+	return ret;
+
+out_free:
+	free_netdev(dev);
+	goto out;
+}
+
+static void br_cpt_nested_dev(struct net_bridge *br, struct cpt_ops *ops,
+			      struct cpt_context *ctx)
+{
+	struct net_bridge_port *p;
+
+	list_for_each_entry(p, &br->port_list, list) {
+		struct cpt_br_nested_dev o;
+		loff_t saved_obj;
+
+		ops->push_object(&saved_obj, ctx);
+
+		o.cpt_next = CPT_NULL;
+		o.cpt_object = CPT_OBJ_NET_BR_DEV;
+		o.cpt_hdrlen = sizeof(o);
+		o.cpt_content = CPT_CONTENT_NAME;
+		BUILD_BUG_ON(IFNAMSIZ != 16);
+		memcpy(o.name, p->dev->name, IFNAMSIZ);
+
+		ops->write(&o, sizeof(o), ctx);
+
+		ops->pop_object(&saved_obj, ctx);
+	}
+
+
+}
+
+static void br_cpt(struct net_device *dev, struct cpt_ops *ops, struct cpt_context *ctx)
+{
+	struct cpt_br_image v;
+	struct net_bridge *br = netdev_priv(dev);
+
+	v.cpt_next = CPT_NULL;
+	v.cpt_object = CPT_OBJ_NET_BR;
+	v.cpt_hdrlen = sizeof(v);
+	v.cpt_content = CPT_CONTENT_VOID;
+
+	memcpy(&v.designated_root, &br->designated_root, 8);
+	memcpy(&v.bridge_id, &br->bridge_id, 8);
+	v.root_path_cost = br->root_path_cost;
+	v.max_age = jiffies_to_clock_t(br->max_age);
+	v.hello_time = jiffies_to_clock_t(br->hello_time);
+	v.forward_delay = br->forward_delay;
+	v.bridge_max_age = br->bridge_max_age;
+	v.bridge_hello_time = br->bridge_hello_time;
+	v.bridge_forward_delay = jiffies_to_clock_t(br->bridge_forward_delay);
+	v.ageing_time = jiffies_to_clock_t(br->ageing_time);
+	v.root_port = br->root_port;
+	v.stp_enabled = br->stp_enabled;
+	v.via_phys_dev = br->via_phys_dev;
+
+	ops->write(&v, sizeof(v), ctx);
+
+	br_cpt_nested_dev(br, ops, ctx);
+}
+
 static const struct ethtool_ops br_ethtool_ops = {
 	.get_drvinfo    = br_getinfo,
 	.get_link	= ethtool_op_get_link,
@@ -307,6 +466,7 @@ static const struct net_device_ops br_netdev_ops = {
 	.ndo_change_mtu		 = br_change_mtu,
 	.ndo_do_ioctl		 = br_dev_ioctl,
 	.ndo_vlan_rx_register	 = br_vlan_rx_register,
+	.ndo_cpt		 = br_cpt,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_netpoll_cleanup	 = br_netpoll_cleanup,
 	.ndo_poll_controller	 = br_poll_controller,
@@ -326,10 +486,6 @@ static void br_dev_free(struct net_device *dev)
 	free_percpu(br->stats);
 	free_netdev(dev);
 }
-
-static struct device_type br_type = {
-	.name	= "bridge",
-};
 
 void br_dev_setup(struct net_device *dev)
 {

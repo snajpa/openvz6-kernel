@@ -15,6 +15,7 @@
 #include <linux/cpu.h>
 #include <linux/vmstat.h>
 #include <linux/sched.h>
+#include <linux/virtinfo.h>
 #include <linux/math64.h>
 
 #ifdef CONFIG_VM_EVENT_COUNTERS
@@ -36,6 +37,20 @@ static void sum_vm_events(unsigned long *ret, const struct cpumask *cpumask)
 	}
 }
 
+unsigned long vm_events(enum vm_event_item i)
+{
+	int cpu;
+	unsigned long sum;
+	struct vm_event_state *st;
+
+	sum = 0;
+	for_each_online_cpu(cpu) {
+		st = &per_cpu(vm_event_states, cpu);
+		sum += st->event[i];
+	}
+
+	return (sum < 0 ? 0 : sum);
+}
 /*
  * Accumulate the vm event counters across all CPUs.
  * The result is unavoidably approximate - it can change
@@ -790,6 +805,9 @@ static const char * const vmstat_text[] = {
 	"nr_isolated_anon",
 	"nr_isolated_file",
 	"nr_shmem",
+#ifdef CONFIG_MEMORY_VSWAP
+	"nr_vswap",
+#endif
 #ifdef CONFIG_NUMA
 	"numa_hit",
 	"numa_miss",
@@ -805,6 +823,10 @@ static const char * const vmstat_text[] = {
 	"pgpgout",
 	"pswpin",
 	"pswpout",
+#ifdef CONFIG_MEMORY_VSWAP
+	"vswpin",
+	"vswpout",
+#endif
 
 	TEXTS_FOR_ZONES("pgalloc")
 
@@ -867,6 +889,20 @@ static const char * const vmstat_text[] = {
 #endif
 };
 
+#ifdef CONFIG_MEMORY_GANGS
+static unsigned long get_zone_junk_pages(struct zone *zone)
+{
+	struct gang *gang = zone_junk_gang(zone);
+	unsigned long junk = 0;
+	enum lru_list lru;
+
+	for_each_lru(lru)
+		junk += gang->lruvec.nr_pages[lru];
+
+	return junk;
+}
+#endif
+
 static void zoneinfo_show_print(struct seq_file *m, pg_data_t *pgdat,
 							struct zone *zone)
 {
@@ -884,7 +920,7 @@ static void zoneinfo_show_print(struct seq_file *m, pg_data_t *pgdat,
 		   min_wmark_pages(zone),
 		   low_wmark_pages(zone),
 		   high_wmark_pages(zone),
-		   zone->pages_scanned,
+		   atomic_long_read(&zone->pages_scanned),
 		   zone->spanned_pages,
 		   zone->present_pages);
 
@@ -920,13 +956,33 @@ static void zoneinfo_show_print(struct seq_file *m, pg_data_t *pgdat,
 	}
 	seq_printf(m,
 		   "\n  all_unreclaimable: %u"
-		   "\n  prev_priority:     %i"
-		   "\n  start_pfn:         %lu"
-		   "\n  inactive_ratio:    %u",
-			   zone_is_all_unreclaimable(zone),
-		   zone->prev_priority,
-		   zone->zone_start_pfn,
-		   zone->inactive_ratio);
+		   "\n  start_pfn:         %lu",
+		   zone_is_all_unreclaimable(zone),
+		   zone->zone_start_pfn);
+
+#ifdef CONFIG_MEMORY_GANGS
+	seq_printf(m,
+		   "\n  junk_pages:        %ld"
+		   "\n  eldest_page:       %u"
+		   "\n  committed:         %ld"
+		   "\n  overcommit:        %ld %%"
+		   "\n  force_scan:        %d",
+		   get_zone_junk_pages(zone),
+		   jiffies_to_msecs(jiffies - zone->eldest_timestamp),
+		   zone->committed,
+		   zone->committed * 100 / zone->present_pages - 100,
+		   zone->force_scan);
+
+	seq_printf(m,
+		   "\n  vmscan_priorities: ");
+	seq_bitmap_list(m, zone->vmscan_mask, NR_VMSCAN_PRIORITIES);
+
+	seq_printf(m,
+		   "\n  vmscan_rounds:     ");
+	for (i = 0; i < NR_VMSCAN_PRIORITIES; i++)
+		seq_printf(m, " %u", atomic_read(zone->vmscan_round + i));
+#endif
+
 	seq_putc(m, '\n');
 }
 
@@ -965,30 +1021,40 @@ static void *vmstat_start(struct seq_file *m, loff_t *pos)
 	unsigned long *v;
 #ifdef CONFIG_VM_EVENT_COUNTERS
 	unsigned long *e;
+#define VMSTAT_BUFSIZE	(NR_VM_ZONE_STAT_ITEMS * sizeof(unsigned long) + \
+				sizeof(struct vm_event_state))
+#else
+#define VMSTAT_BUFSIZE	(NR_VM_ZONE_STAT_ITEMS * sizeof(unsigned long))
 #endif
 	int i;
 
 	if (*pos >= ARRAY_SIZE(vmstat_text))
 		return NULL;
 
-#ifdef CONFIG_VM_EVENT_COUNTERS
-	v = kmalloc(NR_VM_ZONE_STAT_ITEMS * sizeof(unsigned long)
-			+ sizeof(struct vm_event_state), GFP_KERNEL);
-#else
-	v = kmalloc(NR_VM_ZONE_STAT_ITEMS * sizeof(unsigned long),
-			GFP_KERNEL);
-#endif
+	v = kmalloc(VMSTAT_BUFSIZE, GFP_KERNEL);
 	m->private = v;
 	if (!v)
 		return ERR_PTR(-ENOMEM);
-	for (i = 0; i < NR_VM_ZONE_STAT_ITEMS; i++)
-		v[i] = global_page_state(i);
+
+	if (ve_is_super(get_exec_env())) {
+		for (i = 0; i < NR_VM_ZONE_STAT_ITEMS; i++)
+			v[i] = global_page_state(i);
 #ifdef CONFIG_VM_EVENT_COUNTERS
-	e = v + NR_VM_ZONE_STAT_ITEMS;
-	all_vm_events(e);
-	e[PGPGIN] /= 2;		/* sectors -> kbytes */
-	e[PGPGOUT] /= 2;
+		e = v + NR_VM_ZONE_STAT_ITEMS;
+		all_vm_events(e);
+		e[PGPGIN] /= 2;		/* sectors -> kbytes */
+		e[PGPGOUT] /= 2;
 #endif
+	} else
+		memset(v, 0, VMSTAT_BUFSIZE);
+
+	if (virtinfo_notifier_call(VITYPE_GENERAL,
+				VIRTINFO_VMSTAT, v) & NOTIFY_FAIL) {
+		kfree(v);
+		m->private = NULL;
+		return ERR_PTR(-ENOMSG);
+	}
+
 	return v + *pos;
 }
 
@@ -1107,7 +1173,7 @@ static int __init setup_vmstat(void)
 #ifdef CONFIG_PROC_FS
 	proc_create("buddyinfo", S_IRUGO, NULL, &fragmentation_file_operations);
 	proc_create("pagetypeinfo", S_IRUGO, NULL, &pagetypeinfo_file_ops);
-	proc_create("vmstat", S_IRUGO, NULL, &proc_vmstat_file_operations);
+	proc_create("vmstat", S_IRUGO, &glob_proc_root, &proc_vmstat_file_operations);
 	proc_create("zoneinfo", S_IRUGO, NULL, &proc_zoneinfo_file_operations);
 #endif
 	return 0;
